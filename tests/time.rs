@@ -147,3 +147,28 @@ fn a_timeout_is_as_large_as_its_future_plus_a_timer() {
     let parts = std::mem::size_of::<Big>() + std::mem::size_of::<giong::time::Sleep>();
     assert!(size <= parts + 8, "{size} bytes for {parts} bytes of parts");
 }
+
+/// With precise timers on, short and long sleeps still last at least their
+/// duration and not far longer, on every driver (only kqueue acts on it).
+#[test]
+fn precise_timers_keep_sleeps_at_least_their_duration() {
+    giong::Builder::new()
+        .workers(1)
+        .precise_timers(true)
+        .build()
+        .unwrap()
+        .run(|_| async {
+            for ms in [2, 2, 5, 150] {
+                let d = Duration::from_millis(ms);
+                let start = Instant::now();
+                sleep(d).await;
+                let elapsed = start.elapsed();
+                assert!(elapsed >= d, "{d:?} woke early: {elapsed:?}");
+                assert!(
+                    elapsed < d + Duration::from_millis(500),
+                    "{d:?} woke far too late: {elapsed:?}"
+                );
+            }
+        })
+        .unwrap();
+}

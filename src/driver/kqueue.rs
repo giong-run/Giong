@@ -5,12 +5,13 @@
 //! `EV_CLEAR`, which is kqueue's edge-triggered mode), and each event names
 //! one direction. Closing a descriptor removes its filters, as with epoll.
 //!
-//! A short wait with a time limit does not pass that limit to `kevent`:
-//! macOS adds timer slack (coalescing) to it, so a 2 ms wait took 2 to
-//! 4 ms. It arms a one-shot `EVFILT_TIMER` with `NOTE_CRITICAL` instead,
-//! which the kernel fires on time, and blocks until an event comes. A long
-//! wait keeps the plain limit: its slack, about a millisecond, is under
-//! 1% of it, and the coalescing saves power (a laptop's batched wake-ups).
+//! macOS adds timer slack (coalescing) to a wait's time limit, so a 2 ms
+//! wait takes 2 to 4 ms. With `Builder::precise_timers`, a short wait does
+//! not pass its limit to `kevent`: it arms a one-shot `EVFILT_TIMER` with
+//! `NOTE_CRITICAL` instead, which the kernel fires on time, and blocks
+//! until an event comes. That costs CPU and power (more interrupt
+//! wake-ups), so it is off by default. A long wait keeps the plain limit
+//! either way: its slack, about a millisecond, is under 1% of it.
 //!
 //! Built on Linux too with `--cfg giong_libkqueue`, against libkqueue (a
 //! kqueue written over epoll), so that this file can be tested without a
@@ -94,6 +95,8 @@ pub(crate) struct Kqueue {
     /// driver: the queue is closed when the last of them is gone.
     kq: Arc<OwnedFd>,
     events: Vec<Kevent>,
+    /// Short timed waits use the wait timer (`Builder::precise_timers`).
+    precise: bool,
     /// The wait timer is armed: it has neither fired nor been deleted.
     timer_armed: bool,
     /// The kernel refused the wait timer once; waits pass their limit to
@@ -208,9 +211,15 @@ impl Poller for Kqueue {
         Ok(Self {
             kq,
             events: Vec::with_capacity(MAX_EVENTS),
+            precise: false,
             timer_armed: false,
             timer_refused: false,
         })
+    }
+
+    fn set_precise_timers(&mut self, enable: bool) {
+        // A timer armed while it was on is deleted by the next wait.
+        self.precise = enable;
     }
 
     fn waker(&self) -> io::Result<super::WakeHandle> {
@@ -293,9 +302,10 @@ impl Poller for Kqueue {
 
     fn wait(&mut self, timeout: Option<Duration>) -> usize {
         self.events.clear();
-        // A short limit above zero arms the wait timer and blocks. A timer
-        // an earlier wait left armed (an event ended that wait early) is
-        // deleted first, in the same call: re-adding a timer that exists
+        // With precise timers on, a short limit above zero arms the wait
+        // timer and blocks. A timer an earlier wait left armed (an event
+        // ended that wait early) is deleted first, in the same call:
+        // re-adding a timer that exists
         // does not restart it everywhere (libkqueue keeps the old time),
         // and the delete also drops an expiry that came but was not
         // collected. Any other wait takes such a timer back, or it would
@@ -310,7 +320,7 @@ impl Poller for Kqueue {
         let mut limit = timeout;
         match timeout {
             Some(d) if d.is_zero() => nchanges = 0,
-            Some(d) if d <= TIMER_UP_TO && !self.timer_refused => {
+            Some(d) if self.precise && d <= TIMER_UP_TO && !self.timer_refused => {
                 let ev = &mut changes[nchanges];
                 ev.flags = (EV_ADD | EV_ONESHOT) as u16;
                 ev.fflags = (NOTE_NSECONDS | NOTE_CRITICAL) as _;
@@ -413,12 +423,57 @@ mod tests {
     use super::*;
     use std::time::Instant;
 
+    /// A queue with precise timers on.
+    fn precise() -> Kqueue {
+        let mut kq = Kqueue::new().unwrap();
+        kq.set_precise_timers(true);
+        kq
+    }
+
+    /// Precise timers are off by default: a short timed wait passes its
+    /// limit to `kevent` and arms no timer.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
+    fn a_short_wait_arms_no_timer_by_default() {
+        let mut kq = Kqueue::new().unwrap();
+        let limit = Duration::from_millis(20);
+        let start = Instant::now();
+        assert_eq!(kq.wait(Some(limit)), 0);
+        assert!(start.elapsed() >= limit, "{:?}", start.elapsed());
+        let wake = kq.waker().unwrap();
+        wake.ring();
+        assert_eq!(kq.wait(Some(limit)), 1);
+        assert!(!kq.timer_armed);
+    }
+
+    /// Turning precise timers off takes back a timer left armed: it does
+    /// not end the next wait.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
+    fn turning_precise_timers_off_takes_back_an_armed_timer() {
+        let mut kq = precise();
+        let wake = kq.waker().unwrap();
+        wake.ring();
+        assert_eq!(kq.wait(Some(Duration::from_millis(30))), 1);
+        assert!(kq.timer_armed);
+        kq.set_precise_timers(false);
+        let limit = Duration::from_millis(200);
+        let start = Instant::now();
+        assert_eq!(kq.wait(Some(limit)), 0);
+        assert!(
+            start.elapsed() >= limit,
+            "the old timer ended the wait after {:?}",
+            start.elapsed()
+        );
+        assert!(!kq.timer_armed);
+    }
+
     /// A timed wait with nothing to report lasts its limit and reports no
     /// event: the wait timer's own event is not passed on.
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
     fn a_timed_wait_lasts_its_limit_and_reports_nothing() {
-        let mut kq = Kqueue::new().unwrap();
+        let mut kq = precise();
         let limit = Duration::from_millis(20);
         for _ in 0..3 {
             let start = Instant::now();
@@ -435,7 +490,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
     fn a_timer_left_armed_does_not_end_a_later_wait() {
-        let mut kq = Kqueue::new().unwrap();
+        let mut kq = precise();
         let wake = kq.waker().unwrap();
         wake.ring();
         assert_eq!(kq.wait(Some(Duration::from_millis(30))), 1);
@@ -466,7 +521,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
     fn a_short_wait_after_a_long_one_ended_early_lasts_its_own_limit() {
-        let mut kq = Kqueue::new().unwrap();
+        let mut kq = precise();
         let wake = kq.waker().unwrap();
         for long in [TIMER_UP_TO, Duration::from_secs(5)] {
             wake.ring();
@@ -490,7 +545,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
     fn a_long_wait_takes_back_a_timer_left_armed() {
-        let mut kq = Kqueue::new().unwrap();
+        let mut kq = precise();
         let wake = kq.waker().unwrap();
         wake.ring();
         assert_eq!(kq.wait(Some(Duration::from_millis(30))), 1);
@@ -518,7 +573,7 @@ mod tests {
     #[test]
     #[cfg_attr(miri, ignore = "Miri cannot call kevent")]
     fn a_look_arms_no_timer() {
-        let mut kq = Kqueue::new().unwrap();
+        let mut kq = precise();
         let start = Instant::now();
         assert_eq!(kq.wait(Some(Duration::ZERO)), 0);
         assert!(start.elapsed() < Duration::from_secs(1));
