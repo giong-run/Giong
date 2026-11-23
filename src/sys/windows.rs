@@ -707,11 +707,22 @@ pub(crate) enum AcceptWake {
 /// socket, and be told to stop.
 ///
 /// The wait is a `select` on the listener and on a datagram socket that is
-/// connected to itself: [`stop`](Self::stop) sends that socket a byte,
-/// which nobody reads, so it stays readable. `select` reports what is true
-/// at the moment it is asked, so a connection that arrives at any point is
+/// connected to itself: [`stop`](Self::stop) sets a flag and sends that
+/// socket a byte, so that a wait returns. `select` reports what is true at
+/// the moment it is asked, so a connection that arrives at any point is
 /// seen by the next wait (an event object set by `WSAEventSelect` can be
 /// reset past one).
+///
+/// Only the flag stops the thread. A datagram is not proof of a `stop`:
+/// any program on the machine can see the socket's port, and Windows lets
+/// another socket bind the wildcard address on that port (even with
+/// `SO_EXCLUSIVEADDRUSE` on this one) and send from there with this
+/// socket's own address as the source. One datagram would then have ended
+/// the thread for good, and every listener of the shared address would
+/// have stopped taking connections. So a datagram without the flag is read
+/// and ignored. The bind is exclusive all the same, so that no socket can
+/// take over the address itself, and with it the byte of `stop` (the flag
+/// is also looked at every 100 ms).
 pub(crate) struct AcceptEvents {
     listener: RawSock,
     wake: RawSock,
@@ -746,6 +757,22 @@ impl AcceptEvents {
                 wake,
                 stopped: std::sync::atomic::AtomicBool::new(false),
             };
+            let on: BOOL = 1;
+            if WinSock::setsockopt(
+                wake,
+                WinSock::SOL_SOCKET,
+                WinSock::SO_EXCLUSIVEADDRUSE,
+                (&on as *const BOOL).cast(),
+                mem::size_of::<BOOL>() as i32,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Non-blocking, so that `select` can read it empty.
+            let mut nonblocking = 1u32;
+            if WinSock::ioctlsocket(wake, WinSock::FIONBIO, &mut nonblocking) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             let mut addr: WinSock::SOCKADDR_IN = std::mem::zeroed();
             addr.sin_family = WinSock::AF_INET;
             addr.sin_addr.S_un.S_addr = u32::from_ne_bytes([127, 0, 0, 1]);
@@ -782,10 +809,7 @@ impl AcceptEvents {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return AcceptWake::Stop;
         }
-        match self.select(ms, false) {
-            AcceptWake::Accept => AcceptWake::Stop,
-            woke => woke,
-        }
+        self.select(ms, false)
     }
 
     fn wait_once(&self, timeout: u32) -> AcceptWake {
@@ -825,14 +849,40 @@ impl AcceptEvents {
             }
             let set = &read.fd_array[..(read.fd_count as usize).min(2)];
             if ready > 0 && set.contains(&self.wake) {
-                AcceptWake::Stop
-            } else if ready > 0 {
+                self.drain();
+                if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    return AcceptWake::Stop;
+                }
+            }
+            if ready > 0 && set.contains(&self.listener) {
                 AcceptWake::Accept
             } else {
                 AcceptWake::Timeout
             }
         }
     }
+
+    /// Reads what waits on the wake socket, so that a datagram that came
+    /// without [`stop`](Self::stop) does not keep every wait short. At most
+    /// [`DRAIN_MAX`](Self::DRAIN_MAX) datagrams per wait: a program that
+    /// floods the socket must not keep the thread from the listener, which
+    /// the same `select` reports.
+    fn drain(&self) {
+        let mut buf = [0u8; 16];
+        for _ in 0..Self::DRAIN_MAX {
+            // SAFETY: a local buffer of the size given; the socket is open
+            // while `self` lives and does not block.
+            let n = unsafe { WinSock::recv(self.wake, buf.as_mut_ptr(), buf.len() as i32, 0) };
+            // A longer datagram is cut to the buffer and taken all the same.
+            // SAFETY: plain call.
+            if n < 0 && unsafe { WinSock::WSAGetLastError() } != WinSock::WSAEMSGSIZE {
+                return;
+            }
+        }
+    }
+
+    /// Datagrams [`drain`](Self::drain) reads per wait.
+    const DRAIN_MAX: usize = 64;
 
     /// Makes [`wait`](Self::wait) return [`AcceptWake::Stop`], now and
     /// from here on.
@@ -1022,5 +1072,66 @@ mod tests {
             .join()
             .unwrap();
         assert!(super::closed_events().lock().unwrap().contains(&event));
+    }
+
+    /// The thread that hands out the connections of a shared port stops
+    /// for `stop` only. A datagram that reaches its wake socket some other
+    /// way is read and ignored: one sent by the socket itself, which is
+    /// what another socket can forge, and, where Windows lets a socket bind
+    /// the wildcard address on the wake socket's port (real Windows does,
+    /// Wine does not), one forged from there.
+    #[test]
+    fn only_stop_ends_a_wait_for_connections() {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let events = super::AcceptEvents::new(listener.as_raw_socket() as super::RawSock).unwrap();
+
+        // SAFETY: plain data, filled in by the call.
+        let mut addr: WinSock::SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<WinSock::SOCKADDR_IN>() as i32;
+        // SAFETY: an open socket; the address is a local of the size given.
+        let rc = unsafe {
+            WinSock::getsockname(
+                events.wake,
+                (&mut addr as *mut WinSock::SOCKADDR_IN).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        let port = u16::from_be(addr.sin_port);
+        if let Ok(forger) = std::net::UdpSocket::bind(("0.0.0.0", port)) {
+            for _ in 0..3 {
+                forger.send_to(&[7], ("127.0.0.1", port)).unwrap();
+                assert_eq!(events.wait(Some(20)), super::AcceptWake::Timeout);
+            }
+        }
+
+        for _ in 0..3 {
+            // SAFETY: one byte from a local, to the socket's own address.
+            let sent = unsafe { WinSock::send(events.wake, [7u8].as_ptr(), 1, 0) };
+            assert_eq!(sent, 1);
+            assert_eq!(events.wait(Some(20)), super::AcceptWake::Timeout);
+            assert_eq!(events.pause(20), super::AcceptWake::Timeout);
+        }
+        // A flood of them does not hide a connection: the listener is
+        // reported by the same wait.
+        for _ in 0..4 * super::AcceptEvents::DRAIN_MAX {
+            // SAFETY: as above.
+            unsafe { WinSock::send(events.wake, [7u8].as_ptr(), 1, 0) };
+        }
+        let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        while events.wait(Some(5_000)) != super::AcceptWake::Accept {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "never saw the connection"
+            );
+        }
+
+        events.stop();
+        assert_eq!(events.wait(None), super::AcceptWake::Stop);
+        assert_eq!(events.pause(20), super::AcceptWake::Stop);
     }
 }
