@@ -87,7 +87,9 @@ jobs:
           done
           echo "30 runs passed" >> "$GITHUB_STEP_SUMMARY"
 
-  msrv:
+  # Not `msrv`: a job of that name would also count as main's required
+  # `msrv` check (ci.yml's), so a cancelled run here would block a merge.
+  windows-msrv:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: windows-2025
@@ -101,7 +103,7 @@ jobs:
 
   # Every job above passed, or `plan` chose to skip them. One name to require.
   windows-checks:
-    needs: [plan, runtime, msrv]
+    needs: [plan, runtime, windows-msrv]
     if: always()
     runs-on: ubuntu-24.04
     steps:
