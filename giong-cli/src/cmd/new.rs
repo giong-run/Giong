@@ -370,7 +370,14 @@ fn run(args: &Args) -> Result<Report, Failure> {
     if !o.dbs.is_empty() && offer.db {
         next.push("giong db up".into());
     }
-    next.push(if offer.dev { "giong dev" } else { "cargo run" }.into());
+    next.push(
+        match (offer.dev_background, offer.dev) {
+            (true, _) => "giong dev --background",
+            (false, true) => "giong dev",
+            _ => "cargo run",
+        }
+        .into(),
+    );
     r.data("next", json!(next));
 
     let what = match (o.template, o.dbs.is_empty()) {

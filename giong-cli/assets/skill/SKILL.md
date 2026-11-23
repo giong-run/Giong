@@ -131,7 +131,8 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-`cargo add giong giong-web serde --features serde/derive`, then `cargo run --release`.
+`cargo add giong giong-web serde --features serde/derive`, then `giong dev --background`
+(see Local development below; `cargo run` without the giong command).
 
 ## The giong command
 
@@ -143,7 +144,7 @@ the cause and the fix.
 |---|---|
 | Start a project | `giong new api --template web --db postgres` (templates `web`, `grpc`, `worker`; `--db postgres`, `mysql`, `redis`, comma-separated; `--tls`) |
 | Teach this project to your agent | `giong ai init` (`giong new` does it) |
-| Work on it | `giong dev` |
+| Work on it | `giong dev --background`, once (see Local development) |
 | Is my machine right? | `giong doctor` |
 | What is wrong with my code? | `giong check --json`, then `giong fix` |
 | What does this error mean? | `giong explain GIONG-E0102` |
@@ -154,6 +155,26 @@ the cause and the fix.
 test, migrations, `.env.example`, a Dockerfile, a CI workflow and fast dev builds. Extend it
 rather than starting from an empty `main.rs`. `giong fix` applies only fixes that need no
 judgement (the compiler's, clippy's, and `giong check`'s own); what is left needs a decision.
+
+## Local development
+
+One project folder, one runner, on this machine, like `npm run dev`:
+
+1. At the start, run `giong dev --background`. It builds, starts the service, waits until
+   it serves, prints its address (`http://127.0.0.1:PORT`) and returns; if one already runs
+   for this project, it reports that one. A failed build says why (`GIONG-E5009`) and keeps
+   watching: fix the code.
+2. Edit the code. `giong dev` rebuilds and swaps the service by itself, without refusing a
+   connection.
+3. Try it with `curl` on the printed address.
+4. `giong dev status --json` says whether it is building, serving or failed (`state`), its
+   `urls` and the last build's first error (`build.error`); `giong dev logs --lines 100` shows
+   the service's output and requests.
+5. `giong dev stop` when you are done. `--all` on `status` and `stop` covers every project
+   on this machine.
+
+Do not run the service with `cargo run`, `cargo build --release`, Docker or a second
+terminal. One `giong dev` per project.
 
 ## Testing
 

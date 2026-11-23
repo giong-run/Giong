@@ -382,7 +382,11 @@ pub fn context(o: &Options) -> Context {
     cx.flag("sql", o.has(Db::Postgres) || o.has(Db::Mysql))
         .flag("db", !o.dbs.is_empty())
         .flag("tls", o.tls)
-        .flag("local", o.giong_path.is_some());
+        .flag("local", o.giong_path.is_some())
+        .flag(
+            "dev_background",
+            crate::cmd::ai::Offer::here().dev_background,
+        );
     cx
 }
 
@@ -550,6 +554,32 @@ mod tests {
                 assert!(!cargo.contains(GIONG_VERSION), "{cargo}");
             } else {
                 assert!(cargo.contains(&format!("giong = {{ version = \"{GIONG_VERSION}\" }}")));
+            }
+        }
+    }
+
+    /// The README teaches the one `giong dev` an agent keeps running when this
+    /// giong has it, and plain `giong dev` when it does not.
+    #[test]
+    fn readme_teaches_the_dev_runner_this_giong_has() {
+        let readme = files::FILES
+            .iter()
+            .find(|(p, _)| *p == "common/README.md.tmpl")
+            .unwrap()
+            .1;
+        for template in Template::ALL {
+            let o = Options::new("my-api", template);
+            for background in [true, false] {
+                let mut cx = context(&o);
+                cx.flag("dev_background", background);
+                let text = template::render(readme, &cx).unwrap().unwrap();
+                assert_eq!(text.contains("giong dev --background"), background);
+                assert_eq!(text.contains("giong dev stop"), background);
+                assert_eq!(text.contains("giong dev                "), !background);
+                assert_eq!(
+                    text.contains("Try the service on the address it prints"),
+                    background && template != Template::Worker
+                );
             }
         }
     }

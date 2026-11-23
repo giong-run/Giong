@@ -76,6 +76,9 @@ enum Change {
 pub struct Offer {
     pub mcp: bool,
     pub dev: bool,
+    /// `giong dev --background` with `status`, `logs` and `stop`: the one
+    /// runner an agent starts once and keeps using.
+    pub dev_background: bool,
     pub check: bool,
     pub fix: bool,
     pub test: bool,
@@ -89,6 +92,9 @@ impl Offer {
         Offer {
             mcp: has("mcp"),
             dev: has("dev"),
+            dev_background: super::COMMANDS
+                .iter()
+                .any(|c| c.name == "dev" && c.flags.iter().any(|f| f.name == "background")),
             check: has("check"),
             fix: has("fix"),
             test: has("test"),
@@ -102,6 +108,7 @@ impl Offer {
         Offer {
             mcp: true,
             dev: true,
+            dev_background: true,
             check: true,
             fix: true,
             test: true,
@@ -121,8 +128,12 @@ fn command_rows(offer: &Offer) -> String {
     };
     row(
         offer.dev,
-        "Run the service, restarting on every change",
-        "`giong dev`",
+        "Run the service, rebuilt on every change",
+        if offer.dev_background {
+            "`giong dev --background`, once (see Local development)"
+        } else {
+            "`giong dev`"
+        },
     );
     row(
         offer.check,
@@ -156,8 +167,33 @@ fn command_rows(offer: &Offer) -> String {
     rows
 }
 
+/// How to work on the service: one `giong dev` per project, started once and
+/// kept, the way `npm run dev` is.
+fn dev_flow(offer: &Offer) -> &'static str {
+    if !offer.dev_background {
+        return "";
+    }
+    "\n### Local development\n\n\
+     One project folder, one runner, on this machine, like `npm run dev`:\n\n\
+     1. At the start, run `giong dev --background`. It builds, starts the service, waits until\n   \
+     it serves, prints its address (`http://127.0.0.1:PORT`) and returns; if one already runs\n   \
+     for this project, it reports that one. A failed build says why (`GIONG-E5009`) and keeps\n   \
+     watching: fix the code.\n\
+     2. Edit the code. `giong dev` rebuilds and swaps the service by itself, without refusing\n   \
+     a connection.\n\
+     3. Try it with `curl` on the printed address.\n\
+     4. `giong dev status --json` says whether it is building, serving or failed (`state`), its\n   \
+     `urls` and the last build's first error (`build.error`); `giong dev logs --lines 100` shows\n   \
+     the service's output and requests.\n\
+     5. `giong dev stop` when you are done. `--all` on `status` and `stop` covers every project\n   \
+     on this machine.\n\n\
+     Do not run the service with `cargo run`, `cargo build --release`, Docker or a second\n\
+     terminal. One `giong dev` per project.\n"
+}
+
 fn agents_block(version: &str, offer: &Offer) -> String {
     let rows = command_rows(offer);
+    let dev = dev_flow(offer);
     let mcp = if offer.mcp {
         "\nThe `giong` MCP server in `.mcp.json` serves the commands that only read (`check`, `doctor`,\n\
          `explain`, ...) as tools; `fix` and the other changes join them only under\n\
@@ -183,7 +219,7 @@ skill in `.claude/skills/giong/SKILL.md` has every rule; the ones that matter mo
 - **Never block a worker**: `giong::fs`, `giong::net`, `giong::time`, never `std::fs`,
   `std::net` or `std::thread::sleep` on a worker. Heavy work goes to `std::thread::spawn`
   and comes back through `giong::sync::oneshot`.
-- **`bind` takes IP addresses** (`0.0.0.0:8080`), never `localhost`.
+- **`bind` takes IP addresses** (`127.0.0.1:8080`), never `localhost`.
 - **Every wait for another party has a deadline**: `giong::time::timeout(duration, fut)`.
 - **Errors carry a code** (`GIONG-E0102: ... Fix: ...`). Match on `giong::error::code(&err)`,
   never on the text; `giong explain GIONG-E0102` prints the cause and the fix.
@@ -191,7 +227,7 @@ skill in `.claude/skills/giong/SKILL.md` has every rule; the ones that matter mo
   giong-postgres and giong-mysql (not sqlx), giong-redis (not redis-rs), giong-grpc (not
   tonic). A crate that needs the Tokio runtime panics on a worker.
 
-{rows}{mcp}{END}
+{rows}{dev}{mcp}{END}
 "#
     )
 }
@@ -211,6 +247,11 @@ fn cursor_rule(offer: &Offer) -> String {
         }
         _ => "\n",
     };
+    let dev = if offer.dev_background {
+        "Run the service with `giong dev --background`, once, and keep it: it rebuilds on\nevery change. Never `cargo run`, Docker or a release build for it.\n"
+    } else {
+        ""
+    };
     format!(
         "---\n\
          description: Gióng rules for this Rust project\n\
@@ -218,7 +259,7 @@ fn cursor_rule(offer: &Offer) -> String {
          ---\n\
          <!-- giong:owned (giong ai init rewrites this file; delete this line to keep your edits) -->\n\n\
          This project runs on Gióng, a thread-per-core async runtime for Rust. Read `AGENTS.md` at\n\
-         the root before changing code: it has the rules and the commands.{finish}"
+         the root before changing code: it has the rules and the commands.{finish}{dev}"
     )
 }
 
@@ -832,6 +873,7 @@ mod tests {
         let none = Offer {
             mcp: false,
             dev: false,
+            dev_background: false,
             check: false,
             fix: false,
             test: false,
@@ -863,6 +905,39 @@ mod tests {
             crate::cmd::COMMANDS.iter().any(|c| c.name == "mcp")
         );
         fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The flow an agent follows to work on the service: one `giong dev`,
+    /// started in the background once, and nothing else that runs it.
+    #[test]
+    fn agents_learn_one_dev_runner() {
+        let all = Offer::all();
+        let agents = agents_block("1.5.0", &all);
+        for step in [
+            "giong dev --background",
+            "giong dev status",
+            "giong dev logs",
+            "giong dev stop",
+            "http://127.0.0.1:PORT",
+            "Do not run the service with `cargo run`",
+        ] {
+            assert!(agents.contains(step), "{step} missing from {agents}");
+        }
+        assert!(cursor_rule(&all).contains("giong dev --background"));
+        // A giong without the background runner is not taught it.
+        let older = Offer {
+            dev_background: false,
+            ..all
+        };
+        let agents = agents_block("1.5.0", &older);
+        assert!(!agents.contains("--background"), "{agents}");
+        assert!(agents.contains("`giong dev`"));
+        assert!(!cursor_rule(&older).contains("giong dev"));
+        // This build teaches it exactly when `giong dev` has the flag.
+        let has = crate::cmd::COMMANDS
+            .iter()
+            .any(|c| c.name == "dev" && c.flags.iter().any(|f| f.name == "background"));
+        assert_eq!(Offer::here().dev_background, has);
     }
 
     #[test]

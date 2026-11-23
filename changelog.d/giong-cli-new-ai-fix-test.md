@@ -15,8 +15,12 @@
   so in development nobody else on the network reaches it; the Dockerfile sets `0.0.0.0`.
 - **giong-cli**: `giong ai init` (also run by `giong new`) writes `AGENTS.md`, `CLAUDE.md`, a
   Cursor rule, the Gióng skill of the release in `.claude/skills/giong/`, and the `giong` MCP
-  server in `.mcp.json`. It can run again at any time: it replaces only
-  its own marked block or files and never reorders or drops anything else.
+  server in `.mcp.json`. They teach the agent one way to work on the service, like
+  `npm run dev`: `giong dev --background` once, edit the code and let it rebuild, `curl` the
+  address it prints, `giong dev status` and `giong dev logs` for errors and requests,
+  `giong dev stop` at the end, and never `cargo run`, a release build or Docker for it. It
+  can run again at any time: it replaces only its own marked block or files and never
+  reorders or drops anything else.
 - **giong-cli**: `giong fix` applies the fixes that need no judgement: the compiler's and
   clippy's machine-applicable suggestions and `giong check`'s own, in the project's files only,
   each whole or not at all, never two that overlap. It refuses a working tree with

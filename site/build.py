@@ -1846,6 +1846,17 @@ def llms():
              "  (`SET`, `LISTEN`, temporary tables, `USE`). Run those, and transactions, on a\n"
              "  connection from `pool.get().await?`; it comes back with its session reset.\n"
              ) if "giong-postgres" in names else ""
+    # The one-runner dev loop, from the release whose `giong dev` has `--background`.
+    dev = ("- Local development is one runner per project, like `npm run dev`. Run\n"
+           "  `giong dev --background` at the start: it builds, starts the service, waits until it\n"
+           "  serves, prints `http://127.0.0.1:PORT` and returns (or reports the one already\n"
+           "  running for the project). Then edit the code: it rebuilds and swaps the service by\n"
+           "  itself. Test with `curl` on that address; `giong dev status --json` gives `state`,\n"
+           "  `urls` and the last build's first error (`build.error`), `giong dev logs` the\n"
+           "  service's output; `giong dev stop` at the end. Never `cargo run`,\n"
+           "  `cargo build --release`, Docker or a second terminal for the service.\n"
+           "  `cargo install giong-cli` installs `giong`.\n"
+           ) if '"background"' in (released("giong-cli/src/cmd/dev.rs") or "") else ""
     have = {e[0] for e in DOCS}
     platforms = C.PLATFORM_LINE + (
         " On Linux giong runs on epoll by itself where io_uring is blocked (Docker's default "
@@ -1928,7 +1939,7 @@ Facts that are easy to get wrong:
 - On Linux 6.14 to 7.2 each worker's rings count against the locked-memory limit
   (`ulimit -l`, about 150 KiB per worker). Past it giong runs that worker on epoll and says
   why (`GIONG-E0010`); raise the limit as docs/DEPLOYMENT.md shows.
-{pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
+{dev}{pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
 
 ## Docs
 

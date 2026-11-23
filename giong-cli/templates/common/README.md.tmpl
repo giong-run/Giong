@@ -15,12 +15,30 @@ Made with `giong new` from giong {{giong_version}}.
 
 ```sh
 {{#if db}}
-giong db up        # starts the database in Docker and writes its URL into .env
+giong db up              # starts the database in Docker and writes its URL into .env
 {{/if}}
-giong dev          # builds, runs, and restarts on every change
-giong check        # compiler, clippy and giong's own checks, as one list
-giong test         # the tests, on io_uring and on epoll
+{{#if dev_background}}
+giong dev --background   # builds and starts the service, then rebuilds it on every change
+giong dev status         # is it running, and the last build's errors (giong dev logs: its output)
+{{/if}}
+{{#if !dev_background}}
+giong dev                # builds, runs, and restarts on every change
+{{/if}}
+giong check              # compiler, clippy and giong's own checks, as one list
+giong test               # the tests, on io_uring and on epoll
+{{#if dev_background}}
+giong dev stop           # when you are done
+{{/if}}
 ```
+{{#if dev_background}}
+
+One `giong dev` per project, started once: edit the code and it swaps in the new build
+{{#if worker}}
+by itself.
+{{#else}}
+without refusing a connection. Try the service on the address it prints.
+{{/if}}
+{{/if}}
 
 Without the `giong` command, plain cargo works too: `cargo run`, `cargo test`
 (the tests read `.env` themselves).
