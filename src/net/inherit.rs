@@ -30,7 +30,9 @@
 //! holding the port.
 //!
 //! Without `GIONG_DEV_LISTEN` nothing here runs past one environment lookup,
-//! once per process. The variable is for `giong dev` only; in production a
+//! once per process. None of this is in a build without debug assertions
+//! unless the `dev` feature is on (`giong dev --release` turns it on): such a
+//! build has `inherit_off.rs` instead, which refuses to run under giong dev. The variable is for `giong dev` only; in production a
 //! service binds its own sockets (or takes them from systemd).
 
 use std::io;

@@ -7,7 +7,9 @@
 - **giong**: `TcpListener::bind` takes the listening socket that `giong dev` hands down in
   `GIONG_DEV_LISTEN` for the same address, so a service restarted after a rebuild keeps its
   port and no connection is refused between two builds. Without the variable nothing
-  changes.
+  changes. The hand-off is compiled only into debug builds and builds with the new `dev`
+  feature (`giong dev --release` turns it on for its own builds): a release build has none
+  of its code, and refuses to start under `giong dev` with a coded error.
 - **giong-cli**: `giong dev` builds and runs the service and, on every save, builds again
   and swaps the new build in once it accepts connections: measured 0 failed requests over
   30 restarts under constant load (io_uring and epoll). A failed build, or a build that

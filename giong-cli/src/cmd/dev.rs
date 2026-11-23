@@ -460,6 +460,16 @@ impl Dev {
         if self.release {
             cargo_args.push("--release".into());
         }
+        // A release build has giong's socket hand-off only with its `dev`
+        // feature: on for giong dev's own builds (debug builds always have
+        // it, so --prod-like adds it too only for the same build either way).
+        #[cfg(unix)]
+        if (self.release || self.prod_like) && giong_takes_sockets(&self.project) {
+            for f in dev_features(&self.project.metadata, &self.package) {
+                cargo_args.push("--features".into());
+                cargo_args.push(f);
+            }
+        }
         let outcome = match build::run(&self.project.root, "build", &cargo_args) {
             Ok(o) => o,
             Err(f) => {
@@ -1428,6 +1438,30 @@ fn listen_on(addr: SocketAddr) -> Result<socket2::Socket, Failure> {
     Ok(sock)
 }
 
+/// The `dev` features to turn on for `package`'s build: `giong/dev` when it
+/// depends on giong itself (by its own name or a rename). A package that
+/// reaches giong only through another crate gets that crate's feature from
+/// it (giong-web's `dev` turns on giong's).
+#[cfg(unix)]
+fn dev_features(metadata: &Value, package: &str) -> Vec<String> {
+    let Some(p) = metadata["packages"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|p| p["name"] == package)
+    else {
+        return Vec::new();
+    };
+    p["dependencies"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|d| d["name"] == "giong" && d["kind"].is_null())
+        .map(|d| d["rename"].as_str().unwrap_or("giong").to_string() + "/dev")
+        .take(1)
+        .collect()
+}
+
 /// Whether the project's giong takes sockets from giong dev (1.5 and newer,
 /// or a giong from a path, such as a checkout of the repository).
 #[cfg(unix)]
@@ -1493,6 +1527,24 @@ mod tests {
         assert_eq!(mcp_socket(&long, 3), short_socket_dir().join("mcp-3.sock"));
         let _ = fs::remove_dir(short_socket_dir());
         let _ = fs::remove_dir_all(&base);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_release_build_turns_on_giongs_dev_feature() {
+        let meta = json!({"packages": [
+            {"name": "svc", "dependencies": [
+                {"name": "serde", "rename": null, "kind": null},
+                {"name": "giong", "rename": null, "kind": null},
+                {"name": "giong", "rename": null, "kind": "dev"},
+            ]},
+            {"name": "renamed", "dependencies": [{"name": "giong", "rename": "rt", "kind": null}]},
+            {"name": "web-only", "dependencies": [{"name": "giong-web", "rename": null, "kind": null}]},
+        ]});
+        assert_eq!(dev_features(&meta, "svc"), ["giong/dev"]);
+        assert_eq!(dev_features(&meta, "renamed"), ["rt/dev"]);
+        assert!(dev_features(&meta, "web-only").is_empty());
+        assert!(dev_features(&meta, "nope").is_empty());
     }
 
     #[test]
