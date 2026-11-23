@@ -337,6 +337,9 @@ DEVKIT = dict(
          "over without refusing a request."),
     ],
     facts=[
+        "`giong dev` restarted a service 100 times under constant load: 0 failed requests out of "
+        "102,061, a save served again in 0.75 s (median; Linux 6.18, 4 vCPU, io_uring; "
+        "[method and raw data](https://github.com/giong-run/Giong/tree/main/bench/results/dev-restarts)).",
         "A new project's dev profile: clean debug build 12.6 s instead of 15.3 s, `target/` 296 MB "
         "instead of 640 MB ([method and raw data](https://github.com/giong-run/Giong/tree/main/bench/results/devkit/template-profile)).",
         "`giong check --json`, `giong mcp` and a page per error code: agents read what went wrong and how to fix it.",
