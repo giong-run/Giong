@@ -86,8 +86,11 @@ const STALLED: Duration = Duration::from_millis(5);
 /// connections**, since the statements of other tasks would run inside them.
 /// `query`, `query_one`, `query_opt`, `execute` and `insert` refuse `START
 /// TRANSACTION`, `COMMIT`, `ROLLBACK`, `LOCK TABLES`, `SET` (but `SET
-/// GLOBAL`), `USE`, temporary tables, `GET_LOCK` and assignments to user
-/// variables before sending anything ([`ErrorKind::Statement`]).
+/// GLOBAL`), `USE`, temporary tables, `GET_LOCK`, assignments to user
+/// variables and `CALL` (a stored procedure may do any of these) before
+/// sending anything ([`ErrorKind::Statement`]). The check reads the
+/// statement, not code the server runs on its behalf: a stored function or
+/// trigger that changes the session is not refused (see the reset above).
 /// [`batch_execute`](Self::batch_execute) may carry a whole transaction
 /// (`START TRANSACTION; ...; COMMIT`); if a batch leaves one open, or
 /// autocommit off, its connection is closed, which rolls it back, and the
@@ -669,6 +672,7 @@ impl Pool {
                 (new, self.expiry())
             }
         };
+        client.begin_lease();
         Ok(PooledClient {
             client: Some(client),
             expires,
@@ -1047,6 +1051,9 @@ impl DerefMut for PooledClient {
 impl Drop for PooledClient {
     fn drop(&mut self) {
         let client = self.client.take().expect("present until dropped");
+        // A cancel request taken during the lease may still reach the
+        // server: the connection is closed rather than lent to another task.
+        let cancelling = client.end_lease();
         {
             let mut st = self.pool.inner.state.borrow_mut();
             st.taken -= 1;
@@ -1057,10 +1064,12 @@ impl Drop for PooledClient {
                 client.queue_reset();
             }
             let now = Instant::now();
-            if !client.is_closed() && now >= self.expires {
+            // Otherwise closed (dropped) instead of going back.
+            let open = !client.is_closed() && !cancelling;
+            if open && now >= self.expires {
                 // Past its lifetime: closed (dropped) instead of going back.
                 st.recycled += 1;
-            } else if !client.is_closed() {
+            } else if open {
                 client.set_shared(true);
                 st.shared.push(Member {
                     client: Rc::new(client),

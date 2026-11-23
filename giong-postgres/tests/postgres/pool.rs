@@ -572,6 +572,41 @@ fn a_cancel_token_stops_working_when_its_connection_goes_back() {
 }
 
 #[test]
+fn a_connection_goes_back_closed_while_a_cancel_from_its_lease_is_on_its_way() {
+    run(|s| async move {
+        let pool = Pool::new(s.local(), 1);
+        let pid = |row: giong_postgres::Row| row.get::<i32>(0).unwrap();
+        let conn = pool.get().await.unwrap();
+        let first = pid(conn
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap());
+        let token = conn.cancel_token();
+        // The cancel passes the check and starts connecting...
+        let mut cancel = std::pin::pin!(token.cancel());
+        std::future::poll_fn(|cx| {
+            assert!(std::future::Future::poll(cancel.as_mut(), cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        // ...and the connection goes back before the request arrives: the
+        // next task must not get that connection.
+        drop(conn);
+        let next = pool.get().await.unwrap();
+        let second = pid(next
+            .query_one("SELECT pg_backend_pid()", &[])
+            .await
+            .unwrap());
+        assert_ne!(
+            second, first,
+            "a connection a cancel request is on its way to"
+        );
+        cancel.await.unwrap();
+        next.query("SELECT pg_sleep(0.2)", &[]).await.unwrap();
+    });
+}
+
+#[test]
 fn idle_connections_are_closed() {
     run(|s| async move {
         let pool = Pool::new(s.local(), 3).idle_timeout(Duration::from_millis(200));

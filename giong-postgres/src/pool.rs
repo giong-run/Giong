@@ -1422,12 +1422,15 @@ impl DerefMut for PooledClient {
 impl Drop for PooledClient {
     fn drop(&mut self) {
         let client = self.client.take().expect("present until dropped");
-        client.end_lease();
+        // A cancel request taken during the lease may still reach the
+        // server: the connection is closed rather than lent to another task.
+        let cancelling = client.end_lease();
         let now = Instant::now();
         let mut st = self.pool.inner.state.borrow_mut();
         st.taken -= 1;
-        let retire = now >= self.expires || client.should_retire();
-        if retire && !client.is_closed() {
+        let old = now >= self.expires || client.should_retire();
+        let retire = old || cancelling;
+        if old && !client.is_closed() {
             // Closing rolls back whatever was left open.
             st.recycled += 1;
         }
