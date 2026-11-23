@@ -1427,7 +1427,7 @@ def docs():
     errs = "".join(
         f'<details class="errs"{" open" if n == 0 else ""}><summary><b>{html.escape(g["name"])}</b>'
         f'<span>{len(g["rows"])} code{"" if len(g["rows"]) == 1 else "s"}</span></summary><table><tbody>'
-        + "".join(f'<tr><td><a href="{repo_link(r["file"], "docs/errors")}">{r["code"]}</a></td>'
+        + "".join(f'<tr><td><a href="{doc_link(r["file"], "docs/errors")}">{r["code"]}</a></td>'
                   f'<td><code>{html.escape(r["variant"])}</code></td><td>{ilm(r["meaning"])}</td></tr>'
                   for r in g["rows"])
         + "</tbody></table></details>" for n, g in enumerate(ERRORS))
@@ -1445,7 +1445,23 @@ def docs():
     secs = [
         ("requirements", "Requirements", f'<dl class="reqs">{reqs}</dl>',
          "".join(f"- **{a}**: {plain(b)}\n" for a, b in C.REQS)),
-        ("install", "Install",
+    ]
+    if any(e[0] == "cli" for e in DOCS):
+        cli_sh = C.CLI_START
+        steps = "".join(f'<li><a href="{link(doc_page_name("cli/" + c))}"><code>giong {c}</code></a> {ilm(t)}</li>'
+                        for c, t in C.CLI_START_STEPS if any(e[0] == "cli/" + c for e in DOCS))
+        steps_md = "".join(f"- [`giong {c}`]({SITE}{md_file('cli/' + c)}) {plain(t)}\n"
+                           for c, t in C.CLI_START_STEPS if any(e[0] == "cli/" + c for e in DOCS))
+        secs.insert(0,
+            ("quick", "From zero to a running service",
+             f"<p>{ilm(C.CLI_START_LEDE)}</p>"
+             f'<div class="code-copy"><pre class="code" tabindex="0"><code id="cli-start">{shell(cli_sh)}</code></pre>'
+             '<button class="copy" type="button" data-copy="cli-start" data-done="copied">copy</button></div>'
+             f'<ul class="steps">{steps}</ul><p>Every command: <a href="{link(doc_page_name("cli"))}">the dev kit</a>.</p>',
+             f"{plain(C.CLI_START_LEDE)}\n\n```sh\n{cli_sh}\n```\n\n{steps_md}\n"
+             f"Every command: {SITE}{md_file('cli')}\n"))
+    secs += [
+        ("install", "Install the crates",
          "<p>The crates are on crates.io and share one version number. Add the runtime and the "
          "layers you need; <code>giong-http</code> takes <code>--features tls</code> for HTTPS and "
          "<code>--features client</code> for its client.</p>"
@@ -1509,6 +1525,10 @@ def docs():
               if slug in have]
     lede = ("Requirements, a first server, and every page of the documentation: a page for each crate"
             + "".join(", " + g for g in guides) + ". The API reference for each crate is on docs.rs.")
+    if "cli" in have:
+        lede = ("A running service in a few commands, then every page of the documentation: the "
+                "`giong` command, a page for each crate" + "".join(", " + g for g in guides)
+                + ". The API reference for each crate is on docs.rs.")
     sections, scripts, page_parts = [], [], []
     for n, (ident, heading, inner, smd) in enumerate(secs):
         sid = f"md-{n}"

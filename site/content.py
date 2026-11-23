@@ -755,6 +755,25 @@ DOC_GROUPS = ["Start", "Dev kit", "Runtime", "Protocols", "Clients", "Framework"
 CLI_LEDE = ("The `giong` command: start a project, run it with a restart on every save, check it, "
             "test it and ship it. One small binary; every command answers people in text and "
             "agents in JSON with `--json`.")
+# Get started's first section once the release has the giong command.
+CLI_START_LEDE = ("The `giong` command writes a project that builds and passes its tests, runs it on "
+                  "localhost with a rebuild on every save, and checks it the way an agent can read. "
+                  "One project, one folder, one runner: no `cargo run`, no container to start by hand.")
+CLI_START = """curl -fsSL https://giong.run/install.sh | sh
+giong new api --db postgres   # a JSON API that passes its tests
+cd api
+giong db up                   # local PostgreSQL, URL in .env
+giong dev --background        # serve 127.0.0.1:8080, rebuild on save
+curl http://127.0.0.1:8080/health
+giong check                   # compiler, clippy, giong's checks
+giong test                    # on io_uring and on epoll
+giong dev stop                # service and database; data kept"""
+CLI_START_STEPS = [
+    ("new", "writes the service, its tests, migrations, `.env.example`, a Dockerfile, CI and the files that teach coding agents."),
+    ("dev", "is the one way to run it while you work; `giong dev status` and `giong dev logs` say how it goes."),
+    ("check", "is what to run before calling a change done; `giong fix` applies what needs no judgement."),
+]
+
 CLI_ORDER = ["new", "ai", "dev", "check", "fix", "test", "doctor", "db", "env", "routes",
              "record", "dashboard", "top", "bench", "image", "clean", "mcp", "explain"]
 CLI_COMMANDS = {
