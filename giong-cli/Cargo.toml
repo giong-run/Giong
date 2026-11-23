@@ -34,8 +34,8 @@ unsafe_code = "forbid"
 
 # The end-to-end tests run a real service (giong-web routes, giong-mcp) and
 # drive the `giong` binary against it. Unix only: giong-web does not build on
-# Windows.
+# Windows. `dev` keeps giong-web's Record in the release test builds CI runs.
 [target.'cfg(unix)'.dev-dependencies]
 giong = { path = "..", version = "1.4.0" }
-giong-web = { path = "../giong-web", version = "1.4.0" }
+giong-web = { path = "../giong-web", version = "1.4.0", features = ["dev"] }
 giong-mcp = { path = "../giong-mcp", version = "1.4.0", features = ["web"] }
