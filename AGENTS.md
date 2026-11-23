@@ -108,7 +108,7 @@ Run these from the repository root. All tests use loopback; none needs the inter
 scripts/preflight.sh          # the gate before every push: every check CI runs that the changed files call for
 scripts/preflight.sh --quick  # the fast part, while iterating
 scripts/preflight.sh --against 172,173   # also merge with those open pull requests
-scripts/preflight.sh --install           # the toolchains and tools the gate needs (1.80, nightly, cargo-fuzz, semver-checks)
+scripts/preflight.sh --install           # the toolchains and tools the gate needs (CI's pinned stable, 1.80, 1.85, nightly, cargo-fuzz, semver-checks)
 
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
@@ -118,7 +118,7 @@ cargo check -p giong --target x86_64-pc-windows-msvc   # Windows, runtime crate 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
-cargo +1.80.0 check --workspace --all-features   # the minimum Rust version, libraries only
+scripts/msrv.sh                     # the minimum Rust versions (1.80, 1.85 for giong-quic), libraries only; CI runs the same
 
 scripts/check.sh test        # release build, every test 5 times; ROUNDS=1 for one pass
 scripts/check.sh fallback    # the same on the ring setups of kernels older than 6.1, then on epoll
@@ -141,9 +141,14 @@ scripts/instr.py check       # instructions per operation and heap per idle conn
 
 Continuous integration requires `all-checks` on every pull request, which passes when
 every job of the workflow passed: `lint` (fmt, clippy, doc), `msrv`, `test`, `fallback`,
-`tsan` and the jobs named below. A change is done when all of them would pass. A pull
-request is merged through the merge queue, which runs the same jobs once more on `main`
-with the pull request merged, and merges it only if they pass. `main` then moves to the
+`tsan` and the jobs named below. A change is done when all of them would pass. The `plan`
+job (`scripts/ci-scope.py`) picks how much a run does: a pull request ready for review runs
+every job once (each suite one round, two ThreadSanitizer runs), a draft runs a short set
+(lint, msrv, default features, the build, one round of the tests), and a pull request that
+changes no file a build or test reads (the site, `changelog.d/`, prose) runs `lint` and
+`msrv` only. A pull request is merged through the merge queue, which runs every job, with
+every repetition (five rounds, three ThreadSanitizer runs), on `main` with the pull request
+merged, and merges it only if they pass (docs/DEVELOPMENT.md, "CI tiers"). `main` then moves to the
 commit that run tested, so a push to `main` (`.github/workflows/main.yml`) runs the jobs
 again only when no merge queue run passed for that commit, or when the push changes one
 of the two workflows.
@@ -269,7 +274,14 @@ is loaded.
 - **Pull requests in flight conflict in the merge queue.** One that merges first can put
   another out of date while the queue is testing it, and the queue ejects it. Before
   enqueueing, `scripts/preflight.sh --against <open pull requests>` names the files that
-  conflict; the usual ones are README test counts and shared platform files.
+  conflict; the usual ones are README test counts and shared platform files. Two pull
+  requests can also each pass alone and fail together: `bench/instr/baseline.csv` limits
+  are the usual case (both add a little heap to the same path). Merge `main` in and run
+  `scripts/instr.py check` again when the other one lands first.
+- **A push cancels the CI run in progress.** Push a finished step, not each edit: in
+  November 2026 more than half of all pull request runs were cancelled by the next push
+  after running a median of 7 minutes. Iterate locally (`scripts/preflight.sh --quick`, run
+  by the pre-push hook) and as a draft.
 
 - **TCP keeps no message boundaries.** On Linux 6.12 and newer, streams receive through
   packed buffer rings, and a receive ends wherever a shared buffer fills up: a test that
@@ -292,6 +304,10 @@ is loaded.
   `giong_compat::Compat`; flush after writing, as with `BufWriter`. One that needs Tokio's
   reactor, timers or `tokio::spawn` panics with "there is no reactor running": `Compat`
   cannot fix that (see `giong-compat/README.md`).
+- **gVisor is not Linux.** Its network stack records `SO_REUSEPORT` when a socket binds
+  (Linux reads it when the next socket binds), its `somaxconn` is 1024, and it has no
+  `SO_COOKIE` and no io_uring giong can use. Socket code that relies on when Linux reads
+  an option needs a run of `scripts/gvisor.sh` (CI's `gvisor` job).
 - **Benchmarks are not tests.** Do not run `bench/*.sh` to check a change unless the task
   is about performance: they take long and need a quiet machine.
 

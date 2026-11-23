@@ -20,7 +20,10 @@ request; everything else is automated and safe to re-run.
    `minor`, `major`, or an exact version such as `0.3.0` or `0.3.0-rc.1`). It opens a pull
    request `chore(release): giong X.Y.Z` on the branch `release/X.Y.Z` that:
    - bumps `version` in every workspace crate, the path dependencies between them and
-     `Cargo.lock`;
+     every `Cargo.lock` in the repository: the workspace's and those of the separate
+     workspaces under `bench/`, `fuzz/`, `sim/` and the crates' `fuzz/` directories, which
+     CI builds with `--locked` (`python3 scripts/release.py sync-locks` does the same by
+     hand, and `release.py check`, in the `lint` job, fails on a stale one);
    - turns `## [Unreleased]` in `CHANGELOG.md`, with every entry in `changelog.d/`
      merged into its section, into `## [X.Y.Z] - <date>`, deletes the `changelog.d/`
      files and updates the compare links at the bottom (`python3 scripts/release.py

@@ -1,0 +1,45 @@
+name: Review threads
+
+# Resolves the review threads a pull request has answered: a thread whose last
+# comment is a reply `Fixed in <commit>` from someone with write access, where
+# the commit is on the pull request (scripts/review-threads.py). The branch
+# protection requires every thread resolved before a merge, and a pull request
+# with auto-merge on waits silently until they are, which has held finished
+# work back for hours. The job summary lists every thread still open.
+#
+# It runs on a reply, on a push (the reply may name a commit pushed after it)
+# and when auto-merge is turned on. It never fails: it is not a check to pass,
+# only a hand that resolves what is answered and a list of what is not.
+
+on:
+  pull_request_review_comment:
+    types: [created]
+  pull_request:
+    types: [synchronize, ready_for_review, auto_merge_enabled]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: review-threads-${{ github.event.pull_request.number }}
+  cancel-in-progress: false
+
+jobs:
+  resolve:
+    # A pull request from a fork gets a read-only token: nothing to resolve with.
+    if: github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Run the script of main, not one the pull request may have changed.
+          ref: ${{ github.event.repository.default_branch }}
+          sparse-checkout: scripts/review-threads.py
+          sparse-checkout-cone-mode: false
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/review-threads.py "${{ github.event.pull_request.number }}" || true
