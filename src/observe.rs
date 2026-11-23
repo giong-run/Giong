@@ -345,6 +345,9 @@ pub struct PollProfile {
 #[derive(Default)]
 pub(crate) struct Local {
     sources: RefCell<Vec<Weak<dyn Source>>>,
+    /// The length of `sources` at which [`Local::register`] next drops the
+    /// sources that are gone.
+    prune_at: std::cell::Cell<usize>,
     /// Keyed by the location's value (file, line, column), not its address:
     /// one call site can have several `Location`s (Miri gives every call its
     /// own; natively, code inlined into several codegen units can).
@@ -352,6 +355,19 @@ pub(crate) struct Local {
 }
 
 impl Local {
+    /// Adds a source. A dropped source's `Weak` still holds its allocation,
+    /// so the ones that are gone are dropped here too, whenever the list has
+    /// doubled since the last time: a worker that creates and drops pools
+    /// without ever taking a snapshot keeps at most twice the live ones.
+    fn register(&self, source: Weak<dyn Source>) {
+        let mut list = self.sources.borrow_mut();
+        if list.len() >= self.prune_at.get() {
+            list.retain(|s| s.strong_count() > 0);
+            self.prune_at.set((list.len() * 2).max(16));
+        }
+        list.push(source);
+    }
+
     /// Adds one timed poll of a task spawned at `location`.
     pub(crate) fn record(&self, location: Location, took: Duration) {
         let mut profile = self.profile.borrow_mut();
@@ -458,7 +474,7 @@ pub fn snapshot() -> Snapshot {
 /// });
 /// ```
 pub fn register(source: Weak<dyn Source>) -> bool {
-    runtime::try_with_worker(|w| w.observe.sources.borrow_mut().push(source)).is_some()
+    runtime::try_with_worker(|w| w.observe.register(source)).is_some()
 }
 
 /// Returns the poll times gathered on the current worker since profiling
@@ -476,4 +492,42 @@ pub fn take_profile() -> Vec<PollProfile> {
         list.sort_by_key(|p| std::cmp::Reverse(p.total));
         list
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::rc::Rc;
+
+    struct Dummy;
+    impl Source for Dummy {
+        fn kind(&self) -> &'static str {
+            "dummy"
+        }
+        fn name(&self) -> String {
+            String::new()
+        }
+        fn stats(&self) -> Vec<(&'static str, u64)> {
+            Vec::new()
+        }
+    }
+
+    #[test]
+    fn dropped_sources_do_not_pile_up_without_snapshots() {
+        let local = Local::default();
+        let live: Vec<Rc<Dummy>> = (0..10).map(|_| Rc::new(Dummy)).collect();
+        for source in &live {
+            local.register(Rc::downgrade(source) as Weak<dyn Source>);
+        }
+        for _ in 0..100_000 {
+            let gone = Rc::new(Dummy);
+            local.register(Rc::downgrade(&gone) as Weak<dyn Source>);
+        }
+        let list = local.sources.borrow();
+        assert!(list.len() <= 2 * live.len() + 16, "{} entries", list.len());
+        assert_eq!(
+            list.iter().filter(|s| s.strong_count() > 0).count(),
+            live.len()
+        );
+    }
 }
