@@ -15,6 +15,11 @@
 # same tree), so it holds the midpoint of those with a 1.5% tolerance.
 # http1 instructions: the CI run of #333, whose hand-written write-progress
 # future saves about 1% per request.
+# http1 instructions and idle-http1/idle-h2 heap_bytes: the CI run of #309,
+# which marks connections idle and busy for the accept loop (+0.7-0.8% per
+# request, +16.5 bytes per idle HTTP/1.1 connection, +32.5 per HTTP/2), on a
+# main that had grown +0.4% and +16 bytes since those rows were taken. The
+# io_uring idle-http1 midpoint moved by the same growth (+28.5 bytes).
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1397.4,1
 io_uring,spawn,allocations,1.000,1
@@ -32,7 +37,7 @@ io_uring,udp-echo,instructions,4130.4,1
 io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,191.7,1
 io_uring,file-read,allocations,0.000,1
-io_uring,http1,instructions,9322.6,1
+io_uring,http1,instructions,9427.6,1
 io_uring,http1,allocations,3.000,1
 io_uring,http1-client,instructions,30851.4,1
 io_uring,http1-client,allocations,33.008,1
@@ -50,10 +55,10 @@ io_uring,postgres-query,instructions,10248.5,1
 io_uring,postgres-query,allocations,16.000,1
 io_uring,mysql-query,instructions,14128.6,1
 io_uring,mysql-query,allocations,27.000,1
-io_uring,idle-http1,heap_bytes,2019.4,1.5
+io_uring,idle-http1,heap_bytes,2047.9,1.5
 io_uring,idle-http1,rss_bytes,2222.1,10
 io_uring,idle-http1,allocations,3.030,1
-io_uring,idle-h2,heap_bytes,4493.3,1
+io_uring,idle-h2,heap_bytes,4541.8,1
 io_uring,idle-h2,rss_bytes,4849.7,10
 io_uring,idle-h2,allocations,27.040,1
 io_uring,idle-https,heap_bytes,10801.0,1
@@ -75,7 +80,7 @@ epoll,udp-echo,instructions,4842.7,1
 epoll,udp-echo,allocations,1.000,1
 epoll,file-read,instructions,243.6,3
 epoll,file-read,allocations,0.016,1
-epoll,http1,instructions,10187.4,1
+epoll,http1,instructions,10292.4,1
 epoll,http1,allocations,3.000,1
 epoll,http1-client,instructions,31888.6,1
 epoll,http1-client,allocations,33.000,1
@@ -93,10 +98,10 @@ epoll,postgres-query,instructions,10862.7,1
 epoll,postgres-query,allocations,16.000,1
 epoll,mysql-query,instructions,14743.7,1
 epoll,mysql-query,allocations,27.000,1
-epoll,idle-http1,heap_bytes,2096.4,1
+epoll,idle-http1,heap_bytes,2128.9,1
 epoll,idle-http1,rss_bytes,2218.0,10
 epoll,idle-http1,allocations,4.020,1
-epoll,idle-h2,heap_bytes,4509.9,1
+epoll,idle-h2,heap_bytes,4558.4,1
 epoll,idle-h2,rss_bytes,4804.6,10
 epoll,idle-h2,allocations,27.040,1
 epoll,idle-https,heap_bytes,10804.3,1
