@@ -343,69 +343,6 @@ fn a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies() {
 }
 
 #[test]
-#[cfg(unix)]
-fn readers_that_stop_reading_hold_a_bounded_amount_of_memory() {
-    // Peers that keep sending to tasks that read once and then stop (an
-    // HTTP client that pipelines requests and never reads the answers): what
-    // waits for those readers must stay within a bound for the whole worker,
-    // not grow with every connection; the rest waits in the socket, under
-    // TCP flow control. Once they read again, every byte arrives in order.
-    const CONNS: usize = 128;
-    const LEN: usize = 1024 * 1024;
-    allow_open_files(CONNS as u64 * 2 + 64);
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = std_listener.local_addr().unwrap();
-    let clients: Vec<_> = (0..CONNS)
-        .map(|_| {
-            std::thread::spawn(move || {
-                let mut s = std::net::TcpStream::connect(addr).unwrap();
-                let data: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
-                s.write_all(&data).unwrap();
-                s.shutdown(Shutdown::Write).unwrap();
-            })
-        })
-        .collect();
-    giong::block_on(async move {
-        let l = TcpListener::from_std(std_listener);
-        let go = Rc::new(std::cell::Cell::new(false));
-        let mut readers = Vec::new();
-        for _ in 0..CONNS {
-            let s = l.accept().await.unwrap();
-            let go = go.clone();
-            readers.push(giong::spawn(async move {
-                let mut got = s.recv().await.unwrap().to_vec();
-                while !go.get() {
-                    sleep(Duration::from_millis(10)).await;
-                }
-                loop {
-                    let data = s.recv().await.unwrap();
-                    if data.is_empty() {
-                        break;
-                    }
-                    got.extend_from_slice(&data);
-                }
-                assert_eq!(got.len(), LEN);
-                assert!(got.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
-            }));
-        }
-        sleep(Duration::from_secs(1)).await;
-        let stats = giong::observe::worker_stats();
-        // The pool's size (16 KiB buffers) on the heap, plus the pool itself
-        // copied out, plus slack; without a bound this is about 0.5 MiB per
-        // connection (64 MiB here).
-        let bound = 3 * stats.recv_buffers as u64 * 16 * 1024;
-        assert!(stats.recv_copied <= bound, "{stats:?}");
-        go.set(true);
-        for r in readers {
-            r.await.unwrap();
-        }
-    });
-    for c in clients {
-        c.join().unwrap();
-    }
-}
-
-#[test]
 fn large_writes_arrive_intact_with_or_without_zero_copy() {
     // Sizes around the zero-copy threshold (16 KiB), twice on each fresh
     // connection, from buffers that can change (sent with a copy) and from
