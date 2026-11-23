@@ -12,14 +12,13 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 Security fixes and serious bugs from a review of 1.4.0, and nothing new to learn. giong-http
 closes request smuggling after a 2xx to `CONNECT` and refuses malformed `Host` headers. A peer
-can no longer make a server hold memory it never reads: io_uring receives for clients that
-stop reading, giong-quic's forwarded datagrams and DATAGRAM frames, and shared UDP ports on
-Windows are all bounded, and a forged datagram can no longer stop the Windows port dispatch.
-In the database clients, a password is no longer quoted in errors, SQL can no longer slip in
-through a MySQL session variable or a versioned comment, and a late cancel can no longer stop
-another task's query. giong also builds on musl, starts under gVisor, and fires timers at
-their deadline instead of up to a millisecond late. No API is removed or changed; a few
-inputs that were accepted by mistake are now refused, as each entry says.
+can no longer make a server hold memory it never reads through giong-quic's forwarded datagrams
+and DATAGRAM frames or a shared UDP port on Windows, and a forged datagram can no longer stop
+the Windows port dispatch. In the database clients, a password is no longer quoted in errors,
+SQL can no longer slip in through a MySQL session variable or a versioned comment, and a late
+cancel can no longer stop another task's query. giong also builds on musl, starts under gVisor,
+and fires timers at their deadline instead of up to a millisecond late. No API is removed or
+changed; a few inputs that were accepted by mistake are now refused, as each entry says.
 
 ### Added
 
@@ -103,12 +102,6 @@ inputs that were accepted by mistake are now refused, as each entry says.
   another task's receive takes several datagrams from the socket at once. It used to stay
   asleep with a datagram queued for it until the next datagram arrived or its timeout fired
   ([#332](https://github.com/giong-run/Giong/issues/332)).
-- **giong**: on io_uring, peers that keep sending to tasks that stopped reading (an HTTP client
-  that pipelines requests and never reads the answers) no longer make each connection hold
-  about half a megabyte of heap. Once more than the receive pool's size waits on the heap,
-  stream receives take one buffer per read until half of that is gone, and the rest waits in
-  the socket under TCP flow control. 128 such connections held 57 MB; now 16 MB
-  ([#322](https://github.com/giong-run/Giong/issues/322)).
 - **giong-http**: on HTTP/1.1, `Server::write_timeout` counts from the last progress of a
   write, as on HTTP/2 and HTTP/3, instead of from its start. A response that took longer
   than the timeout to send in all (a 64 MiB body to a client reading at 8 MB/s, with the
