@@ -13,10 +13,13 @@
 #                                        name the files that conflict
 #   scripts/preflight.sh --base <ref>    compare with <ref> instead of origin/main
 #   scripts/preflight.sh --install       install the toolchains and tools the gate uses
+#   scripts/preflight.sh --install-hook  make `git push` run the quick gate first (a
+#                                        pre-push hook in this clone); every agent and
+#                                        person installs it once per clone
 #
 # What the gate runs, by what changed:
 #   always                    merge into the base, scripts/release.py check
-#   any Rust or Cargo file    fmt, clippy -D warnings, docs -D warnings, Rust 1.80 check,
+#   any Rust or Cargo file    fmt, clippy -D warnings, docs -D warnings, scripts/msrv.sh,
 #                             the tests on io_uring and on epoll: of the crates that
 #                             changed, or of the whole workspace when the runtime did
 #   a published crate's src   scripts/semver.sh (no breaking change since the release)
@@ -27,9 +30,9 @@
 #   code that parses bytes from the network
 #                             every fuzz target of that crate for FUZZ_SECS (30) seconds
 # A missing tool fails the gate with the command that installs it; nothing is skipped
-# quietly. CI still runs every job on the pull request and again in the merge queue
-# (kernels, fallback tiers, Miri, Kani, instr, the server versions), so the gate makes a
-# green run likely; it does not replace it.
+# quietly. CI runs every job once on a pull request ready for review and all of them,
+# repeated, in the merge queue (kernels, fallback tiers, Miri, Kani, instr, the server
+# versions), so the gate makes a green run likely; it does not replace it.
 # Exit status: 0 when every check it ran passed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -38,31 +41,67 @@ BASE=origin/main
 AGAINST=""
 MODE=gate
 FUZZ_SECS="${FUZZ_SECS:-30}"
-MSRV=1.80.0
+MSRV=$(scripts/msrv.sh versions | head -n 1)   # every MSRV toolchain: scripts/msrv.sh
 SEMVER_CHECKS=0.51.0   # the version CI installs (.github/workflows/ci.yml, job semver)
+# The stable compiler CI pins (RUST_STABLE in .github/workflows/ci.yml): clippy's lints
+# and cargo's behaviour change between releases, so the gate runs the same one.
+STABLE=$(sed -n 's/^  RUST_STABLE: "\(.*\)"$/\1/p' .github/workflows/ci.yml | head -n 1)
 
 install_tools() {
     set -e
-    rustup toolchain install "$MSRV" --profile minimal
+    rustup toolchain install "$STABLE" --profile minimal -c rustfmt -c clippy
+    for v in $(scripts/msrv.sh versions); do rustup toolchain install "$v" --profile minimal; done
     rustup toolchain install nightly --profile minimal -c rust-src
     rustup component add rustfmt clippy
     cargo install --locked cargo-fuzz
     cargo install --locked cargo-semver-checks --version "$SEMVER_CHECKS"
-    echo "ok: $MSRV, nightly with rust-src, cargo-fuzz and cargo-semver-checks $SEMVER_CHECKS"
+    echo "ok: $STABLE (CI's stable), $MSRV, nightly with rust-src, cargo-fuzz and cargo-semver-checks $SEMVER_CHECKS"
+}
+
+install_hook() {
+    local hook
+    hook="$(git rev-parse --git-path hooks)/pre-push"
+    mkdir -p "$(dirname "$hook")"
+    cat > "$hook" <<'HOOK'
+#!/usr/bin/env bash
+# Installed by scripts/preflight.sh --install-hook: the quick gate before every push,
+# so that a run of CI is not spent on what a local check finds in a minute.
+# A push that only deletes refs, or a push of main itself, skips it.
+zero=0000000000000000000000000000000000000000
+run=0
+while read -r _local_ref local_sha remote_ref _remote_sha; do
+    [ "$local_sha" = "$zero" ] && continue
+    [ "$remote_ref" = refs/heads/main ] && continue
+    run=1
+done
+[ "$run" = 1 ] || exit 0
+exec "$(git rev-parse --show-toplevel)/scripts/preflight.sh" --quick
+HOOK
+    chmod +x "$hook"
+    echo "ok: $hook runs scripts/preflight.sh --quick before every push"
 }
 
 while [ $# -gt 0 ]; do
     case "$1" in
+        --install-hook) install_hook; exit $? ;;
         --plan) MODE=plan ;;
         --quick) MODE=quick ;;
         --base) BASE="$2"; shift ;;
         --against) AGAINST="$2"; shift ;;
         --install) install_tools; exit $? ;;
-        -h|--help) sed -n '2,34p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+        -h|--help) sed -n '2,36p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
         *) echo "unknown argument: $1 (see --help)" >&2; exit 2 ;;
     esac
     shift
 done
+
+# Every cargo call below that names no toolchain uses CI's stable compiler.
+if [ -n "$STABLE" ] && rustup run "$STABLE" rustc --version > /dev/null 2>&1; then
+    export RUSTUP_TOOLCHAIN="$STABLE"
+elif [ -n "$STABLE" ]; then
+    echo "warning: CI builds with Rust $STABLE, which is not installed here ($(rustc --version 2>/dev/null));" \
+        "clippy and the tests may disagree with CI. Install it: scripts/preflight.sh --install" >&2
+fi
 
 if ! git rev-parse --verify --quiet "$BASE^{commit}" > /dev/null; then
     echo "error: $BASE does not exist here; run 'git fetch origin main' or pass --base" >&2
@@ -145,6 +184,11 @@ echo "== ${#FILES[@]} files changed since $BASE ($(git rev-parse --short "$FORK"
 printf '   %s\n' "${FILES[@]:0:40}"
 [ ${#FILES[@]} -gt 40 ] && echo "   ... and $((${#FILES[@]} - 40)) more"
 echo
+CI_SCOPE=$(printf '%s\n' "${FILES[@]}" | python3 scripts/ci-scope.py 2>/dev/null | sed -n 's/^scope=//p')
+case "$CI_SCOPE" in
+    docs) echo "CI on the pull request: lint and msrv only (no file a build or test reads changed)." ;;
+    pr) echo "CI on the pull request: every job once (a draft runs a short set); the merge queue runs all, repeated." ;;
+esac
 if [ "$RUST" = 0 ]; then
     echo "Docs, scripts or configuration only: no cargo build needed."
 elif [ "$ALL" = 1 ]; then
@@ -153,7 +197,7 @@ else
     echo "Tests: ${!CRATES[*]}, on io_uring and on epoll."
 fi
 GATE=()
-[ "$RUST" = 1 ] && GATE+=("Rust $MSRV check")
+[ "$RUST" = 1 ] && GATE+=("MSRV checks (scripts/msrv.sh: $(scripts/msrv.sh versions | paste -sd ' '))")
 [ "$SEMVER" = 1 ] && GATE+=("semver (scripts/semver.sh)")
 [ "$TSAN" = 1 ] && GATE+=("ThreadSanitizer, one round (scripts/check.sh tsan)")
 [ "$LOOM" = 1 ] && GATE+=("loom (scripts/check.sh loom)")
@@ -235,8 +279,9 @@ if [ "$RUST" = 1 ]; then
 fi
 
 if [ "$MODE" = gate ]; then
-    if [ "$RUST" = 1 ] && need "cargo +$MSRV --version" "Rust $MSRV"; then
-        step "Rust $MSRV" cargo +"$MSRV" check --workspace --all-features --quiet
+    if [ "$RUST" = 1 ] && need "scripts/msrv.sh versions | while read -r v; do cargo +\$v --version || exit 1; done" \
+        "Rust $(scripts/msrv.sh versions | paste -sd ' ')"; then
+        step "MSRV (scripts/msrv.sh)" scripts/msrv.sh
     fi
     if [ "$SEMVER" = 1 ] && need "cargo semver-checks --version" "cargo-semver-checks"; then
         step "semver" scripts/semver.sh
@@ -264,4 +309,4 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi
 [ "$MODE" = quick ] && echo "Quick mode: run scripts/preflight.sh without --quick before pushing."
-echo "CI runs every job on the pull request and again in the merge queue."
+echo "CI runs every job once when the pull request is ready for review, and all of them, repeated, in the merge queue."
