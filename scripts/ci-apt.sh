@@ -83,9 +83,9 @@ mkdir -p "$dir"
 if [ -n "${CI_APT_SETUP:-}" ]; then
     "$here/ci-net.sh" retry -n 4 -t 600 -- bash -c "$CI_APT_SETUP"
 fi
-"$here/ci-net.sh" retry -n 4 -t 600 -- sudo apt-get update -q
+"$here/ci-net.sh" retry -n 4 -t 300 -- sudo apt-get update -q
 sudo apt-get clean
-"$here/ci-net.sh" retry -n 4 -t 900 -- \
+"$here/ci-net.sh" retry -n 4 -t 600 -- \
     sudo apt-get install -q --download-only "${packages[@]}"
 shopt -s nullglob
 for deb in /var/cache/apt/archives/*.deb; do
@@ -100,6 +100,6 @@ else
     # happen, from the mirror.
     rm -rf "$dir"
     note "installing ${packages[*]} from the files did not work; installing from the mirror"
-    "$here/ci-net.sh" retry -n 4 -t 900 -- \
+    "$here/ci-net.sh" retry -n 4 -t 600 -- \
         sudo apt-get install -q "${packages[@]}"
 fi

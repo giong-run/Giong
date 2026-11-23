@@ -92,6 +92,7 @@ jobs:
 
   lint:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -111,6 +112,7 @@ jobs:
 
   msrv:
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       # The versions and what each checks live in scripts/msrv.sh, which
@@ -129,6 +131,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -148,6 +151,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -172,6 +176,7 @@ jobs:
     # skipped on purpose only for a pull request that `plan` found to change no code.
     if: always() && needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
+    timeout-minutes: 50
     env:
       # Five rounds in the merge queue, one on a pull request (job `plan`).
       ROUNDS: ${{ needs.plan.outputs.rounds || 5 }}
@@ -228,6 +233,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -380,6 +386,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -419,6 +426,7 @@ jobs:
     needs: [plan, fallback-tiers]
     if: always()
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - run: >
           test "${{ needs.fallback-tiers.result }}" = success ||
@@ -433,6 +441,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -486,6 +495,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -540,6 +550,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
@@ -575,6 +586,7 @@ jobs:
     needs: [plan, tsan-runs]
     if: always()
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - run: >
           test "${{ needs.tsan-runs.result }}" = success ||
@@ -588,6 +600,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -602,6 +615,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -617,6 +631,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -635,6 +650,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -661,6 +677,7 @@ jobs:
     needs: [plan, build]
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       # Four at a time on a pull request, all six in the merge queue (see servers).
@@ -728,6 +745,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -755,6 +773,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -788,6 +807,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 40
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
@@ -818,6 +838,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 20
     defaults:
       run:
         working-directory: giong-quic
@@ -846,6 +867,7 @@ jobs:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     env:
       GIONG_PG_REQUIRED: "0"
       GIONG_MYSQL_REQUIRED: "0"
@@ -919,6 +941,7 @@ jobs:
     needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl, macos, windows]
     if: always()
     runs-on: ubuntu-24.04
+    timeout-minutes: 5
     steps:
       - env:
           NEEDS: ${{ toJSON(needs) }}

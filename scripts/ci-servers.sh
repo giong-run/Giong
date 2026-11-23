@@ -90,7 +90,7 @@ mariadb() {
         echo "deb [signed-by=/etc/apt/keyrings/mariadb-keyring.pgp] https://deb.mariadb.org/$series/ubuntu $codename main" |
             sudo tee /etc/apt/sources.list.d/mariadb.list
         "$net" apt-conf
-        "$net" retry -n 4 -t 600 -- sudo apt-get update -q
+        "$net" retry -n 4 -t 300 -- sudo apt-get update -q
         local pkgs=() base p v
         for base in mariadb-server-core mariadb-server mariadb-client-core mariadb-client \
             mariadb-common libmariadb3; do
