@@ -20,7 +20,7 @@ io_uring,yield,instructions,496.2,1
 io_uring,yield,allocations,0.000,1
 io_uring,oneshot,instructions,278.1,1
 io_uring,oneshot,allocations,1.000,1
-io_uring,channel,instructions,1756.4,1
+io_uring,channel,instructions,1721.4,1
 io_uring,channel,allocations,0.000,1
 io_uring,timeout,instructions,98.1,1
 io_uring,timeout,allocations,0.000,1
@@ -63,7 +63,7 @@ epoll,yield,instructions,358.7,1
 epoll,yield,allocations,0.000,1
 epoll,oneshot,instructions,278.1,1
 epoll,oneshot,allocations,1.000,1
-epoll,channel,instructions,1481.4,1
+epoll,channel,instructions,1446.4,1
 epoll,channel,allocations,0.000,1
 epoll,timeout,instructions,98.1,1
 epoll,timeout,allocations,0.000,1

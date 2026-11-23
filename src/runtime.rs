@@ -1400,7 +1400,7 @@ impl Runtime {
             match spawned {
                 Ok(t) => threads.push(t),
                 Err(e) => {
-                    spawn_err = Some(e);
+                    spawn_err = Some(thread_limit_error(index, n, e));
                     break;
                 }
             }
@@ -1435,6 +1435,43 @@ impl Runtime {
         }
         Ok(())
     }
+}
+
+/// The error for a worker thread that could not be started. The kernel says
+/// only `EAGAIN` ("Resource temporarily unavailable"), which is what a
+/// container's PID limit gives: each thread counts against it.
+fn thread_limit_error(index: usize, workers: usize, e: io::Error) -> io::Error {
+    let limit = thread_limit()
+        .map(|(file, max)| format!("; {file} allows {max} threads and processes"))
+        .unwrap_or_default();
+    io::Error::new(
+        e.kind(),
+        crate::error::Error::new(
+            Code::ThreadLimit,
+            format!(
+                "could not start worker thread {} of {workers} ({e}{limit})",
+                index + 1
+            ),
+            "let the process have more threads: a container's PID limit counts each of \
+             them (docker run --pids-limit, a Kubernetes pod's PID limit, TasksMax in a \
+             systemd unit), and so does RLIMIT_NPROC (ulimit -u) for all processes of the \
+             user. Or start fewer workers (Builder::workers); giong needs one thread per \
+             worker, plus blocking threads for file operations on the epoll driver.",
+        )
+        .with_source(e),
+    )
+}
+
+/// The cgroup PID limit that applies to this process, as the file it is
+/// read from and its value, if it is not `max`. Inside a container, the
+/// container's own cgroup is the mount's root.
+fn thread_limit() -> Option<(&'static str, u64)> {
+    ["/sys/fs/cgroup/pids.max", "/sys/fs/cgroup/pids/pids.max"]
+        .into_iter()
+        .find_map(|file| {
+            let max = std::fs::read_to_string(file).ok()?.trim().parse().ok()?;
+            Some((file.rsplit('/').next().unwrap_or(file), max))
+        })
 }
 
 // --------------------------------------------------------------------- signals
@@ -2048,7 +2085,32 @@ fn pin_to_cpu(cpu: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_workers, pin_by_default};
+    use super::{default_workers, pin_by_default, thread_limit_error};
+    use crate::error::{code, Code};
+    use std::io;
+
+    #[test]
+    fn a_worker_thread_that_cannot_start_says_why() {
+        // What the kernel says: `EAGAIN` on Unix. Windows has no such
+        // number (11 is another error there), so the kind stands in for it.
+        #[cfg(unix)]
+        let eagain = io::Error::from_raw_os_error(libc::EAGAIN);
+        #[cfg(windows)]
+        let eagain = io::Error::from(io::ErrorKind::WouldBlock);
+        let words = eagain.to_string();
+        let e = thread_limit_error(2, 4, eagain);
+        assert_eq!(code(&e), Some(Code::ThreadLimit));
+        assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        let text = e.to_string();
+        assert!(
+            text.starts_with("GIONG-E0020: could not start worker thread 3 of 4"),
+            "{text}"
+        );
+        assert!(text.contains("--pids-limit"), "{text}");
+        assert!(text.contains("Builder::workers"), "{text}");
+        let source = std::error::Error::source(e.get_ref().unwrap()).unwrap();
+        assert_eq!(source.to_string(), words);
+    }
 
     #[test]
     fn the_default_worker_count_follows_the_cpu_quota() {
