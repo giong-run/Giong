@@ -1105,6 +1105,9 @@ def doc_link(url, src_dir):
         path += "README.md"
     if anchor and f"{path}#{anchor}" in DOC_BY_PATH:
         return link(doc_page_name(DOC_BY_PATH[f"{path}#{anchor}"][0]))
+    if anchor and path == "giong-cli/README.md":
+        # A command this release's README does not have yet: the README at the tag.
+        return f"{REL_BLOB}{path}#{anchor}"
     if path in DOC_BY_PATH:
         return link(doc_page_name(DOC_BY_PATH[path][0]), anchor)
     return (REL_TREE if path.endswith("/") else REL_BLOB) + path + (f"#{anchor}" if anchor else "")
