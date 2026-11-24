@@ -62,6 +62,10 @@ request; everything else is automated and safe to re-run.
      (configured by [`.github/release.yml`](../.github/release.yml); release pull
      requests are left out). It is marked *Latest*, or *Pre-release* for a version with
      a suffix.
+   - It builds the `giong` command for Linux (static musl, x86_64 and aarch64), macOS
+     (aarch64 and x86_64) and Windows (x86_64) and attaches each archive and its
+     `.sha256` to the Release: what `https://giong.run/install.sh` and `install.ps1`
+     download. Until an archive is there, the scripts build with `cargo install`.
    - It starts the Site workflow, which deploys giong.run with the new version.
 
 4. **Check it.** The run's summary shows the notes. Look at the
