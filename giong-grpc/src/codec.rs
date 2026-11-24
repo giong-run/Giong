@@ -531,10 +531,31 @@ pub(crate) fn format_timeout(timeout: Duration) -> String {
     ] {
         let n = nanos.div_ceil(per);
         if n <= MAX {
-            return format!("{n}{unit}");
+            return timeout_value(n as u32, unit);
         }
     }
-    format!("{MAX}H")
+    timeout_value(MAX as u32, 'H')
+}
+
+/// `n` (at most 8 digits) and its unit, without the formatting machinery:
+/// every call sends one.
+fn timeout_value(mut n: u32, unit: char) -> String {
+    let mut digits = [0u8; 10];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (n % 10) as u8;
+        n /= 10;
+        if n == 0 {
+            break;
+        }
+    }
+    let mut out = String::with_capacity(digits.len() - at + 1);
+    for &d in &digits[at..] {
+        out.push(char::from(d));
+    }
+    out.push(unit);
+    out
 }
 
 // ---------------------------------------------------------- grpc-message
@@ -833,6 +854,9 @@ mod tests {
         }
         assert_eq!(format_timeout(Duration::from_millis(250)), "250000u");
         assert_eq!(format_timeout(Duration::from_nanos(1)), "1n");
+        assert_eq!(format_timeout(Duration::ZERO), "0n");
+        assert_eq!(format_timeout(Duration::from_secs(30)), "30000000u");
+        assert_eq!(format_timeout(Duration::MAX), "99999999H");
         assert_eq!(format_timeout(Duration::from_secs(3600)), "3600000m");
         assert_eq!(
             format_timeout(Duration::from_nanos(100_000_000_001)),

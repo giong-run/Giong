@@ -371,7 +371,12 @@ fn a_kept_alive_connection_closing_as_the_request_goes_is_retried_only_when_safe
         client.post(&base2).send().await.unwrap();
         let e = client.post(&base2).send().await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Closed);
-        assert!(e.to_string().contains("not sent again by itself"), "{e}");
+        let text = e.to_string();
+        assert!(text.contains("not sent again by itself"), "{e}");
+        // The code and its link are said once, at the start and the end.
+        assert!(text.starts_with("GIONG-E1106: POST "), "{e}");
+        assert_eq!(text.matches("GIONG-E1106").count(), 1, "{e}");
+        assert_eq!(text.matches(" See https://").count(), 1, "{e}");
         assert!(e.is_transient());
         let _ = base;
     });
@@ -419,12 +424,15 @@ fn an_answer_sent_before_the_body_was_read_is_the_response() {
                 )
                 .await;
             } else {
-                read_request(&stream, &mut buf).await;
-                write(
-                    &stream,
-                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nretry",
-                )
-                .await;
+                // The request sent again carries the whole body.
+                let request = read_request(&stream, &mut buf).await.unwrap();
+                let body = &request[request.find("\r\n\r\n").unwrap() + 4..];
+                let answer = format!("retry {} {}", body.len(), body.bytes().all(|b| b == b'x'));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    answer.len()
+                );
+                write(&stream, (head + &answer).as_bytes()).await;
             }
         });
         assert_eq!(
@@ -432,7 +440,10 @@ fn an_answer_sent_before_the_body_was_read_is_the_response() {
             "first"
         );
         let response = client.put(&base).body(vec![b'x'; 20 << 20]).send();
-        assert_eq!(response.await.unwrap().text().unwrap(), "retry");
+        assert_eq!(
+            response.await.unwrap().text().unwrap(),
+            format!("retry {} true", 20 << 20)
+        );
     });
 }
 
