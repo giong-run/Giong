@@ -20,7 +20,7 @@ workspace, thirteen crates and three examples:
 
 | Path | Crate | What it is |
 |---|---|---|
-| `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels |
+| `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels, child processes, pipes, signals |
 | `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 and HTTP/2 client (proxies, gzip, streamed bodies; HTTP/2 in `src/client/h2.rs`) behind `client`; HTTP/3 for both behind `unstable-http3` (Rust 1.85) |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
@@ -29,7 +29,7 @@ workspace, thirteen crates and three examples:
 | `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts; `tracing` spans behind `tracing`) and JSON on giong-http |
 | `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
 | `giong-compat/` | `giong-compat` | `Compat`: Tokio and futures-io `AsyncRead`/`AsyncWrite`/`AsyncBufRead` for giong's streams, for transport-generic crates (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`) |
-| `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server |
+| `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server; `Dockerfile` and `compose.yaml` run it in containers |
 | `giong-proto/` | `giong-proto` (new in 1.1) | Protocol Buffers decoded as views over the receive buffer (no copy, no allocation); message structs for encoding; codes `GIONG-E4001`-`E4008`. `conformance/` holds Google's conformance testee and the differential tests against prost |
 | `giong-grpc-build/` | `giong-grpc-build` (new in 1.1) | generates giong-proto messages and giong-grpc service traits, servers and clients from `.proto` files at build time, parsed in Rust by protox (no `protoc`) |
 | `giong-grpc/` | `giong-grpc` (new in 1.1) | gRPC servers and clients on giong-http's HTTP/2: the four kinds of call, deadlines, cancellation, metadata, gzip, health and reflection; codes `GIONG-E4101`-`E4110`. `interop/run.sh` runs gRPC's interoperability cases against grpc-go (needs Go); `tests/generated/` and `src/generated/` hold generated code that `tests/generated.rs` keeps current (`GIONG_GRPC_REGENERATE=1` rewrites it) |
@@ -55,10 +55,19 @@ Where the code is:
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/addr.rs` for addresses and `ToSocketAddrs`, `src/net/dns.rs` for `lookup_host` and `Resolver`, `src/net/share.rs` for the ports `bind` shares between workers only, `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
+| `src/process.rs`, `src/process/` | `Command` and `Child` (waited for through a pidfd), pipes and the process's own stdio (`pipe.rs`), the Linux calls (`sys.rs`) |
+| `src/signal.rs` | `signal::listen`: the process-wide handlers and the `giong-signal` thread that wakes listeners |
+| `src/net/fds.rs`, `src/net/activation.rs` | passing descriptors over Unix sockets (`SCM_RIGHTS`), Unix addresses and peer credentials; socket activation (`LISTEN_FDS`) |
 | `src/error.rs` | `Code`: every `GIONG-Exxxx` code, of every crate |
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
 | `src/observe.rs` | `Handle::pulse`, `snapshot`, profiles and `Source`s: what giong-mcp reads |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
+
+A service built on giong for a container (Docker, Kubernetes, a sandbox): start from
+`examples/rest-api/Dockerfile`; set `Builder::shutdown_on_signals(true)`, and leave the
+worker count to giong unless the pod has a CPU request and no limit. giong raises the soft
+`RLIMIT_NOFILE` to the hard one itself (`Builder::raise_open_files_limit`). [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) has the why and
+the numbers.
 
 Which crate to use, in this repository and in a service built on giong: the giong crate
 for the job first (HTTP server and client, routing, TLS, PostgreSQL, MySQL, Redis, files,
@@ -75,10 +84,10 @@ To find out why a giong service is slow, stuck or leaking, ask it rather than gu
 `let _mcp = giong_mcp::start_from_env(&handle);` alive; run it with
 `GIONG_MCP=127.0.0.1:7777` and `GIONG_MCP_TOKEN` (16 characters or more), and connect with
 `claude mcp add --transport http giong http://127.0.0.1:7777/mcp --header "Authorization: Bearer $GIONG_MCP_TOKEN"`.
-Tools: `overview` (memory, threads, open descriptors, workers, warnings such as a blocked
-worker), `workers`, `tasks` (live tasks by the line that spawned them), `sources` (database
-pools) and `profile` (where the workers spent a time window). It listens on loopback or a
-Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
+Tools: `overview` (memory, threads, open descriptors, container limits and why this many
+workers, warnings such as a blocked worker), `workers`, `tasks` (live tasks by the line that
+spawned them), `sources` (database pools) and `profile` (where the workers spent a time
+window). It listens on loopback or a Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
 
 ## The machine you need
 
@@ -261,6 +270,14 @@ is loaded.
   `cargo test -p rest-api --doc` (and run unless it is marked `no_run`): change the sample
   with the API. A new Markdown file with Rust samples goes into `markdown` in
   `examples/rest-api/src/lib.rs`.
+- The projects `giong new` writes come from `giong-cli/templates/` (`common/` plus one
+  directory per template; `{{var}}` and `{{#if flag}}` lines, see `giong-cli/src/template.rs`).
+  `scripts/templates.sh` builds, lints and tests every combination against the checkout's
+  crates (the `templates` workflow runs it, against real PostgreSQL, MySQL and Redis), so a
+  change to an API a template uses fails there: change the template in the same pull
+  request. `examples/rest-api` is the `web` template's output (except `tests/api.rs` and the
+  doctests at the end of `src/lib.rs`): edit the template, then
+  `GIONG_CLI_REGENERATE=1 cargo test -p giong-cli rest_api`.
 - Releases are automated (`docs/RELEASING.md`). Do not bump versions or tag by hand.
 
 ## Traps
@@ -310,6 +327,10 @@ is loaded.
   `giong::budget::Budget` and runs its requests in it (`budget.spawn`, `budget.enter`, or
   `budget.reserve` and `budget.spawn_compute` in the handler). The waiting forms are the
   default; `try_` forms refuse with `GIONG-E0080`, which a server answers with 503.
+- **Signals are process-wide.** A test that installs a handler (`giong::signal::listen`)
+  changes the whole test binary, so such tests live in `tests/signal.rs`. Tests that need
+  a child process with a particular environment re-run their own test binary with an
+  environment variable set (see `tests/process.rs` and `tests/activation.rs`).
 - **gVisor is not Linux.** Its network stack records `SO_REUSEPORT` when a socket binds
   (Linux reads it when the next socket binds), its `somaxconn` is 1024, and it has no
   `SO_COOKIE` and no io_uring giong can use. Socket code that relies on when Linux reads

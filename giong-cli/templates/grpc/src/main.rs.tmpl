@@ -1,0 +1,134 @@
+//! Starts the gRPC service on every core.
+//!
+//! | Variable | Default | |
+//! |---|---|---|
+//! | `LISTEN` | `127.0.0.1:{{default_port}}` | this machine only; `0.0.0.0:{{default_port}}` to take connections from the network (the Dockerfile sets it) |
+{{#if tls}}
+//! | `TLS_CERT`, `TLS_KEY` | (none) | PEM files; without both, plain HTTP/2 |
+{{/if}}
+//! | `WORKERS` | every core | |
+//! | `GIONG_MCP`, `GIONG_MCP_TOKEN` | (off) | giong-mcp, for agents: `127.0.0.1:7777` |
+//!
+//! ```text
+//! grpcurl -plaintext -d '{"name": "Ada"}' 127.0.0.1:{{default_port}} {{crate}}.v1.Greeter/SayHello
+//! ```
+
+use std::env;
+use std::process::ExitCode;
+use std::time::Duration;
+
+use giong::net::TcpListener;
+use giong_grpc::health::Health;
+use giong_grpc::reflection::Reflection;
+use giong_grpc::Server;
+{{#if tls}}
+use giong_tls::{Certificates, TlsAcceptor};
+{{/if}}
+use {{crate}}::pb::{{crate}}::v1::greeter::{GreeterServer, NAME};
+use {{crate}}::{pb, Hello};
+
+struct Settings {
+    listen: String,
+{{#if tls}}
+    tls: Option<TlsAcceptor>,
+{{/if}}
+    workers: Option<usize>,
+}
+
+fn var(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn settings() -> Result<Settings, String> {
+{{#if tls}}
+    let tls = match (var("TLS_CERT"), var("TLS_KEY")) {
+        (Some(cert), Some(key)) => {
+            let read = |path: &str| std::fs::read(path).map_err(|e| format!("{path}: {e}"));
+            let acceptor = Certificates::from_pem(&read(&cert)?, &read(&key)?)
+                .and_then(|certs| TlsAcceptor::with_certificates(&certs))
+                .map_err(|e| format!("TLS_CERT/TLS_KEY: {e}"))?;
+            Some(acceptor)
+        }
+        (None, None) => None,
+        _ => return Err("set both TLS_CERT and TLS_KEY, or neither".into()),
+    };
+{{/if}}
+    let workers = match var("WORKERS") {
+        None => None,
+        Some(v) => Some(
+            v.parse()
+                .map_err(|_| format!("WORKERS={v:?} is not a number"))?,
+        ),
+    };
+    Ok(Settings {
+        listen: var("LISTEN").unwrap_or_else(|| "127.0.0.1:{{default_port}}".into()),
+{{#if tls}}
+        tls,
+{{/if}}
+        workers,
+    })
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{{name}}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
+    let settings = settings()?;
+{{#if tls}}
+    if settings.tls.is_none() {
+        eprintln!("{{name}}: TLS_CERT and TLS_KEY are not set: serving plain HTTP/2");
+    }
+{{/if}}
+    // Shared by the workers: health can be changed from any thread.
+    let health = Health::new();
+    health.set(NAME, true);
+    let reflection = Reflection::new(&[
+        pb::FILE_DESCRIPTOR_SET,
+        giong_grpc::health::FILE_DESCRIPTOR_SET,
+    ])
+    .map_err(|e| e.to_string())?;
+    let mut builder = giong::Builder::new()
+        .shutdown_on_signals(true)
+        .shutdown_grace(Duration::from_secs(10));
+    if let Some(n) = settings.workers {
+        builder = builder.workers(n);
+    }
+    let runtime = builder.build().map_err(|e| e.to_string())?;
+    // Off unless GIONG_MCP is set: lets an agent ask the running service
+    // about its workers and tasks. Keep the value alive.
+    let _mcp = giong_mcp::start_from_env(&runtime.handle());
+    runtime
+        .run(move |_worker| {
+            // One server per worker, all on the same port.
+            let grpc = Server::new()
+                .add(GreeterServer::new(Hello))
+                .add(health.service())
+                .add(reflection.v1())
+                .add(reflection.v1alpha());
+{{#if tls}}
+            let (listen, tls) = (settings.listen.clone(), settings.tls.clone());
+{{#else}}
+            let listen = settings.listen.clone();
+{{/if}}
+            async move {
+                let listener = TcpListener::bind(listen.as_str()).expect("bind LISTEN");
+                let server = giong_http::Server::new();
+{{#if tls}}
+                match tls {
+                    Some(acceptor) => server.serve_tls(listener, acceptor, grpc).await,
+                    None => server.serve(listener, grpc).await,
+                }
+{{#else}}
+                server.serve(listener, grpc).await;
+{{/if}}
+            }
+        })
+        .map_err(|e| e.to_string())
+}

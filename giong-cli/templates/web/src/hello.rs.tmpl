@@ -1,0 +1,34 @@
+{{#file-if !db}}
+//! `GET /hello/{name}` and `POST /echo`: the two kinds of handler, one that
+//! reads the path and one that reads a JSON body.
+
+use std::borrow::Cow;
+
+use giong_web::{json, Error, Req, Response};
+use serde::{Deserialize, Serialize};
+
+use crate::State;
+
+pub async fn hello(req: Req<State>) -> Result<Response, Error> {
+    let name: String = req.param("name")?;
+    Ok(Response::text(format!("{}, {name}!", req.state().greeting)))
+}
+
+#[derive(Deserialize, Serialize)]
+pub struct Message<'a> {
+    #[serde(borrow)]
+    message: Cow<'a, str>,
+}
+
+/// A body that is not JSON, or has no `message`, is a `400` or `422` that
+/// says what is wrong.
+pub async fn echo(req: Req<State>) -> Result<Response, Error> {
+    let body: Message = req.json()?;
+    if body.message.len() > 1000 {
+        return Err(Error::unprocessable(
+            "message_too_long",
+            "message: at most 1000 bytes",
+        ));
+    }
+    json(200, &body)
+}

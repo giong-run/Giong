@@ -1,0 +1,21 @@
+{{#file-if sql}}
+-- The users table. `giong db migrate` applies the files of this directory in
+-- order and remembers which it applied; the service also runs this one at
+-- startup, so it only creates what is missing. Add changes as new files
+-- (0002_add_column.sql...), never by editing an applied one.
+{{#if postgres}}
+CREATE TABLE IF NOT EXISTS users (
+    id bigserial PRIMARY KEY,
+    name text NOT NULL,
+    email text NOT NULL UNIQUE,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+{{/if}}
+{{#if mysql}}
+CREATE TABLE IF NOT EXISTS users (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(100) NOT NULL,
+    email VARCHAR(254) NOT NULL UNIQUE,
+    created_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6))
+) DEFAULT CHARSET = utf8mb4;
+{{/if}}

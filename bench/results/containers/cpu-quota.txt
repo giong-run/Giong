@@ -1,0 +1,17 @@
+# bench/results/containers/cpu-quota.sh <cpus> <workers|auto>, two rounds.
+# 2026-11-21, cloud VM 4 vCPU, Linux 6.18.44, cgroup v1, Docker 29.10 (runc),
+# seccomp unconfined (io_uring), giong-http `defaults` example at 615591a (1.0.1),
+# wrk -t2 -c64 -d10s --latency on the same host, --network host.
+# throttled_periods = growth of nr_throttled in the container's cpu.stat during the run.
+cpus=1.5 workers=auto rps=147781.76 p50=415.00us p99=1.03ms throttled_periods=0
+cpus=1.5 workers=2 rps=211632.79 p50=198.00us p99=22.81ms throttled_periods=98
+cpus=2 workers=auto rps=287191.94 p50=160.00us p99=528.00us throttled_periods=3
+cpus=2 workers=4 rps=253463.30 p50=139.00us p99=4.15ms throttled_periods=3
+cpus=0.5 workers=auto rps=69406.68 p50=558.00us p99=49.92ms throttled_periods=100
+cpus=0.5 workers=2 rps=68455.01 p50=310.00us p99=72.89ms throttled_periods=100
+cpus=1.5 workers=auto rps=146825.26 p50=424.00us p99=1.99ms throttled_periods=0
+cpus=1.5 workers=2 rps=216827.55 p50=189.00us p99=23.07ms throttled_periods=100
+cpus=2 workers=auto rps=283325.55 p50=165.00us p99=577.00us throttled_periods=8
+cpus=2 workers=4 rps=243156.30 p50=139.00us p99=4.03ms throttled_periods=3
+cpus=0.5 workers=auto rps=71432.19 p50=523.00us p99=49.79ms throttled_periods=100
+cpus=0.5 workers=2 rps=72001.30 p50=267.00us p99=73.44ms throttled_periods=99

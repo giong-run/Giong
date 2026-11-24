@@ -1,6 +1,6 @@
 # rest-api
 
-A complete REST API on giong: users kept in PostgreSQL, read through a Redis cache, served over HTTPS. Every piece is a giong crate ([`giong-web`](../../giong-web/README.md), [`giong-postgres`](../../giong-postgres/README.md), [`giong-redis`](../../giong-redis/README.md), [`giong-tls`](../../giong-tls/README.md)); nothing comes from the Tokio ecosystem.
+A complete REST API on giong: users kept in PostgreSQL, read through a Redis cache, served over HTTPS. It is what `giong new rest-api --db postgres,redis --tls` writes (giong-cli's tests keep the two the same), with a test of its own that needs no database set up. Every piece is a giong crate ([`giong-web`](../../giong-web/README.md), [`giong-postgres`](../../giong-postgres/README.md), [`giong-redis`](../../giong-redis/README.md), [`giong-tls`](../../giong-tls/README.md)); nothing comes from the Tokio ecosystem.
 
 ```sh
 openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 -nodes \
@@ -34,18 +34,19 @@ Errors are problem+json bodies with a code (`{"status":404,"code":"user_not_foun
 |---|---|---|
 | `DATABASE_URL` | (required) | `postgres://user:password@host/db`; TLS to a remote host is on and verified by default |
 | `REDIS_URL` | `redis://127.0.0.1:6379` | `rediss://` for TLS, `redis+unix:///path` for a socket |
-| `LISTEN` | `0.0.0.0:8443` | |
+| `LISTEN` | `127.0.0.1:8443` | this machine only; `0.0.0.0:8443` to take connections from the network |
 | `TLS_CERT`, `TLS_KEY` | (none) | PEM files; without both, plain HTTP (behind a proxy that does TLS) |
 | `WORKERS` | every core | |
 | `DB_POOL`, `CACHE_POOL` | `2`, `1` | connections per worker: statements and commands pipeline over them, so a few go a long way |
 | `CACHE_TTL_SECS` | `60` | |
 | `ACCESS_LOG` | `stdout` | one JSON line per request, or `off` |
+| `GIONG_MCP`, `GIONG_MCP_TOKEN` | (off) | [giong-mcp](../../giong-mcp/README.md), so an agent can look inside the running service |
 
-The table is created at startup when it is missing. SIGTERM and SIGINT stop accepting, answer the requests in progress (for up to 10 s) and exit.
+The table is created at startup when it is missing (`migrations/0001_init.sql`, which `giong db migrate` also applies). SIGTERM and SIGINT stop accepting, answer the requests in progress (for up to 10 s) and exit.
 
 ## How it is built
 
-- `src/lib.rs` is the API: the handlers and `app(state, log)`, which the test builds too. `src/main.rs` reads the environment, creates the table once, then starts one worker per core.
+- `src/lib.rs` is the app: `app(state, log)` with the middleware, `/health` and `/ready`, which the test builds too; `src/users.rs` holds the `/users` handlers. `src/main.rs` reads the environment, creates the table once, then starts one worker per core. These files and `migrations/` come from giong-cli's `web` template: change the template (`giong-cli/templates/web/`), then `GIONG_CLI_REGENERATE=1 cargo test -p giong-cli rest_api` rewrites them here.
 - Each worker has its own pools, app and listener: nothing is shared between threads and nothing is locked. The kernel spreads connections over the workers' listeners.
 - Reads are cache-aside: Redis first, then PostgreSQL, then the row is cached for `CACHE_TTL_SECS`. A Redis that is down slows reads down but does not fail them. Writes delete the cached copy after the database has changed, so a read in between caches at most the old row until it expires.
 - Middleware: request ids, the JSON-line access log, gzip from 1 KiB, and a 10 s timeout. Request bodies are refused past 64 KiB.
