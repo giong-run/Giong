@@ -53,7 +53,7 @@ pub const COMMAND: Command = Command {
     summary: "build and run the service, and restart it on every save without refusing a request",
     usage: "giong dev [--background] [--bin NAME] [--release] [--listen ADDR[,ADDR]] [--lan] \
             [--workers N] [--prod-like] [--once] [--grace S] [--ready-timeout S] \
-            [-- service arguments]\n\
+            [--ui] [--ui-port N] [-- service arguments]\n\
             giong dev status [--all]\n\
             giong dev logs [--lines N]\n\
             giong dev stop [--all]\n\n\
@@ -69,7 +69,8 @@ pub const COMMAND: Command = Command {
             gets the variables of .env, WORKERS=2 (unless set, or --prod-like), RUST_BACKTRACE=1 \
             and a giong-mcp socket. --once builds, runs the service until it exits, and stops. \
             The listening addresses come from --listen or LISTEN (environment, then .env); \
-            0.0.0.0 or [::] is served on loopback (127.0.0.1, ::1) unless --lan is given.",
+            0.0.0.0 or [::] is served on loopback (127.0.0.1, ::1) unless --lan is given. \
+            --ui also serves the dashboard (giong dashboard) on 127.0.0.1:7700 or a port after it.",
     flags: &[
         Flag {
             name: "bin",
@@ -132,6 +133,16 @@ pub const COMMAND: Command = Command {
             name: "ready-timeout",
             kind: Kind::Value,
             help: "seconds a new build has to start accepting (default 30)",
+        },
+        Flag {
+            name: "ui",
+            kind: Kind::Switch,
+            help: "also serve the dashboard, a local page showing the service (giong dashboard)",
+        },
+        Flag {
+            name: "ui-port",
+            kind: Kind::Value,
+            help: "the dashboard's port, or the first of ten to try (default 7700; implies --ui)",
         },
     ],
     max_words: 1,
@@ -232,6 +243,8 @@ struct Dev {
     grace: Duration,
     #[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
     ready_timeout: Duration,
+    /// The dashboard's port, with --ui or --ui-port.
+    ui: Option<u16>,
     listen: Vec<SocketAddr>,
     /// The addresses the service is told to listen on (`LISTEN`), after
     /// [`loopback_unless_lan`]; empty: the service's own choice.
@@ -321,6 +334,10 @@ impl Dev {
             once: args.has("once"),
             grace: secs(args, "grace", 30)?,
             ready_timeout: secs(args, "ready-timeout", 30)?,
+            ui: match args.number::<u16>("ui-port")? {
+                Some(port) => Some(port),
+                None => args.has("ui").then_some(crate::dashboard::PORT),
+            },
             listen: Vec::new(),
             addresses: listen.clone(),
             #[cfg(unix)]
@@ -413,6 +430,9 @@ impl Dev {
                 ),
                 json!({}),
             );
+        }
+        if let Some(port) = self.ui {
+            self.start_dashboard(port);
         }
         let changed_at = Instant::now();
         self.rebuild(changed_at);
@@ -1176,6 +1196,43 @@ impl Dev {
             "build": self.build_json(),
         });
         let _ = state::replace(&dir.join("dev.json"), format!("{doc:#}\n").as_bytes());
+    }
+
+    /// Serves the dashboard on a thread of its own. Ports in use are a
+    /// warning: the service runs without the page.
+    fn start_dashboard(&mut self, port: u16) {
+        match crate::dashboard::spawn(self.project.root.clone(), port) {
+            Ok(url) => {
+                self.say(
+                    "dashboard",
+                    format!("dashboard on {url}"),
+                    json!({ "url": url }),
+                );
+            }
+            Err(e) => {
+                let last = port.saturating_add(9);
+                let (code, what, fix) = if e.kind() == std::io::ErrorKind::AddrInUse {
+                    (
+                        Code::DASHBOARD_PORT_IN_USE,
+                        format!("ports {port}-{last} are in use: running without the dashboard"),
+                        "give another port with --ui-port, or stop what holds them",
+                    )
+                } else {
+                    (
+                        Code::DASHBOARD_FAILED,
+                        format!("the dashboard cannot listen on 127.0.0.1:{port}: {e}"),
+                        "give another port with --ui-port, or run giong dashboard on its own",
+                    )
+                };
+                self.say(
+                    "warning",
+                    format!("{code}: {what}"),
+                    json!({ "code": code.to_string() }),
+                );
+                self.report
+                    .push(Finding::new(code, Severity::Warning, what).fix(fix));
+            }
+        }
     }
 
     /// One event: a line for people on stderr, or a JSON object on stdout.

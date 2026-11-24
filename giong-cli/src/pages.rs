@@ -3380,6 +3380,79 @@ Docker or Podman could not create, start or remove the database container, or th
 
 [All error codes](README.md)
 "#),
+    (5050, r#"# GIONG-E5050: a recorded value looks like a secret
+
+Raised by the `giong` command (giong-cli): `giong record save`. In JSON output: `"code": "GIONG-E5050"`. As an error, nothing was saved; as a warning (with `--keep-secrets`), the value was saved.
+
+## What happened
+
+Case files (`tests/recorded/*.json`) are tests, meant to be committed, so `save` keeps secrets out of them. Redacted headers and request fields whose names say secret (`password`, `token`, `api_key`, `client_secret`, `card_number`, `cvv`, `ssn`, ...) are written as `{{env:GIONG_RECORD_<NAME>}}` and read from the environment when replayed. After that, `save` looks at every value left. It refuses when one still looks like a secret:
+
+- a card number: 13 to 19 digits (spaces or dashes allowed between groups) starting with 2 to 6 and passing the Luhn check, under a field whose name says nothing (`"pan": "4242424242424242"`)
+- a JWT: `eyJ...` followed by two more dot-separated parts, in a body, a header or a `Location`
+- a value under a secret name that was not replaced, such as a header `x-session-token`
+
+The message names each place, as `<case>: <where> (<what>)`, for example `login_200: request.body.pan (a card number)`.
+
+## How to fix it
+
+- Leave that exchange out: `giong record list` shows the numbers, and `save 1-3,5` saves only those.
+- Record the request again with test values, then save the new exchange.
+- When the values already are test values (the `4242 4242 4242 4242` test card, a token made for tests), pass `--keep-secrets`. The values are saved, and each one is reported as a warning.
+- To check a file by hand, look for the places the message names; the rest of the file is as `save` would have written it.
+
+[All error codes](README.md)
+"#),
+    (5051, r#"# GIONG-E5051: the dashboard refused a request without its token
+
+Raised by the `giong` command (giong-cli): the dashboard of `giong dashboard` and `giong dev --ui`. The dashboard's API answers 403 with `"code": "GIONG-E5051"`.
+
+## What happened
+
+Each start of the dashboard makes a random token and prints the address with it: `http://127.0.0.1:7700/#t=<32 hex digits>`. Every request to the dashboard's API (`/api/...`) must send that token in the `X-Giong-Dashboard` header, and the page does so. A request without it, or with another start's token, is refused. This keeps the live request log (which holds bodies) and the send box away from other programs and users on the machine, and from web pages.
+
+Most often the page was opened without the printed address: by typing `127.0.0.1:7700`, from a bookmark, or in a tab left over from a dashboard that has since restarted (each start has a new token).
+
+## How to fix it
+
+- Open the address `giong dashboard` or `giong dev --ui` printed, with its `#t=...` part. The page keeps the token for reloads in that tab.
+- With `giong dashboard --json` or `giong dev --ui --json`, the address is in `data.url` or the `dashboard` event's `url`.
+- A script that calls the API sends the header: `curl -H "X-Giong-Dashboard: <token>" http://127.0.0.1:7700/api/state`.
+
+[All error codes](README.md)
+"#),
+    (5053, r#"# GIONG-E5053: the dashboard's port is in use
+
+Raised by the `giong` command (giong-cli): `giong dashboard`. In JSON output: `"code": "GIONG-E5053"`.
+
+## What happened
+
+`giong dashboard` serves its page on `127.0.0.1:7700` (or `--port`), and something else already listens there: most often another dashboard, opened by `giong dashboard` or `giong dev --ui` in another terminal. (`giong dev --ui` itself tries the nine ports after 7700 before giving up, and prints the one it took.)
+
+## How to fix it
+
+- Open the dashboard that is already running, at the address it printed (`http://127.0.0.1:7700/#t=...`: the token is part of it).
+- Or pick another port: `giong dashboard --port 7710`.
+- To see what holds the port: `lsof -i :7700` (macOS, Linux) or `ss -ltnp 'sport = :7700'` (Linux).
+
+[All error codes](README.md)
+"#),
+    (5054, r#"# GIONG-E5054: the dashboard could not do what the page asked
+
+Raised by the `giong` command (giong-cli): `giong dashboard` and `giong dev --ui`, in the answers the dashboard page shows. In JSON: `"code": "GIONG-E5054"`.
+
+## What happened
+
+The dashboard page asked the `giong` command for something it could not do: the service's log could not be read (permissions), saving a recorded request as a case could not run `giong record save`, or the dashboard failed while answering (a bug: the terminal running the dashboard shows the panic). It also stops with this code when it cannot listen at all for a reason other than a taken port.
+
+## How to fix it
+
+- Check that the log `giong dev` writes (`.giong/dev.log`) can be read by you.
+- Run the step by hand to see its full report: `giong record save <number> --name <name>` (numbers from `giong record list`).
+- If the terminal shows a panic, report it with that text: it is a bug in the dashboard, not in your service.
+
+[All error codes](README.md)
+"#),
     (5055, r#"# GIONG-E5055: a worker of the service is stuck in one task
 
 Raised by the `giong` command (giong-cli): `giong top` and the dashboard. In JSON output: `"code": "GIONG-E5055"`.
@@ -3529,6 +3602,117 @@ In every round the working tree was slower than the build of `<ref>` (99th perce
 
 - Profile the change: `giong top --profile` on the running service shows where the time goes.
 - If the slowdown is expected (more work per request), raise `--max-regression` for this comparison and say why in the pull request.
+
+[All error codes](README.md)
+"#),
+    (5065, r#"# GIONG-E5065: no recorded requests to use
+
+Raised by the `giong` command (giong-cli): `giong record list`, `giong record save` and `giong record replay`. In JSON output: `"code": "GIONG-E5065"`.
+
+## What happened
+
+`giong record` reads the `exchange` lines that giong-web's `Record` middleware writes, one per answered request, from the service's log (by default the log `giong dev` keeps in `.giong/dev.log`), or replays case files from `tests/recorded/`. There was nothing to read: no log (giong dev is not running in this project and no `--from` was given), a log without any `exchange` line (the service does not record), or no case file to replay.
+
+## How to fix it
+
+- Add the middleware to the router, for example only when `GIONG_RECORD` is set, and put it after `RequestId` so lines carry the request id:
+
+  ```rust
+  if std::env::var_os("GIONG_RECORD").is_some() {
+      router = router.layer(Record::new(Sink::Stdout));
+  }
+  ```
+
+- Run the service with `giong dev` (it keeps the service's output in `.giong/dev.log`) and send it some requests, then `giong record list`.
+- Or point at another log: `giong record list --from service.log` (`--from -` reads standard input).
+- To replay, save cases first: `giong record save 3-7 --name users` writes `tests/recorded/users.json`.
+
+[All error codes](README.md)
+"#),
+    (5066, r#"# GIONG-E5066: a recorded case answers differently
+
+Raised by the `giong` command (giong-cli): `giong record replay`. In JSON output: `"code": "GIONG-E5066"`. The finding points at the case in its file.
+
+## What happened
+
+A case's request was sent to the running service and the answer did not match what the case expects: the status, the `Content-Type` or `Location` header, or the body. The finding lists the first differences, each with the place in the body (`body.users[0].name: expected "ada", got "bob"`). When the status differs and the answer is a giong-web problem+json, its code and title are shown too.
+
+A case that fails still keeps the values it captured (`{{capture:NAME}}`) from fields that were there; a field that is missing captures nothing, and later cases that use it fail with GIONG-E5068.
+
+## How to fix it
+
+- If the service changed on purpose, save the case again from a new recording (`giong record save <number> --name <name> --force`), or edit the expectation in the file: it is plain JSON.
+- If a value changes on every run and the case has it literally, replace it with a placeholder: `{{any}}`, `{{string}}`, `{{number}}`, `{{uuid}}`, `{{time}}`, `{{hex}}`, or `{{capture:NAME}}` to remember it for later cases (used as `{{NAME}}`).
+- Replay against a fresh service: a case that creates something expects the state it was recorded in (an empty table, a free email address).
+- If neither applies, the service has a regression: the differences say where.
+
+[All error codes](README.md)
+"#),
+    (5067, r#"# GIONG-E5067: a recording cannot be read or used
+
+Raised by the `giong` command (giong-cli): `giong record list`, `giong record save` and `giong record replay`. In JSON output: `"code": "GIONG-E5067"`.
+
+## What happened
+
+One of these:
+
+- A case file is not valid: not JSON, not in the format this `giong` reads (`"giong_record": 1`), or a case lacks `name`, `request.method`, a `request.path` starting with `/` or an `expect.status`, or has two bodies. The finding names the case.
+- A line of the log says it is an exchange but cannot be read (cut short, or changed by hand).
+- An exchange cannot become a case: its request body was streamed (`Router::stream_bodies`) or cut at `Record::max_body`, so the request cannot be sent again. Its answer may also be compressed, cut or streamed: then the case is saved but its body is marked `body_unchecked`.
+- A case's request is not valid HTTP (a method with spaces, a path with a line break).
+
+## How to fix it
+
+- Fix the file; its format, in short:
+
+  ```json
+  {"giong_record": 1, "cases": [{
+    "name": "post_users_201",
+    "request": {"method": "POST", "path": "/users", "query": null,
+                "headers": [["content-type", "application/json"]], "body_json": {"name": "ada"}},
+    "expect": {"status": 201, "headers": {"content-type": "application/json"},
+               "body_json": {"id": "{{capture:user_id}}", "name": "ada"}}}]}
+  ```
+
+  A body is one of `body` (text), `body_json`, `body_base64`, or in `expect` only `body_unchecked` (a reason).
+- Record large bodies whole: `Record::new(sink).max_body(128 * 1024)`.
+- To check answer bodies, put `Record` inside `Compression` (add `Record` after it), so it sees bodies before they are compressed.
+
+[All error codes](README.md)
+"#),
+    (5068, r#"# GIONG-E5068: a recorded case needs a value that is not set
+
+Raised by the `giong` command (giong-cli): `giong record replay`. In JSON output: `"code": "GIONG-E5068"`. The finding points at the case in its file.
+
+## What happened
+
+A case's request has a placeholder with no value yet, so it was not sent:
+
+- `{{env:GIONG_RECORD_AUTHORIZATION}}` (or another `GIONG_RECORD_*` variable): the header was redacted when recorded (`Authorization`, `Cookie`, API keys), and the environment variable that gives it is not set.
+- `{{NAME}}`: the value is captured by an earlier case's answer (`{{capture:NAME}}`), and that answer did not have the field (or the case does not exist in this file).
+- `{{uuid}}`, `{{any}}` and the other class placeholders match answers; a request needs a real value there.
+
+## How to fix it
+
+- Set the variable for the replay: `GIONG_RECORD_AUTHORIZATION='Bearer <token>' giong record replay`. In CI, take it from a secret.
+- Fix the earlier case first (its GIONG-E5066 finding names the missing field); cases run in file order and share captured values within one file.
+- Replace a class placeholder in a request with a value.
+
+[All error codes](README.md)
+"#),
+    (5069, r#"# GIONG-E5069: the service to replay against does not answer
+
+Raised by the `giong` command (giong-cli): `giong record replay`. In JSON output: `"code": "GIONG-E5069"`.
+
+## What happened
+
+`giong record replay` sends each case's request to the service over plain HTTP. Nothing answered at the address it used, the connection broke, the answer was not HTTP/1.1, or no whole answer came within the timeout (`--timeout-ms`, default 10000). The replay stops there, since every later case would fail the same way. The address is `--base-url`, else the first address `giong dev` listens on, else `http://127.0.0.1:8080`.
+
+## How to fix it
+
+- Start the service: `giong dev` in the project, then replay from the same project.
+- Give the address it listens on: `giong record replay --base-url http://127.0.0.1:3000`. HTTPS is not supported: replay against a plain-HTTP listener of the service in development.
+- A handler that takes longer than the timeout: raise `--timeout-ms`, or find out why it is slow (`giong top`).
 
 [All error codes](README.md)
 "#),

@@ -628,6 +628,8 @@ mod tests {
             names.contains(&"doctor") && names.contains(&"check") && names.contains(&"dev_status")
         );
         assert!(names.contains(&"dev") && !names.contains(&"mcp"));
+        assert!(!names.contains(&"dashboard"), "it serves until stopped");
+        assert!(names.contains(&"record") && names.contains(&"openapi"));
         let clean = &list["result"]["tools"]
             .as_array()
             .unwrap()

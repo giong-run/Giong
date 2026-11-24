@@ -8,6 +8,7 @@ mod args;
 mod build;
 mod cmd;
 mod code;
+mod dashboard;
 mod dotenv;
 mod hist;
 mod host;
@@ -19,6 +20,7 @@ mod pages;
 mod loadgen;
 mod procs;
 mod project;
+mod record;
 mod report;
 mod scaffold;
 mod service;
@@ -26,6 +28,7 @@ mod sha256;
 mod state;
 mod template;
 mod watch;
+mod web_client;
 #[cfg(windows)]
 mod winproc;
 

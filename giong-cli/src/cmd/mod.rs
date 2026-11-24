@@ -13,6 +13,7 @@ pub mod ai;
 pub mod bench;
 pub mod check;
 pub mod clean;
+pub mod dashboard;
 pub mod db;
 pub mod dev;
 pub mod devctl;
@@ -25,6 +26,7 @@ pub mod image;
 pub mod mcp;
 pub mod new;
 pub mod openapi;
+pub mod record;
 pub mod routes;
 pub mod test;
 pub mod top;
@@ -63,6 +65,8 @@ pub const COMMANDS: &[&Command] = &[
     &image::COMMAND,
     &routes::COMMAND,
     &openapi::COMMAND,
+    &record::COMMAND,
+    &dashboard::COMMAND,
     &top::COMMAND,
     &clean::COMMAND,
     &mcp::COMMAND,

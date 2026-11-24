@@ -109,16 +109,9 @@ pub fn base_url(flag: Option<&str>) -> String {
     service::project_root()
         .and_then(|root| DevState::read(&root))
         .and_then(|d| d.listen.into_iter().next())
-        .map(|addr| {
-            let addr = addr
-                .replace("0.0.0.0", "127.0.0.1")
-                .replace("[::]", "[::1]");
-            if addr.contains("://") {
-                addr
-            } else {
-                format!("http://{addr}")
-            }
-        })
+        // DevState keeps only loopback host:port entries: a committed
+        // dev.json cannot send requests (and replay's env values) elsewhere.
+        .map(|addr| format!("http://{addr}"))
         .unwrap_or_else(|| "http://127.0.0.1:8080".to_string())
 }
 

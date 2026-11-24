@@ -312,6 +312,10 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5047](E5047.md) | `MigrationUnknown` | the database has a migration the project does not |
 | [GIONG-E5048](E5048.md) | `DbNotManaged` | the database was not started by giong db up |
 | [GIONG-E5049](E5049.md) | `DbStartFailed` | the database container could not start |
+| [GIONG-E5050](E5050.md) | `RecordSecret` | a recorded value looks like a secret |
+| [GIONG-E5051](E5051.md) | `DashboardToken` | the dashboard refused a request without its token |
+| [GIONG-E5053](E5053.md) | `DashboardPortInUse` | the dashboard's port is in use |
+| [GIONG-E5054](E5054.md) | `DashboardFailed` | the dashboard could not do what the page asked |
 | [GIONG-E5055](E5055.md) | `WorkerBlocked` | a worker of the service is stuck in one task |
 | [GIONG-E5056](E5056.md) | `ServiceWarning` | the service reports a warning |
 | [GIONG-E5057](E5057.md) | `NoService` | no running service to ask |
@@ -322,6 +326,11 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5062](E5062.md) | `BenchGeneratorBehind` | the load generator fell behind its schedule |
 | [GIONG-E5063](E5063.md) | `BenchErrors` | requests failed during the benchmark |
 | [GIONG-E5064](E5064.md) | `BenchRegression` | the change is slower than the build it is compared with |
+| [GIONG-E5065](E5065.md) | `NoRecording` | no recorded requests to use |
+| [GIONG-E5066](E5066.md) | `RecordedCaseFailed` | a recorded case answers differently |
+| [GIONG-E5067](E5067.md) | `RecordingInvalid` | a recording cannot be read or used |
+| [GIONG-E5068](E5068.md) | `RecordValueMissing` | a recorded case needs a value that is not set |
+| [GIONG-E5069](E5069.md) | `ReplayUnreachable` | the service to replay against does not answer |
 | [GIONG-E5070](E5070.md) | `ImageTarget` | the service cannot be built for Linux here |
 | [GIONG-E5071](E5071.md) | `ImageLibraries` | the shared libraries of the binary cannot be found |
 | [GIONG-E5072](E5072.md) | `ImageNoCerts` | no CA certificates to put in the image |

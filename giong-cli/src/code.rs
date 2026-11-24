@@ -88,6 +88,10 @@ codes! {
     MIGRATION_UNKNOWN = 5047, "MigrationUnknown", "the database has a migration the project does not";
     DB_NOT_MANAGED = 5048, "DbNotManaged", "the database was not started by giong db up";
     DB_START_FAILED = 5049, "DbStartFailed", "the database container could not start";
+    RECORD_SECRET = 5050, "RecordSecret", "a recorded value looks like a secret";
+    DASHBOARD_TOKEN = 5051, "DashboardToken", "the dashboard refused a request without its token";
+    DASHBOARD_PORT_IN_USE = 5053, "DashboardPortInUse", "the dashboard's port is in use";
+    DASHBOARD_FAILED = 5054, "DashboardFailed", "the dashboard could not do what the page asked";
     WORKER_BLOCKED = 5055, "WorkerBlocked", "a worker of the service is stuck in one task";
     SERVICE_WARNING = 5056, "ServiceWarning", "the service reports a warning";
     NO_SERVICE = 5057, "NoService", "no running service to ask";
@@ -98,6 +102,11 @@ codes! {
     BENCH_GENERATOR_BEHIND = 5062, "BenchGeneratorBehind", "the load generator fell behind its schedule";
     BENCH_ERRORS = 5063, "BenchErrors", "requests failed during the benchmark";
     BENCH_REGRESSION = 5064, "BenchRegression", "the change is slower than the build it is compared with";
+    NO_RECORDING = 5065, "NoRecording", "no recorded requests to use";
+    RECORDED_CASE_FAILED = 5066, "RecordedCaseFailed", "a recorded case answers differently";
+    RECORDING_INVALID = 5067, "RecordingInvalid", "a recording cannot be read or used";
+    RECORD_VALUE_MISSING = 5068, "RecordValueMissing", "a recorded case needs a value that is not set";
+    REPLAY_UNREACHABLE = 5069, "ReplayUnreachable", "the service to replay against does not answer";
     IMAGE_TARGET = 5070, "ImageTarget", "the service cannot be built for Linux here";
     IMAGE_LIBRARIES = 5071, "ImageLibraries", "the shared libraries of the binary cannot be found";
     IMAGE_NO_CERTS = 5072, "ImageNoCerts", "no CA certificates to put in the image";
