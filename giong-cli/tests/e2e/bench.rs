@@ -128,12 +128,12 @@ fn a_fixed_delay_is_measured_as_that_delay() {
     }
     // The handler times its own sleep: on a starved machine the 20 ms sleep
     // itself overruns, and then no latency bound can judge giong bench.
-    let slowest_sleep_us = Arc::new(AtomicU64::new(0));
-    let slowest = Arc::clone(&slowest_sleep_us);
+    let sleeps_us = Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let sleeps = Arc::clone(&sleeps_us);
     let url = serve(Arc::new(move |_, s: &mut TcpStream| {
         let t = Instant::now();
         std::thread::sleep(Duration::from_millis(20));
-        slowest.fetch_max(t.elapsed().as_micros() as u64, Ordering::Relaxed);
+        sleeps.lock().unwrap().push(t.elapsed().as_micros() as u64);
         s.write_all(OK).map(|()| true)
     }));
     let (out, v) = bench(
@@ -162,23 +162,30 @@ fn a_fixed_delay_is_measured_as_that_delay() {
     // sleeps took twice as long as asked (past that, connections fall behind
     // their schedule and latency from the due time rightly grows), and giong
     // bench did not report its own generator late (GIONG-E5062).
-    let slowest = slowest_sleep_us.load(Ordering::Relaxed);
+    let mut sleeps = sleeps_us.lock().unwrap().clone();
+    sleeps.sort_unstable();
+    let slowest = sleeps.last().copied().unwrap_or(0);
+    let median = sleeps.get(sleeps.len() / 2).copied().unwrap_or(0);
     let lagged = v["findings"]
         .as_array()
         .into_iter()
         .flatten()
         .any(|f| f["code"] == "GIONG-E5062");
+    let timing = format!(
+        "the handler's 20 ms sleeps: median {median} µs, slowest {slowest} µs, {} of them; \
+         generator lag reported: {lagged}",
+        sleeps.len()
+    );
     if lagged || slowest >= 40_000 {
         eprintln!(
             "a_fixed_delay_is_measured_as_that_delay: this machine does not keep time \
-             (slowest 20 ms sleep {slowest} µs, generator lag reported: {lagged}); \
-             upper bound not checked (p50 {p50} µs)"
+             ({timing}); upper bound not checked (p50 {p50} µs)"
         );
         return;
     }
     assert!(
         p50 < 60_000.0,
-        "p50 {p50} µs for a 20 ms handler\n{}",
+        "p50 {p50} µs for a 20 ms handler ({timing})\n{}",
         out.dump()
     );
 }
