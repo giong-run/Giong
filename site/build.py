@@ -717,14 +717,14 @@ def devkit_bench():
     d = C.DEVKIT_BENCH
     blocks = []
     for t in d["tables"]:
-        head = "".join(f"<th>{h}</th>" for h in t["head"])
+        head = "".join(f"<th>{ilm(h)}</th>" for h in t["head"])
         rows = "".join("<tr>" + "".join(f"<td>{ilm(v)}</td>" for v in r) + "</tr>" for r in t["rows"])
         blocks.append(
             f'<h3>{t["title"]}</h3><p>{ilm(t["note"])}</p>'
             f'<div class="table-scroll" tabindex="0" role="region" aria-label="{html.escape(t["title"])}">'
             f'<table class="cmp"><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
             f'<p class="chart-src">Method and raw data: <a href="{BLOB}{t["src"]}">{t["src"]}</a></p>')
-    return f'''<section class="band" id="devkit"><div class="wrap">
+    return f'''<section class="band" id="devkit"><div class="wrap dk-bench">
   {head_block("dev kit", d["h2"], d["lede"])}
   {"".join(blocks)}
 </div></section>'''
