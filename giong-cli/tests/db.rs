@@ -389,3 +389,119 @@ fn a_second_project_gets_a_free_port() {
         "{r}"
     );
 }
+
+/// A `.giong/db.json` a cloned repository committed: its fields would name
+/// the program run, the volume mounted and the containers removed. Every
+/// entry giong db up could not have written is ignored with a warning.
+#[test]
+fn a_planted_state_file_is_ignored() {
+    let p = Project::new("planted", "giong-redis = \"1.5\"\n");
+    let marker = p.dir.join("ran");
+    p.write(
+        "x.sh",
+        &format!("#!/bin/sh\ntouch {}\necho running\n", marker.display()),
+    );
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(p.dir.join("x.sh"), std::fs::Permissions::from_mode(0o755))
+            .unwrap();
+    }
+    let decoy = format!("giongclitest-decoy-{}", std::process::id());
+    let planted = |runtime: &str, volume: &str| {
+        serde_json::json!({"redis": {
+            "runtime": runtime, "container": decoy, "volume": volume,
+            "image": "redis:7-alpine", "port": 6399, "user": "", "password": "",
+            "database": "x; DROP DATABASE y",
+        }})
+        .to_string()
+    };
+    p.write(".giong/db.json", &planted("./x.sh", "/"));
+    // status (a read-only MCP tool) runs nothing the file names.
+    let (s, r) = p.giong(&["db", "status"]);
+    assert_eq!(s, 0, "{r}");
+    assert!(
+        finding_codes(&r).contains(&"GIONG-E5048".to_string()),
+        "{r}"
+    );
+    assert!(!exists(&marker), "status ran the planted runtime");
+    // reset finds nothing giong db up started.
+    let (s, r) = p.giong(&["db", "reset", "--yes"]);
+    assert_eq!(r["error"]["code"].as_str(), Some("GIONG-E5048"), "{r}");
+    assert_ne!(s, 0);
+    assert!(!exists(&marker), "reset ran the planted runtime");
+    if skip() {
+        return;
+    }
+    // down leaves alone a container and a volume the file names but this
+    // checkout does not own.
+    let docker = runtime().unwrap();
+    let made = Command::new(&docker)
+        .args(["create", "--name", &decoy, "redis:7-alpine"])
+        .output()
+        .unwrap();
+    assert!(
+        made.status.success(),
+        "{}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let _ = Command::new(&docker)
+        .args(["volume", "create", &format!("{decoy}-data")])
+        .output();
+    p.write(
+        ".giong/db.json",
+        &planted(&docker, &format!("{decoy}-data")),
+    );
+    let (s, r) = p.giong(&["db", "down", "--volumes"]);
+    assert_eq!(s, 0, "{r}");
+    let alive = Command::new(&docker)
+        .args(["inspect", &decoy])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    let volume_alive = Command::new(&docker)
+        .args(["volume", "inspect", &format!("{decoy}-data")])
+        .output()
+        .unwrap()
+        .status
+        .success();
+    let _ = Command::new(&docker).args(["rm", "-f", &decoy]).output();
+    let _ = Command::new(&docker)
+        .args(["volume", "rm", "-f", &format!("{decoy}-data")])
+        .output();
+    assert!(alive, "giong db down removed a container it does not own");
+    assert!(
+        volume_alive,
+        "giong db down removed a volume it does not own"
+    );
+    // up starts this checkout's own container and volume, never the host
+    // path the file names, and rewrites the entry.
+    p.write(".giong/db.json", &planted(&docker, "/"));
+    let (s, r) = p.giong(&["db", "up"]);
+    assert_eq!(s, 0, "{r}");
+    let state: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(p.dir.join(".giong/db.json")).unwrap())
+            .unwrap();
+    let container = state["redis"]["container"].as_str().unwrap().to_string();
+    assert!(
+        container.starts_with("giong-giongclitest-planted-"),
+        "{state}"
+    );
+    assert_eq!(
+        state["redis"]["volume"].as_str(),
+        Some(format!("{container}-data").as_str()),
+        "{state}"
+    );
+    let mounts = Command::new(&docker)
+        .args([
+            "inspect",
+            "--format",
+            "{{range .Mounts}}{{.Source}} {{end}}",
+            &container,
+        ])
+        .output()
+        .unwrap();
+    let mounts = String::from_utf8_lossy(&mounts.stdout).to_string();
+    assert!(!mounts.split_whitespace().any(|m| m == "/"), "{mounts}");
+}
