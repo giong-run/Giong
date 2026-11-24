@@ -9,16 +9,20 @@ mod build;
 mod cmd;
 mod code;
 mod dotenv;
+mod hist;
 mod host;
 mod lint;
 #[cfg(windows)]
 mod noinherit;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
+mod loadgen;
 mod procs;
 mod project;
 mod report;
 mod scaffold;
+mod service;
+mod sha256;
 mod state;
 mod template;
 mod watch;

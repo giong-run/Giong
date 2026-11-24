@@ -563,14 +563,25 @@ impl Dev {
         if self.release {
             cargo_args.push("--release".into());
         }
-        // A release build has giong's socket hand-off only with its `dev`
-        // feature: on for giong dev's own builds (debug builds always have
-        // it, so --prod-like adds it too only for the same build either way).
-        #[cfg(unix)]
-        if (self.release || self.prod_like) && giong_takes_sockets(&self.project) {
-            for f in dev_features(&self.project.metadata, &self.package) {
-                cargo_args.push("--features".into());
-                cargo_args.push(f);
+        // A release build has giong's socket hand-off, and giong-web's
+        // Record, only with their `dev` features: on for giong dev's own
+        // builds (debug builds always have them, so --prod-like adds them
+        // too only for the same build either way).
+        if self.release || self.prod_like {
+            #[cfg(unix)]
+            let sockets = giong_takes_sockets(&self.project);
+            #[cfg(not(unix))]
+            let sockets = false;
+            for (crate_name, feature) in dev_features(&self.project.metadata, &self.package) {
+                let wanted = if crate_name == "giong" {
+                    sockets
+                } else {
+                    has_dev_feature(&self.project, crate_name)
+                };
+                if wanted {
+                    cargo_args.push("--features".into());
+                    cargo_args.push(feature);
+                }
             }
         }
         let outcome = match build::run(&self.project.root, "build", &cargo_args) {
@@ -1686,11 +1697,11 @@ fn listen_on(addr: SocketAddr) -> Result<socket2::Socket, Failure> {
 }
 
 /// The `dev` features to turn on for `package`'s build: `giong/dev` when it
-/// depends on giong itself (by its own name or a rename). A package that
-/// reaches giong only through another crate gets that crate's feature from
-/// it (giong-web's `dev` turns on giong's).
-#[cfg(unix)]
-fn dev_features(metadata: &Value, package: &str) -> Vec<String> {
+/// depends on giong itself, `giong-web/dev` (recording with `Record`) when
+/// it depends on giong-web, each by its own name or a rename. A package
+/// that reaches giong only through giong-web gets giong's from it
+/// (giong-web's `dev` turns on giong's).
+fn dev_features(metadata: &Value, package: &str) -> Vec<(&'static str, String)> {
     let Some(p) = metadata["packages"]
         .as_array()
         .into_iter()
@@ -1699,14 +1710,33 @@ fn dev_features(metadata: &Value, package: &str) -> Vec<String> {
     else {
         return Vec::new();
     };
-    p["dependencies"]
+    let deps = p["dependencies"]
         .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    ["giong", "giong-web"]
         .into_iter()
-        .flatten()
-        .filter(|d| d["name"] == "giong" && d["kind"].is_null())
-        .map(|d| d["rename"].as_str().unwrap_or("giong").to_string() + "/dev")
-        .take(1)
+        .filter_map(|crate_name| {
+            deps.iter()
+                .find(|d| d["name"] == crate_name && d["kind"].is_null())
+                .map(|d| {
+                    let name = d["rename"].as_str().unwrap_or(crate_name);
+                    (crate_name, format!("{name}/dev"))
+                })
+        })
         .collect()
+}
+
+/// Whether the project's `crate_name` has the `dev` feature: 1.5 and newer,
+/// or from a path (a checkout of the repository). No lock file yet: assume
+/// a current one.
+fn has_dev_feature(project: &Project, crate_name: &str) -> bool {
+    let Ok(lock) = fs::read_to_string(project.root.join("Cargo.lock")) else {
+        return true;
+    };
+    lock_version(&lock, crate_name).map_or(true, |(v, from_path)| {
+        from_path || v >= crate::host::Version(1, 5, 0)
+    })
 }
 
 /// Whether the project's giong takes sockets from giong dev (1.5 and newer,
@@ -1727,6 +1757,11 @@ fn giong_takes_sockets(project: &Project) -> bool {
 /// `source`).
 #[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
 fn lock_giong_version(lock: &str) -> Option<(crate::host::Version, bool)> {
+    lock_version(lock, "giong")
+}
+
+/// A crate's version in a Cargo.lock, and whether it comes from a path.
+fn lock_version(lock: &str, crate_name: &str) -> Option<(crate::host::Version, bool)> {
     for block in lock.split("[[package]]") {
         let mut name = None;
         let mut version = None;
@@ -1741,7 +1776,7 @@ fn lock_giong_version(lock: &str) -> Option<(crate::host::Version, bool)> {
                 source = true;
             }
         }
-        if name == Some("giong") {
+        if name == Some(crate_name) {
             return version.map(|v| (v, !source));
         }
     }
@@ -1777,7 +1812,6 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_release_build_turns_on_giongs_dev_feature() {
         let meta = json!({"packages": [
@@ -1788,10 +1822,23 @@ mod tests {
             ]},
             {"name": "renamed", "dependencies": [{"name": "giong", "rename": "rt", "kind": null}]},
             {"name": "web-only", "dependencies": [{"name": "giong-web", "rename": null, "kind": null}]},
+            {"name": "both", "dependencies": [
+                {"name": "giong-web", "rename": "web", "kind": null},
+                {"name": "giong", "rename": null, "kind": null},
+            ]},
+            {"name": "web-dev-only", "dependencies": [{"name": "giong-web", "rename": null, "kind": "dev"}]},
         ]});
-        assert_eq!(dev_features(&meta, "svc"), ["giong/dev"]);
-        assert_eq!(dev_features(&meta, "renamed"), ["rt/dev"]);
-        assert!(dev_features(&meta, "web-only").is_empty());
+        let features = |p: &str| {
+            dev_features(&meta, p)
+                .into_iter()
+                .map(|(c, f)| format!("{c}: {f}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(features("svc"), ["giong: giong/dev"]);
+        assert_eq!(features("renamed"), ["giong: rt/dev"]);
+        assert_eq!(features("web-only"), ["giong-web: giong-web/dev"]);
+        assert_eq!(features("both"), ["giong: giong/dev", "giong-web: web/dev"]);
+        assert!(features("web-dev-only").is_empty());
         assert!(dev_features(&meta, "nope").is_empty());
     }
 
@@ -1853,5 +1900,12 @@ mod tests {
         let path = "[[package]]\nname = \"giong\"\nversion = \"1.3.0\"\ndependencies = []\n";
         assert_eq!(lock_giong_version(path), Some((Version(1, 3, 0), true)));
         assert_eq!(lock_giong_version("[[package]]\nname = \"a\"\n"), None);
+        let both = "[[package]]\nname = \"giong\"\nversion = \"1.5.0\"\nsource = \"registry+x\"\n\n\
+                    [[package]]\nname = \"giong-web\"\nversion = \"1.4.0\"\nsource = \"registry+x\"\n";
+        assert_eq!(
+            lock_version(both, "giong-web"),
+            Some((Version(1, 4, 0), false))
+        );
+        assert_eq!(lock_version(both, "giong"), Some((Version(1, 5, 0), false)));
     }
 }

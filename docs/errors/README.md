@@ -302,6 +302,33 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5037](E5037.md) | `McpJsonInvalid` | .mcp.json is not valid JSON |
 | [GIONG-E5038](E5038.md) | `VersionMismatch` | the project uses another giong version than this command |
 | [GIONG-E5039](E5039.md) | `NotGiongProject` | the project does not depend on giong |
+| [GIONG-E5040](E5040.md) | `NoContainerRuntime` | neither Docker nor Podman answers |
+| [GIONG-E5041](E5041.md) | `DbNotReady` | the database does not answer queries |
+| [GIONG-E5042](E5042.md) | `DbUrl` | no usable database URL |
+| [GIONG-E5043](E5043.md) | `MigrationChanged` | an applied migration was changed |
+| [GIONG-E5044](E5044.md) | `MigrationFailed` | a migration failed |
+| [GIONG-E5045](E5045.md) | `MigrationName` | a migration file is not valid |
+| [GIONG-E5046](E5046.md) | `DbClientMissing` | no database client to run the SQL |
+| [GIONG-E5047](E5047.md) | `MigrationUnknown` | the database has a migration the project does not |
+| [GIONG-E5048](E5048.md) | `DbNotManaged` | the database was not started by giong db up |
+| [GIONG-E5049](E5049.md) | `DbStartFailed` | the database container could not start |
+| [GIONG-E5055](E5055.md) | `WorkerBlocked` | a worker of the service is stuck in one task |
+| [GIONG-E5056](E5056.md) | `ServiceWarning` | the service reports a warning |
+| [GIONG-E5057](E5057.md) | `NoService` | no running service to ask |
+| [GIONG-E5058](E5058.md) | `McpNoTool` | the service's giong-mcp lacks a tool |
+| [GIONG-E5059](E5059.md) | `McpToolError` | the service's giong-mcp refused a call |
+| [GIONG-E5060](E5060.md) | `BenchTarget` | the service to measure cannot be reached |
+| [GIONG-E5061](E5061.md) | `BenchAgainst` | the build to compare against cannot be made |
+| [GIONG-E5062](E5062.md) | `BenchGeneratorBehind` | the load generator fell behind its schedule |
+| [GIONG-E5063](E5063.md) | `BenchErrors` | requests failed during the benchmark |
+| [GIONG-E5064](E5064.md) | `BenchRegression` | the change is slower than the build it is compared with |
+| [GIONG-E5070](E5070.md) | `ImageTarget` | the service cannot be built for Linux here |
+| [GIONG-E5071](E5071.md) | `ImageLibraries` | the shared libraries of the binary cannot be found |
+| [GIONG-E5072](E5072.md) | `ImageNoCerts` | no CA certificates to put in the image |
+| [GIONG-E5073](E5073.md) | `ImageAdd` | a file to add to the image is not usable |
+| [GIONG-E5074](E5074.md) | `ImageLoad` | the image could not be loaded into Docker or Podman |
+| [GIONG-E5075](E5075.md) | `ImagePush` | the image could not be pushed to the registry |
+| [GIONG-E5076](E5076.md) | `ImageTag` | the image name or tag is not valid |
 | [GIONG-E5080](E5080.md) | `FixDirty` | the project has changes that are not committed |
 | [GIONG-E5081](E5081.md) | `FixFailed` | cargo could not apply its fixes |
 | [GIONG-E5082](E5082.md) | `FixConflict` | a fix no longer matches the code |

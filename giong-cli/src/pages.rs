@@ -3228,6 +3228,415 @@ No package of the workspace has `giong` in its `[dependencies]`, so the rules wr
 
 [All error codes](README.md)
 "#),
+    (5040, r#"# GIONG-E5040: neither Docker nor Podman answers
+
+Raised by the `giong` command (giong-cli): `giong db` up and down. In JSON output: `"code": "GIONG-E5040"`.
+
+## What happened
+
+`giong db up` starts the development database in a container, and neither `docker info` nor `podman info` succeeded: neither is installed, or its daemon or virtual machine is not running. `GIONG_CONTAINER_RUNTIME` names the one to use when both are installed.
+
+## How to fix it
+
+- Install and start Docker (Docker Desktop or OrbStack on a Mac) or Podman (`podman machine start` on a Mac or Windows).
+- Or run the database yourself and put its URL in `DATABASE_URL` (or `REDIS_URL`): `giong db migrate` and `giong db status` then use it through the locally installed client.
+
+[All error codes](README.md)
+"#),
+    (5041, r#"# GIONG-E5041: the database does not answer queries
+
+Raised by the `giong` command (giong-cli): `giong db` up, status and migrate. In JSON output: `"code": "GIONG-E5041"`.
+
+## What happened
+
+The database did not answer a query in time, or refused the connection: it is still starting (MySQL's first start takes several seconds), it stopped, or the URL's user, password or database is wrong. The message ends with what the database client said.
+
+## How to fix it
+
+- `giong db up --timeout 300` waits longer; `docker logs <container>` shows what the database is doing.
+- Check `DATABASE_URL` against the database; `giong db status` shows what giong started and where.
+
+[All error codes](README.md)
+"#),
+    (5042, r#"# GIONG-E5042: no usable database URL
+
+Raised by the `giong` command (giong-cli): `giong db` migrate and status. In JSON output: `"code": "GIONG-E5042"`.
+
+## What happened
+
+`giong db` found no database to use: `giong db up` started none in this project and `DATABASE_URL` (or `REDIS_URL`) is set neither in the environment nor in `.env`, or it is set to something that is not a `postgres://`, `mysql://` or `redis://` URL.
+
+## How to fix it
+
+- Run `giong db up`, which writes the URL into `.env`.
+- Or set `DATABASE_URL=postgres://user:password@host:5432/db` (or `mysql://...:3306/db`).
+
+[All error codes](README.md)
+"#),
+    (5043, r#"# GIONG-E5043: an applied migration was changed
+
+Raised by the `giong` command (giong-cli): `giong db` migrate and status. In JSON output: `"code": "GIONG-E5043"`.
+
+## What happened
+
+A file in `migrations/` was edited after it was applied: its SHA-256 checksum differs from the one recorded in `giong_migrations`. The database does not have the change, and applying it again could fail or duplicate data, so `giong db migrate` applies nothing until it is resolved.
+
+## How to fix it
+
+- Undo the edit (`git checkout migrations/<file>`) and put the new SQL in a new migration: `giong db new <name>`.
+- In development, `giong db reset --yes` drops the database giong started and applies every migration from the start.
+
+[All error codes](README.md)
+"#),
+    (5044, r#"# GIONG-E5044: a migration failed
+
+Raised by the `giong` command (giong-cli): `giong db` migrate and reset. In JSON output: `"code": "GIONG-E5044"`.
+
+## What happened
+
+The database refused a statement of a migration. The finding points at the file and line, with the database's message. On PostgreSQL each file runs in one transaction, so nothing of the failed file was applied and it is not recorded; later files were not run. On MySQL (which commits DDL statement by statement) and for PostgreSQL files marked `-- giong:no-transaction`, the statements before the failing one stay applied.
+
+## How to fix it
+
+- Fix the SQL and run `giong db migrate` again.
+- On MySQL or a no-transaction file, make the statements safe to run twice (`CREATE TABLE IF NOT EXISTS`, `DROP ... IF EXISTS`) or undo the applied ones by hand first.
+
+[All error codes](README.md)
+"#),
+    (5045, r#"# GIONG-E5045: a migration file is not valid
+
+Raised by the `giong` command (giong-cli): `giong db` new, migrate and status. In JSON output: `"code": "GIONG-E5045"`.
+
+## What happened
+
+A `.sql` file in `migrations/` is not named `NNNN_name.sql` (at least four digits, an underscore, then lower-case letters, digits or `_`), two files share a version number, or a file is not UTF-8. Other files (a README) are ignored.
+
+## How to fix it
+
+- Rename the file, for example `0003_add_index.sql`; `giong db new <name>` writes the next number for you.
+- Two branches that each added a migration with the same number: give the newer one the next free number.
+
+[All error codes](README.md)
+"#),
+    (5046, r#"# GIONG-E5046: no database client to run the SQL
+
+Raised by the `giong` command (giong-cli): `giong db` migrate, status and reset. In JSON output: `"code": "GIONG-E5046"`.
+
+## What happened
+
+`giong db` runs SQL through the database's own client. For a database `giong db up` started it uses the client inside the container; for any other `DATABASE_URL` it needs `psql` or `mysql` installed here, and it is not.
+
+## How to fix it
+
+- Install the client: `postgresql-client` (`brew install libpq` on a Mac) or `mysql-client` / `mariadb-client`.
+- Or let `giong db up` start the development database.
+
+[All error codes](README.md)
+"#),
+    (5047, r#"# GIONG-E5047: the database has a migration the project does not
+
+Raised by the `giong` command (giong-cli): `giong db` migrate and status. In JSON output: `"code": "GIONG-E5047"`.
+
+## What happened
+
+`giong_migrations` records a version for which `migrations/` has no file: it was applied from another branch, or its file was deleted or renumbered. A warning: the other migrations still apply.
+
+## How to fix it
+
+- Switch to the branch that has it, or restore the file.
+- In development, `giong db reset --yes` starts the database over from the files you have.
+
+[All error codes](README.md)
+"#),
+    (5048, r#"# GIONG-E5048: the database was not started by giong db up
+
+Raised by the `giong` command (giong-cli): `giong db` reset. In JSON output: `"code": "GIONG-E5048"`.
+
+## What happened
+
+`giong db reset` drops and recreates the database, so it acts only on a database `giong db up` started in this project (listed in `.giong/db.json`), never on one given by `DATABASE_URL`, which could be shared or in production.
+
+## How to fix it
+
+- Start the development database with `giong db up` and reset that.
+- To empty another database, do it yourself with its own tools, deliberately.
+
+[All error codes](README.md)
+"#),
+    (5049, r#"# GIONG-E5049: the database container could not start
+
+Raised by the `giong` command (giong-cli): `giong db` up and down. In JSON output: `"code": "GIONG-E5049"`.
+
+## What happened
+
+Docker or Podman could not create, start or remove the database container, or the container stopped while starting. The message carries the runtime's or the database's own words: a port taken by another program, an image that cannot be pulled, or a data volume written by another major version of the engine. It is also raised when a container with the project's name exists but `.giong/db.json` does not list it (the file was deleted or the project copied without it): its password is not known, so `giong db up` does not guess one.
+
+## How to fix it
+
+- A taken port: `giong db down`, then `giong db up` picks a free one (or `--port`).
+- An image: check `--image` and the network, or `docker pull` it first.
+- A volume from another version: `giong db down --volumes` deletes the data and starts fresh.
+- A container `.giong/db.json` does not list: `giong db down` removes it (`--volumes` also deletes its data), or restore `.giong/db.json` to keep it.
+
+[All error codes](README.md)
+"#),
+    (5055, r#"# GIONG-E5055: a worker of the service is stuck in one task
+
+Raised by the `giong` command (giong-cli): `giong top` and the dashboard. In JSON output: `"code": "GIONG-E5055"`.
+
+## What happened
+
+giong-mcp saw a worker that is awake but has not moved on for a while: one task's poll has not returned. giong runs many tasks on each worker thread, so every other task on that worker (other requests, timers, pool connections) waits. The finding names the line that spawned the task; in a giong-http or giong-web service that is giong-http's connection task, which runs the request handlers.
+
+## How to fix it
+
+- Look for a blocking call in the code the task runs: `std::fs`, `std::thread::sleep`, `std::net`, a blocking client, a `Mutex` held long, or a loop that computes without `.await`.
+- Use the giong equivalent (`giong::fs`, `giong::time::sleep`, `giong::net`, giong's database and HTTP clients), move the work to a thread of its own, or let other tasks run with `giong::yield_now().await` inside long loops.
+- `giong top --profile 2000` shows where the workers spend their time.
+
+[All error codes](README.md)
+"#),
+    (5056, r#"# GIONG-E5056: the service reports a warning
+
+Raised by the `giong` command (giong-cli): `giong top` and the dashboard. In JSON output: `"code": "GIONG-E5056"`.
+
+## What happened
+
+giong-mcp's `overview` listed a warning other than a stuck worker: workers that fell back to the epoll driver because io_uring is blocked, or a process close to its open-files limit. The detail is the warning's text.
+
+## How to fix it
+
+- Read the detail. For epoll: see [GIONG-E0001](E0001.md) and `giong doctor`. For open files: raise the limit (`ulimit -n`, `LimitNOFILE=` in a systemd unit, or the container's `nofile` ulimit) or find the leak (`giong top` lists tasks by spawn line).
+
+[All error codes](README.md)
+"#),
+    (5057, r#"# GIONG-E5057: no running service to ask
+
+Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi`, `giong top` and `giong dashboard`. In JSON output: `"code": "GIONG-E5057"`.
+
+## What happened
+
+The command reads a running service through its giong-mcp server, and found none to ask: no `--mcp` flag, no `GIONG_MCP` in the environment, and no `giong dev` serving the project in the current directory (`.giong/dev.json`).
+
+## How to fix it
+
+- Start the service with `giong dev` in the project and run the command from the same project.
+- Or run the service with `GIONG_MCP=127.0.0.1:7777` and `GIONG_MCP_TOKEN` set (16 characters or more), keep `let _mcp = giong_mcp::start_from_env(&handle);` alive in it, and pass `--mcp 127.0.0.1:7777` with the same `GIONG_MCP_TOKEN`.
+- A service listening on a Unix socket: `--mcp unix:/path/to/mcp.sock` (no token needed).
+
+[All error codes](README.md)
+"#),
+    (5058, r#"# GIONG-E5058: the service's giong-mcp lacks a tool
+
+Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi` and `giong dashboard`. In JSON output: `"code": "GIONG-E5058"`.
+
+## What happened
+
+The service's giong-mcp answered, but has no tool the command needs. The `routes` tool is there only when giong-mcp is built with its `web` feature, and only from giong-mcp 1.5.
+
+## How to fix it
+
+- Turn on the feature in the service's `Cargo.toml`: `giong-mcp = { version = "1.5", features = ["web"] }`, with giong-web 1.5 or newer, and rebuild.
+- Use a giong-mcp of the same version as the `giong` command (`giong --version`).
+
+[All error codes](README.md)
+"#),
+    (5059, r#"# GIONG-E5059: the service's giong-mcp refused a call
+
+Raised by the `giong` command (giong-cli): `giong routes`, `giong openapi`, `giong top` and `giong dashboard`. In JSON output: `"code": "GIONG-E5059"`.
+
+## What happened
+
+The service's giong-mcp answered the call with an error, or with an answer this command cannot read. The message says which: a refused argument, a worker that did not answer, or an answer of another version.
+
+## How to fix it
+
+- Read the message: a worker that does not answer is stuck (`giong top` shows which and in which task).
+- Use giong-mcp and the `giong` command of the same version.
+
+[All error codes](README.md)
+"#),
+    (5060, r#"# GIONG-E5060: the service to measure cannot be reached
+
+Raised by the `giong` command (giong-cli): `giong bench`. In JSON output: `"code": "GIONG-E5060"`.
+
+## What happened
+
+`giong bench` could not measure the service: the URL is not a plain `http://` URL, its host does not resolve, nothing answers there, the service it started did not listen on the address in `LISTEN` in time, or the service exited during a round. The message names which, with the last lines of the service's log (`.giong/bench/service.log`).
+
+## How to fix it
+
+- Give a URL like `http://127.0.0.1:8080/`. HTTPS is not measured: start the service without `TLS_CERT` and `TLS_KEY` for the benchmark.
+- When `giong bench` starts the service, the service must listen on the address in `LISTEN` (services made by `giong new` do). Otherwise start it yourself and give its URL: `giong bench http://127.0.0.1:8080/`.
+- If the service exited, read `.giong/bench/service.log`: a missing `DATABASE_URL` (`giong env check`) or a panic is the usual cause.
+
+[All error codes](README.md)
+"#),
+    (5061, r#"# GIONG-E5061: the build to compare against cannot be made
+
+Raised by the `giong` command (giong-cli): `giong bench --against`. In JSON output: `"code": "GIONG-E5061"`.
+
+## What happened
+
+`--against <ref>` names a git commit, branch or tag to build and measure next to the working tree. The project is not in a git repository, the ref does not name a commit, `git worktree add` failed, or that commit does not build in release mode.
+
+## How to fix it
+
+- Check the ref: `git rev-parse --verify <ref>` must print a commit. Fetch it first if it is a remote branch (`git fetch origin main`, then `--against origin/main`).
+- If the older commit does not build, pick a later one, or build it by hand to see why (the message has cargo's first error).
+
+[All error codes](README.md)
+"#),
+    (5062, r#"# GIONG-E5062: the load generator fell behind its schedule
+
+Raised by the `giong` command (giong-cli): `giong bench` with a fixed rate. In JSON output: `"code": "GIONG-E5062"`.
+
+## What happened
+
+With a fixed rate, every request has a time it is due, and its latency counts from then, so a service that stalls is charged for every request that waited (no coordinated omission). Here the load generator itself woke late: at the 99th percentile it sent requests more than a millisecond after they were due, because the machine is busy (the service and the generator share its cores) or the rate needs more threads than the machine runs well. Those latencies include the generator's own delay.
+
+## How to fix it
+
+- Lower `--rate` or `--conns`, close other programs, or run the generator on another machine against the service's URL.
+- On Linux, a machine without frequency scaling or other load gives steadier numbers; numbers that matter come from the benchmark lab (`bench/lab`), not a laptop.
+
+[All error codes](README.md)
+"#),
+    (5063, r#"# GIONG-E5063: requests failed during the benchmark
+
+Raised by the `giong` command (giong-cli): `giong bench`. In JSON output: `"code": "GIONG-E5063"`.
+
+## What happened
+
+Some requests got no answer (the connection was refused, reset or timed out) or got an error status (4xx or 5xx). Their count is in the report; latencies of answered requests are still reported, but a service that fails fast looks faster than it is. More than 1% failed is an error; fewer is a warning.
+
+## How to fix it
+
+- Check the path and method: `giong bench --path /health` for a route that exists, `--method POST --data '{...}'` for one that needs a body.
+- Read the service's log (`.giong/bench/service.log` when `giong bench` started it): a pool too small for `--conns`, a database that is not up, or a timeout shorter than the service's work (`--timeout`).
+
+[All error codes](README.md)
+"#),
+    (5064, r#"# GIONG-E5064: the change is slower than the build it is compared with
+
+Raised by the `giong` command (giong-cli): `giong bench --against <ref> --max-regression <percent>`. In JSON output: `"code": "GIONG-E5064"`.
+
+## What happened
+
+In every round the working tree was slower than the build of `<ref>` (99th percentile latency at a fixed rate, or requests per second with `--rate max`), and the median difference is larger than `--max-regression`. Rounds alternate between the two builds, so a slow machine affects both. With 5 rounds a build (the default), two identical builds would separate in every round by chance less than 1% of the time; `--max-regression` needs at least 3 rounds a build (10%).
+
+## How to fix it
+
+- Profile the change: `giong top --profile` on the running service shows where the time goes.
+- If the slowdown is expected (more work per request), raise `--max-regression` for this comparison and say why in the pull request.
+
+[All error codes](README.md)
+"#),
+    (5070, r#"# GIONG-E5070: the service cannot be built for Linux here
+
+Raised by the `giong` command (giong-cli): `giong image`. In JSON output: `"code": "GIONG-E5070"`.
+
+## What happened
+
+An image runs a Linux binary. On Linux, `giong image` builds for this machine, statically with musl when the `x86_64-unknown-linux-musl` (or `aarch64-unknown-linux-musl`) target is installed, otherwise against glibc with this machine's libraries copied in. On macOS and Windows it needs a musl target and `cargo zigbuild` to cross-build. Here neither works, or the build is not a Linux ELF binary.
+
+## How to fix it
+
+- On Linux: nothing is needed; for a smaller, fully static image, `rustup target add x86_64-unknown-linux-musl`.
+- On macOS or Windows: `rustup target add x86_64-unknown-linux-musl` (or `aarch64-unknown-linux-musl` for ARM servers) and `cargo install cargo-zigbuild` (it needs Zig: `brew install zig` or `winget install zig.zig`).
+- Give the target yourself with `--target <triple>` when the server's architecture differs from this machine's.
+
+[All error codes](README.md)
+"#),
+    (5071, r#"# GIONG-E5071: the shared libraries of the binary cannot be found
+
+Raised by the `giong` command (giong-cli): `giong image`. In JSON output: `"code": "GIONG-E5071"`.
+
+## What happened
+
+The binary is linked against glibc, so the image needs the libraries it loads (`libc.so.6`, `libgcc_s.so.1`, the dynamic loader). `giong image` asks `ldd` for them and copies them from this machine; `ldd` is missing, failed, or names a library that is not installed.
+
+## How to fix it
+
+- Build statically instead: `rustup target add x86_64-unknown-linux-musl`, then run `giong image` again (it picks the musl target by itself).
+- Install the missing library with the system's package manager, or run `ldd` on the binary to see what it lacks.
+
+[All error codes](README.md)
+"#),
+    (5072, r#"# GIONG-E5072: no CA certificates to put in the image
+
+Raised by the `giong` command (giong-cli): `giong image`. In JSON output: `"code": "GIONG-E5072"`.
+
+## What happened
+
+The image carries the CA certificates of this machine (`/etc/ssl/certs/ca-certificates.crt` or the other usual places), so the service can check the certificates of HTTPS servers, databases and APIs it calls. None was found, so the image has none: outgoing TLS connections will fail to verify. A service that makes no outgoing TLS connection does not need them.
+
+## How to fix it
+
+- Install the CA bundle (`ca-certificates` on Debian, Ubuntu and Alpine; `ca-certificates` or `openssl` on macOS through Homebrew), or point `SSL_CERT_FILE` at a PEM bundle before running `giong image`.
+
+[All error codes](README.md)
+"#),
+    (5073, r#"# GIONG-E5073: a file to add to the image is not usable
+
+Raised by the `giong` command (giong-cli): `giong image --add`. In JSON output: `"code": "GIONG-E5073"`.
+
+## What happened
+
+`--add` takes paths inside the project (comma-separated, such as `static,migrations`), copied under `/app` in the image with the same relative path. This one does not exist, is outside the project (absolute or with `..`), or cannot be read.
+
+## How to fix it
+
+- Give a path relative to the project root that exists: `giong image --add static,migrations`.
+- Files the service needs at run time go under `/app`, its working directory; read them with a relative path (`static/index.html`).
+
+[All error codes](README.md)
+"#),
+    (5074, r#"# GIONG-E5074: the image could not be loaded into Docker or Podman
+
+Raised by the `giong` command (giong-cli): `giong image --load`. In JSON output: `"code": "GIONG-E5074"`.
+
+## What happened
+
+`--load` hands the image file to `docker load` or `podman load` (`GIONG_CONTAINER_RUNTIME` chooses), so it can be run right away. Neither answers, or the load failed; the image file itself was written and is still usable.
+
+## How to fix it
+
+- Start Docker or Podman, or load the file yourself: `docker load -i <file>` (Docker 25 or newer reads OCI archives), `podman load -i <file>`.
+- Leave out `--load` to only write the file, and push it with `giong image --push` or `skopeo copy oci-archive:<file> docker://<ref>`.
+
+[All error codes](README.md)
+"#),
+    (5075, r#"# GIONG-E5075: the image could not be pushed to the registry
+
+Raised by the `giong` command (giong-cli): `giong image --push <ref>`. In JSON output: `"code": "GIONG-E5075"`.
+
+## What happened
+
+`--push` sends the image with the first tool found: `skopeo`, `crane`, then `docker` or `podman` (load, tag, push). None is installed, the registry refused the login, or the reference names a repository the account cannot write to. The image file was written and is still usable.
+
+## How to fix it
+
+- Log in first: `docker login ghcr.io` (crane and skopeo read the same credentials), or `skopeo login`.
+- Check the reference: `ghcr.io/<owner>/<name>:<tag>`, with a repository the account can push to.
+
+[All error codes](README.md)
+"#),
+    (5076, r#"# GIONG-E5076: the image name or tag is not valid
+
+Raised by the `giong` command (giong-cli): `giong image --tag` and `--push`. In JSON output: `"code": "GIONG-E5076"`.
+
+## What happened
+
+An image reference is `[registry/]name[:tag]`: the name in lower case (letters, digits, and `.`, `_`, `-` between them, `/` between parts), the tag up to 128 letters, digits, `_`, `.` and `-`, not starting with `.` or `-`. By default the name is the package's and the tag its version.
+
+## How to fix it
+
+- Write `--tag myservice:1.2.0` or `--push ghcr.io/owner/myservice:1.2.0`.
+- Upper-case letters are not allowed in the name: `MyService` becomes `myservice`.
+
+[All error codes](README.md)
+"#),
     (5080, r#"# GIONG-E5080: the project has changes that are not committed
 
 Raised by the `giong` command (giong-cli): `giong fix`. In JSON output: `"code": "GIONG-E5080"`.

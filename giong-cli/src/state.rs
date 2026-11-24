@@ -164,6 +164,48 @@ pub fn replace(path: &Path, bytes: &[u8]) -> io::Result<()> {
     fs::rename(&tmp, path)
 }
 
+/// [`replace`] for a file that holds a password (`.giong/db.json`, `.env`):
+/// owner-only on Unix from the moment it is made.
+pub fn replace_private(path: &Path, bytes: &[u8]) -> io::Result<()> {
+    let name = path.file_name().unwrap_or_default().to_string_lossy();
+    let tmp = path.with_file_name(format!("{name}.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let mut options = OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let written = open(&tmp, &mut options).and_then(|mut f| f.write_all(bytes));
+    if let Err(e) = written {
+        let _ = fs::remove_file(&tmp);
+        return Err(e);
+    }
+    fs::rename(&tmp, path)
+}
+
+/// Opens `path` for appending (made if missing).
+pub fn append(path: &Path) -> io::Result<File> {
+    open(path, OpenOptions::new().create(true).append(true))
+}
+
+/// Makes `root/.giong/<parts...>`, refusing any folder on the way that is a
+/// link or not a folder.
+pub fn ensure_sub(root: &Path, parts: &[&str]) -> io::Result<PathBuf> {
+    let mut dir = ensure(root)?;
+    for part in parts {
+        dir.push(part);
+        match fs::create_dir(&dir) {
+            Ok(()) => {}
+            Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(e) => return Err(e),
+        }
+        check_dir(&dir)?;
+    }
+    Ok(dir)
+}
+
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
@@ -224,6 +266,32 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn private_files_and_subfolders() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = scratch("private");
+        let secret = root.join("secret");
+        fs::write(&secret, "do not touch").unwrap();
+        let dir = ensure(&root).unwrap();
+        let db = dir.join("db.json");
+        symlink(&secret, &db).unwrap();
+        replace_private(&db, b"{}").unwrap();
+        assert_eq!(fs::read_to_string(&secret).unwrap(), "do not touch");
+        let mode = fs::metadata(&db).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        // A linked folder further down is refused, not written through.
+        let elsewhere = root.join("elsewhere");
+        fs::create_dir_all(&elsewhere).unwrap();
+        symlink(&elsewhere, dir.join("bench")).unwrap();
+        assert!(ensure_sub(&root, &["bench", "bin"]).is_err());
+        assert!(append(&dir.join("bench").join("service.log")).is_err());
+        assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+        fs::remove_file(dir.join("bench")).unwrap();
+        let bin = ensure_sub(&root, &["bench", "bin"]).unwrap();
+        assert!(bin.is_dir());
         let _ = fs::remove_dir_all(&root);
     }
 }
