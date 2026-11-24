@@ -171,10 +171,6 @@ fn nightly_and_odd_version_strings_are_read() {
 /// A toolchain that hangs (a rustup proxy waiting on a lock, a network
 /// mount) must not hang `giong doctor`: agents run it unattended.
 #[test]
-#[cfg_attr(
-    windows,
-    ignore = "known bug #382: on Windows the hanging tool inherits giong's own output pipe and holds it after giong gives up"
-)]
 fn a_hanging_rustc_does_not_hang_doctor() {
     let dir = TempDir::new("doctor-hang");
     let rustc = fake_tool(
