@@ -106,6 +106,14 @@ impl FakeDns {
                     }
                     Err(_) => return,
                 };
+                // A response (the QR bit set) is not a query. Windows hands
+                // out ports in sequence, so this server's port can be one
+                // that a query socket of another test process held, and a
+                // late answer to that query lands here.
+                if buf[..n].get(2).is_some_and(|flags| flags & 0x80 != 0) {
+                    record(&ev, format!("a response from {from}, ignored"));
+                    continue;
+                }
                 let Some((reply, delay)) = answer(&buf[..n], &t, &q, false) else {
                     continue;
                 };
@@ -556,6 +564,7 @@ fn lookups_of_one_name_at_the_same_time_share_one_query() {
         (("gone.test", AAAA), Reply::ServFail),
     ]);
     giong::block_on(async {
+        let started = Instant::now();
         let r = Resolver::new(
             ResolverConfig::parse("", "")
                 .nameservers([dns.addr])
@@ -571,7 +580,12 @@ fn lookups_of_one_name_at_the_same_time_share_one_query() {
             let got = lookup.await.unwrap().unwrap();
             assert_eq!(got, ips(&["2001:db8::7", "192.0.2.7"]));
         }
-        assert_eq!(dns.count("shared.test"), 2);
+        assert_eq!(
+            dns.count("shared.test"),
+            2,
+            "the server:{}",
+            dns.timeline(started)
+        );
 
         // A failure reaches every lookup that waited for it, code and all.
         let lookups: Vec<_> = (0..10)
@@ -599,6 +613,7 @@ fn a_cancelled_lookup_hands_its_waiters_over() {
         ),
     )]);
     giong::block_on(async {
+        let started = Instant::now();
         let r = dns.resolver("");
         let first = {
             let r = r.clone();
@@ -616,7 +631,12 @@ fn a_cancelled_lookup_hands_its_waiters_over() {
         let got = second.await.unwrap().unwrap();
         assert_eq!(got, ips(&["192.0.2.8"]));
         // The second lookup asked again.
-        assert_eq!(dns.count("slow.test"), 4);
+        assert_eq!(
+            dns.count("slow.test"),
+            4,
+            "the server:{}",
+            dns.timeline(started)
+        );
     });
 }
 
