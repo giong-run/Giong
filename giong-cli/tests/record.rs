@@ -486,3 +486,128 @@ fn secrets_stay_out_of_saved_cases() {
     );
     assert!(text.contains("4242424242424242"), "{text}");
 }
+
+/// One recorded exchange: `GET /me` with a redacted `authorization` header.
+fn redacted_exchange_log(dir: &Path) -> PathBuf {
+    let log = dir.join("x.log");
+    let line = json!({
+        "event": "exchange", "method": "GET", "path": "/me", "route": "/me",
+        "status": 200, "duration_us": 1,
+        "request": {"headers": [["authorization", "[redacted]"]], "body": "",
+                    "body_len": 0, "truncated": false, "streamed": false},
+        "response": {"headers": [["content-type", "application/json"]], "body": "{\"ok\":true}",
+                     "body_len": 11, "truncated": false, "streamed": false}
+    });
+    std::fs::write(&log, format!("{line}\n")).unwrap();
+    log
+}
+
+#[test]
+fn a_committed_dev_json_sends_no_secret_elsewhere() {
+    // A cloned repository commits .giong/dev.json naming its own address
+    // (a URL here, so the test can listen on it) and a case that sends a
+    // value from the environment. Replay must not go there.
+    let dir = temp_dir("hostile-dev-json");
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    let log = redacted_exchange_log(&dir);
+    let (exit, r) = giong(
+        &dir,
+        &["record", "save", "all", "--from", log.to_str().unwrap()],
+        &[],
+    );
+    assert_eq!(exit, 0, "{r}");
+    let collector = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+    collector.set_nonblocking(true).unwrap();
+    let port = collector.local_addr().unwrap().port();
+    std::fs::create_dir_all(dir.join(".giong")).unwrap();
+    for listen in [
+        format!("http://127.0.0.1:{port}"),
+        format!("127.0.0.1:{port}/"),
+        "10.255.255.1:80".to_string(),
+    ] {
+        std::fs::write(
+            dir.join(".giong/dev.json"),
+            json!({ "listen": [listen] }).to_string(),
+        )
+        .unwrap();
+        let (_, r) = giong(
+            &dir,
+            &["record", "replay", "--timeout-ms", "300"],
+            &[("GIONG_RECORD_AUTHORIZATION", "Bearer s3cret")],
+        );
+        // The default address instead (nothing answers there in the test).
+        let text = r.to_string();
+        assert!(
+            text.contains("http://127.0.0.1:8080") && !text.contains(&format!(":{port}")),
+            "{listen}: {r}"
+        );
+        assert!(
+            collector.accept().is_err(),
+            "{listen}: replay connected to the address a committed dev.json named"
+        );
+    }
+}
+
+#[test]
+fn committed_links_are_never_followed() {
+    use std::os::unix::fs::symlink;
+    let dir = temp_dir("links");
+    let log = redacted_exchange_log(&dir);
+    let from = log.to_str().unwrap();
+    let secret = dir.join("secret");
+    std::fs::write(&secret, "do not touch").unwrap();
+    let recorded = dir.join("tests/recorded");
+    std::fs::create_dir_all(&recorded).unwrap();
+    let file = recorded.join("recorded.json");
+
+    // A link at the case file: refused, with --force and with --append.
+    symlink(&secret, &file).unwrap();
+    for extra in ["--force", "--append"] {
+        let (exit, r) = giong(&dir, &["record", "save", "all", "--from", from, extra], &[]);
+        assert_eq!(exit, 2, "{extra}: {r}");
+        let what = r["error"]["message"].as_str().unwrap();
+        assert!(what.contains("symbolic link"), "{extra}: {what}");
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "do not touch");
+    }
+    std::fs::remove_file(&file).unwrap();
+
+    // A link where an older giong put its aside file is left alone.
+    symlink(&secret, recorded.join("recorded.json.tmp")).unwrap();
+    let (exit, r) = giong(&dir, &["record", "save", "all", "--from", from], &[]);
+    assert_eq!(exit, 0, "{r}");
+    assert_eq!(std::fs::read_to_string(&secret).unwrap(), "do not touch");
+    assert!(std::fs::read_to_string(&file).unwrap().contains("/me"));
+
+    // A link at a folder on the way: refused, nothing written through it.
+    let outside = dir.join("outside");
+    std::fs::create_dir_all(&outside).unwrap();
+    std::fs::remove_dir_all(&recorded).unwrap();
+    symlink(&outside, &recorded).unwrap();
+    let (exit, r) = giong(&dir, &["record", "save", "all", "--from", from], &[]);
+    assert_eq!(exit, 2, "{r}");
+    assert_eq!(std::fs::read_dir(&outside).unwrap().count(), 0);
+
+    // giong dev's log, committed as a link to another file: not read.
+    std::fs::write(dir.join("Cargo.toml"), "[package]\nname = \"x\"\n").unwrap();
+    std::fs::create_dir_all(dir.join(".giong")).unwrap();
+    symlink(&log, dir.join(".giong/dev.log")).unwrap();
+    std::fs::write(dir.join(".giong/dev.json"), r#"{"log":".giong/dev.log"}"#).unwrap();
+    let (exit, r) = giong(&dir, &["record", "list"], &[]);
+    assert_eq!(exit, 2, "{r}");
+    assert!(
+        r["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("symbolic link"),
+        "{r}"
+    );
+    // ... nor a log named outside .giong.
+    std::fs::write(
+        dir.join(".giong/dev.json"),
+        json!({ "log": log }).to_string(),
+    )
+    .unwrap();
+    let (exit, r) = giong(&dir, &["record", "list"], &[]);
+    assert_eq!(exit, 2, "{r}");
+    assert_eq!(r["error"]["code"], "GIONG-E5065", "{r}");
+}

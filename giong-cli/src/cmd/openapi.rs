@@ -411,7 +411,9 @@ fn run(args: &Args) -> Result<Report, Failure> {
     match args.value("out") {
         Some(out) => {
             let path = PathBuf::from(out);
-            std::fs::write(&path, format!("{text}\n")).map_err(|e| {
+            // Written aside, then renamed over it: a committed link at
+            // openapi.json is replaced, never followed.
+            crate::state::replace(&path, format!("{text}\n").as_bytes()).map_err(|e| {
                 Failure::new(
                     Code::USAGE,
                     format!("cannot write {}: {e}", path.display()),

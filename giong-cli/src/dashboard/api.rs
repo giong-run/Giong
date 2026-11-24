@@ -1,6 +1,5 @@
 //! What the dashboard page asks for: one handler per path.
 
-use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -73,7 +72,7 @@ fn dev_state(target: &Target) -> Option<DevState> {
 /// (`build`, `restarts`, `started_at`).
 fn dev_raw(target: &Target) -> Option<Value> {
     let root = target.root.as_deref()?;
-    let text = std::fs::read_to_string(root.join(".giong").join("dev.json")).ok()?;
+    let text = crate::state::read_to_string(&root.join(".giong").join("dev.json")).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -115,18 +114,10 @@ fn base_url(target: &Target) -> String {
     if let Some(b) = &target.base_url {
         return b.trim_end_matches('/').to_string();
     }
+    // Loopback host:port entries only (DevState drops the rest).
     dev_state(target)
         .and_then(|d| d.listen.into_iter().next())
-        .map(|addr| {
-            let addr = addr
-                .replace("0.0.0.0", "127.0.0.1")
-                .replace("[::]", "[::1]");
-            if addr.contains("://") {
-                addr
-            } else {
-                format!("http://{addr}")
-            }
-        })
+        .map(|addr| format!("http://{addr}"))
         .unwrap_or_else(|| routes::base_url(None))
 }
 
@@ -272,7 +263,8 @@ pub type Lines = Vec<(u64, String)>;
 /// Reads complete lines of the log from `start`, at most [`LOG_CHUNK`]
 /// bytes; gives the lines with their byte offsets and where to go on.
 pub fn read_lines(path: &Path, after: Option<u64>) -> std::io::Result<(u64, u64, Lines)> {
-    let mut f = File::open(path)?;
+    // Never through a link: a repository can commit .giong/dev.log as one.
+    let mut f = crate::state::open_read(path)?;
     let len = f.metadata()?.len();
     // Unknown or past the end (giong dev truncated it on a new start):
     // begin with the tail.
@@ -448,7 +440,7 @@ fn send(req: &Req, target: &Target) -> Resp {
 /// The exchange number of the `exchange` line at byte `at` of the log.
 pub fn exchange_number(path: &Path, at: u64) -> std::io::Result<Option<usize>> {
     use std::io::BufRead;
-    let f = File::open(path)?;
+    let f = crate::state::open_read(path)?;
     let mut r = std::io::BufReader::new(f);
     let mut offset = 0u64;
     let mut count = 0usize;

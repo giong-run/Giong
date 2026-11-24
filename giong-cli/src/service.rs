@@ -110,13 +110,46 @@ impl DevState {
                 .map(|a| {
                     a.iter()
                         .filter_map(Value::as_str)
-                        .map(str::to_string)
+                        .filter_map(loopback)
                         .collect()
                 })
                 .unwrap_or_default(),
-            log: path("log").map(|p| if p.is_relative() { root.join(p) } else { p }),
+            log: path("log").and_then(|p| inside_giong(root, p)),
         })
     }
+}
+
+/// A `listen` entry of `.giong/dev.json` as an address on this machine, or
+/// `None`. The file sits in the project, and a cloned repository can commit
+/// one: an entry naming another host (or a URL) would have `giong record
+/// replay` send the values it reads from the environment there. `giong dev`
+/// writes plain `host:port` entries; a wildcard address answers on loopback.
+fn loopback(addr: &str) -> Option<String> {
+    let (host, port) = addr.rsplit_once(':')?;
+    port.parse::<u16>().ok().filter(|p| *p != 0)?;
+    let host = match host {
+        "0.0.0.0" | "localhost" => "127.0.0.1",
+        "[::]" | "[::1]" => "[::1]",
+        h if h
+            .parse::<std::net::Ipv4Addr>()
+            .is_ok_and(|ip| ip.is_loopback()) =>
+        {
+            h
+        }
+        _ => return None,
+    };
+    Some(format!("{host}:{port}"))
+}
+
+/// The `log` of `.giong/dev.json` when it is a file in `root/.giong`, or
+/// `None`: a committed file must not point `giong record list` or the
+/// dashboard at any other file the user can read.
+fn inside_giong(root: &Path, p: PathBuf) -> Option<PathBuf> {
+    let p = if p.is_relative() { root.join(p) } else { p };
+    let up = p
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir));
+    (!up && p.starts_with(root.join(".giong"))).then_some(p)
 }
 
 /// The project root of the current directory, if in one.
@@ -635,6 +668,25 @@ mod tests {
         assert_eq!(s.mcp_token, None);
         assert_eq!(s.listen, ["127.0.0.1:8080"]);
         assert_eq!(s.log, Some(dir.join(".giong/dev.log")));
+        // A committed dev.json names no other host and no file outside .giong.
+        std::fs::write(
+            dir.join(".giong/dev.json"),
+            r#"{"listen":["http://collector.example","10.0.0.5:80","127.0.0.1:8080/x",
+                "evil@127.0.0.1:80","127.0.0.1:0","0.0.0.0:9000","[::]:9001","127.0.0.2:9002"],
+                "log":"/etc/passwd"}"#,
+        )
+        .unwrap();
+        let s = DevState::read(&dir).unwrap();
+        assert_eq!(s.listen, ["127.0.0.1:9000", "[::1]:9001", "127.0.0.2:9002"]);
+        assert_eq!(s.log, None);
+        for log in [".giong/../secret", "src/main.rs", "../.giong/dev.log"] {
+            std::fs::write(
+                dir.join(".giong/dev.json"),
+                json!({ "log": log }).to_string(),
+            )
+            .unwrap();
+            assert_eq!(DevState::read(&dir).unwrap().log, None, "{log}");
+        }
         std::fs::write(dir.join(".giong/dev.json"), "not json").unwrap();
         assert_eq!(DevState::read(&dir), None);
         std::fs::remove_dir_all(&dir).unwrap();

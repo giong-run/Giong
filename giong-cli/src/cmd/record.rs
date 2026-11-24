@@ -215,7 +215,8 @@ fn source(args: &Args) -> Result<Source, Failure> {
                      or pass --from <log file>",
                 )
             })?;
-            let f = std::fs::File::open(&log).map_err(|e| open_failed(&log, e))?;
+            // Never through a link: a repository can commit .giong/dev.log as one.
+            let f = crate::state::open_read(&log).map_err(|e| open_failed(&log, e))?;
             (log.display().to_string(), exchange::read(BufReader::new(f)))
         }
     };
@@ -417,6 +418,40 @@ fn base_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+/// Refuses `out` when it, or a folder between it and the project (or the
+/// current directory), is a symbolic link.
+fn refuse_links(out: &Path) -> Result<(), Failure> {
+    let base = base_dir();
+    let out_abs = if out.is_relative() {
+        std::env::current_dir()
+            .map(|d| d.join(out))
+            .unwrap_or_else(|_| out.to_path_buf())
+    } else {
+        out.to_path_buf()
+    };
+    let stop = if out_abs.starts_with(&base) {
+        base
+    } else {
+        out_abs.parent().map(Path::to_path_buf).unwrap_or_default()
+    };
+    let mut at = Some(out_abs.as_path());
+    while let Some(p) = at.filter(|p| *p != stop && p.starts_with(&stop)) {
+        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
+            return Err(Failure::new(
+                Code::USAGE,
+                format!(
+                    "{} is a symbolic link, which giong record does not follow (it could \
+                     name a file outside the project)",
+                    p.display()
+                ),
+                "remove the link, or save somewhere else with --name or --out",
+            ));
+        }
+        at = p.parent();
+    }
+    Ok(())
+}
+
 fn valid_file_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 100
@@ -474,11 +509,14 @@ fn save(args: &Args, rest: &[String]) -> Result<Report, Failure> {
     }
     let chosen = exchange::select(&matching, rest).map_err(usage_failure)?;
 
+    // The cases go into the repository, which can commit links: a link at
+    // the file or at a folder on the way is refused, never followed.
+    refuse_links(&out)?;
     let mut existing: Vec<Value> = Vec::new();
     let mut names = BTreeSet::new();
-    if out.exists() {
+    if crate::state::exists(&out) {
         if args.has("append") {
-            let text = std::fs::read_to_string(&out).map_err(|e| {
+            let text = crate::state::read_to_string(&out).map_err(|e| {
                 Failure::new(
                     Code::RECORDING_INVALID,
                     format!("{} cannot be read: {e}", out.display()),
@@ -589,18 +627,16 @@ fn save(args: &Args, rest: &[String]) -> Result<Report, Failure> {
             )
         })?;
     }
-    // Write next to it, then rename: an interrupted save never leaves half a file.
-    let tmp = out.with_extension("json.tmp");
-    std::fs::write(&tmp, format!("{text}\n"))
-        .and_then(|()| std::fs::rename(&tmp, &out))
-        .map_err(|e| {
-            let _ = std::fs::remove_file(&tmp);
-            Failure::new(
-                Code::USAGE,
-                format!("cannot write {}: {e}", out.display()),
-                "save somewhere you can write, with --out",
-            )
-        })?;
+    // Written aside to a new file (never through a link), then renamed over
+    // it: an interrupted save never leaves half a file, and a link at the
+    // file is replaced, not followed.
+    crate::state::replace(&out, format!("{text}\n").as_bytes()).map_err(|e| {
+        Failure::new(
+            Code::USAGE,
+            format!("cannot write {}: {e}", out.display()),
+            "save somewhere you can write, with --out",
+        )
+    })?;
     r.line(format!(
         "Saved {added} case{} to {} ({} in the file).",
         if added == 1 { "" } else { "s" },

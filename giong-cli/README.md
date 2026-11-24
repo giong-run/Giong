@@ -160,7 +160,7 @@ Turns real requests into tests. Add giong-web's `Record` middleware to the route
 - secrets stay out of the file: redacted headers, and request fields whose names say secret (`password`, `token`, `api_key`, `client_secret`, `card_number`, `cvv` and the like) in the query, a form or a JSON body, are read from `GIONG_RECORD_<NAME>` when the cases run (`card.number` from `GIONG_RECORD_CARD_NUMBER`); such fields in answers become `{{string}}`
 - `save` refuses, with `GIONG-E5050`, to write a value that still looks like a secret: a card number (by the Luhn check), a JWT, or a value under a secret name. `--keep-secrets` saves it anyway, for test values such as the `4242 4242 4242 4242` test card
 
-`replay` sends the cases in order to the running service (or `--base-url`) and checks each answer: the status, `Content-Type`, the headers recorded and the body field by field. A difference is a `GIONG-E5066` error at the case's line with the expected and actual values, so `giong record replay` fails a CI run the way a test does. Case files are plain JSON, meant to be read, edited and committed.
+`replay` sends the cases in order to the running service (or `--base-url`; from `.giong/dev.json` it takes only an address on this machine, so a cloned repository cannot send your environment's values elsewhere) and checks each answer: the status, `Content-Type`, the headers recorded and the body field by field. A difference is a `GIONG-E5066` error at the case's line with the expected and actual values, so `giong record replay` fails a CI run the way a test does. Case files are plain JSON, meant to be read, edited and committed.
 
 ## giong dashboard
 
