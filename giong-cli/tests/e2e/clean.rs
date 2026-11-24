@@ -164,6 +164,7 @@ fn fake_old_unit(profile: &Path, name: &str, hash: &str) -> Vec<PathBuf> {
 }
 
 /// Where a stale unit's output may be a symlink, in either layout.
+#[cfg(unix)]
 fn stale_output_path(profile: &Path, name: &str, hash: &str, stale: &[PathBuf]) -> PathBuf {
     if new_layout(profile) {
         stale[0].join("out/linked")
