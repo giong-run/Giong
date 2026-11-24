@@ -61,6 +61,7 @@ Where the code is:
 | `src/error.rs` | `Code`: every `GIONG-Exxxx` code, of every crate |
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
 | `src/observe.rs` | `Handle::pulse`, `snapshot`, profiles and `Source`s: what giong-mcp reads |
+| `src/observe/requests.rs` | request tracing: `RequestTrace`, `wait`, `set_route`, `take_requests` |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
 
 A service built on giong for a container (Docker, Kubernetes, a sandbox): start from
@@ -86,8 +87,10 @@ To find out why a giong service is slow, stuck or leaking, ask it rather than gu
 `claude mcp add --transport http giong http://127.0.0.1:7777/mcp --header "Authorization: Bearer $GIONG_MCP_TOKEN"`.
 Tools: `overview` (memory, threads, open descriptors, container limits and why this many
 workers, warnings such as a blocked worker), `workers`, `tasks` (live tasks by the line that
-spawned them), `sources` (database pools) and `profile` (where the workers spent a time
-window). It listens on loopback or a Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
+spawned them), `sources` (database pools), `profile` (where the workers spent a time window)
+and `slow_requests` (per route, where the time of the slowest requests went: pool waits,
+queries, other services, the handler's code, a worker blocked by another task, with a verdict
+and its confidence). It listens on loopback or a Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
 
 ## The machine you need
 

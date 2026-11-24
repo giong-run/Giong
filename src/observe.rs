@@ -23,6 +23,26 @@
 //! inside a library is named by the library's line, for example the
 //! connection tasks of `giong-http`'s server.
 //!
+//! # Why a request is slow
+//!
+//! [`Handle::set_request_tracing`](crate::Handle::set_request_tracing)
+//! makes every worker follow each request from its first bytes to the last
+//! byte of its answer, and split its time into phases: receiving it, its
+//! handler's own polls, waits for pool connections, database commands and
+//! other services (timed with [`wait`]), the rest of the handler's time,
+//! and writing the answer. It also notes every task poll of [`LONG_POLL`]
+//! or more, so that a request that waited while another task held its
+//! worker says which task. Requests are grouped by route ([`set_route`];
+//! `giong-web` names them), and [`take_requests`] collects, per route, how
+//! many there were, their latency quantiles, where the time of the slowest
+//! went ([`RouteStats::breakdown`]), and the slowest few in full.
+//!
+//! The protocol crates do the following ([`RequestTrace`]); turned off, it
+//! costs one read of a thread-local per request, and one per database
+//! command. Turned on, each request reads the clock about six times, plus
+//! twice per poll of its handler and twice per timed wait, and every task
+//! poll is timed (two clock reads), as with profiling.
+//!
 //! The `giong-mcp` crate serves all of this to AI agents over the Model
 //! Context Protocol.
 //!
@@ -53,6 +73,14 @@ use std::time::{Duration, Instant};
 
 use crate::runtime;
 use crate::DriverKind;
+
+mod requests;
+
+pub(crate) use requests::{clear_entered, set_on as set_request_tracing_here, Requests};
+pub use requests::{
+    set_route, take_requests, wait, BlockedBy, Breakdown, RequestRecord, RequestReport,
+    RequestTrace, Route, RouteStats, Wait, WaitStats, WaitTimer, LONG_POLL,
+};
 
 pub use crate::runtime::{worker_stats, WorkerStats};
 
@@ -539,6 +567,8 @@ pub(crate) struct Local {
     /// one call site can have several `Location`s (Miri gives every call its
     /// own; natively, code inlined into several codegen units can).
     profile: RefCell<HashMap<Location, PollProfile>>,
+    /// Requests traced on this worker (see [`take_requests`]).
+    pub(crate) requests: RefCell<Requests>,
 }
 
 impl Local {

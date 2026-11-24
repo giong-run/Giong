@@ -750,16 +750,45 @@ impl Worker {
     /// the meantime wait for the next tick, so I/O is polled in between.
     pub(crate) fn run_tasks(&self, poll_main: &mut dyn FnMut()) {
         // Read once per batch, and two copies of the loop, so that profiling
-        // turned off costs no clock reads and no branches per poll.
-        if self.rt.profiling() {
-            self.run_batch::<true>(poll_main);
+        // and request tracing turned off cost no clock reads and no branches
+        // per poll.
+        let measuring = self.rt.measuring();
+        if measuring != 0 {
+            self.set_tracing(measuring & runtime::TRACING != 0);
+            self.run_batch::<true>(poll_main, measuring);
         } else {
-            self.run_batch::<false>(poll_main);
+            // Request tracing, if it was on, is turned off by the next
+            // request (see `RequestTrace::start`).
+            self.run_batch::<false>(poll_main, 0);
         }
         self.shared.counters.between_polls();
     }
 
-    fn run_batch<const PROFILE: bool>(&self, poll_main: &mut dyn FnMut()) {
+    /// Tells request tracing on this thread whether it is on.
+    #[cold]
+    fn set_tracing(&self, on: bool) {
+        if self.tracing.get() != on {
+            self.tracing.set(on);
+            crate::observe::set_request_tracing_here(on);
+        }
+    }
+
+    /// One timed poll is over: adds it to the profile, and notes it for
+    /// request tracing if it was long.
+    #[cold]
+    fn timed(&self, location: Location, start: Instant, measuring: u8) {
+        let took = start.elapsed();
+        if measuring & runtime::PROFILING != 0 {
+            self.observe.record(location, took);
+        }
+        if measuring & runtime::TRACING != 0 && took >= crate::observe::LONG_POLL {
+            if let Ok(mut requests) = self.observe.requests.try_borrow_mut() {
+                requests.long_poll(location, start, took);
+            }
+        }
+    }
+
+    fn run_batch<const TIMED: bool>(&self, poll_main: &mut dyn FnMut(), measuring: u8) {
         let budget = self.queue.borrow().len();
         let counters = &self.shared.counters;
         for _ in 0..budget {
@@ -770,10 +799,13 @@ impl Worker {
             if id == MAIN_TASK {
                 let location = self.main_location();
                 counters.polling(location);
-                let start = PROFILE.then(Instant::now);
+                if TIMED {
+                    crate::observe::clear_entered();
+                }
+                let start = TIMED.then(Instant::now);
                 poll_main();
                 if let Some(start) = start {
-                    self.observe.record(location, start.elapsed());
+                    self.timed(location, start, measuring);
                 }
                 continue;
             }
@@ -789,7 +821,10 @@ impl Worker {
 
             task.state.clear_queued();
             counters.polling(location);
-            let start = PROFILE.then(Instant::now);
+            if TIMED {
+                crate::observe::clear_entered();
+            }
+            let start = TIMED.then(Instant::now);
             let finished = {
                 // SAFETY: a waker that borrows the task's reference: made from
                 // the `Arc`'s own pointer without a count of its own, and never
@@ -807,7 +842,7 @@ impl Worker {
                 }
             };
             if let Some(start) = start {
-                self.observe.record(location, start.elapsed());
+                self.timed(location, start, measuring);
             }
 
             let mut tasks = self.tasks.borrow_mut();
