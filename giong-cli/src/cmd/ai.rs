@@ -523,8 +523,71 @@ fn same_file(a: &Path, b: &Path) -> bool {
     links_to(a, b) || links_to(b, a)
 }
 
-/// The changes for a project root, without writing anything.
-fn plan(root: &Path, version: &str, offer: &Offer) -> Vec<(String, Change)> {
+/// A link giong will not write through: a cloned repository can commit
+/// `.mcp.json -> ~/some/config`, and git checks it out as a link.
+fn linked(rel: &str, what: &str) -> Change {
+    Change::Keep(
+        Finding::new(
+            Code::AGENT_FILE_FOREIGN,
+            Severity::Warning,
+            format!("{rel} was left as it is: {what} is a symbolic link"),
+        )
+        .detail(format!(
+            "giong writes its agent files only as plain files in the project: a link \
+             can name a file outside it, so giong does not write through {what}. The one \
+             link it keeps is CLAUDE.md and AGENTS.md naming each other."
+        ))
+        .fix(format!(
+            "replace {what} with a plain file (or folder), then run giong ai init again"
+        ))
+        .at(rel, 1, 1),
+    )
+}
+
+/// Whether `path` is a symbolic link (not followed).
+fn is_link(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_symlink())
+}
+
+/// Where `rel` is written, or the link (file or folder) that stops it. Never
+/// through a link, except that AGENTS.md and CLAUDE.md may name each other
+/// (then the file they share is written, under its own name). A folder on the
+/// way may be a link only to a folder inside the project.
+fn target(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    let canonical_root = fs::canonicalize(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut folder = root.to_path_buf();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for part in &parts[..parts.len() - 1] {
+        folder.push(part);
+        if is_link(&folder) {
+            let inside = fs::canonicalize(&folder)
+                .is_ok_and(|to| to.starts_with(&canonical_root) && to.is_dir());
+            if !inside {
+                let shown = folder.strip_prefix(root).unwrap_or(&folder);
+                return Err(shown.display().to_string().replace('\\', "/"));
+            }
+        }
+    }
+    let path = root.join(rel);
+    if !is_link(&path) {
+        return Ok(path);
+    }
+    let other = match rel {
+        "AGENTS.md" => "CLAUDE.md",
+        "CLAUDE.md" => "AGENTS.md",
+        _ => return Err(rel.to_string()),
+    };
+    let other_path = root.join(other);
+    if same_file(&path, &other_path) && !is_link(&other_path) {
+        Ok(other_path)
+    } else {
+        Err(rel.to_string())
+    }
+}
+
+/// The changes for a project root, without writing anything: each file's
+/// name, the path it is written to, and what happens to it.
+fn plan(root: &Path, version: &str, offer: &Offer) -> Vec<(String, PathBuf, Change)> {
     let block = agents_block(version, offer);
     let agents_new = format!(
         "# AGENTS.md\n\nInstructions for coding agents working on this project.\n\n{block}\n\
@@ -533,12 +596,16 @@ fn plan(root: &Path, version: &str, offer: &Offer) -> Vec<(String, Change)> {
     );
     let claude_new = format!("# CLAUDE.md\n\n{CLAUDE_BLOCK}");
     let each = |rel: &str, change: &dyn Fn(Option<&str>) -> Change| {
-        let c = match on_disk(&root.join(rel)) {
+        let path = match target(root, rel) {
+            Ok(path) => path,
+            Err(link) => return (rel.to_string(), root.join(rel), linked(rel, &link)),
+        };
+        let c = match on_disk(&path) {
             OnDisk::Missing => change(None),
             OnDisk::Text(t) => change(Some(&t)),
             OnDisk::Unreadable(why) => unreadable(rel, &why),
         };
-        (rel.to_string(), c)
+        (rel.to_string(), path, c)
     };
     let mut out = vec![each("AGENTS.md", &|t| {
         merge_block(t, &block, &agents_new, "AGENTS.md")
@@ -547,7 +614,11 @@ fn plan(root: &Path, version: &str, offer: &Offer) -> Vec<(String, Change)> {
         // CLAUDE.md links to AGENTS.md (or the other way round): Claude Code
         // reads the rules through the link, and an import would point the
         // file at itself.
-        out.push(("CLAUDE.md".to_string(), Change::Same));
+        out.push((
+            "CLAUDE.md".to_string(),
+            root.join("CLAUDE.md"),
+            Change::Same,
+        ));
     } else {
         out.push(each("CLAUDE.md", &|t| {
             merge_block(t, CLAUDE_BLOCK, &claude_new, "CLAUDE.md")
@@ -594,17 +665,18 @@ pub fn files_for_new() -> Vec<String> {
 
 fn apply(root: &Path, version: &str, dry_run: bool, offer: &Offer) -> Outcome {
     let mut out = Outcome::default();
-    for (rel, change) in plan(root, version, offer) {
+    for (rel, path, change) in plan(root, version, offer) {
         match change {
             Change::Same => out.unchanged.push(rel),
             Change::Keep(finding) => out.findings.push(finding),
             Change::Write(text) => {
                 if !dry_run {
-                    let path: PathBuf = root.join(&rel);
+                    // Written aside and renamed over the file: a link that
+                    // appeared since the plan is replaced, never followed.
                     let result = path
                         .parent()
                         .map_or(Ok(()), fs::create_dir_all)
-                        .and_then(|()| fs::write(&path, text));
+                        .and_then(|()| crate::state::replace(&path, text.as_bytes()));
                     if let Err(e) = result {
                         out.findings.push(
                             Finding::new(
@@ -806,6 +878,55 @@ mod tests {
                 .is_symlink());
             fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// A repository can commit an agent file, or a folder on its way, as a
+    /// link to something outside the project: giong writes through none of
+    /// them, says so, and leaves the links as they are.
+    #[cfg(unix)]
+    #[test]
+    fn links_out_of_the_project_are_not_written_through() {
+        use std::os::unix::fs::symlink;
+        let outside = scratch("outside");
+        let secret = outside.join("config.json");
+        fs::write(&secret, "{\"keep\": true}\n").unwrap();
+        fs::create_dir_all(outside.join("rules")).unwrap();
+        for (link, to) in [
+            (".mcp.json", secret.clone()),
+            ("CLAUDE.md", secret.clone()),
+            (".cursor", outside.clone()),
+            (".claude/skills/giong/SKILL.md", secret.clone()),
+        ] {
+            let dir = scratch("linked");
+            let at = dir.join(link);
+            fs::create_dir_all(at.parent().unwrap()).unwrap();
+            symlink(&to, &at).unwrap();
+            let out = every(&dir);
+            assert_eq!(
+                fs::read_to_string(&secret).unwrap(),
+                "{\"keep\": true}\n",
+                "{link} was written through"
+            );
+            assert!(!outside.join("rules/giong.mdc").exists(), "{link}");
+            assert!(is_link(&at), "{link} is no longer a link");
+            let warned = out
+                .findings
+                .iter()
+                .any(|f| f.code == Code::AGENT_FILE_FOREIGN && f.title.contains("symbolic link"));
+            assert!(warned, "{link}: {:?}", out.findings);
+            // The other files are written as usual.
+            assert!(read(&dir, "AGENTS.md").contains("## Gióng"), "{link}");
+            fs::remove_dir_all(&dir).unwrap();
+        }
+        // A folder linked to another folder inside the project is fine.
+        let dir = scratch("inside");
+        fs::create_dir_all(dir.join("editor")).unwrap();
+        symlink("editor", dir.join(".cursor")).unwrap();
+        let out = every(&dir);
+        assert!(out.findings.is_empty(), "{:?}", out.findings);
+        assert!(fs::read_to_string(dir.join("editor/rules/giong.mdc")).is_ok());
+        fs::remove_dir_all(&dir).unwrap();
+        fs::remove_dir_all(&outside).unwrap();
     }
 
     #[test]
