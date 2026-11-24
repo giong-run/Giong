@@ -58,7 +58,6 @@ pub fn list(root: &Path) -> Vec<Entry> {
 }
 
 /// Records `entry`, replacing one of the same kind and name.
-#[allow(dead_code)] // called by `giong db up`
 pub fn add(root: &Path, entry: Entry) -> std::io::Result<()> {
     let mut all = list(root);
     all.retain(|e| !(e.kind == entry.kind && e.name == entry.name));

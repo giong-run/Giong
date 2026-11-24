@@ -5,7 +5,8 @@
   labelled volume, and writes `DATABASE_URL` or `REDIS_URL` into `.env` (mode 0600,
   git-ignored). Each checkout gets its own container (package, engine and a short hash of the
   project's path), and a container `.giong/db.json` does not list is refused rather than given
-  a guessed password (`GIONG-E5049`). `giong db new <name>`, `migrate` and `status` apply forward-only SQL files
+  a guessed password (`GIONG-E5049`). Its containers are recorded in `.giong/processes.json`,
+  so `giong dev status` lists them and `giong dev stop` stops them. `giong db new <name>`, `migrate` and `status` apply forward-only SQL files
   from `migrations/` (`NNNN_name.sql`), each PostgreSQL file in one transaction, record a
   SHA-256 checksum per file, refuse a changed applied file (`GIONG-E5043`) and name the line
   that failed (`GIONG-E5044`). `giong db reset --yes` and `down [--volumes]` complete it.
