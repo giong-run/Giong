@@ -12,7 +12,8 @@ The install scripts download the prebuilt binary of the latest release from GitH
 
 ```sh
 giong doctor     # is this machine (and project) ready?
-giong dev        # build, run, and restart on every save without refusing a request
+giong dev --background  # build, run on localhost and rebuild on every save; returns once it serves
+giong dev status        # what runs, where, and how the last build went (logs, stop: the same way)
 giong check      # compiler errors, clippy and giong's own checks in one report
 ```
 
@@ -34,14 +35,19 @@ The exit status is 0 when nothing is wrong, 1 when a finding is an error, and 2 
 ## giong dev
 
 ```sh
-giong dev [--bin NAME] [--release] [--listen ADDR[,ADDR]] [--lan] [--workers N] [--prod-like] [--once] [-- service arguments]
+giong dev [--background] [--bin NAME] [--release] [--listen ADDR[,ADDR]] [--lan] [--workers N] [--prod-like] [--once] [-- service arguments]
+giong dev status [--all]
+giong dev logs [--lines N]
+giong dev stop [--all]
 ```
 
-Builds the service and runs it. On every save it builds again, starts the new build next to the old one, and swaps it in once it accepts connections: measured 0 failed requests over 30 restarts under constant load, on io_uring and on epoll. A build that fails, or one that stops at start-up, leaves the running build serving and prints the compiler's errors. A change to `.env` alone restarts without building.
+Builds the service and runs it. On every save it builds again, starts the new build next to the old one, and swaps it in once it accepts connections: measured 0 failed requests out of 102,061 over 100 restarts under constant load ([method and raw output](../bench/results/dev-restarts/)). A build that fails, or one that stops at start-up, leaves the running build serving and prints the compiler's errors. A change to `.env` alone restarts without building.
 
 How the swap works: `giong dev` binds the service's listening sockets itself and hands them down (`GIONG_DEV_LISTEN`). `giong::net::TcpListener::bind` on the same address takes the socket it was given instead of binding a new one, so the old and the new build accept on one socket and the kernel queues connections between them rather than refusing them. Once the new build accepts, the old one is told to stop accepting, finishes the connections it already took, and gets `SIGTERM` (`--grace` seconds, 30 by default, before `SIGKILL`). The runtime takes a socket only from the `giong dev` that started it; anywhere else `bind` binds as usual. The hand-off is compiled into debug builds, and into release builds only with giong's `dev` feature, which `giong dev --release` and `--prod-like` turn on for their own builds; a release build without it, started by `giong dev`, refuses to bind with a coded error.
 
 The listening addresses come from `--listen`, else `LISTEN` in the environment, else `LISTEN` in `.env`. `0.0.0.0` or `[::]` (every network interface, as a container in production wants) is served on loopback, `127.0.0.1` or `::1` with the same port, with a warning (`GIONG-E5024`); the service gets `LISTEN` set to the address `giong dev` listens on. `--lan` keeps the address, to reach the service from another device. Without one, with a giong older than 1.5, or on Windows, `giong dev` stops the old build before starting the new one: restarts still work, with a moment where the port is closed.
+
+One project has one `giong dev`, and it is the way to run the service while developing: not `cargo run`, `cargo build --release`, a container or a second terminal. `--background` starts it detached from the terminal (its own process group: Ctrl-C or the end of an agent's shell does not stop it), waits until the first build serves, prints its address and returns; a build that fails comes back as findings, and the runner stays to build again on the next save. Started again while one runs, it reports that one. `giong dev status` says what runs (address, process ids, the last build and its first error, the containers giong started for the project), `--all` for every project on this machine (`~/.giong/run`); `giong dev logs` prints the service's last lines; `giong dev stop` asks the runner to stop (it stops its service gracefully), signals it only if it does not, and stops what giong started for the project besides (`.giong/processes.json`: a database container from `giong db up`, its data kept). When the port is taken, the error names the process that holds it, and the project when it is another `giong dev`.
 
 The service gets the variables of `.env` (those not already set), `WORKERS=2` so a laptop stays usable (`--workers N` sets another number, `--prod-like` leaves it to the service: every core), `RUST_BACKTRACE=1`, and `GIONG_MCP` set to a Unix socket so [giong-mcp](https://github.com/giong-run/Giong/tree/main/giong-mcp) can answer. Its output goes to the terminal and to `.giong/dev.log`; `.giong/dev.json` holds the state of the session (process ids, addresses, the last build and its errors) for other tools, and `--json` prints one event per line. `--once` builds, runs the service until it exits, and stops.
 
@@ -83,7 +89,7 @@ Frees the disk old builds use and keeps what the next build needs: removes what 
 claude mcp add giong -- giong mcp
 ```
 
-Serves every command as a tool to coding agents over the Model Context Protocol on standard input and output, each answering with the command's JSON document, plus `dev_status` for a running `giong dev`.
+Serves every command as a tool to coding agents over the Model Context Protocol on standard input and output, each answering with the command's JSON document. `dev` is a tool for `status` and `logs` (read-only) and, with `--allow-writes`, `--background` and `stop`; `dev_status` reads `.giong/dev.json` as it is.
 
 ## Error codes
 

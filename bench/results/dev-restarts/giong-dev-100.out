@@ -1,0 +1,515 @@
+giong dev: building
+giong dev: built in 5.8 s
+starting v0 with 2 workers
+giong dev: ready in 6.0 s, on http://127.0.0.1:18080
+giong dev: watching /tmp/claude-0/devsvc for changes (Ctrl-C stops)
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v1 with 2 workers
+giong dev: ready in 0.7 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v2 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v3 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v4 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v5 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v6 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v7 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v8 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v9 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v10 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v11 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v12 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v13 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v14 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v15 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v16 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v17 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v18 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v19 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v20 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v21 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v22 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v23 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v24 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v25 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v26 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v27 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v28 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v29 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v30 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v31 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v32 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v33 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v34 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v35 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v36 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v37 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v38 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v39 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v40 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v41 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v42 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v43 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v44 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v45 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v46 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v47 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v48 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v49 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v50 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v51 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v52 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v53 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v54 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v55 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v56 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v57 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v58 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v59 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v60 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v61 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v62 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v63 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v64 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v65 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v66 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v67 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v68 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v69 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v70 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v71 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v72 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v73 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v74 with 2 workers
+giong dev: ready in 0.7 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v75 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v76 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v77 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v78 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v79 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v80 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v81 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v82 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v83 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v84 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v85 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v86 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v87 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v88 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v89 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v90 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v91 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v92 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v93 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v94 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v95 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v96 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v97 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v98 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v99 with 2 workers
+giong dev: ready in 0.7 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v100 with 2 workers
+giong dev: ready in 0.7 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.3 s
+starting v201 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080
+giong dev: src/main.rs changed
+giong dev: building
+giong dev: built in 0.2 s
+starting v202 with 2 workers
+giong dev: ready in 0.6 s, on http://127.0.0.1:18080

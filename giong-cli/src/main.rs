@@ -4,10 +4,6 @@
 //! with `--json`, one JSON document for agents (see [`report`]). Commands are
 //! registered in [`cmd::COMMANDS`].
 
-// While the commands arrive (three branches), some shared helpers have no
-// caller yet. Removed before the pull request leaves draft.
-#![allow(dead_code)]
-
 mod args;
 mod build;
 mod cmd;
@@ -17,6 +13,7 @@ mod host;
 mod lint;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
+mod procs;
 mod project;
 mod report;
 mod watch;

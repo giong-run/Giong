@@ -12,6 +12,9 @@ use giong_http::Version;
 use giong_web::middleware::{Logger, RequestId};
 use giong_web::{App, Error, Middleware, Next, Req, Request, Response, Router, Server, Sink};
 
+#[path = "../../giong-http/tests/support/quiet_panics.rs"]
+mod quiet_panics;
+
 fn send(app: &App, raw: &str) -> Response {
     let req = Request::from_bytes(raw.as_bytes()).unwrap_or_else(|s| panic!("{s}: {raw:?}"));
     giong::block_on(app.handle(req))
@@ -26,7 +29,7 @@ fn body(resp: &Response) -> String {
 }
 
 async fn boom(_req: Req) -> Result<Response, Error> {
-    panic!("boom");
+    panic!("boom (expected by this test)");
 }
 
 async fn ok(_req: Req) -> Result<Response, Error> {
@@ -107,7 +110,11 @@ fn a_panicking_handler_is_answered_with_a_500_and_logged_once() {
     let lines = Rc::new(RefCell::new(Vec::new()));
     let app = app(lines.clone());
     let resp = get(&app, "/panic");
-    assert_answered_500(&resp, &lines.borrow(), "the handler panicked: boom");
+    assert_answered_500(
+        &resp,
+        &lines.borrow(),
+        "the handler panicked: boom (expected by this test)",
+    );
     assert!(
         lines.borrow()[0].contains("\"route\":\"/panic\""),
         "{:?}",
@@ -179,6 +186,7 @@ fn a_header_value_from_the_request_that_panics_is_a_500() {
 
 /// Serves `app()` on a free port of this worker; returns the address.
 fn serve() -> String {
+    quiet_panics::quiet_expected_panics();
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
     let app = app(Rc::new(RefCell::new(Vec::new())));

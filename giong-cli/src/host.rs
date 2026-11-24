@@ -60,7 +60,7 @@ pub fn output_in(dir: &Path, program: &str, args: &[&str]) -> Option<String> {
 #[derive(Debug)]
 pub enum ToolError {
     /// It could not be started.
-    Missing(std::io::Error),
+    Missing(#[allow(dead_code)] std::io::Error),
     /// It exited with a failure; its standard error.
     Failed(String),
     /// It took longer than [`TOOL_TIMEOUT`] and was stopped.
@@ -134,6 +134,7 @@ fn run_within(cmd: &mut Command, timeout: Duration) -> Result<String, ToolError>
 }
 
 /// Whether a program can be started.
+#[allow(dead_code)] // called by giong db and image (#220)
 pub fn exists(program: &str, args: &[&str]) -> bool {
     !matches!(
         run(Command::new(program).args(args)),

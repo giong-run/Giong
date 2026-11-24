@@ -544,10 +544,28 @@ fn a_malformed_response_fails_its_request_alone() {
                     out.extend(data(b"x"));
                     out
                 }
+                // 1xx answers for ever.
+                7 => {
+                    let mut out = Vec::new();
+                    for _ in 0..33 {
+                        out.extend(headers(Some(100), &[]));
+                    }
+                    out.extend(headers(Some(200), &[]));
+                    out
+                }
+                // As many as are allowed.
+                8 => {
+                    let mut out = Vec::new();
+                    for _ in 0..32 {
+                        out.extend(headers(Some(103), &[("link", "</a.css>")]));
+                    }
+                    out.extend(headers(Some(200), &[]));
+                    out
+                }
                 _ => headers(Some(200), &[]),
             })
         });
-        for n in 0..7 {
+        for n in 0..8 {
             let error = client.get(&format!("{url}/")).send().await.unwrap_err();
             assert_eq!(error.kind(), ErrorKind::Protocol, "{n}: {error}");
         }

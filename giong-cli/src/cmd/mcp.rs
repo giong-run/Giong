@@ -4,9 +4,11 @@
 //! An agent registers it once (`giong ai init` writes the entry:
 //! `{"command": "giong", "args": ["mcp"]}`) and gets one tool per command,
 //! built from the command's flags, which runs `giong <command> --json` and
-//! answers with its JSON document. `dev` is left out: it runs until stopped;
-//! `dev_status` reads what a running `giong dev` keeps in `.giong/dev.json`
-//! instead.
+//! answers with its JSON document. `dev` is a tool for the words that
+//! return: `status` and `logs` read, and with `--allow-writes`
+//! `--background` starts the project's one runner and `stop` stops it; `giong
+//! dev` in the foreground never returns and is not a tool. `dev_status`
+//! (older) reads `.giong/dev.json` as it is.
 //!
 //! An agent acts without asking at each step, so what a tool may do is
 //! decided here, not by the agent ([`POLICIES`]). By default every tool only
@@ -42,16 +44,16 @@ pub const COMMAND: Command = Command {
     usage: "giong mcp [--allow-writes]\n\n\
             Speaks the Model Context Protocol on standard input and output: one tool per giong \
             command (doctor, check, explain, clean, ...), each answering with the command's JSON \
-            document, and dev_status for a running giong dev. Register it with your agent: \
+            document (dev: status and logs of the project's giong dev). Register it with your agent: \
             claude mcp add giong -- giong mcp (giong ai init writes .mcp.json for you).\n\n\
             The tools only read unless --allow-writes is given; then they may also change the \
-            project (clean, fix, env init, db up/migrate/new, record save, bench, image). \
-            db reset, db down --volumes, clean --all, env get and --reveal are never tools.",
+            project (dev --background and stop, clean, fix, env init, db up/migrate/new, record \
+            save, bench, image). db reset, db down --volumes, clean --all, env get and --reveal are never tools.",
     flags: &[Flag {
         name: "allow-writes",
         kind: Kind::Switch,
-        help: "let the tools change the project too (clean, fix, env init, db up/migrate/new, \
-               record save, bench, image); never db reset, db down --volumes, clean --all or secrets",
+        help: "let the tools change the project too (dev --background and stop, clean, fix, env \
+               init, db up/migrate/new, record save, bench, image); never db reset, db down --volumes, clean --all or secrets",
     }],
     max_words: 0,
     run,
@@ -88,7 +90,7 @@ pub struct Policy {
     pub access: fn(words: &[&str], flags: &[&str]) -> Access,
 }
 
-/// The commands that are tools. `dev` and `dashboard` never return, `help`
+/// The commands that are tools. `dashboard` never returns, `help`
 /// and `version` say nothing an agent needs, `new` and `ai` write a whole
 /// project, and `test` runs the project's code: none is a tool. A thread
 /// that adds a command adds its policy here, or it is not served.
@@ -98,6 +100,28 @@ pub const POLICIES: &[Policy] = &[
     read_only("explain", "explains a GIONG code"),
     read_only("routes", "lists the service's routes"),
     read_only("top", "shows a running service's load"),
+    Policy {
+        name: "dev",
+        reads: "status (what giong dev serves, its last build) and logs (the service's output)",
+        writes: "--background starts the project's giong dev and returns once it serves on \
+                 localhost (it rebuilds on every save); stop stops it and what giong started for \
+                 the project, data kept",
+        never: "giong dev in the foreground or with --once (they do not return), --lan, stop --all",
+        destructive: false,
+        idempotent: true,
+        access: |words, flags| {
+            if flags.contains(&"lan") || flags.contains(&"once") {
+                return Access::Never;
+            }
+            match words.first().copied() {
+                Some("status" | "logs") => Access::Read,
+                Some("stop") if flags.contains(&"all") => Access::Never,
+                Some("stop") => Access::Write,
+                None if flags.contains(&"background") => Access::Write,
+                _ => Access::Never,
+            }
+        },
+    },
     Policy {
         name: "openapi",
         reads: "prints the OpenAPI document",
@@ -186,11 +210,14 @@ pub const POLICIES: &[Policy] = &[
     Policy {
         name: "bench",
         reads: "",
-        writes: "loads the service and writes results",
-        never: "",
+        writes: "loads the project's service, or a URL on this machine, and writes results",
+        never: "a URL that is not on this machine",
         destructive: false,
         idempotent: false,
-        access: |_, _| Access::Write,
+        access: |words, _| match words.first() {
+            Some(url) if !loopback_url(url) => Access::Never,
+            _ => Access::Write,
+        },
     },
     Policy {
         name: "image",
@@ -208,6 +235,24 @@ pub const POLICIES: &[Policy] = &[
         },
     },
 ];
+
+/// Whether a URL's host is this machine: 127.0.0.0/8, ::1 or localhost
+/// (with or without a scheme, a port, a path or user information).
+fn loopback_url(url: &str) -> bool {
+    let rest = url.split_once("://").map_or(url, |(_, r)| r);
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    let host_port = authority.rsplit_once('@').map_or(authority, |(_, h)| h);
+    let host = if let Some(v6) = host_port.strip_prefix('[') {
+        v6.split(']').next().unwrap_or("")
+    } else {
+        host_port.split(':').next().unwrap_or("")
+    };
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<std::net::IpAddr>()
+        .is_ok_and(|ip| ip.is_loopback())
+}
 
 const fn read_only(name: &'static str, reads: &'static str) -> Policy {
     Policy {
@@ -286,16 +331,21 @@ pub fn handle(msg: &Value, writes: bool) -> Option<Value> {
                         "giong's commands as tools. Each answers with the command's JSON \
                         document: findings carry a GIONG-E code, a fix and, when giong fix can apply \
                         it, edits. Pass `dir` to run in a project other than the current directory. \
-                        Writes are allowed (clean, fix, env init, db up/migrate/new, record save, \
-                        bench, image); db reset, db down, clean --all and secrets are not tools: \
-                        ask the person to run them."
+                        Writes are allowed (dev --background and dev stop, clean, fix, env init, \
+                        db up/migrate/new, record save, bench, image); db reset, db down, clean \
+                        --all and secrets are not tools: ask the person to run them. To run the \
+                        service: dev with background once (it serves on localhost and rebuilds on \
+                        every save), then dev status and dev logs; dev stop when done. Not cargo \
+                        run, a release build or a container."
                     } else {
                         "giong's commands as tools. Each answers with the command's JSON \
                         document: findings carry a GIONG-E code, a fix and, when giong fix can apply \
                         it, edits. Pass `dir` to run in a project other than the current directory. \
                         The tools only read: for a change (giong fix, clean, env init, db up, ...) \
                         tell the person the command, or ask them to restart giong mcp with \
-                        --allow-writes."
+                        --allow-writes. The service runs under one giong dev per project (the \
+                        person starts it with giong dev --background): read it with dev status \
+                        and dev logs; do not start another with cargo run or a container."
                     },
                 }),
             )
@@ -394,8 +444,8 @@ pub fn tools(writes: bool) -> Vec<Value> {
         "name": "dev_status",
         "title": "giong dev status",
         "description": "What a running giong dev serves: its pid, the service's pid and addresses, \
-            the last build (state, errors, first error) and the log file. Start giong dev in a \
-            terminal of its own; this reads .giong/dev.json.",
+            the last build (state, errors, first error) and the log file, as .giong/dev.json \
+            keeps them. The dev tool with words [\"status\"] says the same with findings.",
         "inputSchema": {"type": "object", "properties": {
             "dir": {"type": "string", "description": "the project directory (default: where giong mcp runs)"}
         }, "additionalProperties": false},
@@ -541,9 +591,9 @@ fn dev_status(dir: Option<PathBuf>) -> Value {
             json!({"running": true, "dev": v})
         }
         Some(_) => json!({"running": false,
-                          "hint": "the last giong dev here was stopped: start it again in a terminal of its own"}),
+                          "hint": "the last giong dev here was stopped: start it again with giong dev --background"}),
         None => json!({"running": false,
-                       "hint": "giong dev is not running in this project: start it in a terminal of its own"}),
+                       "hint": "giong dev is not running in this project: start it with giong dev --background"}),
     };
     json!({"content": [{"type": "text", "text": doc.to_string()}], "structuredContent": doc, "isError": false})
 }
@@ -577,7 +627,7 @@ mod tests {
         assert!(
             names.contains(&"doctor") && names.contains(&"check") && names.contains(&"dev_status")
         );
-        assert!(!names.contains(&"dev") && !names.contains(&"mcp"));
+        assert!(names.contains(&"dev") && !names.contains(&"mcp"));
         let clean = &list["result"]["tools"]
             .as_array()
             .unwrap()
@@ -666,17 +716,35 @@ mod tests {
         assert_eq!(access("record", &["drop"], &[]), Access::Never);
         assert_eq!(access("image", &[], &["push"]), Access::Never);
         assert_eq!(access("openapi", &[], &["out"]), Access::Write);
-        // Commands with no policy are not tools.
-        for name in [
-            "new",
-            "ai",
-            "test",
-            "dev",
-            "dashboard",
-            "help",
-            "version",
-            "mcp",
+        assert_eq!(access("bench", &[], &["rate"]), Access::Write);
+        assert_eq!(access("dev", &[], &[]), Access::Never);
+        assert_eq!(access("dev", &[], &["once"]), Access::Never);
+        assert_eq!(access("dev", &[], &["background", "lan"]), Access::Never);
+        assert_eq!(access("dev", &[], &["background"]), Access::Write);
+        assert_eq!(access("dev", &["status"], &["all"]), Access::Read);
+        assert_eq!(access("dev", &["logs"], &["lines"]), Access::Read);
+        assert_eq!(access("dev", &["stop"], &[]), Access::Write);
+        assert_eq!(access("dev", &["stop"], &["all"]), Access::Never);
+        for here in [
+            "http://127.0.0.1:8080/users",
+            "127.0.0.2:9000",
+            "http://[::1]:8080",
+            "https://LOCALHOST/",
+            "http://u:p@localhost:1",
         ] {
+            assert_eq!(access("bench", &[here], &[]), Access::Write, "{here}");
+        }
+        for away in [
+            "https://example.com",
+            "http://10.0.0.5:8080",
+            "http://localhost.example.com",
+            "http://127.0.0.1@example.com/",
+            "http://[2001:db8::1]/",
+        ] {
+            assert_eq!(access("bench", &[away], &[]), Access::Never, "{away}");
+        }
+        // Commands with no policy are not tools.
+        for name in ["new", "ai", "test", "dashboard", "help", "version", "mcp"] {
             assert!(policy(name).is_none(), "{name}");
         }
     }
