@@ -310,7 +310,7 @@ fn free_port() -> Result<u16, Failure> {
 
 /// The last lines of the service's log, for a failure message.
 fn log_tail(log: &Path) -> String {
-    let text = std::fs::read_to_string(log).unwrap_or_default();
+    let text = crate::state::read_to_string(log).unwrap_or_default();
     let lines: Vec<&str> = text.lines().rev().take(8).collect();
     if lines.is_empty() {
         return String::new();
@@ -332,7 +332,10 @@ fn service_env(
 ) -> (Vec<(String, String)>, Vec<&'static str>, Vec<String>) {
     let mut set = Vec::new();
     let mut notes = Vec::new();
-    if let Some((vars, _)) = dotenv::read(&root.join(".env")) {
+    if let Some((vars, _)) = crate::state::read_to_string(&root.join(".env"))
+        .ok()
+        .map(|t| dotenv::parse(&t))
+    {
         for v in vars {
             if v.key == "WORKERS" {
                 if std::env::var_os("WORKERS").is_none() && workers.is_none() {
@@ -361,17 +364,13 @@ fn start(
 ) -> Result<Running, Failure> {
     let port = free_port()?;
     let addr: SocketAddr = ([127, 0, 0, 1], port).into();
-    let mut file = std::fs::OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(log)
-        .map_err(|e| {
-            Failure::new(
-                Code::BENCH_TARGET,
-                format!("cannot write {}: {e}", log.display()),
-                "check that .giong/ is writable",
-            )
-        })?;
+    let mut file = crate::state::append(log).map_err(|e| {
+        Failure::new(
+            Code::BENCH_TARGET,
+            format!("cannot write {}: {e}", log.display()),
+            "check that .giong/ is writable",
+        )
+    })?;
     {
         use std::io::Write;
         let _ = writeln!(file, "== {banner}: {} on {addr}", build.binary.display());
@@ -534,17 +533,31 @@ pub(crate) fn build_release(
 /// Copies a binary into `.giong/bench/bin/<role>/` so a later build does not
 /// replace it during the rounds.
 fn keep(binary: &Path, root: &Path, role: &str) -> Result<PathBuf, Failure> {
-    let dir = root.join(".giong").join("bench").join("bin").join(role);
-    let to = dir.join(binary.file_name().unwrap_or_default());
-    std::fs::create_dir_all(&dir)
-        .and_then(|_| std::fs::copy(binary, &to))
-        .map_err(|e| {
-            Failure::new(
-                Code::BENCH_TARGET,
-                format!("cannot copy {} to {}: {e}", binary.display(), to.display()),
-                "check that .giong/ is writable",
-            )
-        })?;
+    let name = binary.file_name().unwrap_or_default();
+    let mut to = root
+        .join(".giong")
+        .join("bench")
+        .join("bin")
+        .join(role)
+        .join(name);
+    // Never through a link: .giong can come from a cloned repository.
+    let mut copy = || -> std::io::Result<()> {
+        to = crate::state::ensure_sub(root, &["bench", "bin", role])?.join(name);
+        crate::state::replace(&to, &std::fs::read(binary)?)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&to, std::fs::Permissions::from_mode(0o755))?;
+        }
+        Ok(())
+    };
+    copy().map_err(|e| {
+        Failure::new(
+            Code::BENCH_TARGET,
+            format!("cannot copy {} to {}: {e}", binary.display(), to.display()),
+            "check that .giong/ is writable",
+        )
+    })?;
     Ok(to)
 }
 
@@ -1007,17 +1020,16 @@ fn run(args: &Args) -> Result<Report, Failure> {
     })?;
     let cwd = std::env::current_dir().unwrap_or_else(|_| root.clone());
     let project = Project::at(&cwd)?;
-    let bench_dir = root.join(".giong").join("bench");
-    std::fs::create_dir_all(&bench_dir).map_err(|e| {
+    let bench_dir = crate::state::ensure_sub(&root, &["bench"]).map_err(|e| {
         Failure::new(
             Code::BENCH_TARGET,
-            format!("cannot create {}: {e}", bench_dir.display()),
+            format!("cannot create {}: {e}", root.join(".giong/bench").display()),
             "check that the project directory is writable",
         )
     })?;
     let _ = super::db::ignore_secrets(&root);
     let log = bench_dir.join("service.log");
-    let _ = std::fs::write(&log, "");
+    let _ = crate::state::create(&log);
     let bin = args.value("bin");
 
     let mut worktree = None;
@@ -1334,10 +1346,21 @@ fn finish(
         }),
     };
     if let Some(path) = &path {
-        if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
-            let _ = std::fs::create_dir_all(parent);
-        }
-        std::fs::write(path, csv(rounds, load)).map_err(|e| {
+        let written = if args.value("csv").is_some() {
+            // A path the user gave.
+            if let Some(parent) = path.parent().filter(|p| !p.as_os_str().is_empty()) {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            std::fs::write(path, csv(rounds, load))
+        } else {
+            // .giong/bench: never through a link.
+            let root = path.parent().and_then(Path::parent).and_then(Path::parent);
+            root.map_or(Ok(()), |r| {
+                crate::state::ensure_sub(r, &["bench"]).map(drop)
+            })
+            .and_then(|()| crate::state::replace(path, csv(rounds, load).as_bytes()))
+        };
+        written.map_err(|e| {
             Failure::new(
                 Code::USAGE,
                 format!("cannot write {}: {e}", path.display()),

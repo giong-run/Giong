@@ -32,6 +32,7 @@ use crate::dotenv;
 use crate::project::find_manifest_dir;
 use crate::report::{Failure, Finding, Report, Severity};
 use crate::sha256;
+use crate::state;
 
 pub const COMMAND: Command = Command {
     name: "db",
@@ -189,6 +190,46 @@ impl Started {
         })
     }
 
+    /// Why `giong db up` could not have written this entry for the checkout
+    /// at `root`, or `None` when it could have.
+    fn problem(&self, project: &str, root: &Path) -> Option<String> {
+        let base = container_base(project, root, self.engine);
+        let word = |s: &str, max: usize| {
+            s.len() <= max
+                && s.chars()
+                    .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '_')
+        };
+        if !known_runtime(&self.runtime) {
+            Some(format!(
+                "its runtime {:?} is neither docker nor podman",
+                self.runtime
+            ))
+        } else if self.container != base {
+            Some(format!(
+                "its container {:?} is not this checkout's ({base})",
+                self.container
+            ))
+        } else if self.volume != format!("{base}-data") {
+            Some(format!(
+                "its volume {:?} is not this checkout's ({base}-data)",
+                self.volume
+            ))
+        } else if !plain_image(&self.image) {
+            Some(format!(
+                "its image {:?} is not a plain image name",
+                self.image
+            ))
+        } else if !word(&self.user, 63) || !word(&self.database, 63) {
+            Some("its user or database is not a plain name (a-z, 0-9, _)".to_string())
+        } else if self.password.len() > 128
+            || !self.password.chars().all(|c| c.is_ascii_alphanumeric())
+        {
+            Some("its password is not letters and digits".to_string())
+        } else {
+            None
+        }
+    }
+
     fn from_json(engine: Engine, v: &Value) -> Option<Started> {
         let s = |k: &str| v[k].as_str().map(str::to_string);
         Some(Started {
@@ -209,21 +250,85 @@ fn state_path(root: &Path) -> PathBuf {
     root.join(".giong").join("db.json")
 }
 
-/// Everything `giong db up` started in this project.
+/// Everything `giong db up` started in this project: the entries of
+/// `.giong/db.json` that it could have written for this checkout. Others are
+/// left out (see [`rejected_state`]).
 pub fn read_state(root: &Path) -> Vec<Started> {
-    let Ok(text) = std::fs::read_to_string(state_path(root)) else {
-        return Vec::new();
+    load_state(root).0
+}
+
+/// The entries of `.giong/db.json` that are left out, with why. A cloned
+/// repository can commit that file, and its fields name the program run, the
+/// volume mounted, the image started and the database dropped.
+pub fn rejected_state(root: &Path) -> Vec<(Option<Engine>, String)> {
+    load_state(root).1
+}
+
+fn load_state(root: &Path) -> (Vec<Started>, Vec<(Option<Engine>, String)>) {
+    let (mut good, mut bad) = (Vec::new(), Vec::new());
+    let text = match state::read_to_string(&state_path(root)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (good, bad),
+        Err(e) => {
+            bad.push((None, format!("it cannot be read: {e}")));
+            return (good, bad);
+        }
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
-        return Vec::new();
+        return (good, bad);
     };
-    let mut out = Vec::new();
+    let project = project_name(root);
     for e in [Engine::Postgres, Engine::Mysql, Engine::Redis] {
-        if let Some(s) = Started::from_json(e, &v[e.name()]) {
-            out.push(s);
+        if v[e.name()].is_null() {
+            continue;
+        }
+        match Started::from_json(e, &v[e.name()]) {
+            None => bad.push((Some(e), "it lacks fields giong db up writes".to_string())),
+            Some(s) => match s.problem(&project, root) {
+                None => good.push(s),
+                Some(why) => bad.push((Some(e), why)),
+            },
         }
     }
-    out
+    (good, bad)
+}
+
+/// The runtimes `giong db up` writes: `docker`, `podman`, or the one
+/// `GIONG_CONTAINER_RUNTIME` names now (the user's own setting).
+fn known_runtime(runtime: &str) -> bool {
+    matches!(runtime, "docker" | "podman")
+        || std::env::var("GIONG_CONTAINER_RUNTIME").is_ok_and(|r| !r.is_empty() && r == runtime)
+}
+
+/// A plain image reference (`postgres:17-alpine`, `ghcr.io/org/pg@sha256:...`):
+/// nothing a container runtime could read as an option.
+fn plain_image(image: &str) -> bool {
+    image.len() <= 255
+        && image
+            .chars()
+            .next()
+            .is_some_and(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+        && image
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '/' | ':' | '@' | '-'))
+}
+
+/// One of the official images of `engine` (any tag): safe to start for a
+/// project whatever its files say, since the repository chose only a version.
+fn official_image(engine: Engine, image: &str) -> bool {
+    let name = image.strip_prefix("docker.io/").unwrap_or(image);
+    let name = name.strip_prefix("library/").unwrap_or(name);
+    let (repo, tag) = name.split_once(':').unwrap_or((name, "latest"));
+    let repos: &[&str] = match engine {
+        Engine::Postgres => &["postgres"],
+        Engine::Mysql => &["mysql", "mariadb"],
+        Engine::Redis => &["redis", "valkey/valkey"],
+    };
+    repos.contains(&repo)
+        && !tag.is_empty()
+        && tag
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
 }
 
 /// `.giong/processes.json`, for the message of a failed write.
@@ -237,34 +342,19 @@ fn write_state(root: &Path, all: &[Started]) -> Result<(), Failure> {
         m.insert(s.engine.name().into(), s.to_json());
     }
     let path = state_path(root);
+    // Never through a link: the project can come from a cloned repository.
     let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(path.parent().expect("parent"))?;
+        state::ensure(root)?;
         if all.is_empty() {
             match std::fs::remove_file(&path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
                 _ => return Ok(()),
             }
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(
-            &tmp,
-            serde_json::to_string_pretty(&Value::Object(m))? + "\n",
-        )?;
-        restrict(&tmp);
-        std::fs::rename(&tmp, &path)
+        let text = serde_json::to_string_pretty(&Value::Object(m))? + "\n";
+        state::replace_private(&path, text.as_bytes())
     };
     write().map_err(|e| io_failure(&path, e))
-}
-
-/// Makes a file that holds a password readable by its owner only.
-pub(crate) fn restrict(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 fn io_failure(path: &Path, e: std::io::Error) -> Failure {
@@ -291,13 +381,18 @@ fn project() -> Result<(PathBuf, String), Failure> {
             "run giong db inside a project, or start one with giong new <name>",
         )
     })?;
+    let name = project_name(&root);
+    Ok((root, name))
+}
+
+/// The package name of the project at `root`, else its directory's name.
+fn project_name(root: &Path) -> String {
     let manifest = std::fs::read_to_string(root.join("Cargo.toml")).unwrap_or_default();
-    let name = package_name(&manifest).unwrap_or_else(|| {
+    package_name(&manifest).unwrap_or_else(|| {
         root.file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "app".into())
-    });
-    Ok((root, name))
+    })
 }
 
 fn package_name(manifest: &str) -> Option<String> {
@@ -777,7 +872,9 @@ fn runner(root: &Path, want: Option<Engine>) -> Result<Runner, Failure> {
         .ok()
         .filter(|u| !u.is_empty())
         .or_else(|| {
-            dotenv::read(&root.join(".env"))
+            state::read_to_string(&root.join(".env"))
+                .ok()
+                .map(|t| dotenv::parse(&t))
                 .and_then(|(vars, _)| vars.into_iter().find(|v| v.key == key).map(|v| v.value))
                 .filter(|u| !u.is_empty())
         });
@@ -1101,14 +1198,17 @@ pub fn error_line(stderr: &str) -> Option<u32> {
 /// and leaves every other line as it is.
 pub fn set_env(root: &Path, key: &str, value: &str) -> Result<(), Failure> {
     let path = root.join(".env");
-    let text = match std::fs::read_to_string(&path) {
+    // Neither file is read or written through a link: a cloned repository
+    // can commit .env -> ~/.bashrc.
+    let text = match state::read_to_string(&path) {
         Ok(t) => t,
-        Err(_) => std::fs::read_to_string(root.join(".env.example")).unwrap_or_default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            state::read_to_string(&root.join(".env.example")).unwrap_or_default()
+        }
+        Err(e) => return Err(io_failure(&path, e)),
     };
     let new = set_env_text(&text, key, value);
-    std::fs::write(&path, new).map_err(|e| io_failure(&path, e))?;
-    restrict(&path);
-    Ok(())
+    state::replace_private(&path, new.as_bytes()).map_err(|e| io_failure(&path, e))
 }
 
 pub fn set_env_text(text: &str, key: &str, value: &str) -> String {
@@ -1140,7 +1240,11 @@ pub fn set_env_text(text: &str, key: &str, value: &str) -> String {
 /// hold the database's password.
 pub(crate) fn ignore_secrets(root: &Path) -> Result<Vec<String>, Failure> {
     let path = root.join(".gitignore");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let text = match state::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(io_failure(&path, e)),
+    };
     let has = |p: &str| {
         text.lines().any(|l| {
             l.trim() == p || l.trim() == format!("/{p}") || l.trim() == p.trim_end_matches('/')
@@ -1159,7 +1263,7 @@ pub(crate) fn ignore_secrets(root: &Path) -> Result<Vec<String>, Failure> {
         }
     }
     if !added.is_empty() {
-        std::fs::write(&path, new).map_err(|e| io_failure(&path, e))?;
+        state::replace(&path, new.as_bytes()).map_err(|e| io_failure(&path, e))?;
     }
     Ok(added)
 }
@@ -1259,6 +1363,14 @@ fn up(args: &Args, root: &Path, project: &str, rep: &mut Report) -> Result<(), F
         ));
     }
     let timeout = Duration::from_secs(args.number::<u64>("timeout")?.unwrap_or(120).max(1));
+    if let Some(image) = args.value("image").filter(|i| !plain_image(i)) {
+        return Err(Failure::new(
+            Code::USAGE,
+            format!("{image:?} is not an image name"),
+            "give --image a plain reference: postgres:16-alpine, mysql:8.4, \
+             ghcr.io/org/image:tag",
+        ));
+    }
     let runtime = container_runtime()?;
     let mut state = read_state(root);
     let added = ignore_secrets(root)?;
@@ -1331,6 +1443,24 @@ fn up(args: &Args, root: &Path, project: &str, rep: &mut Report) -> Result<(), F
                 "started again"
             }
             None => {
+                // A new container: an image the project's files name is used
+                // only when it is one of the engine's official images or the
+                // one --image gives now, since .giong/db.json can come from
+                // a cloned repository.
+                if !official_image(engine, &s.image)
+                    && args.value("image") != Some(s.image.as_str())
+                {
+                    let image = args.value("image").unwrap_or(engine.default_image());
+                    rep.line(format!(
+                        "{}: .giong/db.json names image {}, which is not an official {} image; \
+                         starting {image} (--image {} keeps it)",
+                        engine.name(),
+                        s.image,
+                        engine.name(),
+                        s.image
+                    ));
+                    s.image = image.to_string();
+                }
                 // Data left by a container this project no longer has the
                 // credentials of: the engine would keep the old password.
                 let fresh = !read_state(root).iter().any(|x| x.engine == engine);
@@ -1676,6 +1806,8 @@ fn new_migration(args: &Args, root: &Path, rep: &mut Report) -> Result<(), Failu
     let files = read_migrations(&dir)?;
     let next = files.last().map_or(1, |m| m.version + 1);
     let file = format!("{next:04}_{name}.sql");
+    // A linked migrations folder would put the file somewhere else.
+    state::check_dir(&dir).map_err(|e| io_failure(&dir, e))?;
     std::fs::create_dir_all(&dir).map_err(|e| io_failure(&dir, e))?;
     let path = dir.join(&file);
     let text = format!(
@@ -1751,6 +1883,28 @@ fn run(args: &Args) -> Result<Report, Failure> {
     let (root, project) = project()?;
     let mut rep = Report::new("db");
     rep.data("action", json!(sub));
+    for (engine, why) in rejected_state(&root) {
+        rep.push(
+            Finding::new(
+                Code::DB_NOT_MANAGED,
+                Severity::Warning,
+                match engine {
+                    Some(e) => {
+                        format!("the {} entry of .giong/db.json is ignored: {why}", e.name())
+                    }
+                    None => format!(".giong/db.json is ignored: {why}"),
+                },
+            )
+            .detail(
+                "giong db up never writes such an entry; a cloned repository can commit one to \
+                 make giong run another program, mount the host or drop another database",
+            )
+            .fix(
+                "if you did not write it, delete .giong/db.json (and keep .giong/ out of git); \
+                 giong db up then starts a fresh database",
+            ),
+        );
+    }
     match sub {
         "up" => up(args, &root, &project, &mut rep)?,
         "down" => down(args, &root, &mut rep)?,
@@ -1793,6 +1947,57 @@ fn run(args: &Args) -> Result<Report, Failure> {
 mod tests {
     use super::*;
 
+    /// A cloned repository can commit `.env` or the state file's temporary
+    /// name as a link: giong db never writes through one.
+    #[cfg(unix)]
+    #[test]
+    fn links_in_the_project_are_not_written_through() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("giongdblinks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("proj");
+        std::fs::create_dir_all(root.join(".giong")).unwrap();
+        let target = base.join("bashrc");
+        std::fs::write(&target, "mine").unwrap();
+
+        symlink(&target, root.join(".env")).unwrap();
+        assert!(set_env(&root, "DATABASE_URL", "postgres://h/d").is_err());
+        assert!(ignore_secrets(&root).is_ok());
+        std::fs::remove_file(root.join(".env")).unwrap();
+
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
+        symlink(&target, root.join(".gitignore")).unwrap();
+        assert!(ignore_secrets(&root).is_err());
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
+
+        let tmp = format!("db.json.{}", std::process::id());
+        symlink(&target, root.join(".giong").join(&tmp)).unwrap();
+        let s = Started {
+            engine: Engine::Postgres,
+            runtime: "docker".into(),
+            container: "c".into(),
+            volume: "v".into(),
+            image: "postgres:17".into(),
+            port: 5432,
+            user: "u".into(),
+            password: "p".into(),
+            database: "d".into(),
+        };
+        write_state(&root, &[s]).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        assert!(!std::fs::symlink_metadata(state_path(&root))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // A linked .giong folder is refused outright.
+        std::fs::remove_dir_all(root.join(".giong")).unwrap();
+        symlink(&base, root.join(".giong")).unwrap();
+        assert!(write_state(&root, &[]).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
+
     #[test]
     fn migration_names() {
         assert_eq!(
@@ -1815,6 +2020,76 @@ mod tests {
         ] {
             assert_eq!(parse_migration_name(bad), None, "{bad}");
         }
+    }
+
+    #[test]
+    fn state_entries_a_repository_could_plant_are_rejected() {
+        let root = std::env::temp_dir().join(format!("giong-db-hostile-{}", std::process::id()));
+        std::fs::create_dir_all(&root).unwrap();
+        let base = container_base("shop", &root, Engine::Postgres);
+        let good = Started {
+            engine: Engine::Postgres,
+            runtime: "docker".into(),
+            container: base.clone(),
+            volume: format!("{base}-data"),
+            image: "postgres:16-alpine".into(),
+            port: 5432,
+            user: "giong".into(),
+            password: "0123abcd".into(),
+            database: "shop".into(),
+        };
+        assert_eq!(good.problem("shop", &root), None);
+        let bad = |f: &dyn Fn(&mut Started)| {
+            let mut s = good.clone();
+            f(&mut s);
+            s.problem("shop", &root)
+        };
+        for runtime in ["./x.sh", "/usr/bin/docker", "sh", "docker;id", ""] {
+            assert!(bad(&|s| s.runtime = runtime.into()).is_some(), "{runtime}");
+        }
+        for name in ["giong-other-postgres-abcdef", "-v", ""] {
+            assert!(bad(&|s| s.container = name.into()).is_some(), "{name}");
+        }
+        for volume in ["/", "/home/me", "giong-other-postgres-abcdef-data", "-v"] {
+            assert!(bad(&|s| s.volume = volume.into()).is_some(), "{volume}");
+        }
+        for image in ["-v", "--privileged", "x y", "evil;rm", ""] {
+            assert!(bad(&|s| s.image = image.into()).is_some(), "{image}");
+        }
+        for name in ["shop; DROP DATABASE x", "a'b", "Shop", "a-b"] {
+            assert!(bad(&|s| s.database = name.into()).is_some(), "{name}");
+            assert!(bad(&|s| s.user = name.into()).is_some(), "{name}");
+        }
+        assert!(bad(&|s| s.password = "a\nB=1".into()).is_some());
+        // Another checkout's name is another container.
+        let other = root.join("other");
+        std::fs::create_dir_all(&other).unwrap();
+        assert!(good.problem("shop", &other).is_some());
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn only_official_images_come_from_the_state_file() {
+        for (e, image) in [
+            (Engine::Postgres, "postgres:16-alpine"),
+            (Engine::Postgres, "postgres"),
+            (Engine::Postgres, "docker.io/library/postgres:17"),
+            (Engine::Mysql, "mariadb:11.4"),
+            (Engine::Redis, "valkey/valkey:8"),
+        ] {
+            assert!(official_image(e, image), "{image}");
+        }
+        for (e, image) in [
+            (Engine::Postgres, "evil/postgres:16"),
+            (Engine::Postgres, "ghcr.io/x/postgres:16"),
+            (Engine::Postgres, "mysql:8.4"),
+            (Engine::Redis, "redis:7;id"),
+            (Engine::Mysql, "mysql@sha256:abc"),
+        ] {
+            assert!(!official_image(e, image), "{image}");
+        }
+        assert!(plain_image("ghcr.io/org/pg@sha256:0a1b"));
+        assert!(!plain_image("-v"));
     }
 
     #[test]

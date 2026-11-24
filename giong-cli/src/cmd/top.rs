@@ -456,8 +456,9 @@ mod tests {
         assert!(s.contains("2300 ms in src/main.rs:40:9"), "{s}");
         assert!(s.contains("TASKS 4 live at 2 spawn locations"), "{s}");
         assert!(s.contains("giong-http/src/server.rs:200:13"), "{s}");
+        // In the order the service gives them (serde_json keeps it).
         assert!(
-            s.contains("postgres pool db:5432/app: idle 3, open 4"),
+            s.contains("postgres pool db:5432/app: open 4, idle 3"),
             "{s}"
         );
         assert!(s.contains("    120 "), "{s}");
