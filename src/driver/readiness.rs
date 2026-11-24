@@ -69,6 +69,9 @@ pub(crate) trait Poller: Sized {
     const SKIP_EMPTY_POLL: bool;
     /// Creates the event queue.
     fn new() -> io::Result<Self>;
+    /// Times short waits exactly, without the kernel's timer slack (see
+    /// `Builder::precise_timers`). Only kqueue has that slack.
+    fn set_precise_timers(&mut self, _enable: bool) {}
     /// Makes the worker's wake-up: ringing it from any thread makes
     /// [`wait`](Self::wait) report an event with the token [`WAKE`], and
     /// [`WakeHandle::seen`](super::WakeHandle) resets it. Called once.
@@ -384,6 +387,12 @@ pub(crate) struct Readiness<P: Poller> {
 }
 
 impl<P: Poller> Readiness<P> {
+    /// See [`Poller::set_precise_timers`].
+    #[cfg_attr(not(any(target_os = "macos", giong_libkqueue)), allow(dead_code))]
+    pub(crate) fn set_precise_timers(&mut self, enable: bool) {
+        self.poller.set_precise_timers(enable);
+    }
+
     pub(crate) fn new(pool: Rc<BufPool>) -> io::Result<Self> {
         let poller = P::new()?;
         let wake = poller.waker()?;

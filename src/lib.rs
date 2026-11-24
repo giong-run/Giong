@@ -111,6 +111,8 @@ pub mod fs;
 #[cfg(windows)]
 #[path = "fs/windows.rs"]
 pub mod fs;
+#[cfg(target_os = "linux")]
+pub mod ipc;
 pub mod net;
 pub mod observe;
 #[cfg(target_os = "linux")]

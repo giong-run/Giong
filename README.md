@@ -442,7 +442,7 @@ What matters at run time:
 | Area | API |
 |---|---|
 | Starting | `giong::block_on(fut)` for one thread; `Builder::new().workers(n).build()?.run(\|i\| async { .. })` for one worker per core |
-| Configuration | `.workers(n)`, `.driver(DriverKind)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)`; `giong::driver_kind()` |
+| Configuration | `.workers(n)`, `.driver(DriverKind)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.precise_timers(bool)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)`; `giong::driver_kind()` |
 | Tasks | `spawn(fut) -> JoinHandle<T>`, `handle.abort()`, `yield_now()`; futures need not be `Send` |
 | TCP | `TcpListener::bind` / `bind_balanced` (busy workers hand new connections to idle ones) / `accept`, on an IP address (a host name is refused: `lookup_host` first), shared by the workers of one process and refused to any other; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `write_all_vectored` / `shutdown` / `set_nodelay` |
 | Names | `net::lookup_host("host:port")`; `net::Resolver` (`/etc/hosts`, then DNS over UDP and TCP, search list, cache) |
@@ -518,6 +518,7 @@ For each job a service has, try these in order and take the first that fits:
 | PostgreSQL | [`giong-postgres`](giong-postgres/README.md) | tokio-postgres, sqlx | 3.3 times tokio-postgres + deadpool at its best on one row by key, 2.5 times on 100 rows; 7–9% behind tokio-postgres on one shared connection ([PostgreSQL](docs/BENCHMARKS.md#postgresql)) |
 | MySQL, MariaDB | [`giong-mysql`](giong-mysql/README.md) | sqlx, mysql_async | 5.1 times SQLx at its best on one row by key, 3.7 times on 100 rows ([MySQL](docs/BENCHMARKS.md#mysql)) |
 | Redis | [`giong-redis`](giong-redis/README.md) | redis-rs, fred | 1.1 to 1.8 times redis-rs on small commands, 1.25 to 2.5 times on 8 KiB values, at half its CPU per command or less ([Redis](docs/BENCHMARKS.md#redis)) |
+| Messages between processes on one host (Linux) | `giong::ipc` | `tokio::net::UnixStream` | Shared memory: 6.7 times giong's own `UnixStream` on round trips with spinning workers (1.00 against 6.73 µs) and 8.3 times without; 2.0 to 2.1 times on streams of small messages, at half the CPU; not measured against Tokio ([results](bench/results/ipc-giong/README.md)) |
 | Files | `giong::fs` | `tokio::fs` | 8 times Tokio on reads at an offset, 3.2 to 4.1 times on whole small files ([File I/O](docs/BENCHMARKS.md#file-io)) |
 | Name lookups | `giong::net::lookup_host`, `net::Resolver` | `tokio::net::lookup_host`, hickory-resolver | `localhost` from `/etc/hosts`: 171 ns against Tokio's 28.6 µs ([Core primitives](docs/BENCHMARKS.md#core-primitives)); DNS over the network not measured |
 | Tasks, timers, channels | `giong::spawn`, `giong::time`, `giong::sync` (`mpsc`, `oneshot`) | `tokio::spawn`, `tokio::time`, `tokio::sync` | 1.3 to 2.6 times Tokio; Monoio and Glommio are ahead on spawning and channels within one thread ([Core primitives](docs/BENCHMARKS.md#core-primitives)) |

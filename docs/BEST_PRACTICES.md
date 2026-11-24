@@ -216,6 +216,10 @@ claude mcp add --transport http giong http://127.0.0.1:7777/mcp \
 - **`Builder::spin_before_park(duration)`** lowers latency at low load (19 µs median
   instead of 28 on one connection) by keeping the worker awake, which costs CPU. Use it on
   dedicated cores for latency-sensitive services, not on shared machines.
+- **`Builder::precise_timers(true)`** on macOS makes sleeps and timeouts up to 100 ms end on
+  time instead of up to 2 ms late (macOS adds timer slack to batch wake-ups). It costs CPU
+  and battery (about a third more CPU in a tight 2 ms sleep loop), so it is off by default;
+  Linux and Windows ignore it.
 - **`TcpListener::bind_balanced`** for long-lived connections of uneven weight (gRPC,
   streaming): busy workers hand new connections to idle ones. The kernel's spread is fine for
   short HTTP requests.

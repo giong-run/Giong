@@ -54,6 +54,17 @@ when it is no longer raised.
 |---|---|---|
 | [GIONG-E0028](E0028.md) | `NetworkBuffersExhausted` | the system ran out of network buffers |
 
+## Messages between processes (`giong::ipc`)
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E0090](E0090.md) | `IpcMessageTooLarge` | IPC message too large |
+| [GIONG-E0091](E0091.md) | `IpcCorrupted` | IPC channel memory corrupted |
+| [GIONG-E0092](E0092.md) | `IpcCapacity` | IPC capacity out of range |
+| [GIONG-E0093](E0093.md) | `IpcHandshake` | IPC handshake failed |
+| [GIONG-E0094](E0094.md) | `IpcPeerGone` | IPC peer process gone |
+| [GIONG-E0095](E0095.md) | `IpcReceiverClosed` | IPC receiver closed |
+
 ## Network and name resolution
 
 | Code | `Code::` | Meaning |
