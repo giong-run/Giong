@@ -62,6 +62,10 @@ name = "client_h2"
 required-features = ["client", "tls"]
 
 [[test]]
+name = "tracing"
+required-features = ["client"]
+
+[[test]]
 name = "h3"
 required-features = ["unstable-http3"]
 

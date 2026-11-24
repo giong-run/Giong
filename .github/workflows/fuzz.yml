@@ -30,6 +30,7 @@ on:
       - "giong-tls/**"
       - "giong-mcp/**"
       - "giong-grpc/**"
+      - "giong-cli/**"
       - "giong-grpc-build/**"
       - "giong-proto/**"
       - "giong-quic/**"
@@ -50,6 +51,7 @@ on:
       - "giong-tls/**"
       - "giong-mcp/**"
       - "giong-grpc/**"
+      - "giong-cli/**"
       - "giong-grpc-build/**"
       - "giong-proto/**"
       - "giong-quic/**"
@@ -133,6 +135,10 @@ jobs:
           { "crate": "giong-grpc", "target": "status_message" }
           { "crate": "giong-grpc", "target": "metadata" }
           { "crate": "giong-grpc", "target": "descriptors" }
+          { "crate": "giong-cli", "target": "args" }
+          { "crate": "giong-cli", "target": "dotenv" }
+          { "crate": "giong-cli", "target": "host_parsers" }
+          { "crate": "giong-cli", "target": "lint" }
           EOF
           )
           if [ "$EVENT" = pull_request ]; then
