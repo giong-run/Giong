@@ -76,6 +76,10 @@ for line in sys.stdin:
         # which the guests do not have, and does not depend on the kernel.
         if msg["target"]["name"] == "generated" and "giong-grpc" in msg["package_id"]:
             continue
+        # giong-cli runs the giong binary, cargo, git and containers, none of
+        # which the guests have, and does not depend on the kernel.
+        if msg["manifest_path"].endswith("/giong-cli/Cargo.toml"):
+            continue
         print(msg["executable"])
 '
 )
