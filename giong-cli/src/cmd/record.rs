@@ -413,43 +413,24 @@ fn show(args: &Args, rest: &[String]) -> Result<Report, Failure> {
 
 /// The project root, or the current directory outside a project.
 fn base_dir() -> PathBuf {
-    service::project_root()
-        .or_else(|| std::env::current_dir().ok())
-        .unwrap_or_else(|| PathBuf::from("."))
+    service::base_dir()
 }
 
 /// Refuses `out` when it, or a folder between it and the project (or the
 /// current directory), is a symbolic link.
 fn refuse_links(out: &Path) -> Result<(), Failure> {
-    let base = base_dir();
-    let out_abs = if out.is_relative() {
-        std::env::current_dir()
-            .map(|d| d.join(out))
-            .unwrap_or_else(|_| out.to_path_buf())
-    } else {
-        out.to_path_buf()
-    };
-    let stop = if out_abs.starts_with(&base) {
-        base
-    } else {
-        out_abs.parent().map(Path::to_path_buf).unwrap_or_default()
-    };
-    let mut at = Some(out_abs.as_path());
-    while let Some(p) = at.filter(|p| *p != stop && p.starts_with(&stop)) {
-        if std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink()) {
-            return Err(Failure::new(
-                Code::USAGE,
-                format!(
-                    "{} is a symbolic link, which giong record does not follow (it could \
-                     name a file outside the project)",
-                    p.display()
-                ),
-                "remove the link, or save somewhere else with --name or --out",
-            ));
-        }
-        at = p.parent();
+    match service::link_on_the_way(out) {
+        Some(p) => Err(Failure::new(
+            Code::USAGE,
+            format!(
+                "{} is a symbolic link, which giong record does not follow (it could \
+                 name a file outside the project)",
+                p.display()
+            ),
+            "remove the link, or save somewhere else with --name or --out",
+        )),
+        None => Ok(()),
     }
-    Ok(())
 }
 
 fn valid_file_name(name: &str) -> bool {

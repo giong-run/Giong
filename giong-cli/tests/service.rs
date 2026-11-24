@@ -230,6 +230,48 @@ fn openapi_writes_a_document_for_the_routes() {
 }
 
 #[test]
+fn openapi_out_follows_no_committed_link() {
+    let svc = service(None);
+    let dir = temp_dir("openapi-links");
+    let elsewhere = temp_dir("openapi-elsewhere");
+    let secret = elsewhere.join("openapi.json");
+    std::fs::write(&secret, "do not touch").unwrap();
+    // A committed folder link, and a committed file link.
+    std::os::unix::fs::symlink(&elsewhere, dir.join("docs")).unwrap();
+    std::os::unix::fs::symlink(&secret, dir.join("openapi.json")).unwrap();
+    let absolute = dir.join("docs").join("openapi.json");
+    for out in [
+        "docs/openapi.json",
+        "openapi.json",
+        absolute.to_str().unwrap(),
+    ] {
+        let (status, r) = giong(&dir, &["openapi", "--mcp", &svc.mcp, "--out", out], &[]);
+        assert_eq!(status, 2, "{out}: {r}");
+        assert_eq!(r["error"]["code"], "GIONG-E5000", "{out}: {r}");
+        assert!(
+            r["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("symbolic link"),
+            "{out}: {r}"
+        );
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "do not touch");
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 1, "{out}");
+    }
+    // A folder with no link in it is written as before.
+    std::fs::create_dir(dir.join("api")).unwrap();
+    let (status, r) = giong(
+        &dir,
+        &["openapi", "--mcp", &svc.mcp, "--out", "api/openapi.json"],
+        &[],
+    );
+    assert_eq!(status, 0, "{r}");
+    assert!(dir.join("api").join("openapi.json").is_file());
+    std::fs::remove_dir_all(&dir).unwrap();
+    std::fs::remove_dir_all(&elsewhere).unwrap();
+}
+
+#[test]
 fn top_once_takes_a_snapshot_over_tcp_with_a_token() {
     let token = "0123456789abcdef0123";
     let svc = service(Some(token));

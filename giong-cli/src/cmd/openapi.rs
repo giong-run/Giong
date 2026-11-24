@@ -411,6 +411,19 @@ fn run(args: &Args) -> Result<Report, Failure> {
     match args.value("out") {
         Some(out) => {
             let path = PathBuf::from(out);
+            // A committed folder link on the way (docs -> ~/.config) would
+            // put the file outside the project: refused, never followed.
+            if let Some(link) = service::link_on_the_way(&path) {
+                return Err(Failure::new(
+                    Code::USAGE,
+                    format!(
+                        "{} is a symbolic link, which giong openapi does not follow (it \
+                         could name a folder outside the project)",
+                        link.display()
+                    ),
+                    "remove the link, or give --out a path with no link in it",
+                ));
+            }
             // Written aside, then renamed over it: a committed link at
             // openapi.json is replaced, never followed.
             crate::state::replace(&path, format!("{text}\n").as_bytes()).map_err(|e| {

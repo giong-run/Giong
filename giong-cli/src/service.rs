@@ -167,6 +167,43 @@ pub fn project_root() -> Option<PathBuf> {
     find_manifest_dir(&std::env::current_dir().ok()?)
 }
 
+/// The project root, or the current directory when not in a project.
+pub fn base_dir() -> PathBuf {
+    project_root()
+        .or_else(|| std::env::current_dir().ok())
+        .unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// The first symbolic link at `out`, or at a folder between it and the
+/// project (or the current directory), if any. A repository can commit a
+/// link, so a command that writes or reads a file in the project refuses
+/// one rather than follow it to a file outside. A path outside the project
+/// is the caller's own choice: only its last part is checked. Folders are
+/// compared by what they resolve to, so the project reached by another name
+/// (on macOS /var is /private/var) is still the project.
+pub fn link_on_the_way(out: &Path) -> Option<PathBuf> {
+    let out = if out.is_relative() {
+        std::env::current_dir()
+            .map(|d| d.join(out))
+            .unwrap_or_else(|_| out.to_path_buf())
+    } else {
+        out.to_path_buf()
+    };
+    let is_link = |p: &Path| std::fs::symlink_metadata(p).is_ok_and(|m| m.file_type().is_symlink());
+    let base = base_dir();
+    let base = std::fs::canonicalize(&base).unwrap_or(base);
+    let mut first = None;
+    for p in out.ancestors() {
+        if p == base || std::fs::canonicalize(p).is_ok_and(|c| c == base) {
+            return first;
+        }
+        if first.is_none() && is_link(p) {
+            first = Some(p.to_path_buf());
+        }
+    }
+    is_link(&out).then_some(out)
+}
+
 /// Finds the service: `--mcp`, then `GIONG_MCP`, then `.giong/dev.json`.
 pub fn locate(mcp_flag: Option<&str>) -> Result<Service, Failure> {
     let env_token = std::env::var("GIONG_MCP_TOKEN")
