@@ -1,0 +1,149 @@
+//! Starts the workers: reads the configuration from the environment,
+{{#if sql}}
+//! creates the tables, then runs the job loop on every core.
+{{/if}}
+{{#if redis}}
+//! then runs the job loop on every core.
+{{/if}}
+{{#if !db}}
+//! then runs the job every interval on one worker.
+{{/if}}
+//!
+//! | Variable | Default | |
+//! |---|---|---|
+{{#if postgres}}
+//! | `DATABASE_URL` | (required) | `postgres://user:password@host/db` |
+{{/if}}
+{{#if mysql}}
+//! | `DATABASE_URL` | (required) | `mysql://user:password@host/db` |
+{{/if}}
+{{#if redis}}
+//! | `REDIS_URL` | `redis://127.0.0.1:6379` | |
+//! | `QUEUE` | `{{crate}}` | jobs wait in the list `jobs:<QUEUE>` |
+{{/if}}
+{{#if sql}}
+//! | `QUEUE` | `default` | the `queue` column of the jobs this service runs |
+//! | `POLL_MS` | `500` | how often an idle worker looks for jobs |
+//! | `WORKERS` | every core | |
+{{/if}}
+{{#if redis}}
+//! | `WORKERS` | every core | |
+{{/if}}
+{{#if !db}}
+//! | `INTERVAL_SECS` | `10` | |
+//! | `WORKERS` | `1` | only the first runs the job |
+{{/if}}
+//! | `GIONG_MCP`, `GIONG_MCP_TOKEN` | (off) | giong-mcp, for agents: `127.0.0.1:7777` |
+
+use std::env;
+use std::process::ExitCode;
+use std::time::Duration;
+
+fn var(name: &str) -> Option<String> {
+    env::var(name).ok().filter(|v| !v.is_empty())
+}
+
+fn number<T: std::str::FromStr>(name: &str, default: T) -> Result<T, String> {
+    match var(name) {
+        None => Ok(default),
+        Some(v) => v
+            .parse()
+            .map_err(|_| format!("{name}={v:?} is not a number")),
+    }
+}
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(e) => {
+            eprintln!("{{name}}: {e}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+fn run() -> Result<(), String> {
+{{#if postgres}}
+    let url = var("DATABASE_URL")
+        .ok_or("DATABASE_URL is not set; give postgres://user:password@host/db")?;
+    let db = giong_postgres::Config::from_url(&url).map_err(|e| format!("DATABASE_URL: {e}"))?;
+    giong::block_on(async {
+        let pool = giong_postgres::Pool::new(db.clone(), 1);
+        pool.batch_execute({{crate}}::SCHEMA).await
+    })
+    .map_err(|e| format!("creating the tables: {e}"))?;
+{{/if}}
+{{#if mysql}}
+    let url = var("DATABASE_URL")
+        .ok_or("DATABASE_URL is not set; give mysql://user:password@host/db")?;
+    let db = giong_mysql::Config::from_url(&url).map_err(|e| format!("DATABASE_URL: {e}"))?;
+    giong::block_on(async {
+        let pool = giong_mysql::Pool::new(db.clone(), 1);
+        pool.batch_execute({{crate}}::SCHEMA).await
+    })
+    .map_err(|e| format!("creating the tables: {e}"))?;
+{{/if}}
+{{#if sql}}
+    let queue = var("QUEUE").unwrap_or_else(|| "default".into());
+    let poll = Duration::from_millis(number("POLL_MS", 500)?);
+{{/if}}
+{{#if redis}}
+    let url = var("REDIS_URL").unwrap_or_else(|| "redis://127.0.0.1:6379".into());
+    let redis = giong_redis::Config::from_url(&url).map_err(|e| format!("REDIS_URL: {e}"))?;
+    let queue = {{crate}}::Queue::named(&var("QUEUE").unwrap_or_else(|| "{{crate}}".into()));
+{{/if}}
+{{#if !db}}
+    let interval = Duration::from_secs(number("INTERVAL_SECS", 10)?);
+    if interval.is_zero() {
+        return Err("INTERVAL_SECS must be at least 1".into());
+    }
+{{/if}}
+    let mut builder = giong::Builder::new()
+        .shutdown_on_signals(true)
+        .shutdown_grace(Duration::from_secs(30));
+{{#if db}}
+    if var("WORKERS").is_some() {
+        builder = builder.workers(number("WORKERS", 1)?);
+    }
+{{#else}}
+    builder = builder.workers(number("WORKERS", 1)?);
+{{/if}}
+    let runtime = builder.build().map_err(|e| e.to_string())?;
+    // Off unless GIONG_MCP is set: lets an agent ask the running service
+    // about its workers, tasks and pools. Keep the value alive.
+    let _mcp = giong_mcp::start_from_env(&runtime.handle());
+    runtime
+{{#if db}}
+        .run(move |_worker| {
+{{#else}}
+        .run(move |worker| {
+{{/if}}
+{{#if postgres}}
+            // One connection per worker is enough for a loop that runs one
+            // job at a time.
+            let pool = giong_postgres::Pool::new(db.clone(), 1);
+            let (queue, poll) = (queue.clone(), poll);
+            {{crate}}::work(pool, queue, poll)
+{{/if}}
+{{#if mysql}}
+            // One connection per worker is enough for a loop that runs one
+            // job at a time.
+            let pool = giong_mysql::Pool::new(db.clone(), 1);
+            let (queue, poll) = (queue.clone(), poll);
+            {{crate}}::work(pool, queue, poll)
+{{/if}}
+{{#if redis}}
+            let pool = giong_redis::Pool::new(redis.clone(), 1);
+            let queue = queue.clone();
+            {{crate}}::work(pool, queue)
+{{/if}}
+{{#if !db}}
+            async move {
+                if worker == 0 {
+                    {{crate}}::work(interval, None).await;
+                }
+            }
+{{/if}}
+        })
+        .map_err(|e| e.to_string())
+}

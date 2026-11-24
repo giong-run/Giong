@@ -1,0 +1,288 @@
+//! The jobs and the loop, run the way the service runs them.
+{{#if db}}
+//!
+//! The queue tests talk to the store named by `DATABASE_URL` or `REDIS_URL`,
+//! from the environment or from `.env` (`giong db up` writes them). Without
+//! it they print `SKIPPED` and pass. Each run uses a queue of its own, so a
+//! development database is fine.
+{{/if}}
+
+use std::time::Duration;
+
+{{#if db}}
+use {{crate}}::{run_job, Outcome};
+
+/// A variable from the environment, else from `.env` in the project.
+fn setting(name: &str) -> Option<String> {
+    if let Some(v) = std::env::var(name).ok().filter(|v| !v.is_empty()) {
+        return Some(v);
+    }
+    let env = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok()?;
+    env.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        let value = value.trim().trim_matches('"');
+        (key.trim() == name && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// A queue name no other run uses.
+fn queue_name() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("test-{}x{nanos}", std::process::id())
+}
+
+#[test]
+fn jobs_by_kind() {
+    assert_eq!(run_job(r#"{"kind":"greet","name":"Ada"}"#).unwrap(), "Hello, Ada!");
+    assert_eq!(run_job(r#"{"kind":"greet"}"#).unwrap_err(), "greet needs a name");
+    assert!(run_job(r#"{"kind":"fly"}"#).unwrap_err().contains("no job of kind"));
+    assert!(run_job(r#"{}"#).unwrap_err().contains("no \"kind\""));
+    assert!(run_job("not json").unwrap_err().starts_with("not JSON"));
+}
+{{/if}}
+{{#if redis}}
+
+#[test]
+fn jobs_from_a_redis_list() {
+    use giong_redis::cmd;
+    let Some(url) = setting("REDIS_URL") else {
+        eprintln!("SKIPPED: REDIS_URL is not set (run giong db up, or set it)");
+        return;
+    };
+    let config = giong_redis::Config::from_url(&url).unwrap();
+    let queue = {{crate}}::Queue::named(&queue_name());
+    giong::block_on(async {
+        let pool = giong_redis::Pool::new(config, 2);
+        if let Err(e) = pool.ping().await {
+            panic!("no Redis answers at REDIS_URL={url}: {e}");
+        }
+        for job in [r#"{"kind":"greet","name":"Ada"}"#, r#"{"kind":"fly"}"#] {
+            let _: i64 = pool.query(&cmd("LPUSH").arg(&queue.pending).arg(job)).await.unwrap();
+        }
+        let mut conn = pool.take().await.unwrap();
+        let wait = Duration::from_secs(1);
+        let first = {{crate}}::run_next(&mut conn, &queue, wait).await.unwrap();
+        assert_eq!(first, Outcome::Done("Hello, Ada!".into()));
+        let second = {{crate}}::run_next(&mut conn, &queue, wait).await.unwrap();
+        assert!(matches!(second, Outcome::Failed(ref e) if e.contains("fly")), "{second:?}");
+        let idle = {{crate}}::run_next(&mut conn, &queue, wait).await.unwrap();
+        assert_eq!(idle, Outcome::Idle);
+        drop(conn);
+
+        let failed: Vec<String> = pool
+            .query(&cmd("LRANGE").arg(&queue.failed).arg(0).arg(-1))
+            .await
+            .unwrap();
+        assert_eq!(failed.len(), 1);
+        assert!(failed[0].contains("no job of kind"));
+        let _: i64 = pool.query(&cmd("DEL").arg(&queue.failed)).await.unwrap();
+    });
+}
+{{/if}}
+{{#if postgres}}
+
+#[test]
+fn jobs_from_the_table() {
+    let Some(url) = setting("DATABASE_URL") else {
+        eprintln!("SKIPPED: DATABASE_URL is not set (run giong db up, or set it)");
+        return;
+    };
+    let queue = queue_name();
+    giong::block_on(async {
+        let db = giong_postgres::Pool::new(giong_postgres::Config::from_url(&url).unwrap(), 2);
+        db.batch_execute({{crate}}::SCHEMA).await.unwrap();
+        let ok = {{crate}}::enqueue(&db, &queue, r#"{"kind":"greet","name":"Ada"}"#)
+            .await
+            .unwrap();
+        let bad = {{crate}}::enqueue(&db, &queue, r#"{"kind":"fly"}"#).await.unwrap();
+
+        let first = {{crate}}::run_next(&db, &queue).await.unwrap();
+        assert_eq!(first, Outcome::Done("Hello, Ada!".into()));
+        let second = {{crate}}::run_next(&db, &queue).await.unwrap();
+        assert!(matches!(second, Outcome::Failed(ref e) if e.contains("fly")), "{second:?}");
+        // The failed job waits before its next attempt.
+        assert_eq!({{crate}}::run_next(&db, &queue).await.unwrap(), Outcome::Idle);
+
+        let row = db
+            .query_one("SELECT state FROM jobs WHERE id = $1", &[&ok])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<&str>(0).unwrap(), "done");
+        let row = db
+            .query_one("SELECT state, attempts, last_error FROM jobs WHERE id = $1", &[&bad])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<&str>(0).unwrap(), "queued");
+        assert_eq!(row.get::<i32>(1).unwrap(), 1);
+        assert!(row.get::<&str>(2).unwrap().contains("no job of kind"));
+
+        // After the last attempt it is set aside.
+        db.execute(
+            "UPDATE jobs SET attempts = $2, run_after = now() WHERE id = $1",
+            &[&bad, &({{crate}}::MAX_ATTEMPTS - 1)],
+        )
+        .await
+        .unwrap();
+        assert!(matches!({{crate}}::run_next(&db, &queue).await.unwrap(), Outcome::Failed(_)));
+        let row = db
+            .query_one("SELECT state FROM jobs WHERE id = $1", &[&bad])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<&str>(0).unwrap(), "failed");
+        assert_eq!({{crate}}::run_next(&db, &queue).await.unwrap(), Outcome::Idle);
+
+        db.execute("DELETE FROM jobs WHERE queue = $1", &[&queue])
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn two_claimers_never_take_the_same_job() {
+    let Some(url) = setting("DATABASE_URL") else {
+        eprintln!("SKIPPED: DATABASE_URL is not set (run giong db up, or set it)");
+        return;
+    };
+    let queue = queue_name();
+    giong::block_on(async {
+        let db = giong_postgres::Pool::new(giong_postgres::Config::from_url(&url).unwrap(), 4);
+        db.batch_execute({{crate}}::SCHEMA).await.unwrap();
+        for n in 0..20 {
+            let job = format!(r#"{{"kind":"greet","name":"n{n}"}}"#);
+            {{crate}}::enqueue(&db, &queue, &job).await.unwrap();
+        }
+        let mut claimers = Vec::new();
+        for _ in 0..4 {
+            let (db, queue) = (db.clone(), queue.clone());
+            claimers.push(giong::spawn(async move {
+                let mut done = Vec::new();
+                while let Outcome::Done(r) = {{crate}}::run_next(&db, &queue).await.unwrap() {
+                    done.push(r);
+                }
+                done
+            }));
+        }
+        let mut all = Vec::new();
+        for c in claimers {
+            all.extend(c.await.unwrap());
+        }
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 20, "every job ran exactly once");
+        db.execute("DELETE FROM jobs WHERE queue = $1", &[&queue])
+            .await
+            .unwrap();
+    });
+}
+{{/if}}
+{{#if mysql}}
+
+#[test]
+fn jobs_from_the_table() {
+    let Some(url) = setting("DATABASE_URL") else {
+        eprintln!("SKIPPED: DATABASE_URL is not set (run giong db up, or set it)");
+        return;
+    };
+    let queue = queue_name();
+    giong::block_on(async {
+        let db = giong_mysql::Pool::new(giong_mysql::Config::from_url(&url).unwrap(), 2);
+        db.batch_execute({{crate}}::SCHEMA).await.unwrap();
+        let ok = {{crate}}::enqueue(&db, &queue, r#"{"kind":"greet","name":"Ada"}"#)
+            .await
+            .unwrap();
+        let bad = {{crate}}::enqueue(&db, &queue, r#"{"kind":"fly"}"#).await.unwrap();
+
+        let first = {{crate}}::run_next(&db, &queue).await.unwrap();
+        assert_eq!(first, Outcome::Done("Hello, Ada!".into()));
+        let second = {{crate}}::run_next(&db, &queue).await.unwrap();
+        assert!(matches!(second, Outcome::Failed(ref e) if e.contains("fly")), "{second:?}");
+        // The failed job waits before its next attempt.
+        assert_eq!({{crate}}::run_next(&db, &queue).await.unwrap(), Outcome::Idle);
+
+        let row = db
+            .query_one("SELECT state FROM jobs WHERE id = ?", &[&ok])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "done");
+        let row = db
+            .query_one("SELECT state, attempts, last_error FROM jobs WHERE id = ?", &[&bad])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "queued");
+        assert_eq!(row.get::<i32>(1).unwrap(), 1);
+        assert!(row.get::<String>(2).unwrap().contains("no job of kind"));
+
+        // After the last attempt it is set aside.
+        db.execute(
+            "UPDATE jobs SET attempts = ?, run_after = UTC_TIMESTAMP(6) WHERE id = ?",
+            &[&({{crate}}::MAX_ATTEMPTS - 1), &bad],
+        )
+        .await
+        .unwrap();
+        assert!(matches!({{crate}}::run_next(&db, &queue).await.unwrap(), Outcome::Failed(_)));
+        let row = db
+            .query_one("SELECT state FROM jobs WHERE id = ?", &[&bad])
+            .await
+            .unwrap();
+        assert_eq!(row.get::<String>(0).unwrap(), "failed");
+        assert_eq!({{crate}}::run_next(&db, &queue).await.unwrap(), Outcome::Idle);
+
+        db.execute("DELETE FROM jobs WHERE queue = ?", &[&queue])
+            .await
+            .unwrap();
+    });
+}
+
+#[test]
+fn two_claimers_never_take_the_same_job() {
+    let Some(url) = setting("DATABASE_URL") else {
+        eprintln!("SKIPPED: DATABASE_URL is not set (run giong db up, or set it)");
+        return;
+    };
+    let queue = queue_name();
+    giong::block_on(async {
+        let db = giong_mysql::Pool::new(giong_mysql::Config::from_url(&url).unwrap(), 4);
+        db.batch_execute({{crate}}::SCHEMA).await.unwrap();
+        for n in 0..20 {
+            let job = format!(r#"{{"kind":"greet","name":"n{n}"}}"#);
+            {{crate}}::enqueue(&db, &queue, &job).await.unwrap();
+        }
+        let mut claimers = Vec::new();
+        for _ in 0..4 {
+            let (db, queue) = (db.clone(), queue.clone());
+            claimers.push(giong::spawn(async move {
+                let mut done = Vec::new();
+                while let Outcome::Done(r) = {{crate}}::run_next(&db, &queue).await.unwrap() {
+                    done.push(r);
+                }
+                done
+            }));
+        }
+        let mut all = Vec::new();
+        for c in claimers {
+            all.extend(c.await.unwrap());
+        }
+        all.sort();
+        all.dedup();
+        assert_eq!(all.len(), 20, "every job ran exactly once");
+        db.execute("DELETE FROM jobs WHERE queue = ?", &[&queue])
+            .await
+            .unwrap();
+    });
+}
+{{/if}}
+{{#if !db}}
+#[test]
+fn ticks_until_the_limit() {
+    giong::block_on(async {
+        assert_eq!({{crate}}::tick(7).await, "tick 7");
+        let started = std::time::Instant::now();
+        let count = {{crate}}::work(Duration::from_millis(10), Some(3)).await;
+        assert_eq!(count, 3);
+        assert!(started.elapsed() >= Duration::from_millis(30));
+    });
+}
+{{/if}}

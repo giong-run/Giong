@@ -1906,6 +1906,12 @@ Facts that are easy to get wrong:
   `std::thread::spawn` and a `giong::sync::oneshot` channel, and never block a worker.
   `giong::sync` has `mpsc` and `oneshot`; Tokio's `sync` module (`Semaphore`, `Notify`,
   `watch`, `broadcast`) needs no Tokio runtime and works on giong.
+- Child processes: `giong::process::Command` (std's builder; `.output().await`,
+  `.spawn()?` then `child.wait().await`); a child's pipes and `giong::process::stdin()` /
+  `stdout()` read and write owned buffers. Signals: `giong::signal::listen(SignalKind::HANGUP)?`
+  then `.recv().await`. Descriptors pass between processes with
+  `UnixStream::send_with_fds` / `recv_with_fds`; systemd's sockets come from
+  `giong::net::activated_sockets()`.
 - Choosing crates: use the giong crate for the job first. HTTP server: `giong-http`, not
   hyper or axum; routing, JSON and middleware: `giong-web`, not axum; HTTP client:
   `giong-http` with feature `client`, not reqwest; TLS: `giong-tls`; PostgreSQL:
@@ -1928,6 +1934,13 @@ Facts that are easy to get wrong:
 - On Linux 6.14 to 7.2 each worker's rings count against the locked-memory limit
   (`ulimit -l`, about 150 KiB per worker). Past it giong runs that worker on epoll and says
   why (`GIONG-E0010`); raise the limit as docs/DEPLOYMENT.md shows.
+- In a container giong needs no setting: it falls back to epoll where io_uring is blocked,
+  starts one worker per whole CPU of the CPU limit (1.5 CPUs: 1 worker), and giong-http
+  refuses connections before the memory limit is reached. It raises the soft
+  `RLIMIT_NOFILE` to the hard one (containerd starts containers at 1,024 files). Two things
+  to do yourself: `Builder::shutdown_on_signals(true)` so that `SIGTERM` stops process 1;
+  and in Kubernetes without a CPU limit, set `Builder::workers` from the CPU request.
+  examples/rest-api has a Dockerfile and a compose.yaml.
 {pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
 
 ## Docs

@@ -1488,6 +1488,13 @@ impl AsRawFd for UdpSocket {
     }
 }
 
+#[cfg(unix)]
+impl std::os::fd::AsFd for UdpSocket {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(&*self.sock)
+    }
+}
+
 #[cfg(windows)]
 impl std::os::windows::io::AsRawSocket for UdpSocket {
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {

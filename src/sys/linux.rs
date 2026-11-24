@@ -345,6 +345,22 @@ pub(crate) unsafe fn sendmmsg(
     libc::sendmmsg(fd, msgs, count as libc::c_uint, flags as _) as isize
 }
 
+/// A close-on-exec pipe: `[read, write]`.
+pub(crate) fn cloexec_pipe() -> io::Result<[RawFd; 2]> {
+    let mut fds = [0; 2];
+    // SAFETY: a valid pointer to two descriptors.
+    if unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(fds)
+}
+
+/// The highest signal number, and the first one the C library does not keep
+/// for itself among those above the 31 classic ones (`SIGRTMIN`).
+pub(crate) fn signal_range() -> (i32, i32) {
+    (libc::SIGRTMAX(), libc::SIGRTMIN())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{allowed_cpus, pin_to_cpu};
