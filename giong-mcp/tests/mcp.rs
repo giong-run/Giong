@@ -1197,8 +1197,12 @@ fn slow_requests_name_the_route_that_blocks_the_worker() {
             "{answer}"
         );
         assert_eq!(fast["slowest"][0]["blocked_by"]["route"], "GET /report");
+        // The slowest request, which the verdict is built from, spent its
+        // time behind the hold. Not the tail's mean: latencies are bucketed
+        // to a quarter, so on a slow runner (#381) the tail took in hundreds
+        // of `/fast` requests that were never behind one of the few holds.
         assert!(
-            fast["tail"]["blocked_ms"].as_f64().unwrap() >= 10.0,
+            fast["slowest"][0]["blocked_ms"].as_f64().unwrap() >= 10.0,
             "{answer}"
         );
         let lp = &answer["long_polls"][0];
