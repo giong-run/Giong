@@ -54,6 +54,10 @@ const SKIP: &[(&str, &str)] = &[
         "signals are not simulated",
     ),
     (
+        "multi::a_second_signal_ends_a_process_whose_shutdown_hangs",
+        "signals are not simulated",
+    ),
+    (
         "udp::dropping_a_socket_closes_it",
         "inspects the real kernel's descriptor table",
     ),

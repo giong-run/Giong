@@ -24,6 +24,7 @@ baseline records all three and a check refuses to compare across a change.
 import argparse
 import csv
 import io
+import json
 import os
 import platform
 import re
@@ -63,8 +64,18 @@ def build():
     if os.environ.get("BENCH_INSTR"):
         return os.environ["BENCH_INSTR"]
     print("== building bench/instr", file=sys.stderr)
-    subprocess.run(["cargo", "build", "--release", "--locked"], cwd=CRATE, check=True)
-    return os.path.join(CRATE, "target", "release", "bench-instr")
+    # Cargo names the binary it built: with CARGO_TARGET_DIR (or a
+    # build.target-dir) set, bench/instr/target holds an older build, if any.
+    out = subprocess.run(
+        ["cargo", "build", "--release", "--locked", "--message-format=json-render-diagnostics"],
+        cwd=CRATE, check=True, stdout=subprocess.PIPE, text=True,
+    ).stdout
+    for line in out.splitlines():
+        msg = json.loads(line)
+        if msg.get("reason") == "compiler-artifact" and msg["target"]["name"] == "bench-instr" \
+                and msg.get("executable"):
+            return msg["executable"]
+    sys.exit("cargo built bench/instr but named no bench-instr binary")
 
 
 def environment(binary):

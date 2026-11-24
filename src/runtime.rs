@@ -396,7 +396,20 @@ struct Deferred {
 
 impl Deferred {
     fn is_empty(&self) -> bool {
-        self.multis.is_empty() && self.cancels.is_empty() && self.closes.is_empty()
+        // Destructured so that a field added later cannot be left out: the
+        // pattern stops compiling until it is named here.
+        let Deferred {
+            multis,
+            cancels,
+            closes,
+            #[cfg(windows)]
+            sock_closes,
+        } = self;
+        #[cfg(windows)]
+        if !sock_closes.is_empty() {
+            return false;
+        }
+        multis.is_empty() && cancels.is_empty() && closes.is_empty()
     }
 }
 
@@ -994,6 +1007,11 @@ pub struct Builder {
     spin: Option<Duration>,
     shutdown_grace: Duration,
     open_files: bool,
+    /// Makes this worker panic before it reports that it started. A field
+    /// of the builder, not a static, so that the runtimes of other tests
+    /// running at the same time are not touched.
+    #[cfg(test)]
+    panic_on_start: Option<usize>,
 }
 
 impl Default for Builder {
@@ -1019,6 +1037,8 @@ impl Builder {
             spin: None,
             shutdown_grace: Duration::ZERO,
             open_files: true,
+            #[cfg(test)]
+            panic_on_start: None,
         }
     }
 
@@ -1134,6 +1154,12 @@ impl Builder {
 
     /// Request a runtime shutdown when the process receives SIGINT or SIGTERM
     /// (default: `false`). Only applies to [`Runtime::run`].
+    ///
+    /// A second SIGINT or SIGTERM ends the process at once, as it would
+    /// with no handler: a shutdown that hangs, or a main future that never
+    /// returns, can still be stopped with a second Ctrl-C. A signal within
+    /// 250 ms of the first counts as the same request, since one Ctrl-C can
+    /// arrive twice (wrappers such as cargo-watch forward it to their child).
     pub fn shutdown_on_signals(mut self, enable: bool) -> Self {
         self.signals = enable;
         self
@@ -1376,6 +1402,8 @@ impl Runtime {
         let (tx, rx) = mpsc::channel::<io::Result<()>>();
         let mut threads = Vec::with_capacity(n);
         let mut spawn_err = None;
+        #[cfg(test)]
+        let panic_on_start = self.builder.panic_on_start;
         for index in 0..n {
             let (f, gate, tx, cfg) = (f.clone(), gate.clone(), tx.clone(), cfg.clone());
             let rt = self.shared.clone();
@@ -1383,6 +1411,10 @@ impl Runtime {
             let spawned = thread::Builder::new()
                 .name(format!("giong-{index}"))
                 .spawn(move || {
+                    #[cfg(test)]
+                    if panic_on_start == Some(index) {
+                        panic!("worker {index} failed to start (test)");
+                    }
                     if let Some(cpu) = cpu {
                         pin_to_cpu(cpu);
                     }
@@ -1439,16 +1471,21 @@ impl Runtime {
         drop(tx);
 
         let mut first_err = spawn_err;
+        let mut reported = 0;
         for _ in 0..threads.len() {
             match rx.recv() {
-                Ok(Ok(())) => {}
+                Ok(Ok(())) => reported += 1,
                 Ok(Err(e)) => {
+                    reported += 1;
                     first_err.get_or_insert(e);
                 }
                 Err(_) => break,
             }
         }
-        gate.open(first_err.is_none());
+        // A thread that ended without reporting panicked while it started:
+        // then no worker runs, and its panic is raised below, now rather
+        // than when the others end.
+        gate.open(first_err.is_none() && reported == threads.len());
 
         let mut panic_payload = None;
         for t in threads {
@@ -2171,9 +2208,55 @@ fn pin_to_cpu(cpu: usize) {
 
 #[cfg(test)]
 mod tests {
-    use super::{default_workers, pin_by_default, thread_limit_error};
+    use super::{default_workers, pin_by_default, thread_limit_error, Deferred};
     use crate::error::{code, Code};
     use std::io;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn a_worker_that_panics_while_starting_fails_the_runtime_at_once() {
+        let ran = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = ran.clone();
+        let result = std::panic::catch_unwind(|| {
+            let mut builder = super::Builder::new().workers(3);
+            builder.panic_on_start = Some(1);
+            builder.build().unwrap().run(move |_| {
+                let counter = counter.clone();
+                async move {
+                    counter.fetch_add(1, Ordering::SeqCst);
+                }
+            })
+        });
+        let payload = result.expect_err("the runtime ran with a worker fewer");
+        let message = payload
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .unwrap_or("");
+        assert!(message.contains("failed to start"), "{message:?}");
+        assert_eq!(ran.load(Ordering::SeqCst), 0, "workers ran user code");
+    }
+
+    /// Every kind of deferred work keeps `close_deferred` from skipping the
+    /// turn: on Windows a socket alone was ignored, and stayed open (#289).
+    #[test]
+    fn a_deferred_close_of_any_kind_is_work() {
+        assert!(Deferred::default().is_empty());
+        #[cfg(unix)]
+        {
+            let mut deferred = Deferred::default();
+            deferred.closes.push(-1);
+            assert!(!deferred.is_empty());
+        }
+        let mut deferred = Deferred::default();
+        deferred.multis.push(0);
+        assert!(!deferred.is_empty());
+        #[cfg(windows)]
+        {
+            let mut deferred = Deferred::default();
+            deferred.sock_closes.push(super::sys::RawSock::MAX);
+            assert!(!deferred.is_empty());
+        }
+    }
 
     #[test]
     fn a_worker_thread_that_cannot_start_says_why() {

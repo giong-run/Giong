@@ -9,7 +9,7 @@ use std::net::Shutdown;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
@@ -126,7 +126,7 @@ struct Conn {
     requests: Cell<u64>,
     /// While a pool lends the connection to one task: the flag its cancel
     /// tokens check, cleared when the connection goes back.
-    lease: RefCell<Option<Arc<AtomicBool>>>,
+    lease: RefCell<Option<Arc<Lease>>>,
     /// The server refused a write because it is a standby (it was a primary
     /// once, or DNS still points at it): a pool closes the connection rather
     /// than keep sending writes there.
@@ -279,9 +279,41 @@ enum Kind {
     Simple,
 }
 
+/// The tasks waiting for a request's answer: almost always one, which is
+/// kept without an allocation.
+#[derive(Default)]
+struct Wakers {
+    first: Option<Waker>,
+    more: Vec<Waker>,
+}
+
+impl Wakers {
+    /// Adds `waker` unless it would wake a task already here.
+    fn register(&mut self, waker: &Waker) {
+        match &self.first {
+            None => self.first = Some(waker.clone()),
+            Some(w) if w.will_wake(waker) => {}
+            Some(_) => {
+                if !self.more.iter().any(|w| w.will_wake(waker)) {
+                    self.more.push(waker.clone());
+                }
+            }
+        }
+    }
+
+    fn wake_all(&mut self) {
+        if let Some(w) = self.first.take() {
+            w.wake();
+        }
+        for w in self.more.drain(..) {
+            w.wake();
+        }
+    }
+}
+
 #[derive(Default)]
 struct SlotInner {
-    wakers: Vec<Waker>,
+    wakers: Wakers,
     /// Nobody is waiting for the result any more: rows are not kept.
     abandoned: bool,
     /// The outcome was handed to the caller.
@@ -290,7 +322,7 @@ struct SlotInner {
     params: Option<Vec<Type>>,
     columns: Option<Vec<Column>>,
     rows: RowsBuilder,
-    tag: Option<String>,
+    tag: Option<Tag>,
     /// The server confirmed the Bind: the statement started running.
     bound: bool,
     /// The transaction status in the `ReadyForQuery` that ended the request.
@@ -307,8 +339,8 @@ struct SlotInner {
 
 enum Response {
     Statement(Rc<Statement>),
-    Rows(ResultSet, Option<String>),
-    Done(Option<String>),
+    Rows(ResultSet, Option<Tag>),
+    Done(Option<Tag>),
 }
 
 impl Slot {
@@ -347,9 +379,7 @@ impl Future for Wait {
             }
             None => {}
         }
-        if !inner.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            inner.wakers.push(cx.waker().clone());
-        }
+        inner.wakers.register(cx.waker());
         Poll::Pending
     }
 }
@@ -401,12 +431,28 @@ fn is_stale(db: &DbError) -> bool {
     }
 }
 
-/// The number of rows a command tag reports: `INSERT 0 5`, `UPDATE 3`,
-/// `SELECT 7`.
-fn rows_affected(tag: Option<&str>) -> u64 {
-    tag.and_then(|t| t.rsplit(' ').next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0)
+/// What this crate uses of a command tag (`INSERT 0 5`, `ROLLBACK`), read
+/// as it arrives so that the tag itself need not be kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tag {
+    /// The rows it reports: `INSERT 0 5`, `UPDATE 3`, `SELECT 7`; 0 for a
+    /// tag without a count.
+    rows: u64,
+    /// `COMMIT` ended a failed transaction with a rollback.
+    rollback: bool,
+}
+
+impl Tag {
+    fn of(tag: &str) -> Self {
+        Self {
+            rows: tag
+                .rsplit(' ')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0),
+            rollback: tag == "ROLLBACK",
+        }
+    }
 }
 
 impl Client {
@@ -566,7 +612,7 @@ impl Client {
     /// Not cancel safe, like [`query`](Self::query).
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
         let (_, tag) = self.run(sql, params, false).await?;
-        Ok(rows_affected(tag.as_deref()))
+        Ok(tag.map_or(0, |t| t.rows))
     }
 
     /// Runs SQL that may hold several statements separated by `;`, with no
@@ -620,7 +666,9 @@ impl Client {
     ///
     /// A token taken from a [`PooledClient`](crate::PooledClient) stops
     /// working when the connection goes back to the pool, so that it cannot
-    /// cancel the statements of the tasks that use the connection next.
+    /// cancel the statements of the tasks that use the connection next; and
+    /// a connection that goes back while a request from such a token is on
+    /// its way is closed rather than lent to another task.
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
             config: self.conn.config.without_password(),
@@ -691,14 +739,19 @@ impl Client {
     /// Starts lending the connection to one task: cancel tokens taken from
     /// now on work until [`end_lease`](Self::end_lease).
     pub(crate) fn begin_lease(&self) {
-        *self.conn.lease.borrow_mut() = Some(Arc::new(AtomicBool::new(true)));
+        *self.conn.lease.borrow_mut() = Some(Arc::new(Lease::default()));
     }
 
     /// Ends the lease: the cancel tokens taken during it stop working.
-    pub(crate) fn end_lease(&self) {
-        if let Some(lease) = self.conn.lease.borrow_mut().take() {
-            lease.store(false, Ordering::Release);
-        }
+    /// Returns whether a cancel request taken during it may still be on its
+    /// way to the server, in which case the connection must not be lent to
+    /// another task: the request would stop that task's statement.
+    pub(crate) fn end_lease(&self) -> bool {
+        self.conn
+            .lease
+            .borrow_mut()
+            .take()
+            .is_some_and(|lease| lease.end())
     }
 
     /// Whether the connection should not be used any more although it works:
@@ -744,7 +797,7 @@ impl Client {
         sql: &str,
         params: &[&dyn ToSql],
         batch: bool,
-    ) -> Result<(ResultSet, Option<String>), Error> {
+    ) -> Result<(ResultSet, Option<Tag>), Error> {
         if params.len() > MAX_PARAMS {
             return Err(Error::conversion(format!(
                 "{} parameters were given; a statement can have at most {MAX_PARAMS}",
@@ -1120,9 +1173,7 @@ impl Conn {
             let mut inner = slot.inner.borrow_mut();
             let e = inner.error.take().unwrap_or_else(|| err.clone());
             inner.outcome = Some(Err(e));
-            for w in inner.wakers.drain(..) {
-                w.wake();
-            }
+            inner.wakers.wake_all();
         }
         self.wake_idle();
         self.stream.shutdown(Shutdown::Both);
@@ -1273,7 +1324,7 @@ impl Conn {
                 if tag == "PREPARE" {
                     self.user_prepared.set(true);
                 }
-                inner.tag = Some(tag.to_owned());
+                inner.tag = Some(Tag::of(tag));
             }
             Backend::ErrorResponse(fields) => {
                 if inner.error.is_none() {
@@ -1372,7 +1423,7 @@ impl Conn {
         let mut inner = slot.inner.borrow_mut();
         match *msg {
             Backend::CommandComplete(command) => {
-                inner.tag = Some(command.to_owned());
+                inner.tag = Some(Tag::of(command));
             }
             Backend::ErrorResponse(fields) => {
                 // Not a sign of a standby: the batch is read-only on purpose.
@@ -1522,9 +1573,7 @@ impl Conn {
             },
         };
         inner.outcome = Some(outcome);
-        for w in inner.wakers.drain(..) {
-            w.wake();
-        }
+        inner.wakers.wake_all();
     }
 
     /// Takes a cached statement out of the cache when the server says it no
@@ -1702,7 +1751,7 @@ impl Transaction<'_> {
             .conn
             .enqueue(Kind::Simple, |out| protocol::query(out, "COMMIT"))?;
         match (Wait { slot }).await? {
-            Response::Done(Some(tag)) if tag == "ROLLBACK" => Err(Error::with_sqlstate(
+            Response::Done(Some(tag)) if tag.rollback => Err(Error::with_sqlstate(
                 "25P02",
                 "the transaction was rolled back instead of committed, because a statement in \
                  it failed earlier",
@@ -1764,9 +1813,50 @@ pub struct CancelToken {
     /// need.
     config: Config,
     key: Option<(i32, i32)>,
-    /// Set for a token taken from a pooled connection: cleared when the
+    /// Set for a token taken from a pooled connection: ended when the
     /// connection goes back to the pool.
-    lease: Option<Arc<AtomicBool>>,
+    lease: Option<Arc<Lease>>,
+}
+
+/// A pooled connection's time with one task, shared with the cancel tokens
+/// taken during it: whether it has ended, and how many cancel requests are
+/// on their way.
+#[derive(Default)]
+pub(crate) struct Lease(AtomicU32);
+
+impl Lease {
+    /// Set once the connection has gone back to its pool.
+    const ENDED: u32 = 1 << 31;
+
+    /// Counts a cancel request on its way, unless the lease has ended.
+    fn start_cancel(&self) -> bool {
+        let mut v = self.0.load(Ordering::Acquire);
+        while v & Self::ENDED == 0 {
+            match self
+                .0
+                .compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(now) => v = now,
+            }
+        }
+        false
+    }
+
+    /// A cancel request that `start_cancel` counted got its answer.
+    fn finish_cancel(&self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn is_ended(&self) -> bool {
+        self.0.load(Ordering::Acquire) & Self::ENDED != 0
+    }
+
+    /// Ends the lease; returns whether a cancel request is still on its way
+    /// (or was given up on the way, which counts the same).
+    fn end(&self) -> bool {
+        self.0.fetch_or(Self::ENDED, Ordering::AcqRel) & !Self::ENDED != 0
+    }
 }
 
 impl CancelToken {
@@ -1780,16 +1870,15 @@ impl CancelToken {
     /// Not cancel safe: if the future is dropped, the request may still reach
     /// the server and stop whatever the connection runs then.
     pub async fn cancel(&self) -> Result<(), Error> {
-        if self
-            .lease
-            .as_ref()
-            .is_some_and(|lease| !lease.load(Ordering::Acquire))
-        {
-            return Err(Error::closed(
+        let gone = || {
+            Error::closed(
                 "the connection this cancel token was taken from has gone back to its pool, \
                  where other tasks use it, so nothing was sent; take a new token from the next \
                  connection",
-            ));
+            )
+        };
+        if self.lease.as_ref().is_some_and(|lease| lease.is_ended()) {
+            return Err(gone());
         }
         let key = self.key.ok_or_else(|| {
             Error::new(
@@ -1798,7 +1887,19 @@ impl CancelToken {
                  between), so it cannot be cancelled",
             )
         })?;
-        connect::cancel(&self.config, key).await
+        let Some(lease) = &self.lease else {
+            return connect::cancel(&self.config, key).await;
+        };
+        // Counted until the answer comes: a connection that goes back to the
+        // pool meanwhile is closed rather than lent to a task whose
+        // statement the request would stop. A request given up on the way
+        // stays counted, for the same reason.
+        if !lease.start_cancel() {
+            return Err(gone());
+        }
+        let sent = connect::cancel(&self.config, key).await;
+        lease.finish_cancel();
+        sent
     }
 }
 
@@ -1812,7 +1913,7 @@ impl std::fmt::Debug for CancelToken {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stale, rows_affected};
+    use super::{is_stale, Tag};
     use crate::error::DbError;
 
     fn db_error(fields: &[(u8, &str)]) -> DbError {
@@ -1855,10 +1956,10 @@ mod tests {
 
     #[test]
     fn command_tags_give_row_counts() {
-        assert_eq!(rows_affected(Some("INSERT 0 5")), 5);
-        assert_eq!(rows_affected(Some("UPDATE 3")), 3);
-        assert_eq!(rows_affected(Some("SELECT 12")), 12);
-        assert_eq!(rows_affected(Some("CREATE TABLE")), 0);
-        assert_eq!(rows_affected(None), 0);
+        assert_eq!(Tag::of("INSERT 0 5").rows, 5);
+        assert_eq!(Tag::of("UPDATE 3").rows, 3);
+        assert_eq!(Tag::of("SELECT 12").rows, 12);
+        assert_eq!(Tag::of("CREATE TABLE").rows, 0);
+        assert!(Tag::of("ROLLBACK").rollback && !Tag::of("COMMIT").rollback);
     }
 }
