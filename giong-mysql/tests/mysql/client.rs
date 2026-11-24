@@ -983,12 +983,14 @@ fn a_statement_given_up_inside_a_transaction_stops_the_commit() {
         tx.execute("INSERT INTO given_up VALUES (1)", &[])
             .await
             .unwrap();
+        // Prepared now, so that the timed run below is sent at its first
+        // poll: a statement given up while it is still being prepared never
+        // ran, and rightly leaves the transaction free to commit. On a busy
+        // machine the prepare alone can take the 20 ms.
+        let sleepy = "INSERT INTO given_up SELECT SLEEP(?) + 2";
+        tx.execute(sleepy, &[&0.0f64]).await.unwrap();
         // It still runs on the server, after the caller stopped waiting.
-        let late = timeout(
-            Duration::from_millis(20),
-            tx.execute("INSERT INTO given_up SELECT SLEEP(0.2) + 2", &[]),
-        )
-        .await;
+        let late = timeout(Duration::from_millis(20), tx.execute(sleepy, &[&0.2f64])).await;
         assert!(late.is_err());
         let e = tx.commit().await.unwrap_err();
         assert!(e.to_string().contains("given up"), "{e}");

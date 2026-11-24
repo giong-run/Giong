@@ -57,7 +57,7 @@ instructions per request.
 | `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 30,231 | 31,129 |
 | `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 241,317 | 242,171 |
 | `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 34,337 | 35,355 |
-| `web` | a giong-web router with a path parameter, raw client | 12,711 | 13,571 |
+| `web` | a giong-web router with a path parameter, raw client | 11,596 | 12,459 |
 | `redis-get` | giong-redis `GET` against a fake server | 8,349 | 8,926 |
 | `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,241 | 10,855 |
 | `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,711 | 14,326 |
