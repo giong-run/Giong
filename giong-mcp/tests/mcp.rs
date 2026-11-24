@@ -232,10 +232,11 @@ fn initialize_and_list_the_tools() {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            ["overview", "workers", "tasks", "sources", "profile"]
-        );
+        let mut expected = vec!["overview", "workers", "tasks", "sources", "profile"];
+        if cfg!(feature = "web") {
+            expected.push("routes");
+        }
+        assert_eq!(names, expected);
         for t in tools["result"]["tools"].as_array().unwrap() {
             // `profile` changes what the workers do while it measures.
             assert_eq!(t["annotations"]["readOnlyHint"], t["name"] != "profile");
@@ -862,5 +863,101 @@ fn a_panicking_source_is_not_a_stopped_worker() {
         assert!(error.contains("stats() went wrong"), "{error}");
         assert!(w["workers"][0]["snapshot_error"].is_null(), "{w}");
         task.abort();
+    });
+}
+
+/// The `routes` tool lists the giong-web apps the workers serve, grouping
+/// workers with the same routes.
+#[cfg(feature = "web")]
+#[test]
+fn routes_lists_the_apps_on_every_worker() {
+    use giong_web::{Error, Req, Response, Router};
+
+    async fn ok(_req: Req) -> Result<Response, Error> {
+        Ok(Response::text("ok"))
+    }
+
+    let rt = giong::Builder::new().workers(2).build().unwrap();
+    let handle = rt.handle();
+    let server = open().start(&handle).unwrap();
+    let addr = server.local_addr().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let h = handle.clone();
+    let test = thread::spawn(move || {
+        let outcome = std::panic::catch_unwind(|| {
+            // Both workers have built their apps.
+            ready_rx.recv().unwrap();
+            ready_rx.recv().unwrap();
+            let r = tool(addr, "routes", json!({}));
+            let apps = r["apps"].as_array().unwrap();
+            // Worker 0 serves an extra admin app; both serve the main one.
+            assert_eq!(apps.len(), 2, "{r}");
+            let main = apps
+                .iter()
+                .find(|a| a["workers"] == json!([0, 1]))
+                .expect("the shared app");
+            let routes = main["routes"].as_array().unwrap();
+            assert_eq!(routes.len(), 2);
+            assert_eq!(routes[0]["method"], "GET");
+            assert_eq!(routes[0]["pattern"], "/users/{id}");
+            assert_eq!(routes[0]["params"], json!(["id"]));
+            assert_eq!(routes[1]["method"], "PUT");
+            assert_eq!(routes[1]["pattern"], "/files/{*path}");
+            assert_eq!(routes[1]["catch_all"], true);
+            assert_eq!(routes[1]["stream_limit"], 4096);
+            assert!(routes[0]["added_at"]
+                .as_str()
+                .unwrap()
+                .contains("tests/mcp.rs:"));
+            let admin = apps
+                .iter()
+                .find(|a| a["workers"] == json!([0]))
+                .expect("worker 0's admin app");
+            assert_eq!(admin["routes"][0]["pattern"], "/admin");
+            assert!(r["unanswered"].as_array().unwrap().is_empty());
+            assert!(r.get("note").is_none());
+            // Arguments are refused.
+            let reply = rpc(
+                addr,
+                "tools/call",
+                json!({ "name": "routes", "arguments": { "x": 1 } }),
+            );
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+        });
+        h.shutdown();
+        let _ = done_tx.send(());
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    });
+    rt.run(move |w| {
+        let ready = ready_tx.clone();
+        async move {
+            let app = Router::new()
+                .get("/users/{id}", ok)
+                .put("/files/{*path}", ok)
+                .stream_bodies(4096)
+                .build(());
+            let admin = (w == 0).then(|| Router::new().get("/admin", ok).build(()));
+            ready.send(()).unwrap();
+            giong::shutdown_signal().await;
+            drop((app, admin));
+        }
+    })
+    .unwrap();
+    done_rx.recv().unwrap();
+    test.join().unwrap();
+    server.stop();
+}
+
+/// Without any giong-web app the answer says why the list is empty.
+#[cfg(feature = "web")]
+#[test]
+fn routes_without_an_app_says_so() {
+    with_service(open(), |addr, _| {
+        let r = tool(addr, "routes", json!({}));
+        assert!(r["apps"].as_array().unwrap().is_empty());
+        assert!(r["note"].as_str().unwrap().contains("no giong-web app"));
     });
 }
