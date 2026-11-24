@@ -1136,16 +1136,30 @@ fn slow_requests_name_the_route_that_blocks_the_worker() {
     use giong::observe::Route;
     static REPORT: Route = Route::from_static("GET /report");
     static FAST: Route = Route::from_static("GET /fast");
+    // `/fast` requests in their handler right now. `/report` blocks only
+    // while one is: on one worker, a hold that starts between `/fast`
+    // requests delays none of them (on macOS the four clients fell into
+    // step with the 1 ms timer, and every hold missed them).
+    static FAST_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
     let handler = |req: giong_http::Request| {
         let path = req.path().to_owned();
         async move {
+            use std::sync::atomic::Ordering::Relaxed;
             if path == "/report" {
                 observe::set_route(&REPORT);
+                for _ in 0..1000 {
+                    if FAST_IN_FLIGHT.load(Relaxed) > 0 {
+                        break;
+                    }
+                    giong::yield_now().await;
+                }
                 // A blocking call on the I/O worker.
                 std::thread::sleep(Duration::from_millis(40));
             } else {
                 observe::set_route(&FAST);
+                FAST_IN_FLIGHT.fetch_add(1, Relaxed);
                 giong::time::sleep(Duration::from_millis(1)).await;
+                FAST_IN_FLIGHT.fetch_sub(1, Relaxed);
             }
             giong_http::Response::text("ok")
         }
