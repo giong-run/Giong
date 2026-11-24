@@ -4,7 +4,8 @@
 //! you use several: [`RequestId`] first, so that everything after it knows
 //! the id; [`Logger`] next (or `Trace`, with the `tracing` feature), so that
 //! it sees every response, including those the others make; then [`Cors`],
-//! [`Compression`] and [`Timeout`].
+//! [`Compression`] and [`Timeout`]. [`Record`], for development only, writes
+//! whole requests and responses so that they can become tests.
 //!
 //! ```no_run
 //! use std::time::Duration;
@@ -25,6 +26,14 @@
 mod compression;
 mod cors;
 mod logger;
+// Recording is for development: a release build without the `dev` feature
+// has a `Record` that refuses to be made (record_off.rs), and none of the
+// recording code.
+#[cfg(any(debug_assertions, feature = "dev"))]
+mod record;
+#[cfg(not(any(debug_assertions, feature = "dev")))]
+#[path = "record_off.rs"]
+mod record;
 mod request_id;
 mod timeout;
 #[cfg(feature = "tracing")]
@@ -35,6 +44,7 @@ pub(crate) use compression::gunzip;
 pub use compression::Compression;
 pub use cors::Cors;
 pub use logger::Logger;
+pub use record::Record;
 pub use request_id::RequestId;
 pub use timeout::Timeout;
 #[cfg(feature = "tracing")]
