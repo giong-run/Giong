@@ -34,7 +34,9 @@ socket2 = { version = "0.6", features = ["all"] }
 libc = "0.2"
 
 [lints.rust]
-unsafe_code = "forbid"
+# One Windows-only module (src/noinherit.rs) needs a system call std does
+# not offer; everything else stays free of `unsafe`.
+unsafe_code = "deny"
 
 # The end-to-end tests run a real service (giong-web routes, giong-mcp) and
 # drive the `giong` binary against it. Unix only: giong-web does not build on

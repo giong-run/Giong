@@ -12,6 +12,8 @@ mod dotenv;
 mod hist;
 mod host;
 mod lint;
+#[cfg(windows)]
+mod noinherit;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
 mod loadgen;
@@ -21,9 +23,6 @@ mod report;
 mod scaffold;
 mod service;
 mod sha256;
-// Shared with giong dev, which moves its .giong files onto it separately;
-// until then a few helpers have no caller here.
-#[allow(dead_code)]
 mod state;
 mod template;
 mod watch;
