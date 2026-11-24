@@ -6,4 +6,3 @@
 #
 # ISSUE  TEST NAME (a Python regular expression, matched against the whole name libtest
 #        prints under "failures:")
-355 pool::a_connection_goes_back_closed_while_a_cancel_from_its_lease_is_on_its_way

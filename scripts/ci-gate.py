@@ -220,7 +220,9 @@ class Api:
             req.add_header("Accept", "application/vnd.github+json")
             req.add_header("X-GitHub-Api-Version", "2022-11-28")
             if self.token:
-                req.add_header("Authorization", f"Bearer {self.token}")
+                # Not sent on with a redirect: a job's log answers 302 to blob storage,
+                # whose signed URL needs no token (and must not get one).
+                req.add_unredirected_header("Authorization", f"Bearer {self.token}")
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     out = resp.read()
