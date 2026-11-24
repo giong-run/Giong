@@ -32,7 +32,9 @@ Each `giong dashboard` or `giong dev --ui` makes a random token, printed as part
 
 - `giong db up` starts each database with a random password and writes its URL to `.env`, which it makes readable by you only and lists in `.gitignore`.
 - Each checkout gets its own container, so two copies of a project never share a database; a container giong did not record is refused with `GIONG-E5049` instead of guessing its password.
-- `.env` is read in development only (`giong dev`, `giong test`); in production the service takes its settings from the environment. `giong env show` masks secret values.
+- `.env` is read in development only (`giong dev`, `giong test`); in production the service takes its settings from the environment. `giong env show` masks secret values, and a value only the process environment sets shows as `*** (set in the environment)`; `--reveal` prints them.
+- `giong db` ignores an entry in `.giong/db.json` that `giong db up` could not have written (another container runtime, another checkout's container, an unusual image or user), with the warning `GIONG-E5048`, so an edited file cannot point it at something else.
+- `giong db`, `giong env` and `giong bench` refuse to read or write `.env`, `.gitignore` or their `.giong` files through a symbolic link, and `giong image --add` takes a link only to a file inside the project.
 
 ## The install script checks what it downloads
 
