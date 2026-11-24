@@ -511,6 +511,19 @@ type OnSignal = std::sync::Arc<dyn Fn() + Send + Sync>;
 /// number so that it can leave again.
 static ON_SIGNAL: std::sync::Mutex<Vec<(u64, OnSignal)>> = std::sync::Mutex::new(Vec::new());
 
+/// Console events seen since a runtime started listening with none
+/// listening before it.
+static SIGNALS_SEEN: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// When the first of [`SIGNALS_SEEN`] came.
+static FIRST_SIGNAL_AT: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
+
+/// Events this soon after the first are the same press: Ctrl+C reaches
+/// every process of the console, and a wrapper that also passes one on
+/// (a file watcher, a dev server) makes a second arrive within
+/// milliseconds. Such an event neither asks again nor ends the process.
+const SAME_PRESS: std::time::Duration = std::time::Duration::from_millis(250);
+
 /// Called by Windows, on a thread it starts for the purpose, for Ctrl+C and
 /// Ctrl+Break, and when the console is closed or the user logs off or the
 /// system shuts down. `TRUE` says the event is handled, so the process is
@@ -522,6 +535,12 @@ static ON_SIGNAL: std::sync::Mutex<Vec<(u64, OnSignal)>> = std::sync::Mutex::new
 /// event at the latest. So for those the handler waits, which gives the
 /// runtimes that time to shut down; the process ends when its main thread
 /// does, or when Windows ends it.
+///
+/// Only the first event asks for a shutdown. A second one, while the
+/// shutdown has not finished, is left to the default handler, which ends
+/// the process, as a second `SIGINT` or `SIGTERM` does on Unix: a shutdown
+/// that hangs can still be stopped with a second Ctrl+C. An event less
+/// than [`SAME_PRESS`] after the first counts as the first again.
 unsafe extern "system" fn console_event(kind: u32) -> BOOL {
     let ends_process = matches!(
         kind,
@@ -530,12 +549,28 @@ unsafe extern "system" fn console_event(kind: u32) -> BOOL {
     if kind != CTRL_C_EVENT && kind != CTRL_BREAK_EVENT && !ends_process {
         return 0;
     }
+    let now = std::time::Instant::now();
+    let mut first_at = FIRST_SIGNAL_AT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    let first = SIGNALS_SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) == 0;
+    let again = match *first_at {
+        _ if first => {
+            *first_at = Some(now);
+            false
+        }
+        Some(at) if now.duration_since(at) < SAME_PRESS => true,
+        _ => return 0,
+    };
+    drop(first_at);
     let listeners: Vec<OnSignal> = match ON_SIGNAL.lock() {
         Ok(list) => list.iter().map(|(_, f)| f.clone()).collect(),
         Err(_) => return 0,
     };
-    for on_signal in &listeners {
-        on_signal();
+    if !again {
+        for on_signal in &listeners {
+            on_signal();
+        }
     }
     if ends_process && !listeners.is_empty() {
         // Longer than Windows waits (5 s for a closed console).
@@ -572,10 +607,16 @@ impl SignalGuard {
             return Err(std::io::Error::from_raw_os_error(code));
         }
         let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        ON_SIGNAL
+        let mut list = ON_SIGNAL
             .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .push((id, std::sync::Arc::new(on_signal)));
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Forget events from before any runtime listened. Not while another
+        // runtime listens: one whose shutdown hangs must still be stopped
+        // by the next Ctrl+C.
+        if list.is_empty() {
+            SIGNALS_SEEN.store(0, std::sync::atomic::Ordering::SeqCst);
+        }
+        list.push((id, std::sync::Arc::new(on_signal)));
         Ok(SignalGuard { id })
     }
 }
@@ -707,11 +748,22 @@ pub(crate) enum AcceptWake {
 /// socket, and be told to stop.
 ///
 /// The wait is a `select` on the listener and on a datagram socket that is
-/// connected to itself: [`stop`](Self::stop) sends that socket a byte,
-/// which nobody reads, so it stays readable. `select` reports what is true
-/// at the moment it is asked, so a connection that arrives at any point is
+/// connected to itself: [`stop`](Self::stop) sets a flag and sends that
+/// socket a byte, so that a wait returns. `select` reports what is true at
+/// the moment it is asked, so a connection that arrives at any point is
 /// seen by the next wait (an event object set by `WSAEventSelect` can be
 /// reset past one).
+///
+/// Only the flag stops the thread. A datagram is not proof of a `stop`:
+/// any program on the machine can see the socket's port, and Windows lets
+/// another socket bind the wildcard address on that port (even with
+/// `SO_EXCLUSIVEADDRUSE` on this one) and send from there with this
+/// socket's own address as the source. One datagram would then have ended
+/// the thread for good, and every listener of the shared address would
+/// have stopped taking connections. So a datagram without the flag is read
+/// and ignored. The bind is exclusive all the same, so that no socket can
+/// take over the address itself, and with it the byte of `stop` (the flag
+/// is also looked at every 100 ms).
 pub(crate) struct AcceptEvents {
     listener: RawSock,
     wake: RawSock,
@@ -746,6 +798,22 @@ impl AcceptEvents {
                 wake,
                 stopped: std::sync::atomic::AtomicBool::new(false),
             };
+            let on: BOOL = 1;
+            if WinSock::setsockopt(
+                wake,
+                WinSock::SOL_SOCKET,
+                WinSock::SO_EXCLUSIVEADDRUSE,
+                (&on as *const BOOL).cast(),
+                mem::size_of::<BOOL>() as i32,
+            ) != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Non-blocking, so that `select` can read it empty.
+            let mut nonblocking = 1u32;
+            if WinSock::ioctlsocket(wake, WinSock::FIONBIO, &mut nonblocking) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
             let mut addr: WinSock::SOCKADDR_IN = std::mem::zeroed();
             addr.sin_family = WinSock::AF_INET;
             addr.sin_addr.S_un.S_addr = u32::from_ne_bytes([127, 0, 0, 1]);
@@ -782,10 +850,7 @@ impl AcceptEvents {
         if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
             return AcceptWake::Stop;
         }
-        match self.select(ms, false) {
-            AcceptWake::Accept => AcceptWake::Stop,
-            woke => woke,
-        }
+        self.select(ms, false)
     }
 
     fn wait_once(&self, timeout: u32) -> AcceptWake {
@@ -825,14 +890,40 @@ impl AcceptEvents {
             }
             let set = &read.fd_array[..(read.fd_count as usize).min(2)];
             if ready > 0 && set.contains(&self.wake) {
-                AcceptWake::Stop
-            } else if ready > 0 {
+                self.drain();
+                if self.stopped.load(std::sync::atomic::Ordering::Acquire) {
+                    return AcceptWake::Stop;
+                }
+            }
+            if ready > 0 && set.contains(&self.listener) {
                 AcceptWake::Accept
             } else {
                 AcceptWake::Timeout
             }
         }
     }
+
+    /// Reads what waits on the wake socket, so that a datagram that came
+    /// without [`stop`](Self::stop) does not keep every wait short. At most
+    /// [`DRAIN_MAX`](Self::DRAIN_MAX) datagrams per wait: a program that
+    /// floods the socket must not keep the thread from the listener, which
+    /// the same `select` reports.
+    fn drain(&self) {
+        let mut buf = [0u8; 16];
+        for _ in 0..Self::DRAIN_MAX {
+            // SAFETY: a local buffer of the size given; the socket is open
+            // while `self` lives and does not block.
+            let n = unsafe { WinSock::recv(self.wake, buf.as_mut_ptr(), buf.len() as i32, 0) };
+            // A longer datagram is cut to the buffer and taken all the same.
+            // SAFETY: plain call.
+            if n < 0 && unsafe { WinSock::WSAGetLastError() } != WinSock::WSAEMSGSIZE {
+                return;
+            }
+        }
+    }
+
+    /// Datagrams [`drain`](Self::drain) reads per wait.
+    const DRAIN_MAX: usize = 64;
 
     /// Makes [`wait`](Self::wait) return [`AcceptWake::Stop`], now and
     /// from here on.
@@ -1013,6 +1104,58 @@ pub(crate) fn hosts_path() -> std::path::PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// The first Ctrl+C asks the runtimes to shut down and keeps the
+    /// process; one within the same press is handled again, a later one is
+    /// left to the default handler, which ends it. Listening again, with
+    /// nobody listening in between, starts the count over.
+    #[test]
+    fn only_the_first_console_event_is_handled() {
+        use windows_sys::Win32::System::Console::CTRL_C_EVENT;
+        let asked = Arc::new(AtomicUsize::new(0));
+        let listener = |asked: &Arc<AtomicUsize>| {
+            let seen = asked.clone();
+            move || {
+                seen.fetch_add(1, Ordering::SeqCst);
+            }
+        };
+        let after_same_press = || std::thread::sleep(super::SAME_PRESS * 2);
+        let guard = super::SignalGuard::install(listener(&asked)).unwrap();
+        // SAFETY: plain calls of the handler; nothing ends the process.
+        unsafe {
+            assert_eq!(super::console_event(CTRL_C_EVENT), 1, "first is handled");
+            assert_eq!(
+                super::console_event(CTRL_C_EVENT),
+                1,
+                "the same press passed on by a wrapper is handled"
+            );
+            assert_eq!(asked.load(Ordering::SeqCst), 1, "and asks only once");
+            after_same_press();
+            assert_eq!(
+                super::console_event(CTRL_C_EVENT),
+                0,
+                "second ends the process"
+            );
+        }
+        assert_eq!(asked.load(Ordering::SeqCst), 1);
+
+        // A second runtime that starts listening while the first one's
+        // shutdown hangs does not make the next event a first again.
+        let other = super::SignalGuard::install(listener(&asked)).unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { super::console_event(CTRL_C_EVENT) }, 0);
+        drop(other);
+        drop(guard);
+
+        // With nobody listening in between, a new runtime starts afresh.
+        let _guard = super::SignalGuard::install(listener(&asked)).unwrap();
+        // SAFETY: as above.
+        assert_eq!(unsafe { super::console_event(CTRL_C_EVENT) }, 1);
+        assert_eq!(asked.load(Ordering::SeqCst), 2);
+    }
+
     /// A thread's event for blocking transfers is closed when the thread
     /// ends: the blocking pool starts and ends threads all the time, and an
     /// event left behind by each was one handle more for good.
@@ -1022,5 +1165,66 @@ mod tests {
             .join()
             .unwrap();
         assert!(super::closed_events().lock().unwrap().contains(&event));
+    }
+
+    /// The thread that hands out the connections of a shared port stops
+    /// for `stop` only. A datagram that reaches its wake socket some other
+    /// way is read and ignored: one sent by the socket itself, which is
+    /// what another socket can forge, and, where Windows lets a socket bind
+    /// the wildcard address on the wake socket's port (real Windows does,
+    /// Wine does not), one forged from there.
+    #[test]
+    fn only_stop_ends_a_wait_for_connections() {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Networking::WinSock;
+
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let events = super::AcceptEvents::new(listener.as_raw_socket() as super::RawSock).unwrap();
+
+        // SAFETY: plain data, filled in by the call.
+        let mut addr: WinSock::SOCKADDR_IN = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<WinSock::SOCKADDR_IN>() as i32;
+        // SAFETY: an open socket; the address is a local of the size given.
+        let rc = unsafe {
+            WinSock::getsockname(
+                events.wake,
+                (&mut addr as *mut WinSock::SOCKADDR_IN).cast(),
+                &mut len,
+            )
+        };
+        assert_eq!(rc, 0);
+        let port = u16::from_be(addr.sin_port);
+        if let Ok(forger) = std::net::UdpSocket::bind(("0.0.0.0", port)) {
+            for _ in 0..3 {
+                forger.send_to(&[7], ("127.0.0.1", port)).unwrap();
+                assert_eq!(events.wait(Some(20)), super::AcceptWake::Timeout);
+            }
+        }
+
+        for _ in 0..3 {
+            // SAFETY: one byte from a local, to the socket's own address.
+            let sent = unsafe { WinSock::send(events.wake, [7u8].as_ptr(), 1, 0) };
+            assert_eq!(sent, 1);
+            assert_eq!(events.wait(Some(20)), super::AcceptWake::Timeout);
+            assert_eq!(events.pause(20), super::AcceptWake::Timeout);
+        }
+        // A flood of them does not hide a connection: the listener is
+        // reported by the same wait.
+        for _ in 0..4 * super::AcceptEvents::DRAIN_MAX {
+            // SAFETY: as above.
+            unsafe { WinSock::send(events.wake, [7u8].as_ptr(), 1, 0) };
+        }
+        let _peer = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let started = std::time::Instant::now();
+        while events.wait(Some(5_000)) != super::AcceptWake::Accept {
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(5),
+                "never saw the connection"
+            );
+        }
+
+        events.stop();
+        assert_eq!(events.wait(None), super::AcceptWake::Stop);
+        assert_eq!(events.pause(20), super::AcceptWake::Stop);
     }
 }

@@ -460,3 +460,49 @@ fn mistakes_in_the_routes_panic_with_a_code_and_where() {
     });
     assert!(msg.contains("a prefix cannot end with `/`"), "{msg}");
 }
+
+/// Parameters come out the same whatever form the target has (a path, a
+/// whole URL, a URL with no path) and however many the pattern has.
+#[test]
+fn parameters_are_read_from_every_form_of_target_and_any_count() {
+    async fn all(req: Req) -> Result<Response, Error> {
+        let names = ["a", "b", "c", "d", "e", "f"];
+        let got: Vec<&str> = names.iter().map(|n| req.param_raw(n).unwrap()).collect();
+        Ok(Response::text(got.join(",")))
+    }
+    async fn rest(req: Req) -> Result<Response, Error> {
+        Ok(Response::text(format!("[{}]", req.param_raw("rest")?)))
+    }
+    let app = Router::new()
+        .get("/users/{id}", user)
+        .get("/six/{a}/{b}/{c}/{d}/{e}/{f}", all)
+        .get("/files/{*path}", file)
+        .get("/{*rest}", rest)
+        .get("/", me)
+        .build(());
+    for (target, want) in [
+        ("/users/42", "user 42"),
+        ("/users/42?x=/users/7", "user 42"),
+        ("http://test/users/42", "user 42"),
+        ("http://test/users/42?x=1", "user 42"),
+        (
+            "/six/1/22/333/4444/55555/666666?q",
+            "1,22,333,4444,55555,666666",
+        ),
+        ("http://test/six/1/2/3/4/5/6", "1,2,3,4,5,6"),
+        ("/files/a/b%20c.txt", "a/b c.txt"),
+        ("http://test/files/a/b.txt?v=2", "a/b.txt"),
+        ("/x/y", "[x/y]"),
+        ("http://test/x?q=/y", "[x]"),
+        // The `/` of a URL with no path is not in the target.
+        ("http://test", "me"),
+        ("http://test?q=1", "me"),
+    ] {
+        let resp = call(&app, "GET", target);
+        assert_eq!(
+            (resp.status(), body(&resp)),
+            (200, want.to_string()),
+            "{target}"
+        );
+    }
+}

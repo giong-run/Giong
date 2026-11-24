@@ -47,20 +47,20 @@ instructions per request.
 | `spawn` | spawn a task that returns at once and await it | 1,405 | 1,124 |
 | `yield` | `yield_now`: one trip through the run queue | 501 | 361 |
 | `oneshot` | a oneshot channel: create, send, receive | 280 | 280 |
-| `channel` | a round trip between two tasks over two bounded channels | 1,764 | 1,484 |
+| `channel` | a round trip between two tasks over two bounded channels | 1,721 | 1,446 |
 | `timeout` | a timeout around a future that is ready at once | 100 | 100 |
 | `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,624 | 4,510 |
 | `udp-echo` | a 64-byte datagram to an echo task and back | 4,138 | 4,832 |
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 196 | 248 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 9,416 | 10,276 |
-| `http1-client` | giong-http client and server, HTTP/1.1 | 30,939 | 31,990 |
-| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 43,563 | 44,449 |
-| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 373,372 | 374,185 |
-| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 43,175 | 44,191 |
-| `web` | a giong-web router with a path parameter, raw client | 13,381 | 14,254 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 8,642 | 9,507 |
+| `http1-client` | giong-http client and server, HTTP/1.1 | 22,139 | 23,184 |
+| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 30,231 | 31,129 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 241,317 | 242,171 |
+| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 34,251 | 35,268 |
+| `web` | a giong-web router with a path parameter, raw client | 11,596 | 12,459 |
 | `redis-get` | giong-redis `GET` against a fake server | 8,349 | 8,926 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,224 | 10,838 |
-| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 14,137 | 14,751 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,241 | 10,855 |
+| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,711 | 14,326 |
 
 `udp-echo` went down with the UDP changes of 0.9 (#139, #142): 5,358 to 4,137 on io_uring and
 5,031 to 4,783 on epoll, counted with glibc's malloc as all counts were until 2026-11-20, with
@@ -85,6 +85,11 @@ in time, the epoll round trip got faster (`bench/core.sh` `tcp-rr` 5,741 to 5,30
 idle connection takes one allocation fewer (two with TLS); the task and its future now share
 one. Its heap grew by 40 to 64 bytes for `idle-http1` and `idle-h2` (1.0% to 2.7%), and moved
 by less than 20 bytes for `idle-https`.
+
+#227 (a channel receive or send that is ready at once counts against the task's budget)
+also stopped the bounded channel calling its grant and wake-up functions when no sender
+waits: `channel` 1,756 to 1,721 on io_uring and 1,481 to 1,446 on epoll, measured on the
+same machine before and after; the other cases did not move by more than 0.02%.
 
 ### The allocator is not counted as glibc's
 

@@ -357,6 +357,11 @@ fn a_send_the_server_does_not_take_ends_at_the_deadline() {
         }
         giong::spawn(async move { giong_http::Server::new().serve(listener, NeverReads).await });
         let client = TestServiceClient::new(channel(&base));
+        // The deadline runs from the call's start, so the wait is measured
+        // from there too: everything between the two comes out of the
+        // 300 ms. Measured from after it, a runner that stalled the thread
+        // there for 114 ms saw 186 ms (macOS CI).
+        let started = Instant::now();
         let (mut requests, _responses) =
             client.full_duplex_call(CallOptions::new().timeout(Duration::from_millis(300)));
         let body = vec![0u8; 64 * 1024];
@@ -368,7 +373,6 @@ fn a_send_the_server_does_not_take_ends_at_the_deadline() {
             payload: Some(&payload),
             ..Default::default()
         };
-        let started = Instant::now();
         let status = loop {
             if let Err(status) = requests.send(&request).await {
                 break status;
