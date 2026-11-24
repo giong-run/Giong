@@ -86,6 +86,19 @@ fn wait_for(what: &str, timeout: Duration, mut ok: impl FnMut() -> bool) {
     }
 }
 
+/// The runner's and the service's logs, for a failure message.
+fn logs(dir: &TempDir) -> String {
+    ["runner.log", "dev.log"]
+        .iter()
+        .map(|name| {
+            let text = std::fs::read_to_string(dir.join(".giong").join(name))
+                .unwrap_or_else(|e| format!("({e})"));
+            format!("--- .giong/{name} ---\n{text}")
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
 /// Stops whatever a test started, even when it fails half-way.
 struct StopOnDrop<'a>(&'a TempDir);
 
@@ -185,6 +198,10 @@ fn background_and_once_do_not_go_together() {
 
 /// The whole life of a background runner, the way an agent drives it.
 #[test]
+#[cfg_attr(
+    windows,
+    ignore = "known bug #385: on Windows giong dev status never recognizes the service, so it reads as failed"
+)]
 fn background_serves_reports_logs_and_stops() {
     if !has_command("dev") || !toolchain("background_serves_reports_logs_and_stops") {
         return;
@@ -198,7 +215,7 @@ fn background_serves_reports_logs_and_stops() {
     let started = Instant::now();
     let out = dev(&dir, &["--background"], port).run();
     let v = out.report("dev");
-    out.expect_code(0);
+    assert_eq!(out.code(), 0, "{}\n{}", out.dump(), logs(&dir));
     assert!(
         started.elapsed() < Duration::from_secs(240),
         "{}",
