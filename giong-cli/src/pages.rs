@@ -3024,4 +3024,292 @@ With `--lan`, `giong dev` keeps the address as written and the warning says that
 
 [All error codes](README.md)
 "#),
+    (5030, r#"# GIONG-E5030: the project name is not valid
+
+Raised by the `giong` command (giong-cli): `giong new`. In JSON output: `"code": "GIONG-E5030"`.
+
+## What happened
+
+The name of the new project (the last part of its path, or `--name`) cannot be used. It must start with a letter a-z, hold only lower-case letters, digits, `-` and `_`, end with a letter or a digit, be at most 64 characters, and not be a Rust keyword (`fn`, `async`), the name of a crate the project depends on (`giong`, `giong-web`, `serde`), a name Cargo keeps (`test`, `build`) or a device name of Windows (`con`, `nul`, `com1`). The one name is the package, the binary, the directory and, with `_` for `-`, the crate, so it has to work as all four. Nothing was written.
+
+## How to fix it
+
+- Use the name the message suggests, such as `user-service` or `my-api`.
+- To keep a directory name the package cannot have, give the package its own: `giong new My.Api --name my-api`.
+
+[All error codes](README.md)
+"#),
+    (5031, r#"# GIONG-E5031: the directory for the new project is not empty
+
+Raised by the `giong` command (giong-cli): `giong new`. In JSON output: `"code": "GIONG-E5031"`.
+
+## What happened
+
+`giong new` writes into a directory that does not exist yet or is empty, and this one holds files (or is a file, or cannot be read). It never replaces a file, so nothing was written.
+
+## How to fix it
+
+- Choose another path: `giong new api-2`.
+- To add the files coding agents read to a project you already have, run `giong ai init` inside it instead.
+
+[All error codes](README.md)
+"#),
+    (5032, r#"# GIONG-E5032: the template does not offer that choice
+
+Raised by the `giong` command (giong-cli): `giong new`. In JSON output: `"code": "GIONG-E5032"`.
+
+## What happened
+
+The template, a store in `--db`, or the combination asked for is not one `giong new` offers: the templates are `web`, `grpc` and `worker`; the stores `postgres`, `mysql` and `redis`. A project takes one SQL database (postgres or mysql, with redis besides it in `web`); the `worker` template takes its jobs from one store and serves nothing, so it has no `--tls`; the `grpc` template has no database example yet. Nothing was written.
+
+## How to fix it
+
+- Use one of the choices the message names; `giong new --help` lists them.
+- For a gRPC service with a database, start from `--template grpc` and add the pool to the service struct by hand, built in each worker as `src/main.rs` of the `web` template does.
+
+[All error codes](README.md)
+"#),
+    (5033, r#"# GIONG-E5033: a file of the project could not be written
+
+Raised by the `giong` command (giong-cli): `giong new` and `giong ai init`. In JSON output: `"code": "GIONG-E5033"`.
+
+## What happened
+
+A directory or file could not be created: no permission, a full disk, a path that is too long, or a file where a directory has to go. `giong new` removes what it had written, so no half project is left behind; `giong ai init` reports the file and goes on with the others. The same code names a bug in giong-cli's own templates, which the message then says.
+
+## How to fix it
+
+- Check that you may write to the directory and that the disk has space, then run the command again.
+- If the message says the templates have a bug, report it at https://github.com/giong-run/Giong/issues with the command you ran.
+
+[All error codes](README.md)
+"#),
+    (5034, r#"# GIONG-E5034: the project's crates do not build on Windows
+
+Raised by the `giong` command (giong-cli): `giong new`, on Windows. In JSON output: `"code": "GIONG-E5034"`.
+
+## What happened
+
+The project was written, but on Windows giong 1.x builds only the runtime crate (`giong`). giong-web, giong-grpc, giong-mcp and the database crates, which every template uses, need Linux or macOS.
+
+## How to fix it
+
+- Work on the project in WSL 2: `wsl --install`, then install Rust and giong-cli inside it and run `giong new` there.
+- Or work on Linux or macOS; production runs on Linux in any case.
+
+[All error codes](README.md)
+"#),
+    (5035, r#"# GIONG-E5035: --giong-path is not a giong checkout
+
+Raised by the `giong` command (giong-cli): `giong new`. In JSON output: `"code": "GIONG-E5035"`.
+
+## What happened
+
+`--giong-path` makes the new project depend on the giong crates of a checkout by path instead of crates.io (for working on giong itself, and for giong's own CI). The directory given does not exist or is not a checkout of giong: it has no root `Cargo.toml` for the `giong` package with `giong-web/` beside it. Nothing was written.
+
+## How to fix it
+
+- Give the directory of a clone of https://github.com/giong-run/Giong (the one holding its root `Cargo.toml`).
+- Leave the flag out to use the released crates.
+
+[All error codes](README.md)
+"#),
+    (5036, r#"# GIONG-E5036: an agent file exists that giong did not write
+
+Raised by the `giong` command (giong-cli): `giong ai init` (also run by `giong new`). In JSON output: `"code": "GIONG-E5036"`.
+
+## What happened
+
+A file `giong ai init` would write is already there, and giong cannot tell that it is its own, so it was left exactly as it is: `.cursor/rules/giong.mdc` or `.claude/skills/giong/SKILL.md` without the `<!-- giong:owned -->` line, or an `AGENTS.md` or `CLAUDE.md` with a `<!-- giong:begin` marker but no `<!-- giong:end -->` after it. The other files were written.
+
+## How to fix it
+
+- To get giong's version of a whole file, move yours away (or put back its `<!-- giong:owned -->` line) and run `giong ai init` again.
+- In `AGENTS.md` or `CLAUDE.md`, delete the stray giong marker or close the block; giong keeps everything outside its block.
+- To keep your own file, do nothing: the warning repeats on each run, nothing else happens.
+
+[All error codes](README.md)
+"#),
+    (5037, r#"# GIONG-E5037: .mcp.json is not valid JSON
+
+Raised by the `giong` command (giong-cli): `giong ai init` (also run by `giong new`). In JSON output: `"code": "GIONG-E5037"`.
+
+## What happened
+
+`giong ai init` adds the `giong` MCP server (this command over stdio) to `.mcp.json`, keeping every other server and key. The file is not one JSON object with an object under `mcpServers`, so giong left it untouched rather than guess.
+
+## How to fix it
+
+- Fix the JSON (the message gives the line and column), then run `giong ai init` again.
+- Or add the servers by hand: `"giong": {"command": "giong", "args": ["mcp"]}` under `mcpServers`.
+
+[All error codes](README.md)
+"#),
+    (5038, r#"# GIONG-E5038: the project uses another giong version than this command
+
+Raised by the `giong` command (giong-cli): `giong ai init`. In JSON output: `"code": "GIONG-E5038"`.
+
+## What happened
+
+The project depends on a giong `major.minor` other than the one this `giong` command comes with. The skill and the rules `giong ai init` writes describe the command's release, so an agent may use an API the project's version lacks, or miss one it has. The files were written anyway.
+
+## How to fix it
+
+- Install the command that matches the project: `cargo install giong-cli --version ~1.4` for a project on giong 1.4, then run `giong ai init` again.
+- Or move the project to the command's version: change the giong versions in `Cargo.toml`, then `cargo update`.
+
+[All error codes](README.md)
+"#),
+    (5039, r#"# GIONG-E5039: the project does not depend on giong
+
+Raised by the `giong` command (giong-cli): `giong ai init`. In JSON output: `"code": "GIONG-E5039"`.
+
+## What happened
+
+No package of the workspace has `giong` in its `[dependencies]`, so the rules written for agents may not apply here. The files were written anyway, so a project about to move to giong can have them first.
+
+## How to fix it
+
+- `cargo add giong` (and the giong crates you need), or start from a template with `giong new`.
+- If this is not a giong project, delete the giong block from `AGENTS.md` and `CLAUDE.md` and the files `.cursor/rules/giong.mdc` and `.claude/skills/giong/`.
+
+[All error codes](README.md)
+"#),
+    (5080, r#"# GIONG-E5080: the project has changes that are not committed
+
+Raised by the `giong` command (giong-cli): `giong fix`. In JSON output: `"code": "GIONG-E5080"`.
+
+## What happened
+
+`giong fix` edits source files, and the project's git repository has changes that are not committed. Mixing its edits with yours would make them hard to tell apart or undo, so nothing was changed.
+
+## How to fix it
+
+- Commit or stash your changes first, then run `giong fix`.
+- Or pass `--allow-dirty` to apply the fixes on top of them; `--dry-run` shows the edits first.
+
+[All error codes](README.md)
+"#),
+    (5081, r#"# GIONG-E5081: cargo could not apply its fixes
+
+Raised by the `giong` command (giong-cli): `giong fix`. In JSON output: `"code": "GIONG-E5081"`.
+
+## What happened
+
+`giong fix` runs `cargo clippy --fix` for the compiler's and clippy's machine-applicable suggestions, and it failed: usually because the code does not compile, so there is nothing for it to check. The fixes giong finds itself were still applied when they could be.
+
+## How to fix it
+
+- Run `giong check` to see the first error, fix it by hand, then run `giong fix` again.
+- The message carries the first line cargo printed.
+
+[All error codes](README.md)
+"#),
+    (5082, r#"# GIONG-E5082: a fix no longer matches the code
+
+Raised by the `giong` command (giong-cli): `giong fix`. In JSON output: `"code": "GIONG-E5082"`.
+
+## What happened
+
+A fix found by `giong check` names bytes of a file that no longer hold the code it was found in (the file changed after the check), or two fixes change the same code. That fix was not applied; the others were.
+
+## How to fix it
+
+- Run `giong fix` again: it checks the code afresh first.
+- If it repeats, apply the fix by hand from `giong check`'s message.
+
+[All error codes](README.md)
+"#),
+    (5083, r#"# GIONG-E5083: a test failed
+
+Raised by the `giong` command (giong-cli): `giong test`. In JSON output: `"code": "GIONG-E5083"`.
+
+## What happened
+
+A test failed. `giong test` runs the suite on the default driver (io_uring on Linux when the kernel allows it), then again with `GIONG_DRIVER=epoll`, because containers with Docker's default seccomp profile get epoll. The finding names the test, the driver it failed on and what it printed.
+
+## How to fix it
+
+- Run that one test with its output: `cargo test <name> -- --nocapture` (add `GIONG_DRIVER=epoll` in front when it failed only on epoll).
+- A test that fails only on one driver often reads one message with one `recv()`. TCP keeps no message boundaries: read until the whole message is in (`read_exact`, or a framed reader).
+- A test that needs a database reads `DATABASE_URL` or `REDIS_URL`. `giong test` loads them from `.env`; `giong db up` writes them there.
+
+[All error codes](README.md)
+"#),
+    (5084, r#"# GIONG-E5084: the tests could not run on every driver
+
+Raised by the `giong` command (giong-cli): `giong test`. In JSON output: `"code": "GIONG-E5084"`.
+
+## What happened
+
+`giong test` ran the suite once. On Linux it runs it a second time with `GIONG_DRIVER=epoll`, the driver containers get when io_uring is blocked. The epoll driver exists only on Linux, so on macOS and Windows that second run was left out. This is a note, not an error.
+
+## How to fix it
+
+- Run `giong test` on Linux, or let CI run it there, before you ship to a Linux server or container.
+- Projects made by `giong new` already run both drivers in their CI workflow.
+
+[All error codes](README.md)
+"#),
+    (5085, r#"# GIONG-E5085: cargo-nextest is not installed
+
+Raised by the `giong` command (giong-cli): `giong test --nextest`. In JSON output: `"code": "GIONG-E5085"`.
+
+## What happened
+
+`--nextest` runs the suite with `cargo nextest run`, but `cargo nextest --version` did not work, so cargo-nextest is not installed for this toolchain.
+
+## How to fix it
+
+- Install it: `cargo install cargo-nextest --locked`.
+- Or leave out `--nextest`: `giong test` then runs `cargo test`.
+
+[All error codes](README.md)
+"#),
+    (5086, r#"# GIONG-E5086: the tests took longer than the time limit
+
+Raised by the `giong` command (giong-cli): `giong test`. In JSON output: `"code": "GIONG-E5086"`.
+
+## What happened
+
+A run of the suite went on longer than `--timeout` seconds (1800 by default), so `giong test` stopped cargo and every test process it had started. The finding names the tests libtest reported as running for over 60 seconds. A test that waits for a reply, a lock or a message that never comes runs for ever.
+
+## How to fix it
+
+- Run the named test alone: `cargo test <name> -- --nocapture`, and see where it waits.
+- Give every wait for another party a deadline: `giong::time::timeout(duration, fut)`. A test then fails with the reason instead of hanging.
+- For a suite that is slow rather than stuck, raise the limit: `giong test --timeout 3600`, or `--timeout 0` for none.
+
+[All error codes](README.md)
+"#),
+    (5087, r#"# GIONG-E5087: git init failed in the new project
+
+Raised by the `giong` command (giong-cli): `giong new`. In JSON output: `"code": "GIONG-E5087"`.
+
+## What happened
+
+`giong new` wrote every file of the project, then ran `git init` in it, and that failed (the message says why: often git is not installed, or the directory is inside a repository that git refuses to nest in). The project itself is complete. This is a warning.
+
+## How to fix it
+
+- Install git and run `git init` in the project, or leave it out: `giong new --no-git`.
+- `giong fix` refuses to run on changes that are not committed, so a project without git needs `giong fix --allow-dirty`.
+
+[All error codes](README.md)
+"#),
+    (5088, r#"# GIONG-E5088: .env sets a cargo or rustc setting
+
+Raised by the `giong` command (giong-cli): `giong test`. In JSON output: `"code": "GIONG-E5088"`.
+
+## What happened
+
+`.env` holds the service's configuration (`DATABASE_URL`, `REDIS_URL`, ...), and `giong test` gives its variables to the tests. A variable that changes how cargo or rustc build (`RUSTFLAGS`, `RUSTDOCFLAGS`, anything starting with `CARGO`, `RUSTC` or `RUSTUP_`) would change the build of the tests, and only under `giong test`, so it was left out.
+
+## How to fix it
+
+- Put build settings where cargo reads them for every command: `.cargo/config.toml` (`[build] rustflags = [...]`, `[build] target-dir = "..."`), or the shell.
+- Delete the variable from `.env`.
+
+[All error codes](README.md)
+"#),
 ];

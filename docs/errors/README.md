@@ -289,3 +289,22 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5022](E5022.md) | `DevRunning` | giong dev already serves this project |
 | [GIONG-E5023](E5023.md) | `CompilerWarning` | the compiler has a warning |
 | [GIONG-E5024](E5024.md) | `ListensOnNetwork` | the service would listen on every network interface |
+| [GIONG-E5030](E5030.md) | `BadProjectName` | the project name is not valid |
+| [GIONG-E5031](E5031.md) | `TargetNotEmpty` | the directory for the new project is not empty |
+| [GIONG-E5032](E5032.md) | `BadTemplateChoice` | the template does not offer that choice |
+| [GIONG-E5033](E5033.md) | `WriteFailed` | a file of the project could not be written |
+| [GIONG-E5034](E5034.md) | `WindowsLimited` | the project's crates do not build on Windows |
+| [GIONG-E5035](E5035.md) | `BadGiongPath` | --giong-path is not a giong checkout |
+| [GIONG-E5036](E5036.md) | `AgentFileForeign` | an agent file exists that giong did not write |
+| [GIONG-E5037](E5037.md) | `McpJsonInvalid` | .mcp.json is not valid JSON |
+| [GIONG-E5038](E5038.md) | `VersionMismatch` | the project uses another giong version than this command |
+| [GIONG-E5039](E5039.md) | `NotGiongProject` | the project does not depend on giong |
+| [GIONG-E5080](E5080.md) | `FixDirty` | the project has changes that are not committed |
+| [GIONG-E5081](E5081.md) | `FixFailed` | cargo could not apply its fixes |
+| [GIONG-E5082](E5082.md) | `FixConflict` | a fix no longer matches the code |
+| [GIONG-E5083](E5083.md) | `TestFailed` | a test failed |
+| [GIONG-E5084](E5084.md) | `DriverNotHere` | the tests could not run on every driver |
+| [GIONG-E5085](E5085.md) | `NextestMissing` | cargo-nextest is not installed |
+| [GIONG-E5086](E5086.md) | `TestTimeout` | the tests took longer than the time limit |
+| [GIONG-E5087](E5087.md) | `GitInitFailed` | git init failed in the new project |
+| [GIONG-E5088](E5088.md) | `DotenvBuildSetting` | .env sets a cargo or rustc setting |

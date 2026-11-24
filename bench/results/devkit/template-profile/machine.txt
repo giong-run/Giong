@@ -1,0 +1,2 @@
+machine: 4 vCPU, 6.18.44-fc-v726, rustc 1.100.0 (0ef1bc386 2026-11-09)
+giong: a3b65bd

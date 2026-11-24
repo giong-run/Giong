@@ -1,0 +1,26 @@
+# docker build -t {{name}} .
+{{#if worker}}
+# docker run --rm --ulimit memlock=-1:-1 {{name}}
+{{#else}}
+# docker run --rm --ulimit memlock=-1:-1 -p {{default_port}}:{{default_port}} {{name}}
+{{/if}}
+#
+# Docker's default seccomp profile blocks io_uring, so giong runs on epoll in
+# the container and says so once on stderr; README.md shows how to allow
+# io_uring. `--ulimit memlock=-1:-1` lets each worker lock the memory of its
+# ring (Linux 6.14 to 7.2).
+
+FROM rust:1-bookworm AS build
+WORKDIR /src
+COPY . .
+RUN cargo build --release && cp target/release/{{name}} /{{name}}
+
+FROM gcr.io/distroless/cc-debian12
+COPY --from=build /{{name}} /{{name}}
+{{#if !worker}}
+# Every interface: the container's own network is the boundary.
+ENV LISTEN=0.0.0.0:{{default_port}}
+EXPOSE {{default_port}}
+{{/if}}
+USER nonroot
+ENTRYPOINT ["/{{name}}"]
