@@ -9,14 +9,14 @@ use std::net::Shutdown;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
 use crate::config::Config;
 use crate::connect::{self, Identity, Message, ReadBuf, Startup, Stream};
 use crate::error::{DbError, Error, ErrorKind};
-use crate::protocol::{self, com, status, ColumnDef, Reader};
+use crate::protocol::{self, com, status, Reader};
 use crate::row::{Column, ResultSet, Row, RowsBuilder};
 use crate::session;
 use crate::types::{ColumnType, ToSql};
@@ -171,6 +171,9 @@ struct Conn {
     /// Set once the connection has failed, for [`CancelToken`]s on other
     /// threads.
     closed: Arc<AtomicBool>,
+    /// While a pool lends the connection to one task: the flag its cancel
+    /// tokens check, cleared when the connection goes back.
+    lease: RefCell<Option<Arc<Lease>>>,
     /// The default database changed since the session was last set up.
     schema_changed: Cell<bool>,
     /// Where the pool counts what happens on its connections.
@@ -183,6 +186,134 @@ struct Conn {
     shared: Cell<bool>,
     /// Woken when nothing is in flight any more, or the connection fails.
     idle_wakers: RefCell<Vec<Waker>>,
+    /// Prepares take turns while the server is at its
+    /// `max_prepared_stmt_count`.
+    turn: Turn,
+    /// When a prepare last succeeded in its turn.
+    turn_progress: Cell<Option<giong::time::Instant>>,
+}
+
+/// How long prepares at the server's `max_prepared_stmt_count` keep trying
+/// while none of them on the connection succeeds.
+const LIMIT_PATIENCE: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// The longest pause between the first prepares tried at the limit.
+const LIMIT_PAUSE: std::time::Duration = std::time::Duration::from_millis(20);
+
+/// The longest pause once [`LIMIT_QUICK_TRIES`] have failed: the limit is
+/// then held by other clients for a while, and a slower pace leaves the
+/// server's time to them.
+const LIMIT_PAUSE_LONG: std::time::Duration = std::time::Duration::from_millis(100);
+
+/// Tries at the limit paced by [`LIMIT_PAUSE`] before [`LIMIT_PAUSE_LONG`].
+const LIMIT_QUICK_TRIES: u32 = 6;
+
+/// `pause`, less a random part of up to half of it, so that connections
+/// (of this process and of others) that met the limit together do not all
+/// try again at the same moment.
+fn jittered(pause: std::time::Duration) -> std::time::Duration {
+    use std::hash::{BuildHasher, Hasher};
+    // Not for secrets: only spreads the tries. The standard library seeds
+    // each RandomState differently.
+    let seed = std::collections::hash_map::RandomState::new()
+        .build_hasher()
+        .finish();
+    let half = pause / 2;
+    pause - half.mul_f64((seed % 1024) as f64 / 1024.0)
+}
+
+/// A turn that tasks take one at a time, first come first served.
+#[derive(Default)]
+struct Turn {
+    /// Tasks holding the turn or waiting for it.
+    users: Cell<usize>,
+    held: Cell<bool>,
+    next_id: Cell<u64>,
+    /// The tasks waiting, oldest first.
+    queue: RefCell<VecDeque<(u64, Option<Waker>)>>,
+}
+
+impl Turn {
+    /// Someone holds the turn or waits for it.
+    fn busy(&self) -> bool {
+        self.users.get() > 0
+    }
+
+    async fn take(&self) -> TurnHeld<'_> {
+        let id = self.next_id.get();
+        self.next_id.set(id + 1);
+        self.users.set(self.users.get() + 1);
+        let mut waiting = TurnWait {
+            turn: self,
+            id,
+            done: false,
+        };
+        poll_fn(|cx| {
+            let mut queue = self.queue.borrow_mut();
+            let first = queue.front().map_or(true, |(front, _)| *front == id);
+            if !self.held.get() && first {
+                if !queue.is_empty() {
+                    queue.pop_front();
+                }
+                self.held.set(true);
+                waiting.done = true;
+                return Poll::Ready(());
+            }
+            match queue.iter_mut().find(|(other, _)| *other == id) {
+                Some((_, waker)) => *waker = Some(cx.waker().clone()),
+                None => queue.push_back((id, Some(cx.waker().clone()))),
+            }
+            Poll::Pending
+        })
+        .await;
+        TurnHeld { turn: self }
+    }
+
+    /// Wakes the oldest task waiting, when nobody holds the turn.
+    fn wake_next(&self) {
+        if self.held.get() {
+            return;
+        }
+        if let Some((_, waker)) = self.queue.borrow_mut().front_mut() {
+            if let Some(w) = waker.take() {
+                w.wake();
+            }
+        }
+    }
+}
+
+/// A task waiting for the turn; leaves the queue when given up.
+struct TurnWait<'a> {
+    turn: &'a Turn,
+    id: u64,
+    done: bool,
+}
+
+impl Drop for TurnWait<'_> {
+    fn drop(&mut self) {
+        if self.done {
+            return;
+        }
+        self.turn.users.set(self.turn.users.get() - 1);
+        self.turn
+            .queue
+            .borrow_mut()
+            .retain(|(id, _)| *id != self.id);
+        self.turn.wake_next();
+    }
+}
+
+/// The turn, while a task holds it.
+struct TurnHeld<'a> {
+    turn: &'a Turn,
+}
+
+impl Drop for TurnHeld<'_> {
+    fn drop(&mut self) {
+        self.turn.held.set(false);
+        self.turn.users.set(self.turn.users.get() - 1);
+        self.turn.wake_next();
+    }
 }
 
 struct State {
@@ -249,17 +380,52 @@ enum Phase {
     Rows,
 }
 
+/// The tasks waiting for a request's answer: almost always one, which is
+/// kept without an allocation.
+#[derive(Default)]
+struct Wakers {
+    first: Option<Waker>,
+    more: Vec<Waker>,
+}
+
+impl Wakers {
+    /// Adds `waker` unless it would wake a task already here.
+    fn register(&mut self, waker: &Waker) {
+        match &self.first {
+            None => self.first = Some(waker.clone()),
+            Some(w) if w.will_wake(waker) => {}
+            Some(_) => {
+                if !self.more.iter().any(|w| w.will_wake(waker)) {
+                    self.more.push(waker.clone());
+                }
+            }
+        }
+    }
+
+    fn wake_all(&mut self) {
+        if let Some(w) = self.first.take() {
+            w.wake();
+        }
+        for w in self.more.drain(..) {
+            w.wake();
+        }
+    }
+}
+
 #[derive(Default)]
 struct SlotInner {
     /// The sequence number the next packet of the answer must have.
     seq: u8,
     phase: Phase,
-    wakers: Vec<Waker>,
+    wakers: Wakers,
     /// Nobody is waiting for the result any more: rows are not kept.
     abandoned: bool,
     error: Option<Error>,
     prepared: Option<protocol::PrepareOk>,
     columns: Vec<Column>,
+    /// Definitions read so far that match the statement's columns from its
+    /// last run, in order, and so were not copied into `columns`.
+    matched: usize,
     /// The columns of the first result set, once it has been described.
     result_columns: Option<Rc<[Column]>>,
     rows: RowsBuilder,
@@ -335,9 +501,7 @@ impl Future for Wait {
             self.done = true;
             return Poll::Ready(outcome);
         }
-        if !inner.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            inner.wakers.push(cx.waker().clone());
-        }
+        inner.wakers.register(cx.waker());
         Poll::Pending
     }
 }
@@ -436,11 +600,14 @@ impl Client {
             generation: Cell::new(0),
             dirty: Cell::new(false),
             closed: Arc::new(AtomicBool::new(false)),
+            lease: RefCell::new(None),
             schema_changed: Cell::new(false),
             counters: RefCell::new(None),
             tx: Cell::new(Tx::None),
             shared: Cell::new(false),
             idle_wakers: RefCell::new(Vec::new()),
+            turn: Turn::default(),
+            turn_progress: Cell::new(None),
             state: RefCell::new(State {
                 out: Vec::new(),
                 writer: None,
@@ -656,13 +823,38 @@ impl Client {
 
     /// A handle that asks the server to stop whatever this connection is
     /// running, from any thread.
+    ///
+    /// A token taken from a [`PooledClient`](crate::PooledClient) stops
+    /// working when the connection goes back to the pool, so that it cannot
+    /// stop the statements of the tasks that use the connection next; and a
+    /// connection that goes back while a cancel request from such a token is
+    /// on its way is closed rather than lent to another task.
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
             config: self.conn.config.clone(),
             connection_id: self.conn.connection_id,
             identity: self.conn.identity.clone(),
             closed: self.conn.closed.clone(),
+            lease: self.conn.lease.borrow().clone(),
         }
+    }
+
+    /// Starts lending the connection to one task: cancel tokens taken from
+    /// now on work until [`end_lease`](Self::end_lease).
+    pub(crate) fn begin_lease(&self) {
+        *self.conn.lease.borrow_mut() = Some(Arc::new(Lease::default()));
+    }
+
+    /// Ends the lease: the cancel tokens taken during it stop working.
+    /// Returns whether a cancel request taken during it may still be on its
+    /// way to the server, in which case the connection must not be lent to
+    /// another task: the request would stop that task's statement.
+    pub(crate) fn end_lease(&self) -> bool {
+        self.conn
+            .lease
+            .borrow_mut()
+            .take()
+            .is_some_and(|lease| lease.end())
     }
 
     /// The server's version, such as `8.0.46`.
@@ -979,9 +1171,15 @@ impl Conn {
     /// already in flight, or prepared now.
     ///
     /// When the server holds as many prepared statements as it allows, for
-    /// all its clients together, the statements this connection is not using
-    /// are closed and the prepare tried once more.
+    /// all its clients together, prepares on this connection take turns:
+    /// each closes the statements the connection is not using and tries
+    /// again, pausing between tries (1 ms doubling to 20 ms, then to 100 ms,
+    /// each less a random part of up to half), until it gets its statement or no
+    /// prepare on the connection has succeeded for [`LIMIT_PATIENCE`].
     async fn statement(&self, sql: &str) -> Result<Rc<Statement>, Error> {
+        if self.turn.busy() && !self.is_cached(sql) {
+            return self.statement_at_limit(sql, None).await;
+        }
         let e = match self.statement_once(sql).await {
             Err(e) if e.server_code() == Some(code::PREPARED_LIMIT) => e,
             other => return other,
@@ -991,26 +1189,69 @@ impl Conn {
                 .statement_limit_errors
                 .set(counters.statement_limit_errors.get() + 1);
         }
-        let closed = self.close_unused();
-        self.statement_once(sql).await.map_err(|again| {
-            let Some(db) = again.db().cloned() else {
-                return again;
+        self.statement_at_limit(sql, Some(e)).await
+    }
+
+    /// The statement for `sql` is prepared and in the cache.
+    fn is_cached(&self, sql: &str) -> bool {
+        matches!(
+            self.state.borrow().cache.get(sql),
+            Some(Entry::Ready { .. })
+        )
+    }
+
+    /// Prepares `sql` in its turn, while the server is at its
+    /// `max_prepared_stmt_count`; `first` is the error that showed it.
+    #[cold]
+    async fn statement_at_limit(
+        &self,
+        sql: &str,
+        mut first: Option<Error>,
+    ) -> Result<Rc<Statement>, Error> {
+        let entered = giong::time::Instant::now();
+        let _turn = self.turn.take().await;
+        let mut pause = std::time::Duration::from_millis(1);
+        let mut closed = 0;
+        let mut tries = 0u32;
+        loop {
+            tries += 1;
+            closed += self.close_unused();
+            let again = match self.statement_once(sql).await {
+                Ok(stmt) => {
+                    self.turn_progress.set(Some(giong::time::Instant::now()));
+                    return Ok(stmt);
+                }
+                Err(again) if again.server_code() == Some(code::PREPARED_LIMIT) => again,
+                Err(other) => return Err(other),
             };
-            if db.code() != code::PREPARED_LIMIT {
-                return again;
+            let since = self.turn_progress.get().map_or(entered, |p| p.max(entered));
+            let now = giong::time::Instant::now();
+            let wait = jittered(pause);
+            if now + wait > since + LIMIT_PATIENCE {
+                let db = again.db().cloned().expect("a server error");
+                let first = first.take().unwrap_or(again);
+                return Err(Error::with_db(
+                    ErrorKind::Db,
+                    format!(
+                        "the server holds as many prepared statements as its \
+                         max_prepared_stmt_count allows, counting those of every client (this \
+                         connection closed the {closed} it was not using and tried again for {} \
+                         ms). Lower Config::statement_cache_capacity or the number of \
+                         connections, or raise max_prepared_stmt_count on the server (first \
+                         error: {first})",
+                        LIMIT_PATIENCE.as_millis()
+                    ),
+                    db,
+                ));
             }
-            Error::with_db(
-                ErrorKind::Db,
-                format!(
-                    "the server holds as many prepared statements as its max_prepared_stmt_count \
-                     allows, counting those of every client (this connection closed the {closed} \
-                     it was not using and tried again). Lower Config::statement_cache_capacity or \
-                     the number of connections, or raise max_prepared_stmt_count on the server \
-                     (first error: {e})"
-                ),
-                db,
-            )
-        })
+            giong::time::sleep(wait).await;
+            let cap = if tries < LIMIT_QUICK_TRIES {
+                LIMIT_PAUSE
+            } else {
+                LIMIT_PAUSE_LONG
+            };
+            pause = (pause * 2).min(cap);
+        }
     }
 
     /// Closes the cached statements no task is about to use; returns how
@@ -1103,9 +1344,7 @@ impl Conn {
             let mut inner = slot.inner.borrow_mut();
             let e = inner.error.take().unwrap_or_else(|| err.clone());
             inner.outcome = Some(Err(e));
-            for w in inner.wakers.drain(..) {
-                w.wake();
-            }
+            inner.wakers.wake_all();
         }
         self.wake_idle();
         self.stream.shutdown(Shutdown::Both);
@@ -1239,6 +1478,7 @@ impl Conn {
                         )));
                     }
                     inner.columns.clear();
+                    inner.matched = 0;
                     inner.phase = Phase::Columns { left: count };
                     false
                 }
@@ -1262,14 +1502,44 @@ impl Conn {
                         "the server sent column definitions larger than max_result_size",
                     ));
                 }
-                let def: ColumnDef = protocol::column_def(payload)?;
-                inner.columns.push(Column::from_def(def));
+                let def = protocol::column_def_ref(payload)?;
+                // A statement run again describes the same columns as last
+                // time: while each definition matches them, none is copied.
+                let kept = match &slot.kind {
+                    Kind::Execute { stmt, .. } if !inner.first_done => {
+                        Some(stmt.columns.borrow().clone())
+                    }
+                    _ => None,
+                };
+                let same = inner.columns.is_empty()
+                    && kept
+                        .as_ref()
+                        .and_then(|k| k.get(inner.matched))
+                        .is_some_and(|c| c.is(&def));
+                if same {
+                    inner.matched += 1;
+                } else {
+                    if let Some(k) = &kept {
+                        let matched = std::mem::take(&mut inner.matched);
+                        inner.columns.extend(k[..matched].iter().cloned());
+                    }
+                    inner.columns.push(Column::from_def(def));
+                }
                 if left > 1 {
                     inner.phase = Phase::Columns { left: left - 1 };
                 } else {
                     inner.phase = Phase::Rows;
                     if !inner.first_done {
-                        let columns = self.share_columns(&slot.kind, &inner.columns);
+                        let columns = match kept {
+                            Some(k) if inner.columns.is_empty() && inner.matched == k.len() => k,
+                            kept => {
+                                if let Some(k) = kept {
+                                    let matched = std::mem::take(&mut inner.matched);
+                                    inner.columns.extend(k[..matched].iter().cloned());
+                                }
+                                self.share_columns(&slot.kind, &inner.columns)
+                            }
+                        };
                         inner.result_columns = Some(columns);
                     }
                 }
@@ -1500,9 +1770,7 @@ impl Conn {
             },
         };
         inner.outcome = Some(outcome);
-        for w in inner.wakers.drain(..) {
-            w.wake();
-        }
+        inner.wakers.wake_all();
     }
 
     /// Takes a cached statement out of the cache when the server no longer
@@ -1745,6 +2013,46 @@ pub struct CancelToken {
     connection_id: u32,
     identity: Identity,
     closed: Arc<AtomicBool>,
+    /// Set for a token taken from a pooled connection: ended when the
+    /// connection goes back to the pool.
+    lease: Option<Arc<Lease>>,
+}
+
+/// A pooled connection's time with one task, shared with the cancel tokens
+/// taken during it: whether it has ended, and how many cancel requests are
+/// on their way.
+#[derive(Default)]
+pub(crate) struct Lease(AtomicU32);
+
+impl Lease {
+    /// Set once the connection has gone back to its pool.
+    const ENDED: u32 = 1 << 31;
+
+    /// Counts a cancel request on its way, unless the lease has ended.
+    fn start_cancel(&self) -> bool {
+        let mut v = self.0.load(Ordering::Acquire);
+        while v & Self::ENDED == 0 {
+            match self
+                .0
+                .compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(now) => v = now,
+            }
+        }
+        false
+    }
+
+    /// A cancel request that `start_cancel` counted got its answer.
+    fn finish_cancel(&self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    /// Ends the lease; returns whether a cancel request is still on its way
+    /// (or was given up on the way, which counts the same).
+    fn end(&self) -> bool {
+        self.0.fetch_or(Self::ENDED, Ordering::AcqRel) & !Self::ENDED != 0
+    }
 }
 
 impl CancelToken {
@@ -1752,13 +2060,33 @@ impl CancelToken {
     /// something was stopped: the statement may have finished first. Once
     /// the connection is closed, it does nothing: its id may be reused.
     ///
+    /// Fails with [`ErrorKind::Closed`], sending nothing, when the token was
+    /// taken from a [`PooledClient`](crate::PooledClient) that has gone back
+    /// to its pool since.
+    ///
     /// Not cancel safe: if the future is dropped, the request may still reach
     /// the server and stop whatever the connection runs then.
     pub async fn cancel(&self) -> Result<(), Error> {
         if self.closed.load(Ordering::Acquire) {
             return Ok(());
         }
-        connect::kill_query(&self.config, &self.identity, self.connection_id).await
+        let Some(lease) = &self.lease else {
+            return connect::kill_query(&self.config, &self.identity, self.connection_id).await;
+        };
+        // Counted until the answer comes: a connection that goes back to the
+        // pool meanwhile is closed rather than lent to a task whose
+        // statement the request would stop. A request given up on the way
+        // stays counted, for the same reason.
+        if !lease.start_cancel() {
+            return Err(Error::closed(
+                "the connection this cancel token was taken from has gone back to its pool, \
+                 where other tasks use it, so nothing was sent; take a new token from the next \
+                 connection",
+            ));
+        }
+        let sent = connect::kill_query(&self.config, &self.identity, self.connection_id).await;
+        lease.finish_cancel();
+        sent
     }
 }
 
@@ -1768,5 +2096,63 @@ impl std::fmt::Debug for CancelToken {
             .field("server", &self.config.target())
             .field("connection_id", &self.connection_id)
             .finish()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pauses_at_the_limit_are_spread_over_their_second_half() {
+        let pause = std::time::Duration::from_millis(100);
+        let waits: std::collections::HashSet<_> = (0..64).map(|_| jittered(pause)).collect();
+        assert!(
+            waits.iter().all(|w| *w >= pause / 2 && *w <= pause),
+            "{waits:?}"
+        );
+        assert!(waits.len() > 8, "{waits:?}");
+    }
+
+    #[test]
+    fn the_turn_goes_in_order_and_skips_tasks_that_gave_up() {
+        giong::block_on(async {
+            let turn = Rc::new(Turn::default());
+            let order = Rc::new(RefCell::new(Vec::new()));
+            let first = turn.take().await;
+            let task = |n: u32| {
+                let (turn, order) = (turn.clone(), order.clone());
+                giong::spawn(async move {
+                    let _held = turn.take().await;
+                    order.borrow_mut().push(n);
+                    giong::yield_now().await;
+                })
+            };
+            let one = task(1);
+            let two = task(2);
+            let three = task(3);
+            giong::yield_now().await;
+            assert_eq!(turn.users.get(), 4);
+            // A task that gives up its place leaves the queue.
+            two.abort();
+            giong::yield_now().await;
+            assert_eq!(turn.users.get(), 3);
+            drop(first);
+            one.await.unwrap();
+            three.await.unwrap();
+            assert_eq!(*order.borrow(), [1, 3]);
+            assert!(!turn.busy());
+            // The first task waiting gives up while the turn is free: the
+            // next one gets it.
+            let held = turn.take().await;
+            let gone = task(4);
+            let next = task(5);
+            giong::yield_now().await;
+            drop(held);
+            gone.abort();
+            next.await.unwrap();
+            assert_eq!(*order.borrow(), [1, 3, 5]);
+            assert!(!turn.busy());
+        });
     }
 }

@@ -42,6 +42,13 @@ when it is no longer raised.
 | [GIONG-E0011](E0011.md) | `NotInRuntime` | not inside a giong runtime |
 | [GIONG-E0012](E0012.md) | `RuntimeAlreadyRunning` | a runtime already runs on this thread |
 | [GIONG-E0013](E0013.md) | `WrongWorker` | an operation was polled on another worker |
+| [GIONG-E0020](E0020.md) | `ThreadLimit` | a worker thread could not be started |
+
+## macOS
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E0028](E0028.md) | `NetworkBuffersExhausted` | the system ran out of network buffers |
 
 ## Network and name resolution
 
@@ -57,6 +64,8 @@ when it is no longer raised.
 | [GIONG-E0107](E0107.md) | `DnsBadResponse` | malformed DNS answer |
 | [GIONG-E0108](E0108.md) | `DnsServerUnreachable` | cannot reach the DNS server |
 | [GIONG-E0109](E0109.md) | `EmptyBuffer` | buffer with no room |
+| [GIONG-E0110](E0110.md) | `RecvBufferTooSmall` | receive buffers too small for GRO |
+| [GIONG-E0111](E0111.md) | `RecvAlreadyStarted` | receive option set after recv started |
 
 ## Files
 
@@ -195,6 +204,11 @@ when it is no longer raised.
 | [GIONG-E3209](E3209.md) | `RedisPoolTimeout` | Redis pool wait timed out |
 | [GIONG-E3210](E3210.md) | `RedisProtocol` | Redis protocol error |
 | [GIONG-E3211](E3211.md) | `RedisTimeout` | Redis reply timed out |
+| [GIONG-E3601](E3601.md) | `QuicConfig` | invalid QUIC configuration |
+| [GIONG-E3602](E3602.md) | `QuicConnect` | cannot set up the QUIC connection |
+| [GIONG-E3603](E3603.md) | `QuicConnectionLost` | the QUIC connection was lost |
+| [GIONG-E3604](E3604.md) | `QuicStreamReset` | the QUIC stream was reset |
+| [GIONG-E3605](E3605.md) | `QuicEarlyDataRejected` | the server refused the 0-RTT data |
 
 ## giong-proto
 

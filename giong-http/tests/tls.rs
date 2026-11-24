@@ -443,8 +443,12 @@ fn shutdown_finishes_requests_in_progress_over_tls() {
     assert_eq!(idle.reply().text(), "done");
 
     let mut busy = server.client();
+    let sent = Instant::now();
     busy.send("GET /slow HTTP/1.1\r\nHost: localhost\r\n\r\n");
     std::thread::sleep(Duration::from_millis(100));
+    // A loaded machine sleeps longer, and the request is that much nearer
+    // its end when the server is told to stop.
+    let waited = sent.elapsed();
 
     let stopped_after = server.stop();
 
@@ -454,8 +458,8 @@ fn shutdown_finishes_requests_in_progress_over_tls() {
     busy.expect_closed();
     idle.expect_closed();
     assert!(
-        stopped_after >= Duration::from_millis(250),
-        "{stopped_after:?}"
+        waited + stopped_after >= Duration::from_millis(350),
+        "{stopped_after:?} after {waited:?}"
     );
     assert!(stopped_after < Duration::from_secs(10), "{stopped_after:?}");
 }
@@ -494,6 +498,21 @@ fn handlers_see_the_client_address_over_tls() {
     let expected = format!("{:?}", Some(c.stream.sock.local_addr().unwrap()));
     c.send("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert_eq!(c.reply().text(), expected);
+}
+
+/// At the limit, an idle TLS connection makes room for a new client: it
+/// ends its session cleanly.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_an_idle_tls_connection_makes_room() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut first = server.client();
+    first.send("GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(first.reply().text(), "GET /first body=");
+    let mut second = server.client();
+    second.send("GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(second.reply().text(), "GET /second body=");
+    first.expect_closed();
 }
 
 #[test]

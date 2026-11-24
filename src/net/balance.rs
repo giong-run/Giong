@@ -18,7 +18,6 @@ use std::task::{Context, Poll, Waker};
 
 use socket2::Socket;
 
-use super::ListenSocket;
 use crate::runtime::{self, lock, RuntimeShared};
 
 /// How much busier than the least busy member a worker must look before it
@@ -26,6 +25,12 @@ use crate::runtime::{self, lock, RuntimeShared};
 /// as busy do not pass connections back and forth; the accepting worker is
 /// awake, which alone counts one (see `RuntimeShared::score`).
 const MARGIN: usize = 2;
+
+/// Every listener of the group is a duplicate of one socket with one queue
+/// of connections (`net/share.rs`), so each connection wakes every member,
+/// not just the one that will accept it. A member that looks awake may then
+/// only have been woken by that connection; see `busier_than_another`.
+const ONE_QUEUE: bool = cfg!(any(target_os = "macos", giong_libkqueue));
 
 /// The balanced listeners of one runtime on one address.
 struct Group {
@@ -107,7 +112,7 @@ impl Member {
     pub(crate) fn poll_accept(
         &self,
         cx: &mut Context<'_>,
-        listener: &ListenSocket,
+        mut next: impl FnMut(&mut Context<'_>) -> Poll<io::Result<Socket>>,
     ) -> Poll<io::Result<Socket>> {
         let group = &*self.group;
         {
@@ -122,7 +127,7 @@ impl Member {
             }
         }
         loop {
-            let sock = match listener.poll_accept(cx) {
+            let sock = match next(cx) {
                 Poll::Ready(Ok(sock)) => sock,
                 other => return other,
             };
@@ -145,10 +150,25 @@ impl Member {
     fn busier_than_another(&self) -> Option<usize> {
         let group = &*self.group;
         let rt = &group.rt;
-        let target = rt.least_loaded_of(None, |i| {
-            i != self.worker && group.mailboxes[i].listeners.load(Ordering::Acquire) > 0
-        })?;
-        (rt.score(self.worker) > rt.score(target) + MARGIN).then_some(target)
+        let member =
+            |i: usize| i != self.worker && group.mailboxes[i].listeners.load(Ordering::Acquire) > 0;
+        let (target, other) = if ONE_QUEUE {
+            // The other members were woken by this very connection, so
+            // being awake says nothing about them: counting it would pick
+            // the wrong member, and let this worker keep connections until
+            // it is three ahead instead of two. Ties go to the next member
+            // after this worker.
+            let n = rt.workers();
+            (1..n)
+                .map(|k| (self.worker + k) % n)
+                .filter(|&i| member(i))
+                .map(|i| (i, rt.work(i)))
+                .min_by_key(|&(_, work)| work)?
+        } else {
+            let target = rt.least_loaded_of(None, member)?;
+            (target, rt.score(target))
+        };
+        (rt.score(self.worker) > other + MARGIN).then_some(target)
     }
 }
 

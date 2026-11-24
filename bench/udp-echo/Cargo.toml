@@ -5,7 +5,7 @@ edition = "2021"
 publish = false
 
 [dependencies]
-giong = { path = "../.." }
+giong = { path = "../..", features = ["unstable-udp-offload"] }
 libc = "0.2"
 tokio = { version = "1", features = ["rt", "net"] }
 

@@ -1,6 +1,6 @@
 [package]
 name = "giong-grpc-build"
-version = "0.7.0"
+version = "1.4.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Generates giong-proto views and gRPC service descriptions from .proto files at build time, with no protoc to install"
@@ -10,8 +10,6 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong-grpc-build"
 keywords = ["protobuf", "grpc", "codegen", "build"]
 categories = ["development-tools::build-utils", "encoding"]
-# Prototype for 1.1: not published until giong 1.0.0 is out.
-publish = false
 
 [dependencies]
 # Pure-Rust .proto parser: no protoc binary. 0.8 keeps the minimum Rust

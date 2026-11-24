@@ -99,7 +99,10 @@ reason; its types are reachable only through the `unstable-rustls` feature.
 
 ## Rust version (MSRV)
 
-The libraries build with **Rust 1.80** and newer, checked by the `msrv` CI job.
+The libraries build with **Rust 1.80** and newer, checked by the `msrv` CI job. The
+exception is giong-quic, and with it giong-http's `unstable-http3` feature, which need
+**Rust 1.85**: the QUIC engine underneath, quinn-proto, needs it from the version that fixes
+a remote memory exhaustion (GHSA-4w2j-m93h-cj5j) on.
 
 - The minimum is raised only in a minor release, never in a patch release, and the
   CHANGELOG entry says so.
@@ -122,7 +125,7 @@ run on the epoll driver with the same API.
 
 ## Versions of the crates
 
-The nine crates are released together and carry the same version. A crate that depends on
+The thirteen crates are released together and carry the same version. A crate that depends on
 another depends on the same minor or newer. New crates (`giong-quic`, `giong-grpc` and the
 others on the roadmap) join at the current version when they are first published.
 

@@ -77,6 +77,17 @@ use crate::response::{Body, FileBody, Response};
 use crate::server::{catching, drop_quietly, give_buffer, take_buffer, Config, Handler, Transport};
 use crate::trailers::Trailers;
 
+/// How long the client has to acknowledge our SETTINGS before the
+/// connection ends with `SETTINGS_TIMEOUT` (RFC 9113, section 6.5.3).
+/// Until then it is treated as not knowing our limits, which costs more
+/// to serve: a client must not keep that state.
+const SETTINGS_ACK_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Stream windows moved by SETTINGS frames, in every session: what
+/// `h2::tests` counts to see that a frame moves them once.
+#[cfg(test)]
+pub(crate) static WINDOW_MOVES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 /// The smallest window a stream starts with (`SETTINGS_INITIAL_WINDOW_SIZE`
 /// is half the body budget divided among the streams, within this and the
 /// protocol's default).
@@ -131,8 +142,8 @@ const ERROR_LINGER: Duration = Duration::from_secs(1);
 const KEEP_STREAMS: Duration = Duration::from_secs(1);
 
 /// The larger of `max_body_size` and 1 MiB: what one connection may hold of
-/// request bodies, and of responses not sent yet.
-fn budget(cfg: &Config) -> u64 {
+/// request bodies, and of responses not sent yet (over HTTP/3 too).
+pub(crate) fn budget(cfg: &Config) -> u64 {
     cfg.http2_budget
         .unwrap_or_else(|| (cfg.max_body_size as u64).max(1 << 20))
 }
@@ -398,6 +409,9 @@ pub(crate) struct Session {
     peer_window: i64,
     peer_frame: usize,
     conn_send: i64,
+    /// The client closed its side: it can send no more window, so a
+    /// response its flow control holds back can never go out.
+    peer_closed: bool,
     conn_recv: i64,
     conn_unacked: u32,
     /// Body bytes the streams hold, and how many they may.
@@ -446,6 +460,8 @@ pub(crate) struct Session {
     pub(crate) wakers: Wakers,
     /// Since when no stream has been open.
     idle_since: Instant,
+    /// When the client must have acknowledged our SETTINGS by.
+    settings_deadline: Instant,
     /// Requests have followed one another within `KEEP_STREAMS`: the memory
     /// for streams is kept between them, and given back once the connection
     /// has been idle for that long.
@@ -474,6 +490,7 @@ impl Session {
             peer_window: i64::from(frame::DEFAULT_WINDOW),
             peer_frame: frame::DEFAULT_FRAME_SIZE,
             conn_send: i64::from(frame::DEFAULT_WINDOW),
+            peer_closed: false,
             conn_recv: i64::from(CONN_WINDOW),
             conn_unacked: 0,
             held: 0,
@@ -502,6 +519,7 @@ impl Session {
             events: Vec::new(),
             wakers: Wakers::default(),
             idle_since: Instant::now(),
+            settings_deadline: Instant::now() + SETTINGS_ACK_TIMEOUT,
             warm: false,
             released: false,
             starts_shrunk: false,
@@ -686,8 +704,11 @@ impl Session {
 
     /// The client closed its side of the connection: no frame comes any
     /// more. Streams still waiting for their request are dropped; the
-    /// others are answered, then the connection ends.
+    /// others are answered, then the connection ends. An answer that
+    /// flow control holds back is reset as soon as it is (see
+    /// `blocked_limit`).
     pub(crate) fn on_eof(&mut self) {
+        self.peer_closed = true;
         self.go_away();
         self.block = None;
         let waiting: Vec<usize> = self
@@ -1094,11 +1115,11 @@ impl Session {
                     return self.reset_closed(id, Reason::Protocol);
                 }
                 if self.ids.len() >= self.cfg.max_concurrent_streams as usize {
-                    return self.reset_closed(id, Reason::RefusedStream);
+                    return self.refuse_new(id);
                 }
                 if !end_stream && !self.settings_acked && self.early_bodies_full() {
                     // Not processed: the client sends it again later.
-                    return self.reset_closed(id, Reason::RefusedStream);
+                    return self.refuse_new(id);
                 }
                 match built {
                     Built::Malformed(_) => self.reset_closed(id, Reason::Protocol),
@@ -1354,6 +1375,13 @@ impl Session {
             self.cheap()?;
         }
         self.settings_seen = true;
+        // The stream windows move once per frame, by the last
+        // INITIAL_WINDOW_SIZE in it: a frame can hold thousands, and moving
+        // every stream for each would cost streams x entries. Taken in
+        // order, the largest one would have overflowed first: it is the one
+        // checked.
+        let mut initial = None;
+        let mut largest = i64::MIN;
         for setting in payload.chunks_exact(6) {
             let id = u16::from_be_bytes([setting[0], setting[1]]);
             let value = frame::read_u32(&setting[2..]);
@@ -1367,19 +1395,8 @@ impl Session {
                     if value > frame::MAX_WINDOW {
                         return Err(flow_control("SETTINGS_INITIAL_WINDOW_SIZE above 2^31-1"));
                     }
-                    let delta = value - self.peer_window;
-                    self.peer_window = value;
-                    let slots: Vec<usize> = self.ids.iter().map(|&(_, slot)| slot).collect();
-                    for slot in slots {
-                        let Some(st) = self.stream(slot) else {
-                            continue;
-                        };
-                        st.send_window += delta;
-                        if st.send_window > frame::MAX_WINDOW {
-                            return Err(flow_control("a stream window grew above 2^31-1"));
-                        }
-                        self.enqueue(slot);
-                    }
+                    initial = Some(value);
+                    largest = largest.max(value);
                 }
                 frame::MAX_FRAME_SIZE => {
                     if !(frame::DEFAULT_FRAME_SIZE as u32..=frame::MAX_FRAME_SIZE_LIMIT)
@@ -1391,6 +1408,24 @@ impl Session {
                 }
                 // Advisory, or not for a server; unknown ones are ignored.
                 _ => {}
+            }
+        }
+        if let Some(value) = initial {
+            let delta = value - self.peer_window;
+            let largest = largest - self.peer_window;
+            self.peer_window = value;
+            let slots: Vec<usize> = self.ids.iter().map(|&(_, slot)| slot).collect();
+            for slot in slots {
+                let Some(st) = self.stream(slot) else {
+                    continue;
+                };
+                if st.send_window + largest > frame::MAX_WINDOW {
+                    return Err(flow_control("a stream window grew above 2^31-1"));
+                }
+                st.send_window += delta;
+                #[cfg(test)]
+                WINDOW_MOVES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.enqueue(slot);
             }
         }
         self.reserve_out();
@@ -1520,6 +1555,21 @@ impl Session {
         self.reserve_out();
         frame::write_rst(&mut self.out, id, Reason::RefusedStream);
         self.remove(slot, Failure::Abandoned, true);
+    }
+
+    /// Refuses a new stream with `REFUSED_STREAM`: over the stream limit,
+    /// or a body the worker has no room for yet. Until the client has our
+    /// SETTINGS it cannot know the limit, and a first flight of many
+    /// streams is within the protocol (RFC 9113, section 6.5.2): such a
+    /// refusal counts as a frame that does no work, not as a reset.
+    fn refuse_new(&mut self, id: u32) -> Result<(), ConnError> {
+        if self.settings_acked {
+            return self.reset_closed(id, Reason::RefusedStream);
+        }
+        self.reserve_out();
+        frame::write_rst(&mut self.out, id, Reason::RefusedStream);
+        self.remember_closed(id, true);
+        self.cheap()
     }
 
     /// Resets a stream that has no slot (refused, or closed already).
@@ -1677,9 +1727,9 @@ impl Session {
                 .field(b"content-length", digits, Index::No, &mut block);
         }
         let mut name = mem::take(&mut self.name);
-        for (n, v) in resp.headers() {
+        for (n, v) in resp.header_fields() {
             name.clear();
-            name.extend(n.bytes().map(|b| b.to_ascii_lowercase()));
+            name.extend(n.iter().map(u8::to_ascii_lowercase));
             if matches!(
                 &name[..],
                 b"keep-alive" | b"proxy-connection" | b"upgrade" | b"te"
@@ -1693,7 +1743,7 @@ impl Session {
             } else {
                 Index::Yes
             };
-            self.encoder.field(&name, v.as_bytes(), index, &mut block);
+            self.encoder.field(&name, v, index, &mut block);
         }
         self.name = name;
         self.reserve_out();
@@ -2070,6 +2120,9 @@ impl Session {
         if let Some(block) = &self.block {
             at(block.deadline);
         }
+        if !self.settings_acked && !self.failed {
+            at(self.settings_deadline);
+        }
         if self.ids.is_empty() {
             if self.goaway.is_none() {
                 at(self.idle_since + self.cfg.idle_timeout);
@@ -2084,15 +2137,34 @@ impl Session {
                     at(deadline);
                 }
                 if let Some(since) = st.blocked_since {
-                    at(since + self.cfg.write_timeout);
+                    at(since + self.blocked_limit());
                 }
             }
         }
         next
     }
 
+    /// How long a response may wait for the client's flow control:
+    /// `write_timeout`, or nothing once the client closed its side, since
+    /// it can no longer open the window.
+    fn blocked_limit(&self) -> Duration {
+        if self.peer_closed {
+            Duration::ZERO
+        } else {
+            self.cfg.write_timeout
+        }
+    }
+
     /// Handles what timed out by `now`.
     pub(crate) fn on_timer(&mut self, now: Instant) {
+        if !self.settings_acked && self.settings_deadline <= now {
+            self.fail(ConnError {
+                reason: Reason::SettingsTimeout,
+                code: Code::Http2Protocol,
+                detail: "the client did not acknowledge the server's SETTINGS within 10 s",
+            });
+            return;
+        }
         if self.block.as_ref().is_some_and(|b| b.deadline <= now) {
             self.fail(protocol(
                 "a header block was not finished within the request timeout",
@@ -2109,7 +2181,7 @@ impl Session {
             self.go_away();
             return;
         }
-        let write_timeout = self.cfg.write_timeout;
+        let write_timeout = self.blocked_limit();
         let slots: Vec<usize> = self.ids.iter().map(|&(_, slot)| slot).collect();
         for slot in slots {
             let Some(st) = self.stream(slot) else {
@@ -2479,16 +2551,22 @@ enum Wake<R, W> {
 }
 
 /// Serves HTTP/2 on `io` until the connection ends. `input` holds bytes
-/// already received, which may include the client's preface.
+/// already received, which may include the client's preface. `slot` is the
+/// connection's place under `max_connections`, if it has one: it is marked
+/// idle while no stream is open, so that the accept loop may close it.
 pub(crate) async fn serve<T: Transport, H: Handler>(
     io: &T,
     cfg: Config,
     peer: Option<SocketAddr>,
     handler: &H,
     mut input: Vec<u8>,
+    slot: Option<&crate::server::Slot>,
 ) {
     let mut s = Session::new(cfg, peer);
     s.start();
+    if let Some(slot) = slot {
+        slot.allow_idle();
+    }
 
     // The client's preface, within the request timeout.
     let preface_deadline = Instant::now() + cfg.request_timeout;
@@ -2607,7 +2685,8 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
         if s.finished() && write.is_none() {
             break;
         }
-        if write.is_none() && s.open_streams() == 0 {
+        let idle = write.is_none() && s.open_streams() == 0;
+        if idle {
             // Idle: hand the buffers back, and the memory for streams once
             // the session has (see `release_streams`).
             s.release();
@@ -2615,6 +2694,9 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
                 tasks = Vec::new();
                 traces.clear();
             }
+        }
+        if let Some(slot) = slot {
+            slot.set_idle(idle);
         }
 
         // Streams woken while the others were polled: let the rest of the
@@ -2741,6 +2823,7 @@ mod tests {
     #[test]
     fn stream_memory_is_kept_while_requests_follow_and_released_when_idle() {
         let mut s = Session::new(crate::Server::new().cfg, None);
+        s.settings_acked = true;
         // One request, then idle: given back at once.
         let slot = s.open(1, true, None, false);
         s.remove(slot, Failure::Abandoned, false);
@@ -2777,6 +2860,39 @@ mod tests {
         while s.pop_event().is_some() {}
         s.release();
         assert!(!s.keeps_streams());
+    }
+
+    #[test]
+    fn a_client_that_never_acknowledges_our_settings_is_cut_off() {
+        let mut s = Session::new(crate::Server::new().cfg, None);
+        let deadline = s.settings_deadline;
+        assert_eq!(s.next_deadline(), Some(deadline));
+        s.on_timer(deadline - Duration::from_millis(1));
+        assert!(!s.failed());
+        s.on_timer(deadline);
+        assert!(s.failed());
+        // The GOAWAY says why.
+        let mut out = &s.out[..];
+        let mut code = None;
+        while out.len() >= frame::HEAD_LEN {
+            let head = Head::parse(out);
+            let payload = &out[frame::HEAD_LEN..frame::HEAD_LEN + head.len];
+            if head.kind == frame::GOAWAY {
+                code = Some(frame::read_u32(&payload[4..8]));
+            }
+            out = &out[frame::HEAD_LEN + head.len..];
+        }
+        assert_eq!(code, Some(Reason::SettingsTimeout as u32));
+
+        // Acknowledged in time: no such deadline any more.
+        let mut s = Session::new(crate::Server::new().cfg, None);
+        s.on_settings(
+            Head::parse(&[0, 0, 0, frame::SETTINGS, frame::ACK, 0, 0, 0, 0]),
+            &[],
+        )
+        .unwrap();
+        assert!(s.settings_acked);
+        assert_ne!(s.next_deadline(), Some(s.settings_deadline));
     }
 
     #[test]

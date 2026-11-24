@@ -1,6 +1,6 @@
 [package]
 name = "giong"
-version = "1.0.1"
+version = "1.4.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Gióng — a thread-per-core async runtime for Linux, built on io_uring, with an epoll fallback"
@@ -10,23 +10,51 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong"
 keywords = ["async", "runtime", "io-uring", "thread-per-core", "network"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/", "sim/"]
+exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", "giong-quic/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/", "sim/"]
 
 [workspace]
-members = [".", "giong-proto", "giong-grpc-build", "giong-grpc", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "examples/rest-api", "examples/proto-hello", "examples/grpc-hello"]
+members = [".", "giong-proto", "giong-grpc-build", "giong-grpc", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "giong-quic", "examples/rest-api", "examples/proto-hello", "examples/grpc-hello"]
 exclude = ["bench", "sim"]
 
 [dependencies]
-io-uring = "0.7.2"
+socket2 = "0.6"
+
+# What only Unix has: `libc`, and socket2's Unix-only calls.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2.172"
 socket2 = { version = "0.6", features = ["all"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+io-uring = "0.7.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Memory",
+    "Win32_System_SystemInformation",
+    "Win32_System_Threading",
+] }
+
+[features]
+# UDP offloads for QUIC on UdpSocket: GSO, GRO, ECN, the local address of a
+# datagram and the source address of a send, socket buffer sizes, "don't
+# fragment". Not part of the 1.0 API: may change until it is stabilised.
+unstable-udp-offload = []
 
 [lints.rust]
 # Set by scripts/check.sh for ThreadSanitizer builds (see Driver::close_fd).
 # `loom` is set to model-check the wake-up handshakes in src/notify.rs.
 # `fuzzing` is set by cargo fuzz for the targets in fuzz/.
 # `kani` is set by the Kani model checker for the proofs (scripts/check.sh kani).
-unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(loom)', 'cfg(fuzzing)', 'cfg(kani)'] }
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(giong_tsan)', 'cfg(giong_libkqueue)', 'cfg(giong_inject_enobufs)', 'cfg(loom)', 'cfg(fuzzing)', 'cfg(kani)'] }
 
 [profile.release]
 opt-level = 3
@@ -41,3 +69,19 @@ loom = "0.7"
 
 [dev-dependencies]
 libc = "0.2.172"
+
+# The soak test reads the process's handle count and memory; driver and
+# UDP tests ask whether they run under Wine and how a socket behaves; the
+# file tests make named pipes.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Pipes",
+    "Win32_System_ProcessStatus",
+    "Win32_System_Threading",
+] }

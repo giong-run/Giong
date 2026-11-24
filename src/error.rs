@@ -151,6 +151,22 @@ codes! {
     /// A future that had started an I/O operation on one giong worker was
     /// polled on another worker or runtime. It panics with this code.
     WrongWorker = 13, Other, "an operation was polled on another worker";
+    /// A worker thread could not be started, most often because the
+    /// process may not have more threads: a container's PID limit (`pids.max`)
+    /// or `RLIMIT_NPROC` counts each thread. The kernel's error kind
+    /// (`WouldBlock` for `EAGAIN`) is kept.
+    ThreadLimit = 20, WouldBlock, "a worker thread could not be started";
+
+    // -------------------------------------------------------------- macOS
+    /// macOS had no network buffer for a send or connect (`ENOBUFS`), for
+    /// longer than giong waits: sockets holding much unread data bring it
+    /// on, and some virtual machines get it in bursts. A stream send or
+    /// connect waits
+    /// for buffers and is tried again for up to 2 seconds before it fails
+    /// with this code (a datagram send keeps the kernel's error). The
+    /// kernel's error is the [`source`](std::error::Error::source), so
+    /// `raw_os_error` stays reachable.
+    NetworkBuffersExhausted = 28, OutOfMemory, "the system ran out of network buffers";
 
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.
@@ -181,6 +197,13 @@ codes! {
     /// a buffer with no capacity, into which a datagram would be received
     /// and lost.
     EmptyBuffer = 109, InvalidInput, "buffer with no room";
+    /// `UdpSocket::set_gro` (feature `unstable-udp-offload`) was called on
+    /// a worker whose receive buffers cannot hold 64 KiB of coalesced
+    /// datagrams.
+    RecvBufferTooSmall = 110, InvalidInput, "receive buffers too small for GRO";
+    /// A socket option that changes how datagrams are received (`set_gro`,
+    /// `set_recv_ecn`) was set after `recv_from` had started.
+    RecvAlreadyStarted = 111, InvalidInput, "receive option set after recv started";
 
     // -------------------------------------------------------------- files
     /// A path contains a NUL byte, which Linux paths cannot.
@@ -474,6 +497,24 @@ codes! {
     /// The reply did not arrive within the response timeout.
     RedisTimeout = 3211, TimedOut, "Redis reply timed out";
 
+    // -------------------------------------------- giong-quic (prototype)
+    /// A giong-quic configuration was refused: a TLS configuration that
+    /// allows no TLS 1.3, has no ALPN protocol, or a transport setting out of
+    /// range.
+    QuicConfig = 3601, InvalidInput, "invalid QUIC configuration";
+    /// A QUIC connection could not be set up: no answer, a refused
+    /// handshake, a certificate not valid for the name, or no common ALPN.
+    QuicConnect = 3602, Other, "cannot set up the QUIC connection";
+    /// An established QUIC connection is gone: closed by the peer or by this
+    /// side, timed out, or reset.
+    QuicConnectionLost = 3603, ConnectionAborted, "the QUIC connection was lost";
+    /// The peer reset a stream it was sending, or stopped one this side was
+    /// sending, with an application error code.
+    QuicStreamReset = 3604, ConnectionReset, "the QUIC stream was reset";
+    /// The server refused the 0-RTT data a stream was opened in: nothing of
+    /// that stream reached the application, and the request can be sent
+    /// again on a new stream.
+    QuicEarlyDataRejected = 3605, ConnectionRefused, "the server refused the 0-RTT data";
     // -------------------------------------------------------- giong-grpc
     /// A metadata name or value cannot be sent as written: a name that is
     /// not lowercase letters, digits, `-`, `_` and `.`, a name gRPC keeps

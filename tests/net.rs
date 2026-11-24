@@ -1,5 +1,8 @@
 //! TCP: accept, recv (multishot + provided buffers), read, write, close.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::borrow::Cow;
 use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr};
@@ -15,6 +18,7 @@ mod common;
 /// limit up to the hard one. Shells start with a soft limit of 1024 (Ubuntu's
 /// included), which the tests below need more than; the tests running
 /// alongside open some, too.
+#[cfg(unix)]
 fn allow_open_files(needed: u64) {
     let mut lim = libc::rlimit {
         rlim_cur: 0,
@@ -78,6 +82,172 @@ async fn recv_exact(stream: &TcpStream, len: usize) -> Vec<u8> {
         out.extend_from_slice(&chunk);
     }
     out
+}
+
+#[test]
+fn connections_reset_before_they_are_accepted_do_not_end_the_accept_loop() {
+    // A port scan or a health check: connect, then reset at once, before
+    // the server takes the connection. The accept loop must carry on and
+    // serve the next client, as on Unix.
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let resets = std::thread::spawn(move || {
+            for _ in 0..20 {
+                let s = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None)
+                    .unwrap();
+                s.connect(&addr.into()).unwrap();
+                // Closing with a zero linger sends RST, not FIN.
+                s.set_linger(Some(Duration::ZERO)).unwrap();
+                drop(s);
+            }
+            // Let the resets reach the server first.
+            std::thread::sleep(Duration::from_millis(100));
+            let mut good = std::net::TcpStream::connect(addr).unwrap();
+            good.write_all(b"hello").unwrap();
+            good
+        });
+        sleep(Duration::from_millis(50)).await;
+        let served = timeout(Duration::from_secs(10), async {
+            loop {
+                // Never an error: a reset connection is skipped, or
+                // accepted and then fails to read.
+                let s = l.accept().await.expect("accept goes on after resets");
+                let (res, buf) = s.read(vec![0u8; 16]).await;
+                if let Ok(5) = res {
+                    assert_eq!(&buf[..5], b"hello");
+                    return;
+                }
+            }
+        })
+        .await;
+        assert!(served.is_ok(), "the good client was not served");
+        drop(resets.join().unwrap());
+    });
+}
+
+#[test]
+fn no_other_socket_can_bind_over_a_live_listener_or_udp_socket() {
+    // Not even one that sets `SO_REUSEADDR`: on Windows that option lets a
+    // socket bind a port another socket holds, unless that one is bound
+    // exclusively.
+    giong::block_on(async {
+        let (_l, addr) = listener();
+        let udp = giong::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let udp_addr = udp.local_addr().unwrap();
+        for (kind, addr) in [
+            (socket2::Type::STREAM, addr),
+            (socket2::Type::DGRAM, udp_addr),
+        ] {
+            let other = socket2::Socket::new(socket2::Domain::IPV4, kind, None).unwrap();
+            other.set_reuse_address(true).unwrap();
+            let err = match other.bind(&addr.into()) {
+                Err(err) => err,
+                // Linux 6.0.16 to 6.0.19 report success for a TCP bind to a
+                // busy address and leave the socket unbound (see
+                // `binding_a_busy_address_fails_and_says_so`): not bound
+                // over the live socket either.
+                Ok(()) => {
+                    let at = other.local_addr().unwrap().as_socket();
+                    assert!(
+                        at.map_or(true, |a| a.port() == 0),
+                        "{kind:?}: bound over a live socket, at {at:?}"
+                    );
+                    continue;
+                }
+            };
+            // Windows says "access denied" to a socket that asked to share.
+            let refused = [std::io::ErrorKind::AddrInUse]
+                .into_iter()
+                .chain(cfg!(windows).then_some(std::io::ErrorKind::PermissionDenied));
+            assert!(
+                refused.into_iter().any(|k| k == err.kind()),
+                "{kind:?}: {err:?}"
+            );
+        }
+    });
+}
+
+/// Connections a shared address hands round are not inherited by child
+/// processes, like every other socket: a child holding a copy would keep
+/// the connection open after this process closed it. (One name on every
+/// system, for the simulator's index; the body is Windows', where a thread
+/// accepts for listeners that share an address.)
+#[test]
+fn connections_handed_round_a_shared_address_are_not_inherited() {
+    #[cfg(windows)]
+    giong::block_on(async {
+        use std::os::windows::io::AsRawSocket;
+        use windows_sys::Win32::Foundation::{GetHandleInformation, HANDLE_FLAG_INHERIT};
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = first.local_addr().unwrap();
+        let second = TcpListener::bind(addr).unwrap();
+        // Whichever listener the connections go to: each accepts them.
+        let got: Rc<std::cell::RefCell<Vec<(usize, TcpStream)>>> = Rc::default();
+        let tasks: Vec<_> = [first, second]
+            .into_iter()
+            .enumerate()
+            .map(|(which, listener)| {
+                let got = got.clone();
+                giong::spawn(async move {
+                    loop {
+                        let stream = listener.accept().await.unwrap();
+                        got.borrow_mut().push((which, stream));
+                    }
+                })
+            })
+            .collect();
+        let _clients: Vec<_> = (0..2)
+            .map(|_| std::net::TcpStream::connect(addr).unwrap())
+            .collect();
+        let start = std::time::Instant::now();
+        while got.borrow().len() < 2 && start.elapsed() < Duration::from_secs(5) {
+            sleep(Duration::from_millis(10)).await;
+        }
+        tasks.iter().for_each(|t| t.abort());
+        let got = got.borrow();
+        assert_eq!(got.len(), 2, "connections handed over");
+        // Which listener took each: the first one's own accept may take
+        // one, and the thread's turn may give it the other as well.
+        let takers: Vec<usize> = got.iter().map(|(which, _)| *which).collect();
+        eprintln!("taken by listeners {takers:?}");
+        for (_, stream) in got.iter() {
+            let mut flags = 0u32;
+            // SAFETY: reads the flags of an open socket into a local.
+            let ok = unsafe { GetHandleInformation(stream.as_raw_socket() as _, &mut flags) };
+            assert_ne!(ok, 0);
+            assert_eq!(flags & HANDLE_FLAG_INHERIT, 0, "an inheritable connection");
+        }
+    });
+}
+
+/// A listener dropped after its own accept took a connection, while
+/// another listener shares the address, gives that connection to the other
+/// one instead of closing it. (One name on every system, for the
+/// simulator's index; the body is Windows', where the first listener of an
+/// address accepts through its own driver.)
+#[test]
+fn a_dropped_listener_hands_its_accepted_connection_to_another_sharing_the_address() {
+    #[cfg(windows)]
+    giong::block_on(async {
+        let first = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = first.local_addr().unwrap();
+        // An accept of the first listener left waiting in the driver.
+        assert!(timeout(Duration::from_millis(20), first.accept())
+            .await
+            .is_err());
+        let second = TcpListener::bind(addr).unwrap();
+        let mut client = std::net::TcpStream::connect(addr).unwrap();
+        client.write_all(b"x").unwrap();
+        // Time for the first listener's accept to complete.
+        sleep(Duration::from_millis(100)).await;
+        drop(first);
+        let stream = timeout(Duration::from_secs(5), second.accept())
+            .await
+            .expect("the connection was lost with the first listener")
+            .unwrap();
+        let data = stream.recv().await.unwrap();
+        assert_eq!(&data[..], b"x");
+    });
 }
 
 #[test]
@@ -269,6 +439,7 @@ fn read_and_recv_cannot_be_mixed() {
 
 /// One control message: `level`, `kind`, then `data`, laid out the way
 /// `CMSG_SPACE` says.
+#[cfg(target_os = "linux")]
 fn control_message(level: i32, kind: i32, data: &[u8]) -> Vec<u8> {
     // SAFETY: CMSG_SPACE and CMSG_LEN only compute sizes.
     let (space, len) = unsafe {
@@ -288,6 +459,8 @@ fn control_message(level: i32, kind: i32, data: &[u8]) -> Vec<u8> {
     buf
 }
 
+// Linux cmsghdr layout and SO_TIMESTAMPING.
+#[cfg(target_os = "linux")]
 #[test]
 fn send_with_control_hands_the_control_message_to_the_kernel() {
     giong::block_on(async {
@@ -395,6 +568,60 @@ fn send_file_sends_the_file_and_leaves_the_stream_usable() {
 }
 
 #[test]
+fn a_dropped_send_file_whose_file_is_closed_leaves_the_stream_usable() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        let s = Rc::new(l.accept().await.unwrap());
+        // Larger than the socket buffers, so the first send is in flight
+        // when its future is dropped.
+        let first = TempFile::new("dropped-send-file-1", &[0x11; 8 << 20]);
+        let second = TempFile::new("dropped-send-file-2", &[0x22; 4096]);
+        let reader = {
+            let s = s.clone();
+            giong::spawn(async move {
+                let mut out = Vec::new();
+                loop {
+                    let chunk = s.recv().await.unwrap();
+                    if chunk.is_empty() {
+                        break out;
+                    }
+                    out.extend_from_slice(&chunk);
+                }
+            })
+        };
+        let file = giong::fs::File::open(&first.0).await.unwrap();
+        {
+            // Started (one poll hands it to the kernel), then dropped, and
+            // the file closed with it, as when a handler is cancelled.
+            let mut send = std::pin::pin!(c.send_file(&file, 0, 8 << 20));
+            std::future::poll_fn(|cx| {
+                assert!(
+                    std::future::Future::poll(send.as_mut(), cx).is_pending(),
+                    "the send ended at once"
+                );
+                std::task::Poll::Ready(())
+            })
+            .await;
+        }
+        drop(file);
+        let file = giong::fs::File::open(&second.0).await.unwrap();
+        c.send_file(&file, 0, 4096).await.unwrap();
+        c.shutdown(Shutdown::Write).unwrap();
+        let got = reader.await.unwrap();
+        let ones = got.iter().take_while(|&&b| b == 0x11).count();
+        assert!(
+            got[ones..] == [0x22; 4096][..],
+            "{} bytes after the first file's",
+            got.len() - ones
+        );
+        // Windows sends the piece in flight to its end.
+        #[cfg(windows)]
+        assert_eq!(ones, 8 << 20);
+    });
+}
+
+#[test]
 fn send_file_past_the_end_sends_what_there_is_and_says_so() {
     giong::block_on(async {
         let (l, addr) = listener();
@@ -454,6 +681,7 @@ fn send_file_to_a_closed_peer_is_an_error_not_a_signal() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn a_non_blocking_stream_never_reports_would_block() {
     // io_uring stops waiting on a non-blocking socket in some cases (Linux
@@ -635,6 +863,7 @@ fn dropping_a_stream_closes_the_connection() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn accept_many_connections() {
     const N: usize = 500;
@@ -660,7 +889,7 @@ fn accept_many_connections() {
             clients.push(TcpStream::connect(addr).await.unwrap());
         }
         assert_eq!(server.await.unwrap(), N);
-        let mut seen = vec![false; N];
+        let mut seen = [false; N];
         for c in &clients {
             let id = u32::from_le_bytes(recv_exact(c, 4).await.try_into().unwrap()) as usize;
             assert!(!seen[id]);
@@ -776,12 +1005,16 @@ fn from_std_listener_and_stream() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 fn accept_backlog_is_bounded_and_no_connection_is_lost() {
     // More pending connections than the driver is willing to queue (1024):
     // the multishot accept must pause, leave the rest in the kernel's listen
     // backlog, and resume once the application catches up.
-    const N: usize = 1300;
+    // The kqueue driver accepts only when asked, so on macOS all of them
+    // wait in the kernel, which keeps at most 128 (`kern.ipc.somaxconn`)
+    // and drops the rest: fewer there, and none may be lost.
+    const N: usize = if cfg!(target_os = "macos") { 100 } else { 1300 };
     // Every client, up to 1024 accepted sockets queued in the driver, and
     // room for the other tests.
     allow_open_files(N as u64 + 1024 + 1024);
@@ -801,7 +1034,7 @@ fn accept_backlog_is_bounded_and_no_connection_is_lost() {
         }
         sleep(Duration::from_millis(50)).await;
 
-        let mut seen = vec![false; N];
+        let mut seen = [false; N];
         for _ in 0..N {
             let s = timeout(Duration::from_secs(10), l.accept())
                 .await
@@ -891,6 +1124,7 @@ fn small_writes_from_many_connections_share_buffers_and_arrive_intact() {
 /// the kernel would split the connections between the two processes.
 /// A socket made here with socket2 stands for it, since giong does not know
 /// it.
+#[cfg(unix)]
 #[test]
 fn a_port_shared_by_another_process_is_refused() {
     giong::block_on(async {
@@ -935,6 +1169,7 @@ fn a_dropped_listener_s_port_can_be_bound_again_at_once() {
 
 /// `bind` cannot wait for a name to be resolved, so it takes IP addresses
 /// only and says what to write instead.
+#[cfg(unix)]
 #[test]
 fn bind_refuses_a_host_name_and_says_what_to_write() {
     giong::block_on(async {
@@ -981,9 +1216,22 @@ fn a_write_after_a_dropped_write_is_not_reordered() {
         });
         let c = TcpStream::connect(addr).await.unwrap();
         // Far more than the socket buffers hold: the send stays in the driver.
-        let big = vec![b'a'; 32 << 20];
-        let dropped = timeout(Duration::from_millis(5), c.write_all(big)).await;
-        assert!(dropped.is_err(), "32 MiB went out in 5 ms");
+        // Windows would take a send into the kernel whole, whatever its
+        // size, while the socket's buffer has room; giong hands it a
+        // megabyte at a time, so there too the write waits once the buffer
+        // is full.
+        let mut dropped = false;
+        for _ in 0..4 {
+            let big = vec![b'a'; 32 << 20];
+            if timeout(Duration::from_millis(5), c.write_all(big))
+                .await
+                .is_err()
+            {
+                dropped = true;
+                break;
+            }
+        }
+        assert!(dropped, "32 MiB went out in 5 ms, four times over");
         let (res, _) = c.write_all(b"END".to_vec()).await;
         res.unwrap();
         c.shutdown(Shutdown::Write).unwrap();
@@ -991,4 +1239,203 @@ fn a_write_after_a_dropped_write_is_not_reordered() {
         assert!(all.ends_with(b"END"), "the last write was overtaken");
         assert!(all[..all.len() - 3].iter().all(|&b| b == b'a'));
     });
+}
+
+/// A write to a peer that has stopped reading waits for it, however large:
+/// the kernel holds about a socket buffer's worth, not the whole write. On
+/// Windows an overlapped send of 32 MiB, or 512 MiB, was taken whole while
+/// the socket's buffer had room, so `write_all` ended at once, the kernel
+/// held every byte for the stalled peer, and a write timeout counting from
+/// the last progress could never fire. Plain and vectored writes, to a peer
+/// that reads once and then nothing until told to; every byte then arrives,
+/// in order.
+#[test]
+fn a_write_to_a_peer_that_stopped_reading_waits_for_it() {
+    const BIG: usize = 64 << 20;
+    for vectored in [false, true] {
+        let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = peer.local_addr().unwrap();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = peer.accept().unwrap();
+            let mut all = Vec::with_capacity(BIG);
+            let mut buf = vec![0u8; 64 * 1024];
+            let n = s.read(&mut buf).unwrap();
+            all.extend_from_slice(&buf[..n]);
+            wait.recv().unwrap();
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf[..n]);
+            }
+            all
+        });
+        giong::block_on(async move {
+            let c = TcpStream::connect(addr).await.unwrap();
+            let data: Vec<u8> = (0..BIG).map(pattern).collect();
+            let started = std::time::Instant::now();
+            let res = if vectored {
+                let half = data[BIG / 2..].to_vec();
+                let bufs = vec![data[..BIG / 2].to_vec(), half];
+                let mut write = std::pin::pin!(c.write_all_vectored(bufs));
+                let early = timeout(Duration::from_secs(1), write.as_mut()).await;
+                assert!(
+                    early.is_err(),
+                    "a vectored write of {BIG} bytes ended in {:?}, the peer reading nothing",
+                    started.elapsed()
+                );
+                go.send(()).unwrap();
+                write.await.0
+            } else {
+                let mut write = std::pin::pin!(c.write_all(data));
+                let early = timeout(Duration::from_secs(1), write.as_mut()).await;
+                assert!(
+                    early.is_err(),
+                    "a write of {BIG} bytes ended in {:?}, the peer reading nothing",
+                    started.elapsed()
+                );
+                go.send(()).unwrap();
+                write.await.0
+            };
+            res.unwrap();
+            c.shutdown(Shutdown::Write).unwrap();
+        });
+        let all = reader.join().unwrap();
+        assert_eq!(all.len(), BIG, "vectored: {vectored}");
+        assert!(
+            all.iter().enumerate().all(|(i, &b)| b == pattern(i)),
+            "vectored: {vectored}: a byte out of place"
+        );
+    }
+}
+
+/// Byte `i` of the test stream: a pattern that shows any byte out of place.
+fn pattern(i: usize) -> u8 {
+    (i % 251) as u8
+}
+
+/// `recv_into` (hidden, used by giong-http for large bodies) after `recv`,
+/// with data already taken into pool buffers, then `recv` again: every byte
+/// arrives once and in order, under either driver.
+#[test]
+fn recv_into_follows_recv_and_keeps_the_order() {
+    const TOTAL: usize = 6 << 20;
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let writer = std::thread::spawn(move || {
+            let mut c = std::net::TcpStream::connect(addr).unwrap();
+            let data: Vec<u8> = (0..TOTAL).map(pattern).collect();
+            // In rounds, so that each round starts with `recv` and the pooled
+            // receive has taken part of it by the time `recv_into` runs.
+            for round in data.chunks(TOTAL / 6) {
+                c.write_all(round).unwrap();
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let s = l.accept().await.unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        let mut round = 0;
+        while got.len() < TOTAL {
+            // A round: some through `recv`, the rest straight into `got`.
+            let chunk = s.recv().await.unwrap();
+            assert!(!chunk.is_empty(), "the stream ended at {}", got.len());
+            got.extend_from_slice(&chunk);
+            drop(chunk);
+            let end = ((round + 1) * (TOTAL / 6)).min(TOTAL);
+            got.reserve(end.saturating_sub(got.len()));
+            while got.len() < end {
+                let (res, back) = s.recv_into(got).await;
+                got = back;
+                assert!(res.unwrap() > 0);
+            }
+            round += 1;
+        }
+        writer.join().unwrap();
+        assert_eq!(got.len(), TOTAL);
+        if let Some(i) = (0..TOTAL).find(|&i| got[i] != pattern(i)) {
+            panic!("byte {i} is {}, not {}", got[i], pattern(i));
+        }
+        // The stream ends: `recv_into` says so, and so does `recv` after it.
+        let (res, _) = s.recv_into(Vec::new()).await;
+        assert_eq!(res.unwrap(), 0);
+        assert!(s.recv().await.unwrap().is_empty());
+    });
+}
+
+/// `recv_into` on a stream that never used `recv`, and with no free
+/// capacity in the buffer it is given: it makes room and appends.
+#[test]
+fn recv_into_appends_without_recv_first() {
+    giong::block_on(async {
+        let (l, addr) = listener();
+        let c = TcpStream::connect(addr).await.unwrap();
+        let s = l.accept().await.unwrap();
+        c.write_all(&b"world"[..]).await.0.unwrap();
+        let mut buf = b"hello ".to_vec();
+        buf.shrink_to_fit();
+        let (res, buf) = s.recv_into(buf).await;
+        assert_eq!(res.unwrap(), 5);
+        assert_eq!(buf, b"hello world");
+        // `recv` works after it.
+        c.write_all(&b"!"[..]).await.0.unwrap();
+        assert_eq!(&*s.recv().await.unwrap(), b"!");
+    });
+}
+
+/// macOS only, in a module of its own: the simulator's copy of this file
+/// wraps top-level tests for every platform.
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+
+    /// macOS has no per-send flag against `SIGPIPE`, so every stream must carry
+    /// `SO_NOSIGPIPE`: a process that does not ignore the signal (a library in
+    /// a C or Swift program, a Rust program built to keep it) would otherwise
+    /// die when a client goes away while the server writes. Connections a
+    /// listener accepts included.
+    #[test]
+    fn accepted_and_connected_streams_never_raise_sigpipe() {
+        use std::os::fd::AsRawFd;
+
+        fn no_sigpipe(fd: std::os::fd::RawFd) -> bool {
+            let mut on: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: reads an int option into a local of the right size.
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    (&mut on as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+            on != 0
+        }
+
+        giong::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = giong::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let server = listener.accept().await.unwrap();
+            let client = client.await.unwrap();
+            assert!(no_sigpipe(client.as_raw_fd()), "a connected stream");
+            assert!(no_sigpipe(server.as_raw_fd()), "an accepted stream");
+
+            let dir = std::env::temp_dir().join(format!("giong-nosigpipe-{}", std::process::id()));
+            drop(std::fs::remove_file(&dir));
+            let listener = giong::net::UnixListener::bind(&dir).unwrap();
+            let path = dir.clone();
+            let client =
+                giong::spawn(async move { giong::net::UnixStream::connect(&path).await.unwrap() });
+            let server = listener.accept().await.unwrap();
+            let client = client.await.unwrap();
+            assert!(no_sigpipe(client.as_raw_fd()), "a connected Unix stream");
+            assert!(no_sigpipe(server.as_raw_fd()), "an accepted Unix stream");
+            drop(std::fs::remove_file(&dir));
+        });
+    }
 }

@@ -30,6 +30,8 @@ pub enum Version {
     /// HTTP/2, over TLS (chosen through ALPN) or over plain TCP with prior
     /// knowledge.
     Http2,
+    /// HTTP/3, over QUIC.
+    Http3,
 }
 
 impl Version {
@@ -40,6 +42,7 @@ impl Version {
             Version::Http10 => "HTTP/1.0",
             Version::Http11 => "HTTP/1.1",
             Version::Http2 => "HTTP/2",
+            Version::Http3 => "HTTP/3",
         }
     }
 }
@@ -72,6 +75,9 @@ pub struct Request {
     /// given back when it is dropped.
     #[allow(dead_code)] // Held for its `Drop`.
     pub(crate) charge: Charge,
+    /// Its head came in QUIC early data, which can be replayed.
+    #[cfg_attr(not(feature = "unstable-http3"), allow(dead_code))]
+    pub(crate) early_data: bool,
 }
 
 impl Request {
@@ -120,6 +126,7 @@ impl Request {
             body,
             peer: None,
             charge: Charge::none(),
+            early_data: false,
         })
     }
 
@@ -161,26 +168,40 @@ impl Request {
     /// and a URL with no path has the path `/`.
     pub fn path(&self) -> &str {
         let target = self.target();
-        let target = match crate::parse::split_absolute(target.as_bytes()) {
-            // `split_absolute` cuts at ASCII bytes, so `rest` is a suffix
-            // of the target on a character boundary.
-            Some((_, _, rest)) if !target.starts_with('/') => match rest.first() {
-                Some(b'/') => &target[target.len() - rest.len()..],
-                _ => "/",
-            },
-            _ => target,
+        // Origin form (`/path?query`), the common case, needs no split.
+        let target = if target.starts_with('/') {
+            target
+        } else {
+            match crate::parse::split_absolute(target.as_bytes()) {
+                // `split_absolute` cuts at ASCII bytes, so `rest` is a
+                // suffix of the target on a character boundary.
+                Some((_, _, rest)) => match rest.first() {
+                    Some(b'/') => &target[target.len() - rest.len()..],
+                    _ => "/",
+                },
+                None => target,
+            }
         };
-        target.split('?').next().unwrap_or(target)
+        // `?` is ASCII: the first such byte is where the query starts.
+        match target.bytes().position(|b| b == b'?') {
+            Some(q) => &target[..q],
+            None => target,
+        }
     }
 
     /// The query string, without the leading `?`.
     pub fn query(&self) -> Option<&str> {
-        self.target().split_once('?').map(|(_, query)| query)
+        let target = self.target();
+        target
+            .bytes()
+            .position(|b| b == b'?')
+            .map(|q| &target[q + 1..])
     }
 
     /// The HTTP version the request came with.
     pub fn version(&self) -> Version {
         match (self.head.h2, self.head.minor) {
+            (true, _) if self.head.h3 => Version::Http3,
             (true, _) => Version::Http2,
             (false, 0) => Version::Http10,
             (false, _) => Version::Http11,
@@ -195,8 +216,9 @@ impl Request {
 
     /// The first value of the header `name` (case-insensitive).
     pub fn header(&self, name: &str) -> Option<&[u8]> {
-        self.headers()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        // Compared as bytes: no UTF-8 check of every name on the way.
+        header_lines(&self.head_bytes()[self.head.headers.clone()])
+            .find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
             .map(|(_, value)| value)
     }
 
@@ -213,6 +235,21 @@ impl Request {
     /// worth believing when it comes from a proxy you run.
     pub fn peer_addr(&self) -> Option<SocketAddr> {
         self.peer
+    }
+
+    /// Whether the request came in 0-RTT early data (HTTP/3 to a server
+    /// whose QUIC configuration takes it), which anyone who recorded it can
+    /// send again (RFC 8470).
+    ///
+    /// The server answers early requests of methods other than `GET`,
+    /// `HEAD` and `OPTIONS` with `425 Too Early` itself, so a handler only
+    /// sees early requests of those three. A handler for which even such a
+    /// request has effects it must not repeat answers it with
+    /// `Response::new(425)`: the client sends it again once the handshake
+    /// is over, and it is no longer early.
+    #[cfg(feature = "unstable-http3")]
+    pub fn is_early_data(&self) -> bool {
+        self.early_data
     }
 
     /// The request body. Empty if the request has none, or if its body is

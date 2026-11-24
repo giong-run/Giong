@@ -373,6 +373,9 @@ fn launch(
         if let Some((uid, gid)) = owner {
             cmd.uid(uid).gid(gid);
         }
+        // Linux only: elsewhere a killed test binary leaves the server running
+        // until the test's own cleanup or the CI job ends.
+        #[cfg(target_os = "linux")]
         // SAFETY: prctl is async-signal-safe and touches only this process.
         unsafe {
             cmd.pre_exec(|| {

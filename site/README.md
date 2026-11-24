@@ -1,17 +1,17 @@
 # giong.run
 
-The project's website: six static pages in English. No framework, no build tool to
+The project's website: static pages in English, six made by hand and a documentation page for every crate and guide. No framework, no build tool to
 install, no external requests: fonts and logos are served from this folder.
 
 ```
 site/
   build.py        generates the pages into public/ (run it, do not edit its output)
   content.py      what a person writes: the pitch, benchmark notes, code samples, FAQ
-  md.py           the small Markdown renderer for ROADMAP.md and CHANGELOG.md
+  md.py           the small Markdown renderer for the READMEs, guides, ROADMAP.md and CHANGELOG.md
   art.py          the drawings that explain the design (inline SVG, coloured by styles.css)
   public/         the folder that is deployed
     styles.css    every style; dark by default, light from the system or the toggle
-    main.js       theme toggle, phone menu, copy buttons, code tabs, the ring animation
+    main.js       theme toggle, phone menu, copy buttons ("Copy for agent" too), code tabs, the ring animation
     fonts/        Inter and JetBrains Mono (SIL Open Font License), latin subsets
     assets/       the mark, favicon and social preview, copied from ../assets/
     CNAME         giong.run, for GitHub Pages
@@ -20,11 +20,21 @@ site/
 | Page | Address | Made from |
 |---|---|---|
 | Home | `/` | `content.py`, the crates, the latest release |
-| Docs | `/docs/` | `content.py`, the crates, `docs/errors/README.md` |
+| Get started | `/docs/` | `content.py`, the crates, `docs/errors/README.md` |
+| A crate's docs | `/docs/<crate>/` | the crate's `README.md` at the release tag |
+| Guides | `/docs/best-practices/`, `deployment/`, `stability/`, `benchmark-tables/`, `errors/` | `content.py` `DOC_PAGES`: `docs/*.md` at the release tag |
+| Agent skill | `/docs/agent-skill/`, `/skills/giong.zip` | `skills/giong/SKILL.md`, with the guides and READMEs as `references/` |
 | Crates | `/crates/` | `content.py` `CRATES`, each crate's `Cargo.toml` and `src/` |
 | Benchmarks | `/benchmarks/` | `content.py` `CHARTS`, `CAVEATS`, `COMPARE` |
 | Roadmap | `/roadmap/` | `ROADMAP.md` |
 | Releases | `/releases/` | `CHANGELOG.md` |
+
+Every documentation page is also served as Markdown (`/docs/<page>.md`, `/docs/index.md`
+for Get started), keeps its Markdown in the page for its "Copy for agent" and "Copy prompt"
+buttons (`content.py` `PROMPT` is the prompt's preamble), and gives every `##` section a copy
+button. These pages are read from the release tag like `llms.txt`, so a page appears once a
+release has its file. Facts in `content.py` that changed with a release (platforms) are
+set by `content.apply_version()` from the workspace version.
 
 `llms.txt`, `llms-full.txt`, `sitemap.xml`, `robots.txt` and `404.html` are generated too.
 `llms.txt` and `llms-full.txt` are for language models, so they describe the release that
@@ -44,8 +54,12 @@ changes to the project reach the site without anyone touching `site/`:
   `content.py` `CRATES` for its layer in the stack, bullets and a headline fact.
 - **Lines of code** are counted from each crate's `src/`. The **test counts** are in
   `content.py` (one number per crate, summed by the build).
-- **The roadmap** is `ROADMAP.md`: a `## X.Y — Name` heading is a milestone, its
-  `- [x]` boxes give its progress, `(done)` or all boxes ticked marks it done.
+- **The roadmap** is `ROADMAP.md`: a `## X.Y — Name` (or `## X.Y.x — Name`) heading is a
+  milestone, its `- [x]` boxes give its progress, `(done)` or all boxes ticked marks it
+  done. A milestone done in `ROADMAP.md` whose version is newer than the release shows as
+  "releasing", never as shipped; one whose text starts with "Proposed" gets that badge.
+  The roadmap page draws every numbered milestone on one track and gives each one that
+  has not shipped a card; the home page shows the first four of those cards.
 - **The release notes** are `CHANGELOG.md`; the newest release is announced on the
   home page, with its milestone's name from the roadmap.
 - **The error codes** are the tables in `docs/errors/README.md`.
@@ -65,7 +79,9 @@ changes, change the drawing in the same pull request.
 
 ## Changing the words or a number
 
-Edit `content.py`. Every number on the site comes from the README and `bench/results/`;
+Edit `content.py`. The home page's head-to-head table (`SCOREBOARD`, the README's table of
+the Tokio crates each giong crate replaces, with its losses) and its build numbers
+(`BUILD`, from `bench/results/build/`) are there too. Every number on the site comes from the README and `bench/results/`;
 when a benchmark is run again, update the README first and then `content.py`, so the
 two never disagree. Keep the caveats next to the numbers they qualify.
 

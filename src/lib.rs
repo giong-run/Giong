@@ -78,9 +78,22 @@
 #![warn(missing_docs)]
 // Every `unsafe` block and impl says why it is sound (CI denies warnings).
 #![warn(clippy::undocumented_unsafe_blocks)]
+// Windows uses less of the shared code than Unix does: it has no Unix
+// sockets yet, and its files do not go through the path operations of the
+// driver.
+#![cfg_attr(windows, allow(dead_code))]
 
-#[cfg(not(target_os = "linux"))]
-compile_error!("giong only supports Linux: it is built on io_uring and epoll");
+#[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
+compile_error!(
+    "giong supports Linux (io_uring and epoll), Windows (completion ports) and, as a development \
+     platform, macOS (kqueue)"
+);
+
+#[cfg(all(windows, feature = "unstable-udp-offload"))]
+compile_error!(
+    "the unstable-udp-offload feature is for Linux and macOS: Windows has none of its offloads in \
+     giong yet"
+);
 
 mod buf;
 mod driver;
@@ -90,8 +103,13 @@ mod notify;
 mod op;
 mod runtime;
 mod slab;
+mod sys;
 
 pub mod error;
+#[cfg(unix)]
+pub mod fs;
+#[cfg(windows)]
+#[path = "fs/windows.rs"]
 pub mod fs;
 pub mod net;
 pub mod observe;
@@ -106,10 +124,24 @@ pub use runtime::{
     until_shutdown, worker_id, Builder, Handle, Runtime, ShutdownSignal, UntilShutdown,
 };
 
+/// Makes stream sends and connects fail with `ENOBUFS`, as macOS does when its
+/// network buffers run out, to test how giong waits for them. Built only with
+/// `--cfg giong_inject_enobufs`. Not part of the API.
+#[cfg(giong_inject_enobufs)]
+#[doc(hidden)]
+pub mod inject_enobufs;
+
 /// Entry points for the fuzz targets in `fuzz/`, built only by `cargo fuzz`
 /// (`--cfg fuzzing`). Not part of the API.
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing {
     pub use crate::net::dns::fuzzing::{dns_response, resolv_conf};
+
+    /// The control messages of a UDP receive (GRO segment size, ECN, the
+    /// address the datagram was sent to): must
+    /// never panic or read past the end.
+    pub fn udp_control(data: &[u8]) -> (u16, u8, Option<std::net::IpAddr>) {
+        crate::net::udp::parse_control(data)
+    }
 }

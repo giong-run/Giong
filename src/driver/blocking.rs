@@ -1,4 +1,5 @@
-//! The blocking threads of the epoll driver.
+//! The blocking threads of the epoll driver, and of the Windows driver for
+//! the file operations Windows has no overlapped form of.
 //!
 //! A regular file is always "ready" as far as epoll is concerned, so a read
 //! that has to wait for the disk would hold up the whole worker. The epoll
@@ -11,12 +12,20 @@
 //! writer, a hung network filesystem) holds up only its own thread. A
 //! finished job pushes its result onto its worker's [`Completions`] and pokes
 //! the worker's eventfd.
+//!
+//! When every thread is busy, jobs wait their turn. If no job finishes for
+//! [`STALL`] while jobs wait, the busy threads are taken to be stuck, and a
+//! thread starts for each waiting job, at most doubling the pool per stall
+//! and up to [`LIMIT`] threads in all: [`MAX_THREADS`] stuck jobs then hold
+//! up nothing but themselves.
 
 use std::collections::VecDeque;
+#[cfg(unix)]
 use std::io;
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex, OnceLock};
+use std::sync::Arc;
+use std::sync::{Condvar, Mutex, OnceLock};
 use std::thread;
 use std::time::Duration;
 
@@ -25,7 +34,16 @@ use crate::runtime::lock;
 /// The most blocking threads at once. Enough for disks that serve many
 /// requests in parallel (NVMe), and a bound on what a hung network
 /// filesystem can tie up.
-const MAX_THREADS: usize = 64;
+pub(super) const MAX_THREADS: usize = 64;
+
+/// The most blocking threads at once when [`MAX_THREADS`] of them are
+/// stuck, as Tokio's blocking pool has.
+const LIMIT: usize = 512;
+
+/// How long jobs wait with every thread busy and none finishing before one
+/// more thread starts. Disks under load finish something far more often,
+/// and a job stuck for good waits this long once.
+const STALL: Duration = Duration::from_millis(100);
 
 /// How long a thread waits for work before it ends.
 const IDLE: Duration = Duration::from_secs(10);
@@ -36,6 +54,11 @@ struct State {
     jobs: VecDeque<Job>,
     threads: usize,
     idle: usize,
+    /// Jobs finished so far, so that the watcher can tell stuck threads
+    /// from busy ones.
+    done: u64,
+    /// Set while a watcher thread runs.
+    watching: bool,
 }
 
 struct Pool {
@@ -50,6 +73,8 @@ fn pool() -> &'static Pool {
             jobs: VecDeque::new(),
             threads: 0,
             idle: 0,
+            done: 0,
+            watching: false,
         }),
         work: Condvar::new(),
     })
@@ -70,15 +95,23 @@ pub(super) fn spawn(job: Job) {
         return;
     }
     if state.threads >= MAX_THREADS {
-        // Every thread is busy: the job waits its turn.
+        // Every thread is busy: the job waits its turn, and a watcher
+        // starts another thread if the busy ones turn out to be stuck.
+        if !state.watching {
+            state.watching = true;
+            drop(state);
+            let started = thread::Builder::new()
+                .name("giong-blocking-watch".into())
+                .spawn(|| watch(self::pool()));
+            if started.is_err() {
+                lock(&pool.state).watching = false;
+            }
+        }
         return;
     }
     state.threads += 1;
     drop(state);
-    let started = thread::Builder::new()
-        .name("giong-blocking".into())
-        .spawn(|| work(self::pool()));
-    if started.is_err() {
+    if !start(pool) {
         let mut state = lock(&pool.state);
         state.threads -= 1;
         if state.threads == 0 {
@@ -93,6 +126,14 @@ pub(super) fn spawn(job: Job) {
     }
 }
 
+/// Starts a blocking thread, already counted in `threads`.
+fn start(pool: &'static Pool) -> bool {
+    thread::Builder::new()
+        .name("giong-blocking".into())
+        .spawn(move || work(pool))
+        .is_ok()
+}
+
 fn work(pool: &'static Pool) {
     let mut state = lock(&pool.state);
     loop {
@@ -100,6 +141,7 @@ fn work(pool: &'static Pool) {
             drop(state);
             job();
             state = lock(&pool.state);
+            state.done += 1;
             continue;
         }
         state.idle += 1;
@@ -116,49 +158,69 @@ fn work(pool: &'static Pool) {
     }
 }
 
+/// Runs while jobs wait with every thread busy. A [`STALL`] in which no job
+/// finished means the busy threads are stuck (a FIFO with no writer, a hung
+/// network filesystem): a thread starts for each waiting job, so the jobs
+/// behind them run.
+fn watch(pool: &'static Pool) {
+    let mut seen = lock(&pool.state).done;
+    loop {
+        thread::sleep(STALL);
+        let mut state = lock(&pool.state);
+        if state.jobs.is_empty() {
+            state.watching = false;
+            return;
+        }
+        if state.done == seen {
+            // A thread for each job that no idle thread will take, so that
+            // a few jobs behind stuck ones wait one stall, not one each; at
+            // most as many as run already, so that a long queue on a slow
+            // but working disk grows the pool by doubling, not in one step.
+            let more = (state.jobs.len().saturating_sub(state.idle))
+                .min(state.threads.max(1))
+                .min(LIMIT.saturating_sub(state.threads));
+            state.threads += more;
+            drop(state);
+            let started = (0..more).take_while(|_| start(pool)).count();
+            state = lock(&pool.state);
+            state.threads -= more - started;
+        }
+        seen = state.done;
+    }
+}
+
 /// Results of one worker's blocking jobs, waiting for the worker.
+#[cfg(unix)]
 pub(super) struct Completions {
     done: Mutex<Vec<(usize, i32)>>,
     /// Set while `done` is not empty, so the worker can check without the
     /// lock.
     any: AtomicBool,
-    /// Poked after a push; the worker watches it with epoll.
-    eventfd: OwnedFd,
+    /// Rung after a push; the worker watches it for readability.
+    bell: crate::sys::Bell,
 }
 
+#[cfg(unix)]
 impl Completions {
     pub(super) fn new() -> io::Result<Arc<Self>> {
-        // SAFETY: plain syscall; the result is checked.
-        let fd = unsafe { libc::eventfd(0, libc::EFD_CLOEXEC | libc::EFD_NONBLOCK) };
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
+        let bell = crate::sys::Bell::new()?;
         Ok(Arc::new(Self {
             done: Mutex::new(Vec::new()),
             any: AtomicBool::new(false),
-            // SAFETY: a fresh descriptor we own.
-            eventfd: unsafe { OwnedFd::from_raw_fd(fd) },
+            bell,
         }))
     }
 
     pub(super) fn fd(&self) -> i32 {
-        self.eventfd.as_raw_fd()
+        self.bell.read_fd()
     }
 
     /// Called on a blocking thread when the job for `key` is done.
     pub(super) fn push(&self, key: usize, res: i32) {
         lock(&self.done).push((key, res));
         self.any.store(true, Ordering::Release);
-        let one: u64 = 1;
-        // SAFETY: writes 8 bytes from a valid u64 to an eventfd we own (the
-        // `Arc` keeps it open while any job can still call this).
-        unsafe {
-            libc::write(
-                self.eventfd.as_raw_fd(),
-                &one as *const u64 as *const libc::c_void,
-                8,
-            );
-        }
+        // The `Arc` keeps the bell open while any job can still call this.
+        self.bell.ring();
     }
 
     /// `true` if results are waiting; no lock, no system call.
@@ -166,18 +228,27 @@ impl Completions {
         self.any.load(Ordering::Acquire)
     }
 
-    /// Takes the waiting results, and resets the eventfd.
-    pub(super) fn take(&self, into: &mut Vec<(usize, i32)>) {
-        let mut count: u64 = 0;
-        // SAFETY: reads 8 bytes into a valid u64; the eventfd is
-        // non-blocking, so an empty one returns EAGAIN at once.
-        unsafe {
-            libc::read(
-                self.eventfd.as_raw_fd(),
-                &mut count as *mut u64 as *mut libc::c_void,
-                8,
-            );
+    /// Resets the bell if no result is waiting. A job that finishes while
+    /// [`take`](Self::take) runs can ring the bell after `take` reset it
+    /// and took the job's result: the bell then stays readable with nothing
+    /// to take, and a level-triggered watch would report it on every wait.
+    /// A job's ring comes after its `any`, so a reset here never hides a
+    /// result: `any` already says it.
+    pub(super) fn quiet(&self) {
+        if !self.any() {
+            self.bell.drain();
         }
+    }
+
+    /// Rings the bell as a job does, with no result.
+    #[cfg(test)]
+    pub(super) fn ring(&self) {
+        self.bell.ring();
+    }
+
+    /// Takes the waiting results, and resets the bell.
+    pub(super) fn take(&self, into: &mut Vec<(usize, i32)>) {
+        self.bell.drain();
         let mut done = lock(&self.done);
         self.any.store(false, Ordering::Relaxed);
         into.append(&mut done);

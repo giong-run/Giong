@@ -121,6 +121,7 @@ pub struct Config {
     pub(crate) statement_timeout: Option<Duration>,
     pub(crate) max_result_size: usize,
     pub(crate) statement_cache: usize,
+    pub(crate) batch_reads: bool,
 }
 
 impl Default for Config {
@@ -163,6 +164,7 @@ impl Config {
             statement_timeout: Some(Duration::from_secs(30)),
             max_result_size: 64 << 20,
             statement_cache: 256,
+            batch_reads: false,
         }
     }
 
@@ -304,6 +306,72 @@ impl Config {
         self
     }
 
+    /// Lets [`Pool`](crate::Pool) send the `SELECT` statements it runs on
+    /// its shared connections (`query`, `query_one`, `query_opt`) in batches:
+    /// off by default.
+    ///
+    /// The server sends its answers to the statements before one `Sync`
+    /// message in one write, where it otherwise makes a write, and wakes the
+    /// client, for each statement; when it is the busy side, it then answers
+    /// more statements a second (on PostgreSQL 16, about 50% more one-row
+    /// `SELECT`s, measured with pgbench in batches of 16). A batch is the
+    /// `SELECT`s that are waiting to be written to one connection when it
+    /// writes, at most 16: a statement never waits for others to join it.
+    ///
+    /// A `SELECT` whose text contains `set_config` runs alone, never in a
+    /// batch: the statements of a batch share one transaction, and a
+    /// transaction-local setting (`set_config(name, value, true)`, as
+    /// row-level security set up per request uses) would apply to the
+    /// statements of other tasks after it. The text is matched in any case,
+    /// quoted strings and comments included; a false match only costs the
+    /// statement its batch. **Do not turn it on if functions that
+    /// statements call make such settings** (`set_config(.., true)` or
+    /// `SET LOCAL` inside a function): those calls cannot be seen in the
+    /// statement's text.
+    ///
+    /// What changes for a statement in a batch:
+    ///
+    /// * It runs in one transaction with the others, made read-only first
+    ///   (`set_config('transaction_read_only', 'on', true)`). A `SELECT`
+    ///   that writes (one that calls a function that writes, or takes a row
+    ///   lock with `FOR UPDATE`) fails with the server's `25006` and is sent
+    ///   again on its own, where it runs as it would without batches; it is
+    ///   not batched again on that connection.
+    /// * When a statement in a batch fails, or the batch's commit does (a
+    ///   deferred constraint on a temporary table, say), the batch's
+    ///   transaction is rolled back: the statement that failed fails, and
+    ///   every other statement of the batch is sent again, on its own,
+    ///   whether it had run (what it did was rolled back) or the server had
+    ///   skipped it. What a transaction's rollback does not undo happens
+    ///   twice then: a sequence advanced by `nextval` (allowed on temporary
+    ///   sequences) is advanced again, and a session-level advisory lock
+    ///   (`pg_advisory_lock`, `pg_try_advisory_lock`) is taken twice, so one
+    ///   unlock leaves it held. One statement that fails on its input (a bad
+    ///   `$1::int4`, say) also makes up to 15 statements before it run
+    ///   again: bounded, but more work for a database that is the limit.
+    /// * Its answer arrives when the batch ends, once its commit is known:
+    ///   a statement waits for up to 15 others that were written after it.
+    ///   They run one after another on the server either way, so this is
+    ///   added only to the statements early in a batch; keep slow statements
+    ///   and fast ones in different pools when that matters.
+    /// * `now()` and `transaction_timestamp()` give the time the batch
+    ///   started, and a transaction-scoped advisory lock is held until the
+    ///   batch ends.
+    /// * The locks its statements take are held until the batch ends, so a
+    ///   statement of a batch waits at most 50 ms for a lock: past that, or
+    ///   when it fails with a deadlock (`40P01`) or a serialization failure
+    ///   (`40001`), the batch is rolled back and the statement is sent
+    ///   again alone, where it waits as it would without batches (a
+    ///   `lock_timeout` shorter than 50 ms then applies to that run). Without
+    ///   that, a batch could deadlock with a transaction that the same
+    ///   statements one by one never would (a migration that locks two
+    ///   tables the batch reads), and the server would roll one of them
+    ///   back.
+    pub fn batch_reads(mut self, batch: bool) -> Self {
+        self.batch_reads = batch;
+        self
+    }
+
     /// Reads a connection URL:
     ///
     /// ```text
@@ -324,6 +392,14 @@ impl Config {
     /// (stricter than libpq, which checks nothing for `require`).
     /// `sslrootcert` is a PEM file of authorities to trust instead of the
     /// machine's, or `system`.
+    ///
+    /// The user name, the password and the database name are
+    /// percent-decoded: write `/` as `%2F`, `?` as `%3F` and `@` as `%40`
+    /// in them. A URL with an `@` after the first `/` or `?` that would
+    /// otherwise not read, or with an `@` in its database name, is refused
+    /// with a message that quotes none of it, since a piece of a password
+    /// with an unescaped `/` or `?` would end up in the message (or, as the
+    /// database name, be sent to the wrong host).
     pub fn from_url(url: &str) -> Result<Self, Error> {
         parse_url(url)
     }
@@ -453,6 +529,42 @@ fn percent_decode(s: &str, what: &str) -> Result<String, Error> {
 }
 
 fn parse_url(url: &str) -> Result<Config, Error> {
+    // An `@` after the first `/` or `?` is most likely the end of a password
+    // holding an unescaped `/` or `?`: the URL is cut in the wrong place, so
+    // a piece of the password would be read as the port, the database name
+    // or a parameter, and quoted in the error, or sent to the server as the
+    // database name. Say what to fix instead, quoting nothing.
+    let after_cut = |accepted: bool| {
+        let Some((_, rest)) = url.split_once("://") else {
+            return false;
+        };
+        let Some(cut) = rest.find(['/', '?']) else {
+            return false;
+        };
+        if accepted {
+            // Read without an error: only a database name holding an `@`
+            // gives it away (parameters may hold one).
+            let before_query = rest.split_once('?').map_or(rest, |(r, _)| r);
+            before_query.get(cut..).is_some_and(|db| db.contains('@'))
+        } else {
+            rest[cut..].contains('@')
+        }
+    };
+    let cut_password = |read: &str| {
+        Error::config(format!(
+            "the URL {read}has an @ after a / or ?: if the password (or the user name) holds one \
+             of them, percent-encode it (/ as %2F, ? as %3F, @ as %40); write an @ in the \
+             database name as %40 too"
+        ))
+    };
+    match parse(url) {
+        Ok(_) if after_cut(true) => Err(cut_password("")),
+        Err(_) if after_cut(false) => Err(cut_password("could not be read, and it ")),
+        result => result,
+    }
+}
+
+fn parse(url: &str) -> Result<Config, Error> {
     let rest = url
         .strip_prefix("postgres://")
         .or_else(|| url.strip_prefix("postgresql://"))
@@ -757,5 +869,36 @@ mod tests {
         let err = |url: &str| Config::from_url(url).unwrap_err().to_string();
         assert!(err("postgres://u@h/db?require_auth=!md5").contains("not the ones"));
         assert!(err("postgres://u@h/db?require_auth=gss").contains("not a method"));
+    }
+    #[test]
+    fn a_password_cut_by_an_unescaped_slash_or_question_mark_is_never_quoted() {
+        for url in [
+            "postgres://app:s3cr/et@db/x",
+            "postgres://app:pa?ss@db/x",
+            "postgres://app:se:cr/et@db/x",
+            "postgres://app:pa?ss=1@db",
+            "postgres://app:pa%zz/ss@db",
+            // Read without an error, these would connect to the host "app"
+            // with a piece of the password as the port and the rest, with
+            // the real host, as the database name.
+            "postgres://app:12/34@db/x",
+            "postgres://app:p@ss/word@db/x",
+        ] {
+            let e = Config::from_url(url).unwrap_err().to_string();
+            assert!(e.contains("percent-encode"), "{url}: {e}");
+            for piece in ["s3cr", "et", "pa", "ss", "cr", "zz", "12", "34", "word"] {
+                assert!(!e.contains(&format!("\"{piece}")), "{url}: {e}");
+                assert!(!e.contains(&format!("{piece}\"")), "{url}: {e}");
+            }
+        }
+        // An @ in a parameter is fine when the URL reads.
+        let c = Config::from_url("postgres://db/x?application_name=me@here").unwrap();
+        assert_eq!(c.application_name.as_deref(), Some("me@here"));
+        // Encoded, the same passwords work, and so does an @ in the
+        // database name.
+        let c = Config::from_url("postgres://app:s3cr%2Fet@db/x%40y").unwrap();
+        assert_eq!(c.password.as_deref(), Some("s3cr/et"));
+        assert_eq!(c.target(), "db:5432");
+        assert_eq!(c.dbname.as_deref(), Some("x@y"));
     }
 }

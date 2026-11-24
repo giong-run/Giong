@@ -112,8 +112,8 @@ Other status codes: `408` the request was too slow, `413` the body is too large,
 Turn on the `tls` feature to get `Server::serve_tls`, which uses the [`giong-tls`](../giong-tls/README.md) crate (rustls, TLS 1.2 and 1.3):
 
 ```toml
-giong-http = { version = "1.0.1", features = ["tls"] }
-giong-tls = "1.0.1"
+giong-http = { version = "1.4.2", features = ["tls"] }
+giong-tls = "1.4.2"
 ```
 
 ```rust,no_run
@@ -214,12 +214,59 @@ Memory per connection, measured with `bench/hold` over HTTP/2 with prior knowled
 
 An idle connection gives its buffers back, so what it keeps is its task, its HPACK tables and its state; an idle HTTP/1.1 connection still costs 1.9 KiB. Results are in `bench/results/h2/`.
 
+## HTTP/3 (unstable)
+
+The `unstable-http3` feature adds HTTP/3 (RFC 9114) on [`giong-quic`](../giong-quic/README.md),
+for the same handlers, on Linux and macOS. It needs Rust 1.85, and may change before it is
+stabilised; the default build does not have it.
+
+```toml
+giong-http = { version = "1.4.2", features = ["unstable-http3", "client"] }
+giong-quic = "1.4.2"
+```
+
+```rust,ignore
+use giong_http::{Request, Response, Server};
+
+async fn handler(req: Request) -> Response {
+    Response::text(format!("hello over {}", req.version()))
+}
+
+async fn serve(tls: rustls::ServerConfig) -> std::io::Result<()> {
+    // `tls` allows TLS 1.3 and has `alpn_protocols` set to `vec![b"h3".to_vec()]`.
+    let config = giong_quic::ServerConfig::new(tls)?;
+    let endpoint = giong_quic::Endpoint::server("0.0.0.0:443".parse().unwrap(), config)?;
+    Server::new().serve_h3(endpoint, handler).await;
+    Ok(())
+}
+```
+
+- **Browsers find it through `Alt-Svc`.** Have the server that answers over TCP add
+  `Response::header("alt-svc", "h3=\":443\"; ma=86400")`, with the UDP port of the
+  endpoint.
+- **Limits come from the endpoint**: the requests a client may have open at once are its
+  `TransportConfig::max_streams`, and an idle connection closes after its
+  `TransportConfig::idle_timeout`. On shutdown the client gets `GOAWAY`, requests in flight
+  finish, and later ones are refused with `H3_REQUEST_REJECTED` so the client can retry them
+  elsewhere.
+- **Trailers** travel both ways as over HTTP/2. A streamed request body goes over HTTP/1.1
+  or HTTP/2.
+- **The client**: `Client::builder().http3(quic)` uses HTTP/3 for origins that advertise it
+  with `Alt-Svc`, and falls back to TCP for five minutes when the QUIC handshake does not
+  answer; `http3_prior_knowledge(quic)` speaks it at once. With early data on in `quic`,
+  only GET, HEAD and OPTIONS requests without a body go in 0-RTT. Not through a proxy.
+- **Checked** with `h3spec` in CI: 85 of 86 cases pass and none fails (the other needs
+  0-RTT, which the example leaves off). `cargo run --release -p giong-http --features
+  unstable-http3 --example h3` serves it locally (`curl -k --http3-only https://localhost:8443/`).
+- **Not measured yet** end to end; the QUIC layer underneath is in
+  [docs/BENCHMARKS.md](../docs/BENCHMARKS.md#quic).
+
 ## Client
 
 The `client` feature adds an HTTP/1.1 and HTTP/2 client, `giong_http::client` (HTTPS included, through giong-tls):
 
 ```toml
-giong-http = { version = "1.0.1", features = ["client"] }
+giong-http = { version = "1.4.2", features = ["client"] }
 ```
 
 ```rust,no_run
@@ -249,6 +296,7 @@ async fn demo() -> Result<(), Error> {
 - **Connections kept and shared.** A pool for each origin (scheme, host, port), up to 16 connections by default (`ClientBuilder::max_connections_per_host`). Further requests wait in line and are served first come, first served: a connection that comes back goes to the request that has waited longest.
 - **Connections that closed are noticed.** An idle connection the server has closed is not used. An idempotent request (`GET`, `HEAD`, `PUT`, `DELETE`, `OPTIONS`) that meets a kept-alive connection closing under it is sent once more on a new one; a `POST` or `PATCH` is not, since the server may have processed it, and the error says so.
 - **HTTP/2 when the server picks it.** `https` connections offer `h2` and `http/1.1` through ALPN; a server that picks `h2` gets every request to its origin on one connection, as many at once as it allows (another connection is opened, up to the limit, when it allows no more), and `Response::version()` says which was spoken. `ClientBuilder::http2(false)` sticks to HTTP/1.1; `ClientBuilder::http2_prior_knowledge(true)` speaks HTTP/2 to `http` URLs from the first byte, for servers known to accept it (gRPC backends, giong-http's own). What a server can make the client hold is bounded: 1 MiB of each response body and 4 MiB in all on a connection until the program reads them, header blocks by the head limit. A request the server refused unprocessed (`REFUSED_STREAM`, or left out by a GOAWAY) is sent again whatever its method; a dropped request resets its stream and the connection carries on. The client's side of HTTP/2 is fuzzed every night (`h2_client`).
+- **Warm-up and idle checks, when asked.** `Client::preconnect(url)` opens a connection to the origin (DNS, TCP, proxy tunnel, TLS) without sending a request and returns the version it speaks; requests made meanwhile wait for it and share it when ALPN picks `h2`, and open their own when it picks `http/1.1` or the connection fails, so none is sent twice. `Client::ping_idle_http2(url, deadline)` sends a PING on each idle HTTP/2 connection to the origin and waits for the acknowledgements: one that answers counts as used, one that does not within `deadline` and still carries no request is closed at once (`GIONG-E1103`), so a connection that died silently is found before a request waits on it. The client never pings on its own.
 - **HTTPS, verified.** Certificates are checked against the machine's certificate authorities and the host name; `ClientBuilder::tls` takes a `TlsConnector` for a private authority or a client certificate. A redirect from HTTPS to HTTP is refused.
 - **Redirects** (301, 302, 303, 307, 308) are followed, up to 10. 303, and 301 or 302 after a `POST`, become a `GET` without the body; 307 and 308 repeat the request as it was. `Authorization`, `Cookie` and a `Host` set by hand are not sent to another origin.
 - **Finite limits.** A request has 30 s in all (`ClientBuilder::timeout`, or `RequestBuilder::timeout` for one): waiting for a connection, connecting (10 s of it at most), sending, reading the response, redirects. A response body may have 16 MiB, its head 64 KiB. An unused connection is closed after 60 s.
@@ -288,8 +336,8 @@ Results are in `bench/results/http-client/`.
 
 ## Not there yet
 
-Server push. Routing and compression of responses are in [`giong-web`](../giong-web/README.md). In the client: cookies, streaming request bodies, `br` and `zstd`, SOCKS proxies, HTTP/2 through an `http://` proxy (HTTPS through a proxy's tunnel gets HTTP/2), the `Upgrade: h2c` handshake.
+Server push. Routing and compression of responses are in [`giong-web`](../giong-web/README.md). In the client: cookies, `br` and `zstd`, SOCKS proxies, HTTP/2 through an `http://` proxy (HTTPS through a proxy's tunnel gets HTTP/2), the `Upgrade: h2c` handshake.
 
 ## Tests
 
-`cargo test -p giong-http --all-features`: 66 unit tests (including 500,000 random inputs for the parser and the chunked decoder, 300,000 for the client's response parser and URLs, 100,000 responses read by the client on a connection in random pieces, 50,000 damaged gzip and deflate bodies, 200,000 HPACK header blocks and Huffman strings, 3,000 HTTP/2 connections whose every frame is checked, and 3,000 from the client's side, checking what it holds and writes), 44 HTTP/2 tests (22 end-to-end on real sockets with a client that writes its frames by hand, 22 of frames, HPACK, requests and stream memory), 27 end-to-end tests of the server on real sockets (one of them over a Unix socket, three of the memory budget for requests being received), 14 end-to-end tests of streamed bodies (a 250 KB upload read piece by piece with the connection used again after it, chunked uploads, bodies past the handler's limit, broken framing, nothing read and no `100 Continue` until the handler asks, a handler that answers early, a body cut short, the timeout of each piece; streamed responses chunked and sent piece by piece, to an HTTP/1.0 client, without a body for `HEAD`, 204 and 304, aborted, and stopped when the client goes away), 12 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 22 end-to-end tests of the client against this server, against servers that misbehave on purpose and through proxies, 15 of the client over HTTP/2 (against this server through ALPN, over kernel TLS where the kernel has it, and with prior knowledge, and against servers that refuse streams, send GOAWAY, reset streams, send malformed responses, close early, send past the window or wait for a window the client grants only once the connection has gone quiet), 15 documentation examples. One more client test, ignored by default (`-- --ignored`), fetches from crates.io over HTTPS.
+`cargo test -p giong-http --all-features`: 66 unit tests (including 500,000 random inputs for the parser and the chunked decoder, 300,000 for the client's response parser and URLs, 100,000 responses read by the client on a connection in random pieces, 50,000 damaged gzip and deflate bodies, 200,000 HPACK header blocks and Huffman strings, 3,000 HTTP/2 connections whose every frame is checked, and 3,000 from the client's side, checking what it holds and writes), 44 HTTP/2 tests (22 end-to-end on real sockets with a client that writes its frames by hand, 22 of frames, HPACK, requests and stream memory), 30 end-to-end tests of the server on real sockets (one of them over a Unix socket, four of the memory budget for requests being received, one of them with bodies received straight into the request buffer, one of bodies from 64 KiB to 3 MiB received straight into the request buffer between other requests), 14 end-to-end tests of streamed bodies (a 250 KB upload read piece by piece with the connection used again after it, chunked uploads, bodies past the handler's limit, broken framing, nothing read and no `100 Continue` until the handler asks, a handler that answers early, a body cut short, the timeout of each piece; streamed responses chunked and sent piece by piece, to an HTTP/1.0 client, without a body for `HEAD`, 204 and 304, aborted, and stopped when the client goes away), 12 end-to-end HTTPS tests with a rustls client (TLS 1.2 and 1.3, pipelining, a 3 MB body, 400/413 errors, idle connections, clients that do not speak TLS, graceful shutdown, 16 client threads at once), 22 end-to-end tests of the client against this server, against servers that misbehave on purpose and through proxies, 15 of the client over HTTP/2 (against this server through ALPN, over kernel TLS where the kernel has it, and with prior knowledge, and against servers that refuse streams, send GOAWAY, reset streams, send malformed responses, close early, send past the window or wait for a window the client grants only once the connection has gone quiet), 15 documentation examples. One more client test, ignored by default (`-- --ignored`), fetches from crates.io over HTTPS.

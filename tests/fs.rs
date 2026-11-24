@@ -1,7 +1,11 @@
 //! Files: open, read and write at an offset, sync, metadata, and the
 //! path operations.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::fd::FromRawFd;
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -9,6 +13,39 @@ use std::time::{Duration, Instant, SystemTime};
 
 use giong::fs::{self, File, OpenOptions};
 use giong::time::timeout;
+
+/// The readiness driver of this platform: epoll on Linux, kqueue on macOS.
+#[cfg(target_os = "linux")]
+const READINESS: giong::DriverKind = giong::DriverKind::Epoll;
+#[cfg(target_os = "macos")]
+const READINESS: giong::DriverKind = giong::DriverKind::Kqueue;
+
+/// A file whose size its metadata does not tell.
+#[cfg(target_os = "linux")]
+const FILE_OF_UNKNOWN_SIZE: &str = "/proc/self/status";
+#[cfg(target_os = "macos")]
+const FILE_OF_UNKNOWN_SIZE: &str = "/dev/null";
+
+/// 1 if this or any other process has `path` open, 0 if not: Windows lists
+/// no handles by path, but it refuses to open a file for nobody else to
+/// share while a handle to it is open. So the tests that count descriptors
+/// check here that the last one goes.
+#[cfg(windows)]
+fn open_fds(path: &std::path::Path) -> usize {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000; // opens directories too
+    const ERROR_SHARING_VIOLATION: i32 = 32;
+    let alone = std::fs::OpenOptions::new()
+        .read(true)
+        .share_mode(0)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path);
+    match alone {
+        Ok(_) => 0,
+        Err(e) if e.raw_os_error() == Some(ERROR_SHARING_VIOLATION) => 1,
+        Err(e) => panic!("cannot tell whether {path:?} is open: {e}"),
+    }
+}
 
 /// A directory of its own for one test, removed afterwards.
 struct TempDir(PathBuf);
@@ -47,11 +84,36 @@ fn payload(len: usize, seed: u64) -> Vec<u8> {
 
 /// How many descriptors of this process refer to `path`. (Counting all
 /// descriptors would see those of tests running in parallel.)
+#[cfg(target_os = "linux")]
 fn open_fds(path: &std::path::Path) -> usize {
     std::fs::read_dir("/proc/self/fd")
         .unwrap()
         .filter_map(|entry| std::fs::read_link(entry.ok()?.path()).ok())
         .filter(|target| target == path)
+        .count()
+}
+
+/// How many descriptors of this process refer to `path`. macOS has no
+/// `/proc`: the descriptors are listed in `/dev/fd` and `F_GETPATH` names
+/// their file, with symbolic links resolved (`/var` is `/private/var`).
+#[cfg(target_os = "macos")]
+fn open_fds(path: &std::path::Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    fds.into_iter()
+        .filter(|&fd| {
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
+            if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+                return false;
+            }
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            std::ffi::OsStr::from_bytes(&buf[..len]) == path.as_os_str()
+        })
         .count()
 }
 
@@ -175,6 +237,21 @@ fn offsets_above_i64_max_are_refused_on_every_driver() {
 }
 
 #[test]
+#[cfg_attr(miri, ignore = "Miri refuses pwrite on a file opened with O_APPEND")]
+fn an_appending_file_writes_at_the_end_whatever_the_offset() {
+    let dir = TempDir::new("append");
+    giong::block_on(async {
+        let path = dir.path("f");
+        fs::write(&path, "one").await.unwrap();
+        let file = File::options().append(true).open(&path).await.unwrap();
+        file.write_all_at(",two", 0).await.0.unwrap();
+        file.write_all_at(",three", 0).await.0.unwrap();
+        drop(file);
+        assert_eq!(fs::read(&path).await.unwrap(), b"one,two,three");
+    });
+}
+
+#[test]
 fn open_options_behave_like_the_standard_library() {
     let dir = TempDir::new("options");
     giong::block_on(async {
@@ -210,14 +287,6 @@ fn open_options_behave_like_the_standard_library() {
         drop(File::create(&path).await.unwrap());
         assert!(fs::read(&path).await.unwrap().is_empty());
 
-        // Append: every write lands at the end, whatever its offset.
-        fs::write(&path, "one").await.unwrap();
-        let file = File::options().append(true).open(&path).await.unwrap();
-        file.write_all_at(",two", 0).await.0.unwrap();
-        file.write_all_at(",three", 0).await.0.unwrap();
-        drop(file);
-        assert_eq!(fs::read(&path).await.unwrap(), b"one,two,three");
-
         // Truncate.
         let file = File::options().write(true).truncate(true).open(&path).await;
         drop(file.unwrap());
@@ -231,15 +300,18 @@ fn open_options_behave_like_the_standard_library() {
         assert!(file.read_at(Vec::with_capacity(4), 0).await.0.is_err());
 
         // Permission bits of a new file.
-        let private = dir.path("private");
-        let file = File::options()
-            .write(true)
-            .create_new(true)
-            .mode(0o600)
-            .open(&private)
-            .await
-            .unwrap();
-        assert_eq!(file.metadata().await.unwrap().mode() & 0o777, 0o600);
+        #[cfg(unix)]
+        {
+            let private = dir.path("private");
+            let file = File::options()
+                .write(true)
+                .create_new(true)
+                .mode(0o600)
+                .open(&private)
+                .await
+                .unwrap();
+            assert_eq!(file.metadata().await.unwrap().mode() & 0o777, 0o600);
+        }
 
         let err = File::open("nul\0byte").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -338,17 +410,37 @@ fn metadata_describes_files_directories_and_links() {
         assert!(meta.is_dir() && !meta.is_file());
 
         let link = dir.path("link");
-        std::os::unix::fs::symlink(&path, &link).unwrap();
-        assert!(fs::metadata(&link).await.unwrap().is_file());
-        assert!(fs::symlink_metadata(&link).await.unwrap().is_symlink());
+        #[cfg(unix)]
+        let linked = std::os::unix::fs::symlink(&path, &link);
+        // Windows lets only some accounts make links (administrators, or
+        // anyone in developer mode).
+        #[cfg(windows)]
+        let linked = std::os::windows::fs::symlink_file(&path, &link);
+        match linked {
+            // (Wine makes the link and then cannot follow it; the standard
+            // library is the witness of whether the system can.)
+            Ok(()) if cfg!(windows) && std::fs::metadata(&link).is_err() => {
+                eprintln!("links not followed here");
+                assert!(fs::metadata(&link).await.is_err());
+            }
+            Ok(()) => {
+                assert!(fs::metadata(&link).await.unwrap().is_file());
+                assert!(fs::symlink_metadata(&link).await.unwrap().is_symlink());
+            }
+            Err(e) if cfg!(windows) => eprintln!("links not checked: {e}"),
+            Err(e) => panic!("{e}"),
+        }
 
         let err = fs::metadata(dir.path("missing")).await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
 
-        // Files whose size is not known in advance.
-        let status = fs::read("/proc/self/status").await.unwrap();
-        assert!(status.starts_with(b"Name:"));
-        assert!(status.len() > 100);
+        // Files whose size is not known in advance (Linux's /proc).
+        #[cfg(target_os = "linux")]
+        {
+            let status = fs::read("/proc/self/status").await.unwrap();
+            assert!(status.starts_with(b"Name:"));
+            assert!(status.len() > 100);
+        }
     });
 }
 
@@ -461,6 +553,9 @@ fn closed_and_dropped_files_release_their_descriptors() {
         assert_eq!(open_fds(&path), 1);
         drop(kept);
     });
+    // Nothing is left open once the runtime has ended. (Where descriptors
+    // cannot be counted, as on Windows, this is what catches a leak.)
+    assert_eq!(open_fds(&path), 0);
     // Dropping a file outside the runtime closes it directly.
     let file = giong::block_on(async { File::open(&path).await.unwrap() });
     assert_eq!(open_fds(&path), 1);
@@ -486,11 +581,12 @@ fn files_dropped_at_shutdown_release_their_descriptors() {
     assert_eq!(open_fds(&path), 0);
 }
 
+#[cfg(unix)]
 #[test]
 fn a_read_that_never_completes_can_be_cancelled() {
     // A pipe nobody writes to: the read stays in flight until it is dropped.
     let mut fds = [0; 2];
-    assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+    assert_eq!(unsafe { pipe_cloexec(fds.as_mut_ptr()) }, 0);
     let (reader, writer) = unsafe {
         (
             std::fs::File::from_raw_fd(fds[0]),
@@ -513,6 +609,7 @@ fn a_read_that_never_completes_can_be_cancelled() {
     });
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot open a pseudo-terminal")]
 fn a_file_is_closed_only_once_a_blocking_thread_is_done_with_it() {
@@ -529,21 +626,40 @@ fn a_file_is_closed_only_once_a_blocking_thread_is_done_with_it() {
     }
 }
 
+/// The file descriptor `fd` refers to.
+#[cfg(target_os = "linux")]
+fn fd_path(fd: i32) -> std::path::PathBuf {
+    std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap()
+}
+
+/// The file descriptor `fd` refers to (`F_GETPATH`).
+#[cfg(target_os = "macos")]
+fn fd_path(fd: i32) -> std::path::PathBuf {
+    use std::os::unix::ffi::OsStrExt;
+    let mut buf = [0u8; libc::PATH_MAX as usize];
+    // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
+    assert!(unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } >= 0);
+    let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    std::path::PathBuf::from(std::ffi::OsStr::from_bytes(&buf[..len]))
+}
+
+#[cfg(unix)]
 fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, close: bool) {
     let fd = std::os::fd::AsRawFd::as_raw_fd(&master);
-    let target = std::fs::read_link(format!("/proc/self/fd/{fd}")).unwrap();
+    let target = fd_path(fd);
     let before = open_fds(&target);
     giong::block_on(async move {
         let file = File::from_std(master);
         let read = file.read_at(Vec::with_capacity(16), 0);
-        assert!(timeout(Duration::from_millis(100), read).await.is_err());
+        let early = timeout(Duration::from_millis(100), read).await;
+        assert!(early.is_err(), "the read did not wait: {:?}", early);
         if close {
             file.close().await.unwrap();
         } else {
             drop(file);
         }
-        let epoll = giong::driver_kind() == giong::DriverKind::Epoll;
-        if epoll {
+        let readiness = giong::driver_kind() != giong::DriverKind::IoUring;
+        if readiness {
             // The thread still waits in read(2): the descriptor stays open.
             giong::time::sleep(Duration::from_millis(20)).await;
             assert_eq!(open_fds(&target), before);
@@ -552,7 +668,7 @@ fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, clos
         // io_uring the read was cancelled in the kernel, and the terminal
         // may already be closed, which makes this write fail.)
         let wrote = std::io::Write::write_all(&mut slave, b"x\n");
-        if epoll {
+        if readiness {
             wrote.unwrap();
         }
         let start = Instant::now();
@@ -563,7 +679,56 @@ fn closed_after_the_thread(master: std::fs::File, mut slave: std::fs::File, clos
     });
 }
 
+/// `pipe2(O_CLOEXEC)`, or `pipe` and `fcntl` where there is no `pipe2`.
+///
+/// # Safety
+///
+/// `fds` must have room for two descriptors.
+#[cfg(unix)]
+unsafe fn pipe_cloexec(fds: *mut libc::c_int) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    return libc::pipe2(fds, libc::O_CLOEXEC);
+    #[cfg(target_os = "macos")]
+    {
+        let res = libc::pipe(fds);
+        if res == 0 {
+            for i in 0..2 {
+                libc::fcntl(*fds.add(i), libc::F_SETFD, libc::FD_CLOEXEC);
+            }
+        }
+        res
+    }
+}
+
+/// The name of the terminal whose master is `fd`, into `name`.
+///
+/// # Safety
+///
+/// `fd` must be a terminal master.
+#[cfg(unix)]
+unsafe fn ptsname(fd: libc::c_int, name: &mut [libc::c_char; 64]) -> libc::c_int {
+    #[cfg(target_os = "linux")]
+    return libc::ptsname_r(fd, name.as_mut_ptr(), name.len());
+    #[cfg(target_os = "macos")]
+    {
+        // Not reentrant, which no test needs.
+        let p = libc::ptsname(fd);
+        if p.is_null() {
+            return -1;
+        }
+        let bytes = std::ffi::CStr::from_ptr(p).to_bytes_with_nul();
+        if bytes.len() > name.len() {
+            return -1;
+        }
+        for (d, s) in name.iter_mut().zip(bytes) {
+            *d = *s as libc::c_char;
+        }
+        0
+    }
+}
+
 /// A pseudo-terminal's two ends, or `None` where there are none.
+#[cfg(unix)]
 fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
     use std::os::unix::fs::OpenOptionsExt;
     let master = std::fs::OpenOptions::new()
@@ -576,10 +741,7 @@ fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
     let mut name = [0 as libc::c_char; 64];
     // SAFETY: `fd` is a terminal master we own; `name` is large enough.
     unsafe {
-        if libc::grantpt(fd) != 0
-            || libc::unlockpt(fd) != 0
-            || libc::ptsname_r(fd, name.as_mut_ptr(), name.len()) != 0
-        {
+        if libc::grantpt(fd) != 0 || libc::unlockpt(fd) != 0 || ptsname(fd, &mut name) != 0 {
             return None;
         }
     }
@@ -593,6 +755,7 @@ fn pseudo_terminal() -> Option<(std::fs::File, std::fs::File)> {
     Some((master, slave))
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri has no mkfifo")]
 fn a_stuck_file_operation_does_not_hold_up_the_others() {
@@ -617,7 +780,7 @@ fn a_stuck_file_operation_does_not_hold_up_the_others() {
     });
     let opens = paths.clone();
     giong::Builder::new()
-        .driver(giong::DriverKind::Epoll)
+        .driver(READINESS)
         .block_on(async move {
             // One quick operation, so that a blocking thread exists and is idle.
             fs::metadata("/").await.unwrap();
@@ -655,6 +818,84 @@ fn a_stuck_file_operation_does_not_hold_up_the_others() {
     drop(writer.join().unwrap());
 }
 
+#[cfg(unix)]
+#[test]
+#[cfg_attr(miri, ignore = "Miri has no mkfifo, nor starts a process")]
+fn a_full_pool_of_stuck_file_operations_does_not_hold_up_the_others() {
+    // On epoll, file operations run on the process's blocking threads, at
+    // most 64 of them. With 64 opens of FIFOs that have no writer, every
+    // thread was stuck and every other file operation of the process waited
+    // behind them for good.
+    //
+    // Runs in a child process: the pool is the process's, and the other
+    // tests of this file expect a thread to take their jobs at once.
+    const CHILD: &str = "GIONG_FULL_POOL_CHILD";
+    if std::env::var_os(CHILD).is_none() {
+        let out = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "a_full_pool_of_stuck_file_operations_does_not_hold_up_the_others",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env(CHILD, "1")
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "child failed: {}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        return;
+    }
+    const OPENS: usize = 64;
+    let dir = TempDir::new("pool-stuck");
+    let paths: Vec<PathBuf> = (0..OPENS).map(|i| dir.path(&i.to_string())).collect();
+    for path in &paths {
+        let path = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a valid NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+    }
+    let plain = dir.path("plain");
+    std::fs::write(&plain, b"hello").unwrap();
+    let opens = paths.clone();
+    giong::Builder::new()
+        .driver(READINESS)
+        .block_on(async move {
+            let handles: Vec<_> = opens
+                .into_iter()
+                .map(|path| giong::spawn(async move { File::open(path).await.map(drop) }))
+                .collect();
+            // Time for every open to reach a thread and block there.
+            giong::time::sleep(Duration::from_millis(200)).await;
+            let start = Instant::now();
+            let read = timeout(Duration::from_secs(5), fs::read(&plain)).await;
+            assert!(
+                matches!(&read, Ok(Ok(data)) if data == b"hello"),
+                "a read behind 64 stuck opens did not complete after {:?}: {read:?}",
+                start.elapsed()
+            );
+            // Let the opens finish: a FIFO opened for reading and writing has
+            // a writer.
+            let ends: Vec<std::fs::File> = paths
+                .iter()
+                .map(|path| {
+                    std::fs::OpenOptions::new()
+                        .read(true)
+                        .write(true)
+                        .open(path)
+                        .unwrap()
+                })
+                .collect();
+            for handle in handles {
+                handle.await.unwrap().unwrap();
+            }
+            drop(ends);
+        })
+        .unwrap();
+}
+
 #[test]
 fn files_work_on_every_worker() {
     let dir = TempDir::new("workers");
@@ -679,33 +920,48 @@ fn files_work_on_every_worker() {
 fn runtime_teardown_with_file_operations_in_flight() {
     let dir = TempDir::new("teardown");
     for round in 0..20 {
-        let mut fds = [0; 2];
-        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
-        let (reader, writer) = unsafe {
-            (
-                std::fs::File::from_raw_fd(fds[0]),
-                std::fs::File::from_raw_fd(fds[1]),
-            )
+        #[cfg(unix)]
+        let (reader, writer) = {
+            let mut fds = [0; 2];
+            assert_eq!(unsafe { pipe_cloexec(fds.as_mut_ptr()) }, 0);
+            unsafe {
+                (
+                    std::fs::File::from_raw_fd(fds[0]),
+                    std::fs::File::from_raw_fd(fds[1]),
+                )
+            }
         };
         let path = dir.path(&format!("f{round}"));
         giong::block_on(async move {
-            // A read that never completes, and a large write, an open and a
-            // sync that may or may not have finished when the runtime stops.
-            let pipe = File::from_std(reader);
-            giong::spawn(async move {
-                let _ = pipe.read_at(Vec::with_capacity(4096), 0).await;
-            });
+            // A read that never completes (a pipe nobody writes to; on
+            // Unix, where a pipe's read can be cancelled), and a large
+            // write, an open and a sync that may or may not have finished
+            // when the runtime stops.
+            #[cfg(unix)]
+            {
+                let pipe = File::from_std(reader);
+                giong::spawn(async move {
+                    let _ = pipe.read_at(Vec::with_capacity(4096), 0).await;
+                });
+            }
             let file = Rc::new(File::create(&path).await.unwrap());
             let f = file.clone();
             giong::spawn(async move {
                 let _ = f.write_all_at(vec![7u8; 4 * 1024 * 1024], 0).await;
                 let _ = f.sync_all().await;
             });
+            #[cfg(unix)]
             giong::spawn(async move {
-                let _ = fs::read("/proc/self/status").await;
+                let _ = fs::read(FILE_OF_UNKNOWN_SIZE).await;
+            });
+            #[cfg(windows)]
+            giong::spawn(async move {
+                let _ = fs::read(std::env::current_exe().unwrap()).await;
+                let _ = fs::metadata(std::env::temp_dir()).await;
             });
             giong::yield_now().await;
         });
+        #[cfg(unix)]
         drop(writer);
     }
 }
@@ -733,6 +989,7 @@ fn a_std_file_can_be_adopted_and_knows_its_length() {
 const STDIN_CHILD: &str = "GIONG_TEST_STDIN_CHILD";
 
 /// Whether `fd` is in non-blocking mode.
+#[cfg(unix)]
 fn nonblocking(fd: i32) -> bool {
     // SAFETY: F_GETFL on a descriptor this process owns.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
@@ -745,6 +1002,7 @@ fn nonblocking(fd: i32) -> bool {
 /// must read it on a blocking thread rather than switch the mode (which
 /// would make `cat` on the same pipe fail with `EAGAIN`). A pipe the
 /// process made itself still goes through epoll.
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn standard_input_pipes_stay_blocking() {
@@ -764,7 +1022,7 @@ fn standard_input_pipes_stay_blocking() {
 
             let mut fds = [0; 2];
             // SAFETY: a valid array of two descriptors.
-            assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+            assert_eq!(unsafe { pipe_cloexec(fds.as_mut_ptr()) }, 0);
             // SAFETY: both ends are fresh descriptors this process owns.
             let (read, mut write) = unsafe {
                 (
@@ -792,7 +1050,7 @@ fn standard_input_pipes_stay_blocking() {
             "--nocapture",
         ])
         .env(STDIN_CHILD, "1")
-        .env("GIONG_DRIVER", "epoll")
+        .env("GIONG_DRIVER", READINESS.name())
         .stdin(std::process::Stdio::piped())
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
@@ -824,6 +1082,16 @@ async fn list(dir: &std::path::Path) -> Vec<fs::DirEntry> {
 #[test]
 #[cfg_attr(miri, ignore = "Miri has no getdents64")]
 fn directories_list_like_the_standard_library() {
+    // One test with a body per system, as they differ in what a directory
+    // can hold (links without a privilege, sockets, names that are no text).
+    #[cfg(unix)]
+    directories_on_unix();
+    #[cfg(windows)]
+    directories_on_windows();
+}
+
+#[cfg(unix)]
+fn directories_on_unix() {
     use std::os::unix::ffi::OsStrExt;
     use std::os::unix::fs::{DirEntryExt, MetadataExt};
 
@@ -839,9 +1107,12 @@ fn directories_list_like_the_standard_library() {
         std::os::unix::fs::symlink(dir.path("file"), dir.path("link")).unwrap();
         std::os::unix::fs::symlink(dir.path("missing"), dir.path("dangling")).unwrap();
         let _socket = std::os::unix::net::UnixListener::bind(dir.path("socket")).unwrap();
-        // A name that is not UTF-8.
-        let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9");
-        std::fs::write(dir.0.join(latin1), "").unwrap();
+        // A name that is not UTF-8 (APFS refuses one with EILSEQ).
+        #[cfg(target_os = "linux")]
+        {
+            let latin1 = std::ffi::OsStr::from_bytes(b"caf\xe9");
+            std::fs::write(dir.0.join(latin1), "").unwrap();
+        }
 
         let ours = list(&dir.0).await;
         let mut theirs: Vec<_> = std::fs::read_dir(&dir.0)
@@ -853,17 +1124,11 @@ fn directories_list_like_the_standard_library() {
             .iter()
             .map(|entry| entry.file_name().as_bytes())
             .collect();
-        assert_eq!(
-            names,
-            [
-                &b"caf\xe9"[..],
-                b"dangling",
-                b"file",
-                b"link",
-                b"socket",
-                b"sub"
-            ]
-        );
+        let mut expected = vec![&b"dangling"[..], b"file", b"link", b"socket", b"sub"];
+        if cfg!(target_os = "linux") {
+            expected.insert(0, b"caf\xe9");
+        }
+        assert_eq!(names, expected);
         assert_eq!(ours.len(), theirs.len());
         for (ours, theirs) in ours.iter().zip(&theirs) {
             assert_eq!(ours.file_name(), theirs.file_name());
@@ -874,7 +1139,7 @@ fn directories_list_like_the_standard_library() {
             let std_meta = std::fs::symlink_metadata(theirs.path()).unwrap();
             assert_eq!(
                 kind.mode(),
-                std_meta.mode() & libc::S_IFMT,
+                std_meta.mode() & 0o170000, // S_IFMT, a u16 on macOS
                 "{:?}",
                 ours.path()
             );
@@ -888,7 +1153,11 @@ fn directories_list_like_the_standard_library() {
             assert_eq!(meta.len(), std_meta.len());
         }
         // An entry outlives its listing, and clones share the directory.
-        let file = ours[2].clone();
+        let file = ours
+            .iter()
+            .find(|entry| entry.file_name() == "file")
+            .unwrap()
+            .clone();
         drop(ours);
         assert_eq!(file.path(), dir.path("file"));
         assert_eq!(file.metadata().await.unwrap().len(), 5);
@@ -966,7 +1235,11 @@ fn read_dir_reports_what_it_cannot_list() {
 
         fs::write(dir.path("file"), "x").await.unwrap();
         let err = fs::read_dir(dir.path("file")).await.unwrap_err();
+        #[cfg(unix)]
         assert_eq!(err.raw_os_error(), Some(libc::ENOTDIR));
+        // ERROR_DIRECTORY; Wine says ERROR_INVALID_NAME.
+        #[cfg(windows)]
+        assert!(matches!(err.raw_os_error(), Some(267 | 123)), "{err:?}");
 
         let err = fs::read_dir("bad\0path").await.unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -978,6 +1251,75 @@ fn read_dir_reports_what_it_cannot_list() {
         assert_eq!(err.kind(), ErrorKind::NotFound);
         // Its type was reported with the name, so it is still known.
         assert!(entry.file_type().await.unwrap().is_file());
+    });
+}
+
+#[cfg(windows)]
+fn directories_on_windows() {
+    let dir = TempDir::new("read-dir");
+    giong::block_on(async {
+        // An empty directory stays empty when asked again.
+        let mut empty = fs::read_dir(&dir.0).await.unwrap();
+        assert!(empty.next_entry().await.unwrap().is_none());
+        assert!(empty.next_entry().await.unwrap().is_none());
+
+        fs::write(dir.path("file"), "12345").await.unwrap();
+        fs::create_dir(dir.path("sub")).await.unwrap();
+        // A name that is not valid UTF-16: Windows keeps it as it is.
+        let lone = {
+            use std::os::windows::ffi::OsStringExt;
+            std::ffi::OsString::from_wide(&[0x61, 0xD800, 0x62])
+        };
+        // (Wine cannot store such a name on a Unix filesystem.)
+        let odd = std::fs::write(dir.0.join(&lone), "");
+        if let Err(e) = &odd {
+            eprintln!("names outside UTF-16 not checked: {e}");
+        }
+        let linked = std::os::windows::fs::symlink_file(dir.path("file"), dir.path("link"));
+        if let Err(e) = &linked {
+            eprintln!("links not checked: {e}");
+        }
+
+        let ours = list(&dir.0).await;
+        let mut theirs: Vec<_> = std::fs::read_dir(&dir.0)
+            .unwrap()
+            .map(Result::unwrap)
+            .collect();
+        theirs.sort_by_key(|entry| entry.file_name());
+        // At most: Wine reports a link as made that no listing shows.
+        let expected = 2 + usize::from(odd.is_ok()) + usize::from(linked.is_ok());
+        assert!((2..=expected).contains(&ours.len()), "{ours:?}");
+        assert_eq!(ours.len(), theirs.len());
+        assert_eq!(
+            ours.iter().any(|entry| entry.file_name() == lone),
+            odd.is_ok()
+        );
+        for (ours, theirs) in ours.iter().zip(&theirs) {
+            assert_eq!(ours.file_name(), theirs.file_name());
+            assert_eq!(ours.path(), theirs.path());
+            // The entry itself: links are not followed.
+            let kind = ours.file_type().await.unwrap();
+            let std_kind = theirs.file_type().unwrap();
+            assert_eq!(
+                (kind.is_file(), kind.is_dir(), kind.is_symlink()),
+                (std_kind.is_file(), std_kind.is_dir(), std_kind.is_symlink()),
+                "{:?}",
+                ours.path()
+            );
+            let meta = ours.metadata().await.unwrap();
+            let std_meta = std::fs::symlink_metadata(theirs.path()).unwrap();
+            assert_eq!(meta.file_type(), kind);
+            assert_eq!(meta.len(), std_meta.len());
+        }
+        // An entry outlives its listing, and clones share the directory.
+        let file = ours
+            .iter()
+            .find(|entry| entry.file_name() == "file")
+            .unwrap()
+            .clone();
+        drop(ours);
+        assert_eq!(file.path(), dir.path("file"));
+        assert_eq!(file.metadata().await.unwrap().len(), 5);
     });
 }
 
@@ -1011,6 +1353,7 @@ fn dropped_listings_release_their_descriptors() {
 #[test]
 #[cfg_attr(miri, ignore = "Miri's fallocate does not reserve blocks")]
 fn allocate_reserves_space_without_touching_data() {
+    #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
 
     let dir = TempDir::new("allocate");
@@ -1032,6 +1375,7 @@ fn allocate_reserves_space_without_touching_data() {
         }
         // The file grows, the space is reserved, and the new bytes are zeros.
         assert_eq!(file.len().unwrap(), 1 << 20);
+        #[cfg(unix)]
         assert!(std::fs::metadata(&path).unwrap().blocks() * 512 >= 1 << 20);
         let data = fs::read(&path).await.unwrap();
         assert_eq!(data.len(), 1 << 20);
@@ -1055,7 +1399,10 @@ fn allocate_reserves_space_without_touching_data() {
         // allocating_nothing_does_nothing.)
         let read_only = File::open(&path).await.unwrap();
         let err = read_only.allocate(0, 1).await.unwrap_err();
+        #[cfg(unix)]
         assert_eq!(err.raw_os_error(), Some(libc::EBADF));
+        #[cfg(windows)]
+        assert_eq!(err.kind(), ErrorKind::PermissionDenied);
     });
 }
 
@@ -1153,4 +1500,159 @@ fn cached_reads_return_the_right_bytes_and_end_of_file() {
         assert_eq!(res.unwrap(), 0);
         assert_eq!(fs::read(&path).await.unwrap(), data);
     });
+}
+
+/// A named pipe whose server, which wrote, is gone: the reader gets what
+/// was written and then the end, as from a file, not an error. (One name
+/// on every system, for the simulator's index; the body is Windows'.)
+#[test]
+fn a_pipe_whose_writer_has_gone_reads_to_its_end() {
+    #[cfg(windows)]
+    {
+        let (server, name) = named_pipe("eof", false);
+        giong::block_on(async move {
+            let file = File::open(&name).await.unwrap();
+            let mut server = connect_pipe(server);
+            std::io::Write::write_all(&mut server, b"hi").unwrap();
+            drop(server);
+            let (res, buf) = file.read_at(Vec::with_capacity(16), 0).await;
+            assert_eq!(res.unwrap(), 2);
+            assert_eq!(&buf[..], b"hi");
+            let (res, _) = file.read_at(Vec::with_capacity(16), 0).await;
+            assert_eq!(res.unwrap(), 0, "the end of the pipe is not an error");
+        });
+    }
+}
+
+/// A read of a message pipe with less room than the message returns what
+/// fits, and the rest comes with the next read, not an error.
+#[test]
+fn a_pipe_message_longer_than_the_buffer_is_read_in_parts() {
+    #[cfg(windows)]
+    for blocking in [false, true] {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Pipes::{SetNamedPipeHandleState, PIPE_READMODE_MESSAGE};
+        let (server, name) = named_pipe(&format!("message-{blocking}"), true);
+        giong::block_on(async move {
+            // Changing the read mode needs write access to the pipe's
+            // attributes, which a read-only open does not have. A handle
+            // from the standard library takes the blocking path.
+            let file = if blocking {
+                let std = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&name)
+                    .unwrap();
+                File::from_std(std)
+            } else {
+                OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(&name)
+                    .await
+                    .unwrap()
+            };
+            let mode = PIPE_READMODE_MESSAGE;
+            // SAFETY: the client end, open; the mode is a local.
+            let ok = unsafe {
+                SetNamedPipeHandleState(
+                    file.as_raw_handle(),
+                    &mode,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            assert_ne!(ok, 0, "{}", std::io::Error::last_os_error());
+            let mut server = connect_pipe(server);
+            std::io::Write::write_all(&mut server, b"0123456789").unwrap();
+            let mut got = Vec::new();
+            while got.len() < 10 {
+                let (res, buf) = file.read_at(Vec::with_capacity(4), 0).await;
+                let n = res.unwrap_or_else(|e| panic!("blocking path {blocking}: {e}"));
+                assert!(n > 0 && n <= 4, "{n}");
+                got.extend_from_slice(&buf);
+            }
+            assert_eq!(got, b"0123456789");
+        });
+    }
+}
+
+/// The console opens and takes writes: it cannot join the completion
+/// port, so its calls run on the blocking threads.
+#[test]
+fn the_console_opens_and_takes_writes() {
+    #[cfg(windows)]
+    {
+        if std::fs::OpenOptions::new()
+            .write(true)
+            .open("CONOUT$")
+            .is_err()
+        {
+            eprintln!("skipped: this process has no console");
+            return;
+        }
+        giong::block_on(async {
+            let console = OpenOptions::new()
+                .write(true)
+                .open("CONOUT$")
+                .await
+                .unwrap();
+            let (res, _) = console.write_at(b"\n".to_vec(), 0).await;
+            assert_eq!(res.unwrap(), 1);
+        });
+    }
+}
+
+/// A new named pipe's server end, byte or message type, and its name.
+#[cfg(windows)]
+fn named_pipe(name: &str, message: bool) -> (std::fs::File, String) {
+    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::FromRawHandle;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::PIPE_ACCESS_DUPLEX;
+    use windows_sys::Win32::System::Pipes::{
+        CreateNamedPipeW, PIPE_READMODE_MESSAGE, PIPE_TYPE_MESSAGE, PIPE_WAIT,
+    };
+    let name = format!(r"\\.\pipe\giong-fs-{}-{name}", std::process::id());
+    let wide: Vec<u16> = std::ffi::OsStr::new(&name)
+        .encode_wide()
+        .chain([0])
+        .collect();
+    let kind = if message {
+        PIPE_TYPE_MESSAGE | PIPE_READMODE_MESSAGE
+    } else {
+        0
+    };
+    // SAFETY: a NUL-terminated name; no security attributes.
+    let handle = unsafe {
+        CreateNamedPipeW(
+            wide.as_ptr(),
+            PIPE_ACCESS_DUPLEX,
+            kind | PIPE_WAIT,
+            1,
+            4096,
+            4096,
+            0,
+            std::ptr::null(),
+        )
+    };
+    assert_ne!(
+        handle,
+        INVALID_HANDLE_VALUE,
+        "{}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: a new handle, owned from here on.
+    (unsafe { std::fs::File::from_raw_handle(handle) }, name)
+}
+
+/// The server end once its client has opened the pipe.
+#[cfg(windows)]
+fn connect_pipe(server: std::fs::File) -> std::fs::File {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::System::Pipes::ConnectNamedPipe;
+    // SAFETY: the server end, open. The client is already there, so this
+    // ends at once (`ERROR_PIPE_CONNECTED`, which is fine).
+    unsafe { ConnectNamedPipe(server.as_raw_handle(), std::ptr::null_mut()) };
+    server
 }

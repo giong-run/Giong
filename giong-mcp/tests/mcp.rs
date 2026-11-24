@@ -683,6 +683,7 @@ fn what_one_request_can_cost_is_bounded() {
 #[test]
 fn many_clients_at_once_do_not_grow_the_process() {
     with_service(open(), |addr, _| {
+        #[cfg(target_os = "linux")]
         let rss = || {
             std::fs::read_to_string("/proc/self/status")
                 .unwrap()
@@ -691,6 +692,20 @@ fn many_clients_at_once_do_not_grow_the_process() {
                 .and_then(|v| v.split_whitespace().next()?.parse::<u64>().ok())
                 .unwrap()
                 * 1024
+        };
+        #[cfg(target_os = "macos")]
+        let rss = || {
+            let pid = std::process::id().to_string();
+            let out = std::process::Command::new("ps")
+                .args(["-o", "rss=", "-p", &pid])
+                .output()
+                .unwrap();
+            let kb: u64 = String::from_utf8(out.stdout)
+                .unwrap()
+                .trim()
+                .parse()
+                .unwrap();
+            kb * 1024
         };
         let before = rss();
         let clients: Vec<_> = (0..24)

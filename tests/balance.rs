@@ -1,9 +1,12 @@
 //! Choosing where new work starts: `Handle::spawn_balanced` and
 //! `Handle::least_loaded_worker`.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use giong::observe::WorkerState;
@@ -15,6 +18,18 @@ mod common;
 fn a_burst_of_balanced_jobs_spreads_over_every_worker() {
     const WORKERS: usize = 4;
     const JOBS: usize = 8;
+    // Each job holds its worker's thread, as CPU-heavy work does, until
+    // jobs of its round have started on as many workers as there are: a
+    // worker can take another job only once its round is complete, so every
+    // worker must take one job of each round. A worker that is never woken
+    // for queued jobs leaves its round incomplete, and the test fails after
+    // the wait below. (Jobs that hold their thread for a fixed time were
+    // not enough: on the Windows runners a worker that was woken could wait
+    // longer for a CPU than the whole burst took, and got no job.)
+    let rounds: Arc<(Mutex<Vec<HashSet<usize>>>, Condvar)> = Arc::new((
+        Mutex::new(vec![HashSet::new(); JOBS / WORKERS]),
+        Condvar::new(),
+    ));
     let rt = giong::Builder::new().workers(WORKERS).build().unwrap();
     let handle = rt.handle();
     let ran_on = Arc::new(Mutex::new(Vec::new()));
@@ -22,14 +37,24 @@ fn a_burst_of_balanced_jobs_spreads_over_every_worker() {
     rt.run(move |index| {
         let handle = handle.clone();
         let ran_on = r.clone();
+        let rounds = rounds.clone();
         async move {
             if index == 0 {
-                // Jobs that hold their worker's thread, as CPU-heavy work does.
                 let jobs: Vec<_> = (0..JOBS)
-                    .map(|_| {
-                        handle.spawn_balanced(|| async {
-                            std::thread::sleep(Duration::from_millis(20));
-                            giong::worker_id()
+                    .map(|i| {
+                        let rounds = rounds.clone();
+                        handle.spawn_balanced(move || async move {
+                            let worker = giong::worker_id();
+                            let (sets, all_there) = &*rounds;
+                            let mut sets = sets.lock().unwrap();
+                            sets[i / WORKERS].insert(worker);
+                            all_there.notify_all();
+                            let _ = all_there
+                                .wait_timeout_while(sets, Duration::from_secs(10), |sets| {
+                                    sets[i / WORKERS].len() < WORKERS
+                                })
+                                .unwrap();
+                            worker
                         })
                     })
                     .collect();
@@ -56,8 +81,8 @@ fn a_burst_of_balanced_jobs_spreads_over_every_worker() {
         "every worker gets work: {per_worker:?}"
     );
     assert!(
-        per_worker.values().all(|&n| n <= 3),
-        "no worker gets most of it: {per_worker:?}"
+        per_worker.values().all(|&n| n == JOBS / WORKERS),
+        "every worker gets its share: {per_worker:?}"
     );
 }
 

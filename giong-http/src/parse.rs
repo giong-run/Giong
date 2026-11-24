@@ -25,6 +25,9 @@ pub(crate) struct Head {
     /// The request came over HTTP/2 (the head was rebuilt from its
     /// header fields; see `h2::request`).
     pub(crate) h2: bool,
+    /// With `h2`: the request came over HTTP/3, whose field rules are those
+    /// of HTTP/2 (RFC 9114, section 4.2).
+    pub(crate) h3: bool,
 }
 
 /// Position just past the `\r\n\r\n` that ends a head, searching from `from`.
@@ -41,10 +44,23 @@ pub(crate) fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
 }
 
 fn is_token(b: u8) -> bool {
-    matches!(b,
-        b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' |
-        b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z')
+    TOKEN[b as usize]
 }
+
+/// `tchar` (RFC 9110 section 5.6.2) for every byte. A table lookup costs a
+/// third of the comparisons the pattern compiles to, on every byte of every
+/// header name the server and the client parse.
+const TOKEN: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0;
+    while b < 256 {
+        table[b] = matches!(b as u8,
+            b'!' | b'#' | b'$' | b'%' | b'&' | b'\'' | b'*' | b'+' | b'-' | b'.' |
+            b'^' | b'_' | b'`' | b'|' | b'~' | b'0'..=b'9' | b'a'..=b'z' | b'A'..=b'Z');
+        b += 1;
+    }
+    table
+};
 
 pub(crate) fn is_token_str(s: &[u8]) -> bool {
     !s.is_empty() && s.iter().all(|&b| is_token(b))
@@ -85,6 +101,86 @@ pub(crate) fn split_absolute(target: &[u8]) -> Option<(&[u8], &[u8], &[u8])> {
         .position(|&b| matches!(b, b'/' | b'?' | b'#'))
         .unwrap_or(rest.len());
     Some((scheme, &rest[..end], &rest[end..]))
+}
+
+/// Bytes of a host name (`reg-name`, RFC 3986 section 3.2.2): unreserved
+/// characters, sub-delimiters and `%` (which must start a percent-encoded
+/// byte).
+const HOST_BYTES: [bool; 256] = {
+    let mut t = [false; 256];
+    let mut b = 0;
+    while b < 256 {
+        t[b] = (b as u8).is_ascii_alphanumeric();
+        b += 1;
+    }
+    let others = b"-._~!$&'()*+,;=%";
+    let mut i = 0;
+    while i < others.len() {
+        t[others[i] as usize] = true;
+        i += 1;
+    }
+    t
+};
+
+/// Whether `value` can be a `Host` header or an `:authority`: `uri-host
+/// [ ":" port ]` (RFC 9110, section 7.2), or empty. RFC 9112 (section 3.2)
+/// has a server answer any other `Host` with 400. A user name (`a@b`), a
+/// path or anything after a bracketed address would let a proxy in front
+/// and a handler that builds URLs from `Host` read two different hosts.
+pub(crate) fn valid_host(value: &[u8]) -> bool {
+    if let Some(rest) = value.strip_prefix(b"[") {
+        return valid_ip_literal(rest);
+    }
+    // One pass, every request: a name, then maybe `:` and a port.
+    let mut i = 0;
+    while let Some(&b) = value.get(i) {
+        if b == b'%' {
+            if pct_encoded(&value[i..]) == 0 {
+                return false;
+            }
+            i += 3;
+        } else if HOST_BYTES[b as usize] {
+            i += 1;
+        } else if b == b':' {
+            return value[i + 1..].iter().all(u8::is_ascii_digit);
+        } else {
+            return false;
+        }
+    }
+    true
+}
+
+/// The length of the `%XX` at the start of `s`, or 0 if it is not one.
+fn pct_encoded(s: &[u8]) -> usize {
+    match s {
+        [b'%', a, b, ..] if a.is_ascii_hexdigit() && b.is_ascii_hexdigit() => 3,
+        _ => 0,
+    }
+}
+
+/// What follows the `[` of a `Host`: an IPv6 address (with a zone, RFC
+/// 6874) or an IPvFuture, `]`, then maybe `:` and a port.
+fn valid_ip_literal(rest: &[u8]) -> bool {
+    let Some(end) = rest.iter().position(|&b| b == b']') else {
+        return false;
+    };
+    let port = match &rest[end + 1..] {
+        [] => &[][..],
+        [b':', port @ ..] => port,
+        _ => return false,
+    };
+    let inside = &rest[..end];
+    let mut i = 0;
+    while let Some(&b) = inside.get(i) {
+        match b {
+            b'%' if pct_encoded(&inside[i..]) == 3 => i += 3,
+            b'%' => return false,
+            b':' => i += 1,
+            _ if HOST_BYTES[b as usize] => i += 1,
+            _ => return false,
+        }
+    }
+    end > 0 && port.iter().all(u8::is_ascii_digit)
 }
 
 /// Whether a `Host` header and the authority of a request (an absolute
@@ -131,8 +227,14 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
     if !is_token_str(method) || method.len() > 32 {
         return Err(400);
     }
-    // Visible ASCII only, so the target is always valid UTF-8.
-    if target.is_empty() || !target.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
+    // Visible ASCII only, so the target is always valid UTF-8; no fragment,
+    // which a client never sends (RFC 9112, section 3.2) and which a proxy
+    // and the handler could read differently.
+    if target.is_empty()
+        || !target
+            .iter()
+            .all(|&b| (0x21..=0x7e).contains(&b) && b != b'#')
+    {
         return Err(400);
     }
     // The version first: the rules below are HTTP/1.x's, and another
@@ -184,6 +286,7 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
         keep_alive: false,
         expect_continue: false,
         h2: false,
+        h3: false,
     };
     let mut hosts = 0;
     let mut host: Option<&[u8]> = None;
@@ -202,7 +305,19 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
         // No obsolete line folding, no whitespace around the name.
         let colon = line.iter().position(|&b| b == b':').ok_or(400u16)?;
         let (name, value) = (&line[..colon], trim(&line[colon + 1..]));
-        if !is_token_str(name) || !is_field_value(value) {
+        if !is_token_str(name) {
+            return Err(400);
+        }
+        // `Host` has a stricter syntax than a field value, which it implies.
+        if name.eq_ignore_ascii_case(b"host") {
+            if !valid_host(value) {
+                return Err(400);
+            }
+            hosts += 1;
+            host = Some(value);
+            continue;
+        }
+        if !is_field_value(value) {
             return Err(400);
         }
 
@@ -239,9 +354,6 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
                 return Err(417);
             }
             parsed.expect_continue = true;
-        } else if name.eq_ignore_ascii_case(b"host") {
-            hosts += 1;
-            host = Some(value);
         }
     }
 
@@ -268,6 +380,60 @@ mod tests {
 
     fn parse(s: &str) -> Result<Head, u16> {
         parse_head(s.as_bytes())
+    }
+
+    #[test]
+    fn a_host_is_a_host_and_a_port() {
+        for good in [
+            "",
+            "example.com",
+            "Example.COM:8080",
+            "a:",
+            "127.0.0.1:80",
+            "[::1]",
+            "[::1]:8443",
+            "[fe80::1%25eth0]",
+            "[v1.x]",
+            "a_b.example",
+            "caf%C3%A9.example",
+            "xn--caf-dma.example",
+        ] {
+            assert!(valid_host(good.as_bytes()), "{good:?} was refused");
+        }
+        for bad in [
+            "user@example.com",
+            "a/b",
+            "a?b",
+            "a#b",
+            "a b",
+            "a:b",
+            "a:80:80",
+            "[::1]evil.com",
+            "[::1",
+            "[]",
+            "[::1]:8x",
+            "a%2",
+            "a%zz",
+            "caf\u{e9}.example",
+            "a\\b",
+        ] {
+            assert!(!valid_host(bad.as_bytes()), "{bad:?} was accepted");
+        }
+    }
+
+    #[test]
+    fn a_host_or_target_that_no_client_sends_is_refused() {
+        for head in [
+            "GET / HTTP/1.1\r\nHost: user@example.com\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: [::1]evil.com\r\n\r\n",
+            "GET / HTTP/1.1\r\nHost: a/b\r\n\r\n",
+            "GET /a#b HTTP/1.1\r\nHost: a\r\n\r\n",
+            "GET http://a/b#c HTTP/1.1\r\nHost: a\r\n\r\n",
+        ] {
+            assert_eq!(parse(head).err(), Some(400), "{head:?}");
+        }
+        assert!(parse("GET / HTTP/1.1\r\nHost: \r\n\r\n").is_ok());
+        assert!(parse("GET / HTTP/1.1\r\nHost: [::1]:8080\r\n\r\n").is_ok());
     }
 
     #[test]

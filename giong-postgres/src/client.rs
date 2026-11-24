@@ -9,7 +9,7 @@ use std::net::Shutdown;
 use std::ops::Deref;
 use std::pin::Pin;
 use std::rc::{Rc, Weak};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, Waker};
 
@@ -49,6 +49,9 @@ pub(crate) struct Statement {
     /// statement can be closed if it was never run.
     conn: Option<Weak<Conn>>,
     closed: Cell<bool>,
+    /// It failed in a batch because it writes (`25006`): it is sent on its
+    /// own from then on.
+    writes: Cell<bool>,
 }
 
 impl Drop for Statement {
@@ -61,6 +64,8 @@ impl Drop for Statement {
             if let Ok(mut st) = conn.state.try_borrow_mut() {
                 if st.broken.is_none() {
                     let _ = protocol::close_statement(&mut st.out, &self.name);
+                    // A batch must end `out` to take more statements.
+                    st.batch = None;
                 }
             }
         }
@@ -121,7 +126,7 @@ struct Conn {
     requests: Cell<u64>,
     /// While a pool lends the connection to one task: the flag its cancel
     /// tokens check, cleared when the connection goes back.
-    lease: RefCell<Option<Arc<AtomicBool>>>,
+    lease: RefCell<Option<Arc<Lease>>>,
     /// The server refused a write because it is a standby (it was a primary
     /// once, or DNS still points at it): a pool closes the connection rather
     /// than keep sending writes there.
@@ -161,6 +166,71 @@ struct State {
     clock: u64,
     next_name: u64,
     server_params: Vec<(String, String)>,
+    /// The last request in `out`, while it may still grow into a batch, or
+    /// the batch it grew into.
+    batch: Option<OpenBatch>,
+    /// How many slots of `queue` are a batch's guard or end, not requests.
+    extra: usize,
+    /// [`READ_ONLY`] is prepared (or its Parse is queued).
+    read_only_prepared: bool,
+    /// The statements of the batch being answered that have their answer:
+    /// they complete with the batch's `ReadyForQuery`, once it is known
+    /// whether its transaction committed.
+    held: Vec<Rc<Slot>>,
+    /// The batch being answered had an error: its transaction rolled back.
+    batch_failed: bool,
+}
+
+/// Statements in `out` that end with one `Sync` (see [`Config::batch_reads`]).
+struct OpenBatch {
+    /// Where the first statement's messages start in `out`.
+    start: usize,
+    /// How many statements it holds.
+    members: usize,
+}
+
+/// The most statements in one batch.
+const BATCH_MAX: usize = 16;
+/// The length of a `Sync` message.
+const SYNC_LEN: usize = 5;
+/// Makes the transaction of a batch read-only, until its `Sync`: a
+/// statement that writes then fails instead of writing what the batch's
+/// rollback would undo.
+///
+/// It also caps how long a statement of the batch waits for a lock, at 50 ms
+/// (a constant: computed from the session's `lock_timeout`, the guard cost
+/// the batch 10% of its speed): a batch holds the locks its statements took
+/// until it ends, so a statement that waits behind another transaction while
+/// earlier ones hold their locks could close a cycle that the statements one
+/// by one never would (a migration that locks two tables, say), and the
+/// server would roll back one side after its `deadlock_timeout`. Given up within 50 ms instead, the wait fails the
+/// batch, whose statements run again on their own and wait as they would
+/// without batches.
+const READ_ONLY: &str =
+    "SELECT set_config('transaction_read_only', 'on', true), set_config('lock_timeout', '50ms', true)";
+
+/// The name [`READ_ONLY`] is prepared under, once per connection.
+const READ_ONLY_NAME: &str = "__giong_read_only";
+
+/// Bind and Execute of [`READ_ONLY`], after its Parse unless `prepared`.
+fn read_only_guard(out: &mut Vec<u8>, prepared: bool) {
+    let parsed = if prepared {
+        Ok(())
+    } else {
+        protocol::parse(out, READ_ONLY_NAME, READ_ONLY)
+    };
+    let encoded = parsed
+        .and_then(|()| {
+            protocol::bind(
+                out,
+                READ_ONLY_NAME,
+                0,
+                |_, _| unreachable!("no parameters"),
+                [].into_iter(),
+            )
+        })
+        .and_then(|()| protocol::execute(out));
+    debug_assert!(encoded.is_ok(), "a constant statement encodes");
 }
 
 enum Entry {
@@ -179,7 +249,22 @@ struct Slot {
     /// A statement of an open transaction: giving it up before its answer
     /// marks the transaction [`Tx::Abandoned`].
     in_tx: Option<Weak<Conn>>,
+    /// Its part in a batch: it ends with its own `CommandComplete` or
+    /// error, or (the batch's end) with the `ReadyForQuery`.
+    batch: Cell<Role>,
     inner: RefCell<SlotInner>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Role {
+    /// A request of its own, ended by its `ReadyForQuery`.
+    Alone,
+    /// One of the batch's statements.
+    Member,
+    /// The statement that makes the batch's transaction read-only.
+    Guard,
+    /// The batch's `Sync`.
+    End,
 }
 
 enum Kind {
@@ -194,9 +279,41 @@ enum Kind {
     Simple,
 }
 
+/// The tasks waiting for a request's answer: almost always one, which is
+/// kept without an allocation.
+#[derive(Default)]
+struct Wakers {
+    first: Option<Waker>,
+    more: Vec<Waker>,
+}
+
+impl Wakers {
+    /// Adds `waker` unless it would wake a task already here.
+    fn register(&mut self, waker: &Waker) {
+        match &self.first {
+            None => self.first = Some(waker.clone()),
+            Some(w) if w.will_wake(waker) => {}
+            Some(_) => {
+                if !self.more.iter().any(|w| w.will_wake(waker)) {
+                    self.more.push(waker.clone());
+                }
+            }
+        }
+    }
+
+    fn wake_all(&mut self) {
+        if let Some(w) = self.first.take() {
+            w.wake();
+        }
+        for w in self.more.drain(..) {
+            w.wake();
+        }
+    }
+}
+
 #[derive(Default)]
 struct SlotInner {
-    wakers: Vec<Waker>,
+    wakers: Wakers,
     /// Nobody is waiting for the result any more: rows are not kept.
     abandoned: bool,
     /// The outcome was handed to the caller.
@@ -205,7 +322,7 @@ struct SlotInner {
     params: Option<Vec<Type>>,
     columns: Option<Vec<Column>>,
     rows: RowsBuilder,
-    tag: Option<String>,
+    tag: Option<Tag>,
     /// The server confirmed the Bind: the statement started running.
     bound: bool,
     /// The transaction status in the `ReadyForQuery` that ended the request.
@@ -213,13 +330,17 @@ struct SlotInner {
     /// The request failed on a stale cached statement before running, outside
     /// a transaction: running it again is safe.
     retry: bool,
+    /// A statement of a batch that did not run (the server skipped it after
+    /// another failed), or that failed because it writes: it is sent again on
+    /// its own.
+    alone: bool,
     outcome: Option<Result<Response, Error>>,
 }
 
 enum Response {
     Statement(Rc<Statement>),
-    Rows(ResultSet, Option<String>),
-    Done(Option<String>),
+    Rows(ResultSet, Option<Tag>),
+    Done(Option<Tag>),
 }
 
 impl Slot {
@@ -229,6 +350,7 @@ impl Slot {
             shared,
             close_on_error,
             in_tx,
+            batch: Cell::new(Role::Alone),
             inner: RefCell::default(),
         })
     }
@@ -257,9 +379,7 @@ impl Future for Wait {
             }
             None => {}
         }
-        if !inner.wakers.iter().any(|w| w.will_wake(cx.waker())) {
-            inner.wakers.push(cx.waker().clone());
-        }
+        inner.wakers.register(cx.waker());
         Poll::Pending
     }
 }
@@ -311,12 +431,28 @@ fn is_stale(db: &DbError) -> bool {
     }
 }
 
-/// The number of rows a command tag reports: `INSERT 0 5`, `UPDATE 3`,
-/// `SELECT 7`.
-fn rows_affected(tag: Option<&str>) -> u64 {
-    tag.and_then(|t| t.rsplit(' ').next())
-        .and_then(|n| n.parse().ok())
-        .unwrap_or(0)
+/// What this crate uses of a command tag (`INSERT 0 5`, `ROLLBACK`), read
+/// as it arrives so that the tag itself need not be kept.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct Tag {
+    /// The rows it reports: `INSERT 0 5`, `UPDATE 3`, `SELECT 7`; 0 for a
+    /// tag without a count.
+    rows: u64,
+    /// `COMMIT` ended a failed transaction with a rollback.
+    rollback: bool,
+}
+
+impl Tag {
+    fn of(tag: &str) -> Self {
+        Self {
+            rows: tag
+                .rsplit(' ')
+                .next()
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0),
+            rollback: tag == "ROLLBACK",
+        }
+    }
 }
 
 impl Client {
@@ -363,6 +499,10 @@ impl Client {
                 out: Vec::new(),
                 writer: None,
                 queue: VecDeque::new(),
+                extra: 0,
+                read_only_prepared: false,
+                held: Vec::new(),
+                batch_failed: false,
                 broken: None,
                 closing: false,
                 status,
@@ -370,6 +510,7 @@ impl Client {
                 clock: 0,
                 next_name: 0,
                 server_params: params,
+                batch: None,
             }),
         });
         giong::spawn(read_loop(conn.clone(), buf));
@@ -401,7 +542,19 @@ impl Client {
     /// Inside a [`Transaction`], a later [`commit`](Transaction::commit)
     /// commits it.
     pub async fn query(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Vec<Row>, Error> {
-        let (set, _) = self.run(sql, params).await?;
+        let (set, _) = self.run(sql, params, false).await?;
+        Ok(set.into_rows())
+    }
+
+    /// [`query`](Self::query) for the pool's shared connections: `batch`
+    /// lets the statement join a batch ([`Config::batch_reads`]).
+    pub(crate) async fn query_shared(
+        &self,
+        sql: &str,
+        params: &[&dyn ToSql],
+        batch: bool,
+    ) -> Result<Vec<Row>, Error> {
+        let (set, _) = self.run(sql, params, batch).await?;
         Ok(set.into_rows())
     }
 
@@ -411,17 +564,7 @@ impl Client {
     ///
     /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_one(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Row, Error> {
-        let mut rows = self.query(sql, params).await?;
-        match rows.len() {
-            1 => Ok(rows.pop().expect("one row")),
-            n => Err(Error::new(
-                ErrorKind::RowCount,
-                format!(
-                    "the statement returned {n} rows where exactly one was expected; use \
-                     query_opt for zero or one, or query for any number"
-                ),
-            )),
-        }
+        one_row(self.query(sql, params).await?)
     }
 
     /// Runs a statement that returns at most one row.
@@ -430,26 +573,46 @@ impl Client {
     ///
     /// Not cancel safe, like [`query`](Self::query).
     pub async fn query_opt(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Option<Row>, Error> {
-        let mut rows = self.query(sql, params).await?;
-        match rows.len() {
-            0 | 1 => Ok(rows.pop()),
-            n => Err(Error::new(
-                ErrorKind::RowCount,
-                format!(
-                    "the statement returned {n} rows where at most one was expected; add a \
-                     LIMIT, or use query"
-                ),
-            )),
-        }
+        at_most_one_row(self.query(sql, params).await?)
     }
+}
 
+/// The one row of a result, or [`ErrorKind::RowCount`].
+pub(crate) fn one_row(mut rows: Vec<Row>) -> Result<Row, Error> {
+    match rows.len() {
+        1 => Ok(rows.pop().expect("one row")),
+        n => Err(Error::new(
+            ErrorKind::RowCount,
+            format!(
+                "the statement returned {n} rows where exactly one was expected; use \
+                     query_opt for zero or one, or query for any number"
+            ),
+        )),
+    }
+}
+
+/// The row of a result of at most one, or [`ErrorKind::RowCount`].
+pub(crate) fn at_most_one_row(mut rows: Vec<Row>) -> Result<Option<Row>, Error> {
+    match rows.len() {
+        0 | 1 => Ok(rows.pop()),
+        n => Err(Error::new(
+            ErrorKind::RowCount,
+            format!(
+                "the statement returned {n} rows where at most one was expected; add a \
+                     LIMIT, or use query"
+            ),
+        )),
+    }
+}
+
+impl Client {
     /// Runs a statement and returns the number of rows it inserted, updated
     /// or deleted (or returned, for a `SELECT`).
     ///
     /// Not cancel safe, like [`query`](Self::query).
     pub async fn execute(&self, sql: &str, params: &[&dyn ToSql]) -> Result<u64, Error> {
-        let (_, tag) = self.run(sql, params).await?;
-        Ok(rows_affected(tag.as_deref()))
+        let (_, tag) = self.run(sql, params, false).await?;
+        Ok(tag.map_or(0, |t| t.rows))
     }
 
     /// Runs SQL that may hold several statements separated by `;`, with no
@@ -504,7 +667,9 @@ impl Client {
     ///
     /// A token taken from a [`PooledClient`](crate::PooledClient) stops
     /// working when the connection goes back to the pool, so that it cannot
-    /// cancel the statements of the tasks that use the connection next.
+    /// cancel the statements of the tasks that use the connection next; and
+    /// a connection that goes back while a request from such a token is on
+    /// its way is closed rather than lent to another task.
     pub fn cancel_token(&self) -> CancelToken {
         CancelToken {
             config: self.conn.config.without_password(),
@@ -531,7 +696,8 @@ impl Client {
 
     /// How many requests have been sent and not answered yet.
     pub fn in_flight(&self) -> usize {
-        self.conn.state.borrow().queue.len()
+        let st = self.conn.state.borrow();
+        st.queue.len() - st.extra + st.held.len()
     }
 
     /// How long the oldest unanswered request has been waiting for its
@@ -574,14 +740,19 @@ impl Client {
     /// Starts lending the connection to one task: cancel tokens taken from
     /// now on work until [`end_lease`](Self::end_lease).
     pub(crate) fn begin_lease(&self) {
-        *self.conn.lease.borrow_mut() = Some(Arc::new(AtomicBool::new(true)));
+        *self.conn.lease.borrow_mut() = Some(Arc::new(Lease::default()));
     }
 
     /// Ends the lease: the cancel tokens taken during it stop working.
-    pub(crate) fn end_lease(&self) {
-        if let Some(lease) = self.conn.lease.borrow_mut().take() {
-            lease.store(false, Ordering::Release);
-        }
+    /// Returns whether a cancel request taken during it may still be on its
+    /// way to the server, in which case the connection must not be lent to
+    /// another task: the request would stop that task's statement.
+    pub(crate) fn end_lease(&self) -> bool {
+        self.conn
+            .lease
+            .borrow_mut()
+            .take()
+            .is_some_and(|lease| lease.end())
     }
 
     /// Whether the connection should not be used any more although it works:
@@ -597,7 +768,9 @@ impl Client {
     pub(crate) fn reset_session(&self) {
         let deallocate = self.conn.user_prepared.replace(false);
         let sql = if deallocate {
-            self.conn.state.borrow_mut().cache.clear();
+            let mut st = self.conn.state.borrow_mut();
+            st.cache.clear();
+            st.read_only_prepared = false;
             format!("{RESET}; DEALLOCATE ALL")
         } else {
             RESET.to_owned()
@@ -624,7 +797,8 @@ impl Client {
         &self,
         sql: &str,
         params: &[&dyn ToSql],
-    ) -> Result<(ResultSet, Option<String>), Error> {
+        batch: bool,
+    ) -> Result<(ResultSet, Option<Tag>), Error> {
         let _wait = giong::observe::wait(giong::observe::Wait::Query, "postgres");
         if params.len() > MAX_PARAMS {
             return Err(Error::conversion(format!(
@@ -637,12 +811,24 @@ impl Client {
         // more, unless that happened inside a transaction, which the error
         // aborted.
         let mut retried = false;
+        // A statement a batch skipped, or that writes, is sent again alone.
+        let mut alone = !batch;
         loop {
-            let slot = self.send(sql, params).await?;
+            let slot = self.send(sql, params, !alone).await?;
             let result = Wait { slot: slot.clone() }.await;
-            if result.is_err() && !retried && slot.inner.borrow().retry {
-                retried = true;
-                continue;
+            if result.is_err() {
+                let (skipped, stale) = {
+                    let inner = slot.inner.borrow();
+                    (inner.alone, inner.retry)
+                };
+                if skipped && !alone {
+                    alone = true;
+                    continue;
+                }
+                if stale && !retried {
+                    retried = true;
+                    continue;
+                }
             }
             return match result? {
                 Response::Rows(set, tag) => Ok((set, tag)),
@@ -652,7 +838,7 @@ impl Client {
     }
 
     /// Prepares the statement if needed and sends a Bind and Execute for it.
-    async fn send(&self, sql: &str, params: &[&dyn ToSql]) -> Result<Rc<Slot>, Error> {
+    async fn send(&self, sql: &str, params: &[&dyn ToSql], batch: bool) -> Result<Rc<Slot>, Error> {
         let stmt = self.conn.statement(sql).await?;
         if stmt.params.len() != params.len() {
             return Err(Error::conversion(format!(
@@ -662,24 +848,35 @@ impl Client {
             )));
         }
         let cached = stmt.conn.is_none();
-        let slot = self
-            .conn
-            .enqueue(Kind::Execute { stmt: stmt.clone() }, |out| {
-                protocol::bind(
-                    out,
-                    &stmt.name,
-                    params.len(),
-                    |i, out| {
-                        params[i].to_sql(stmt.params[i], out).map_err(|e| {
-                            e.context(&format!("parameter ${} ({})", i + 1, stmt.params[i]))
-                        })
-                    },
-                    stmt.columns.iter().map(|c| c.ty().binary_result()),
-                )?;
-                protocol::execute(out)?;
+        let encode = |out: &mut Vec<u8>| {
+            protocol::bind(
+                out,
+                &stmt.name,
+                params.len(),
+                |i, out| {
+                    params[i].to_sql(stmt.params[i], out).map_err(|e| {
+                        e.context(&format!("parameter ${} ({})", i + 1, stmt.params[i]))
+                    })
+                },
+                stmt.columns.iter().map(|c| c.ty().binary_result()),
+            )?;
+            protocol::execute(out)
+        };
+        let kind = Kind::Execute { stmt: stmt.clone() };
+        let slot = if batch
+            && cached
+            && !stmt.writes.get()
+            && self.conn.shared.get()
+            && self.conn.tx.get() == Tx::None
+        {
+            self.conn.enqueue_batched(kind, encode)?
+        } else {
+            self.conn.enqueue(kind, |out| {
+                encode(out)?;
                 protocol::sync(out);
                 Ok(())
-            })?;
+            })?
+        };
         if !cached {
             // In a request of its own: after an error the server skips the
             // rest of a request, and the statement must go either way.
@@ -703,6 +900,7 @@ impl Drop for Client {
         st.closing = true;
         if st.broken.is_none() {
             protocol::terminate(&mut st.out);
+            st.batch = None;
         }
         if let Some(w) = st.writer.take() {
             w.wake();
@@ -757,6 +955,8 @@ impl Conn {
         } else {
             Some(self.in_tx()?)
         };
+        // Anything else written after a batch ends it.
+        st.batch = None;
         let start = st.out.len();
         if let Err(e) = encode(&mut st.out) {
             st.out.truncate(start);
@@ -772,6 +972,105 @@ impl Conn {
             w.wake();
         }
         Ok(slot)
+    }
+
+    /// Appends a statement's Bind and Execute (`encode`) and a `Sync`, and
+    /// queues its slot: the statement joins the batch that ends `out` when
+    /// there is one with room, or may start one; its `Sync` is then taken
+    /// off and the statement's messages go before it (see
+    /// [`Config::batch_reads`]). On a shared connection outside a
+    /// transaction only.
+    #[inline(never)]
+    fn enqueue_batched(
+        &self,
+        kind: Kind,
+        encode: impl FnOnce(&mut Vec<u8>) -> Result<(), Error>,
+    ) -> Result<Rc<Slot>, Error> {
+        let mut st = self.state.borrow_mut();
+        if let Some(e) = &st.broken {
+            return Err(e.clone());
+        }
+        let joins = st.batch.as_ref().is_some_and(|b| b.members < BATCH_MAX);
+        if !joins {
+            let start = st.out.len();
+            if let Err(e) = encode(&mut st.out) {
+                st.out.truncate(start);
+                return Err(e);
+            }
+            protocol::sync(&mut st.out);
+            st.batch = Some(OpenBatch { start, members: 1 });
+            return Ok(self.queue_slot(&mut st, Slot::new(kind, true, false, None)));
+        }
+        // Encoded apart first: a value that cannot be encoded leaves the
+        // batch as it was.
+        let mut messages = Vec::new();
+        encode(&mut messages)?;
+        let sync_at = st.out.len() - SYNC_LEN;
+        st.out.truncate(sync_at);
+        let b = st.batch.as_mut().expect("joins");
+        if b.members == 1 {
+            // The request alone so far becomes the batch's first statement,
+            // behind the one that makes the transaction read-only.
+            let start = b.start;
+            let mut guard = Vec::new();
+            read_only_guard(&mut guard, st.read_only_prepared);
+            st.read_only_prepared = true;
+            st.out.splice(start..start, guard);
+            let first = st.queue.pop_back().expect("the batch's first statement");
+            first.batch.set(Role::Member);
+            let guard = Slot::new(Kind::Simple, true, false, None);
+            guard.batch.set(Role::Guard);
+            st.extra += 2; // The guard, and the end queued below.
+            guard.inner.borrow_mut().abandoned = true;
+            st.queue.push_back(guard);
+            st.queue.push_back(first);
+        } else {
+            let end = st.queue.pop_back().expect("the batch's end");
+            debug_assert_eq!(end.batch.get(), Role::End);
+        }
+        st.batch.as_mut().expect("joins").members += 1;
+        st.out.extend_from_slice(&messages);
+        protocol::sync(&mut st.out);
+        let slot = Slot::new(kind, true, false, None);
+        slot.batch.set(Role::Member);
+        st.queue.push_back(slot.clone());
+        let end = Slot::new(Kind::Simple, true, false, None);
+        end.batch.set(Role::End);
+        end.inner.borrow_mut().abandoned = true;
+        self.queue_slot(&mut st, end);
+        Ok(slot)
+    }
+
+    /// Queues `slot` behind the requests in flight and wakes the writer.
+    fn queue_slot(&self, st: &mut State, slot: Rc<Slot>) -> Rc<Slot> {
+        self.requests.set(self.requests.get() + 1);
+        if st.queue.is_empty() {
+            self.head_since.set(Some(giong::time::Instant::now()));
+        }
+        st.queue.push_back(slot.clone());
+        if let Some(w) = st.writer.take() {
+            w.wake();
+        }
+        slot
+    }
+
+    /// A statement of a batch is done: its `CommandComplete` or its error
+    /// arrived, or the batch ended without running it.
+    /// Its result is held until the batch's end, when it is known whether
+    /// the batch's transaction committed.
+    fn finish_member(&self, slot: &Rc<Slot>) {
+        // The batch's transaction ends with its `Sync`: the outcome is as
+        // outside a transaction.
+        slot.inner.borrow_mut().status = b'I';
+        let mut st = self.state.borrow_mut();
+        st.queue.pop_front();
+        if slot.batch.get() == Role::Guard {
+            st.extra -= 1;
+        } else {
+            st.held.push(slot.clone());
+        }
+        self.head_since
+            .set((!st.queue.is_empty()).then(giong::time::Instant::now));
     }
 
     /// The prepared statement for `sql`: from the cache, from a prepare
@@ -865,15 +1164,18 @@ impl Conn {
             if let Some(w) = st.writer.take() {
                 w.wake();
             }
-            std::mem::take(&mut st.queue)
+            st.extra = 0;
+            st.read_only_prepared = false;
+            st.batch_failed = false;
+            let mut slots = std::mem::take(&mut st.held);
+            slots.extend(std::mem::take(&mut st.queue));
+            slots
         };
         for slot in slots {
             let mut inner = slot.inner.borrow_mut();
             let e = inner.error.take().unwrap_or_else(|| err.clone());
             inner.outcome = Some(Err(e));
-            for w in inner.wakers.drain(..) {
-                w.wake();
-            }
+            inner.wakers.wake_all();
         }
         self.wake_idle();
         self.stream.shutdown(Shutdown::Both);
@@ -975,7 +1277,25 @@ impl Conn {
             }
             _ => {}
         }
-        let slot = self.front()?;
+        let slot = loop {
+            let slot = self.front()?;
+            if slot.batch.get() != Role::Alone
+                && matches!(
+                    msg,
+                    Backend::CommandComplete(_)
+                        | Backend::ErrorResponse(_)
+                        | Backend::ReadyForQuery(_)
+                )
+            {
+                if self.handle_batched(slot, &msg)? {
+                    // A skipped statement's slot is done; the message is
+                    // the next slot's.
+                    continue;
+                }
+                return Ok(());
+            }
+            break slot;
+        };
         let mut inner = slot.inner.borrow_mut();
         match msg {
             Backend::BindComplete => inner.bound = true,
@@ -1006,26 +1326,11 @@ impl Conn {
                 if tag == "PREPARE" {
                     self.user_prepared.set(true);
                 }
-                inner.tag = Some(tag.to_owned());
+                inner.tag = Some(Tag::of(tag));
             }
             Backend::ErrorResponse(fields) => {
                 if inner.error.is_none() {
-                    let db = DbError::parse(fields)?;
-                    if db.code() == "25006" && self.on_standby() {
-                        self.retire.set(true);
-                    }
-                    // Only a note: the message is translated on servers whose
-                    // lc_messages is not English, and then there is none.
-                    let note = (db.code() == "57014" && db.message().contains("statement timeout"))
-                        .then(|| match self.config.statement_timeout {
-                            Some(limit) => format!(
-                                "the statement ran longer than the statement timeout ({limit:?}; \
-                                 Config::statement_timeout)"
-                            ),
-                            None => "the statement ran longer than the server's statement_timeout"
-                                .to_owned(),
-                        });
-                    inner.error = Some(Error::from_db(db, note));
+                    inner.error = Some(self.db_error(fields, true)?);
                 }
             }
             Backend::CopyOutResponse | Backend::CopyData | Backend::CopyDone => {
@@ -1089,6 +1394,131 @@ impl Conn {
         Ok(())
     }
 
+    /// The request's error from an `ErrorResponse`.
+    fn db_error(&self, fields: &[u8], may_retire: bool) -> Result<Error, Error> {
+        let db = DbError::parse(fields)?;
+        if may_retire && db.code() == "25006" && self.on_standby() {
+            self.retire.set(true);
+        }
+        // Only a note: the message is translated on servers whose
+        // lc_messages is not English, and then there is none.
+        let note = (db.code() == "57014" && db.message().contains("statement timeout")).then(
+            || match self.config.statement_timeout {
+                Some(limit) => format!(
+                    "the statement ran longer than the statement timeout ({limit:?}; \
+                     Config::statement_timeout)"
+                ),
+                None => "the statement ran longer than the server's statement_timeout".to_owned(),
+            },
+        );
+        Ok(Error::from_db(db, note))
+    }
+
+    /// The `CommandComplete`, `ErrorResponse` or `ReadyForQuery` of a slot
+    /// of a batch ([`Config::batch_reads`]). Apart from [`handle`](Self::handle),
+    /// which every request goes through, so that it stays as small as it was.
+    #[cold]
+    #[inline(never)]
+    ///
+    /// Returns whether the message is still to be handled, by the next slot.
+    fn handle_batched(&self, slot: Rc<Slot>, msg: &Backend<'_>) -> Result<bool, Error> {
+        let mut inner = slot.inner.borrow_mut();
+        match *msg {
+            Backend::CommandComplete(command) => {
+                inner.tag = Some(Tag::of(command));
+            }
+            Backend::ErrorResponse(fields) => {
+                // Not a sign of a standby: the batch is read-only on purpose.
+                let error = self.db_error(fields, false)?;
+                self.state.borrow_mut().batch_failed = true;
+                match slot.batch.get() {
+                    // At the `Sync`: the commit failed (a deferred
+                    // constraint, say). The `ReadyForQuery` follows.
+                    Role::End => return Ok(false),
+                    // The guard's statement is gone (a `DEALLOCATE`): it is
+                    // prepared again with the next batch. Its other errors
+                    // (a cancel, a timeout) leave it prepared.
+                    Role::Guard if error.server_code() == Some("26000") => {
+                        self.state.borrow_mut().read_only_prepared = false;
+                    }
+                    _ => {}
+                }
+                if matches!(error.server_code(), Some("55P03" | "40P01" | "40001"))
+                    && slot.batch.get() == Role::Member
+                {
+                    // A lock waited for, a deadlock or a serialization
+                    // failure the batch may have caused by holding its
+                    // locks: run again alone, where it is as without
+                    // batches.
+                    if let Kind::Execute { .. } = &slot.kind {
+                        inner.alone = true;
+                    }
+                }
+                if error.server_code() == Some("25006") {
+                    // It would have run alone: send it alone.
+                    if let Kind::Execute { stmt } = &slot.kind {
+                        stmt.writes.set(true);
+                        inner.alone = true;
+                    }
+                }
+                inner.error = Some(error);
+            }
+            Backend::ReadyForQuery(status) if slot.batch.get() == Role::End => {
+                // The batch's transaction ended, committed or rolled back:
+                // the outcome is as outside a transaction.
+                inner.status = status;
+                drop(inner);
+                let (idle, held, failed) = {
+                    let mut st = self.state.borrow_mut();
+                    st.status = status;
+                    st.queue.pop_front();
+                    st.extra -= 1;
+                    self.head_since
+                        .set((!st.queue.is_empty()).then(giong::time::Instant::now));
+                    let failed = std::mem::take(&mut st.batch_failed);
+                    (st.queue.is_empty(), std::mem::take(&mut st.held), failed)
+                };
+                for member in &held {
+                    if failed {
+                        let mut inner = member.inner.borrow_mut();
+                        if inner.error.is_none() {
+                            // It ran, but what it did was rolled back with
+                            // the batch: it runs again, alone.
+                            inner.error = Some(Error::new(
+                                ErrorKind::Closed,
+                                "another statement of this one's batch failed, so the batch \
+                                 was rolled back",
+                            ));
+                            inner.alone = matches!(member.kind, Kind::Execute { .. });
+                        }
+                    }
+                    self.complete(member);
+                }
+                self.complete(&slot);
+                if idle {
+                    self.wake_idle();
+                }
+                return Ok(false);
+            }
+            Backend::ReadyForQuery(_) => {
+                // The batch ended before this statement ran: a statement
+                // before it failed, and the server skipped the rest.
+                inner.error = Some(Error::new(
+                    ErrorKind::Closed,
+                    "a statement before this one in its batch failed, so the server skipped it",
+                ));
+                inner.alone = matches!(slot.kind, Kind::Execute { .. });
+                drop(inner);
+                self.finish_member(&slot);
+                return Ok(true);
+            }
+            _ => unreachable!("only these three come here"),
+        }
+        drop(inner);
+        self.finish_member(&slot);
+        Ok(false)
+    }
+
     /// Works out a finished request's outcome and wakes whoever waits.
     fn complete(&self, slot: &Rc<Slot>) {
         let mut inner = slot.inner.borrow_mut();
@@ -1105,6 +1535,7 @@ impl Conn {
                             columns: inner.columns.take().unwrap_or_default().into(),
                             conn: (!*cached).then(|| self.weak.clone()),
                             closed: Cell::new(false),
+                            writes: Cell::new(false),
                         })),
                         None => Err(Error::protocol("the server did not describe the statement")),
                     },
@@ -1144,9 +1575,7 @@ impl Conn {
             },
         };
         inner.outcome = Some(outcome);
-        for w in inner.wakers.drain(..) {
-            w.wake();
-        }
+        inner.wakers.wake_all();
     }
 
     /// Takes a cached statement out of the cache when the server says it no
@@ -1213,6 +1642,8 @@ impl Conn {
                 // No Sync: the close travels with the next request, whose
                 // reply includes the CloseComplete.
                 let _ = protocol::close_statement(&mut st.out, &stmt.name);
+                // A batch must end `out` to take more statements.
+                st.batch = None;
             }
         }
     }
@@ -1248,6 +1679,8 @@ async fn write_loop(conn: Rc<Conn>) {
                 return Poll::Ready(None);
             }
             if !st.out.is_empty() {
+                // What is written cannot grow: a batch ends here.
+                st.batch = None;
                 return Poll::Ready(Some(std::mem::replace(
                     &mut st.out,
                     std::mem::take(&mut spare),
@@ -1320,7 +1753,7 @@ impl Transaction<'_> {
             .conn
             .enqueue(Kind::Simple, |out| protocol::query(out, "COMMIT"))?;
         match (Wait { slot }).await? {
-            Response::Done(Some(tag)) if tag == "ROLLBACK" => Err(Error::with_sqlstate(
+            Response::Done(Some(tag)) if tag.rollback => Err(Error::with_sqlstate(
                 "25P02",
                 "the transaction was rolled back instead of committed, because a statement in \
                  it failed earlier",
@@ -1382,9 +1815,50 @@ pub struct CancelToken {
     /// need.
     config: Config,
     key: Option<(i32, i32)>,
-    /// Set for a token taken from a pooled connection: cleared when the
+    /// Set for a token taken from a pooled connection: ended when the
     /// connection goes back to the pool.
-    lease: Option<Arc<AtomicBool>>,
+    lease: Option<Arc<Lease>>,
+}
+
+/// A pooled connection's time with one task, shared with the cancel tokens
+/// taken during it: whether it has ended, and how many cancel requests are
+/// on their way.
+#[derive(Default)]
+pub(crate) struct Lease(AtomicU32);
+
+impl Lease {
+    /// Set once the connection has gone back to its pool.
+    const ENDED: u32 = 1 << 31;
+
+    /// Counts a cancel request on its way, unless the lease has ended.
+    fn start_cancel(&self) -> bool {
+        let mut v = self.0.load(Ordering::Acquire);
+        while v & Self::ENDED == 0 {
+            match self
+                .0
+                .compare_exchange_weak(v, v + 1, Ordering::AcqRel, Ordering::Acquire)
+            {
+                Ok(_) => return true,
+                Err(now) => v = now,
+            }
+        }
+        false
+    }
+
+    /// A cancel request that `start_cancel` counted got its answer.
+    fn finish_cancel(&self) {
+        self.0.fetch_sub(1, Ordering::AcqRel);
+    }
+
+    fn is_ended(&self) -> bool {
+        self.0.load(Ordering::Acquire) & Self::ENDED != 0
+    }
+
+    /// Ends the lease; returns whether a cancel request is still on its way
+    /// (or was given up on the way, which counts the same).
+    fn end(&self) -> bool {
+        self.0.fetch_or(Self::ENDED, Ordering::AcqRel) & !Self::ENDED != 0
+    }
 }
 
 impl CancelToken {
@@ -1398,16 +1872,15 @@ impl CancelToken {
     /// Not cancel safe: if the future is dropped, the request may still reach
     /// the server and stop whatever the connection runs then.
     pub async fn cancel(&self) -> Result<(), Error> {
-        if self
-            .lease
-            .as_ref()
-            .is_some_and(|lease| !lease.load(Ordering::Acquire))
-        {
-            return Err(Error::closed(
+        let gone = || {
+            Error::closed(
                 "the connection this cancel token was taken from has gone back to its pool, \
                  where other tasks use it, so nothing was sent; take a new token from the next \
                  connection",
-            ));
+            )
+        };
+        if self.lease.as_ref().is_some_and(|lease| lease.is_ended()) {
+            return Err(gone());
         }
         let key = self.key.ok_or_else(|| {
             Error::new(
@@ -1416,7 +1889,19 @@ impl CancelToken {
                  between), so it cannot be cancelled",
             )
         })?;
-        connect::cancel(&self.config, key).await
+        let Some(lease) = &self.lease else {
+            return connect::cancel(&self.config, key).await;
+        };
+        // Counted until the answer comes: a connection that goes back to the
+        // pool meanwhile is closed rather than lent to a task whose
+        // statement the request would stop. A request given up on the way
+        // stays counted, for the same reason.
+        if !lease.start_cancel() {
+            return Err(gone());
+        }
+        let sent = connect::cancel(&self.config, key).await;
+        lease.finish_cancel();
+        sent
     }
 }
 
@@ -1430,7 +1915,7 @@ impl std::fmt::Debug for CancelToken {
 
 #[cfg(test)]
 mod tests {
-    use super::{is_stale, rows_affected};
+    use super::{is_stale, Tag};
     use crate::error::DbError;
 
     fn db_error(fields: &[(u8, &str)]) -> DbError {
@@ -1473,10 +1958,10 @@ mod tests {
 
     #[test]
     fn command_tags_give_row_counts() {
-        assert_eq!(rows_affected(Some("INSERT 0 5")), 5);
-        assert_eq!(rows_affected(Some("UPDATE 3")), 3);
-        assert_eq!(rows_affected(Some("SELECT 12")), 12);
-        assert_eq!(rows_affected(Some("CREATE TABLE")), 0);
-        assert_eq!(rows_affected(None), 0);
+        assert_eq!(Tag::of("INSERT 0 5").rows, 5);
+        assert_eq!(Tag::of("UPDATE 3").rows, 3);
+        assert_eq!(Tag::of("SELECT 12").rows, 12);
+        assert_eq!(Tag::of("CREATE TABLE").rows, 0);
+        assert!(Tag::of("ROLLBACK").rollback && !Tag::of("COMMIT").rollback);
     }
 }

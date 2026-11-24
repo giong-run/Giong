@@ -1,0 +1,74 @@
+# The soak tests on macOS (the kqueue driver): connection churn, UDP, file
+# and cross-worker traffic (tests/soak.rs), and TLS handshakes, traffic and
+# interrupted operations (giong-tls/tests/soak.rs), each followed by checks
+# that no descriptor, memory or driver state was left behind. On macOS 15
+# and 26, side by side.
+#
+# Run it from the Actions tab, or by pushing a branch named soak/macos-*.
+
+name: macOS soak
+
+on:
+  push:
+    branches: ["soak/macos-*"]
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: Minutes to run each workload
+        default: "120"
+      clients:
+        description: Clients per worker (empty for 32 for runtime, 16 for TLS)
+        default: ""
+
+permissions:
+  contents: read
+
+env:
+  # CI's stable compiler (see ci.yml).
+  RUST_STABLE: "1.100.0"
+
+jobs:
+  soak:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, macos-26]
+        workload: [runtime, tls]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 300
+    env:
+      GIONG_TEST_EXPECT_DRIVER: kqueue
+      # The clients the soak runs on Linux (32 per worker for runtime, 16
+      # for TLS), same scenarios and checks. Sends and connects on these
+      # runners got ENOBUFS (no buffer) for 0.05-0.15% of connections at
+      # this load, and in rare bursts even at a quarter of it (0.01% once,
+      # see portability.md section 7), where Linux makes the sender wait. They now wait too
+      # (driver/readiness/nobufs.rs), so the full load must pass with no
+      # failed connection; `clients` sets a lighter one.
+      GIONG_SOAK_CLIENTS: ${{ inputs.clients || (matrix.workload == 'runtime' && '32' || '16') }}
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - run: sw_vers && sysctl -n hw.ncpu && ulimit -n
+      # The runtime soak opens and closes thousands of loopback connections
+      # a second. macOS keeps each closed one's port for 30 s (TIME_WAIT,
+      # twice net.inet.tcp.msl) out of 16,384 ephemeral ports, so within
+      # seconds the runner's own connections to GitHub found no free port
+      # and the job was cancelled. Linux runners have a wider range and
+      # reuse such ports. A shorter TIME_WAIT and a wider range here. With
+      # 1 s (TIME_WAIT 2 s) the runtime soak's 15,000-27,000 connections a
+      # second still held up to 55,000 ports at once, the whole range, and
+      # connect failed now and then with EADDRNOTAVAIL or ENOBUFS; 250 ms
+      # keeps about a quarter of the range in TIME_WAIT.
+      - name: Ports for connection churn
+        run: |
+          sudo sysctl -w net.inet.tcp.msl=250 net.inet.ip.portrange.first=10240 net.inet.ip.portrange.hifirst=10240
+          sysctl net.inet.tcp.msl net.inet.ip.portrange.first net.inet.ip.portrange.last
+      - name: Soak
+        run: |
+          ulimit -n 65536 || ulimit -n 10240
+          # Every minute, how many sockets wait in TIME_WAIT, for the log.
+          (while sleep 60; do echo "time_wait: $(netstat -an -p tcp | grep -c TIME_WAIT) $(netstat -m | grep -m1 'mbufs in use')"; done) &
+          SOAK_SECS=$(( ${{ inputs.minutes || '120' }} * 60 )) scripts/check.sh soak ${{ matrix.workload }}

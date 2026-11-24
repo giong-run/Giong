@@ -5,7 +5,7 @@ Generates [giong-proto](../giong-proto) messages and [giong-grpc](../giong-grpc)
 well-known types included), so there is **no `protoc` to install**: `cargo build` is
 enough, on any machine an agent or a CI runner starts with.
 
-> **New in giong 1.1.** Not published before giong 1.0.0 is released.
+> **New in giong 1.1.**
 
 ```rust
 // build.rs

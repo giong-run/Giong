@@ -16,6 +16,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem;
 use std::ops::Range;
 use std::pin::pin;
@@ -158,9 +159,50 @@ impl Connection {
         self.inner.state.borrow().has_room()
     }
 
+    /// Whether the connection can still take requests, now or once a
+    /// stream ends: it is not over, and the server has not said GOAWAY.
+    pub(crate) fn is_usable(&self) -> bool {
+        let st = self.inner.state.borrow();
+        st.dead.is_none() && st.goaway.is_none()
+    }
+
+    /// Why the connection takes no more requests, if it does not: it
+    /// ended, or the server said GOAWAY.
+    pub(crate) fn unusable_because(&self) -> Option<String> {
+        let st = self.inner.state.borrow();
+        st.dead.clone().or_else(|| {
+            st.goaway
+                .map(|_| "the server is closing the connection (GOAWAY)".to_owned())
+        })
+    }
+
+    /// How many streams were ever opened: it changes whenever a request
+    /// is sent on the connection.
+    pub(crate) fn opened(&self) -> u32 {
+        self.inner.state.borrow().next_id / 2
+    }
+
     /// Streams in progress.
     pub(crate) fn streams(&self) -> usize {
         self.inner.state.borrow().streams.len()
+    }
+
+    /// Sends a PING, or returns `None` when the connection is over. The
+    /// [`Ping`] says when the server acknowledged it.
+    pub(crate) fn ping(&self) -> Option<Ping> {
+        let mut st = self.inner.state.borrow_mut();
+        let id = st.ping()?;
+        Some(Ping {
+            inner: self.inner.clone(),
+            id,
+        })
+    }
+
+    /// Ends the connection now: it takes no more requests, says GOAWAY to
+    /// the server and closes. Streams still in progress fail with
+    /// `message`.
+    pub(crate) fn retire(&self, message: &str) {
+        self.inner.state.borrow_mut().retire(message);
     }
 
     /// Sends `request` on a new stream, or returns `None` when the
@@ -186,6 +228,59 @@ impl Connection {
             trailers: None,
         })
     }
+}
+
+/// A PING the client sent, waiting for the server's acknowledgement.
+/// Dropped, it stops waiting; an acknowledgement that arrives later is
+/// ignored.
+pub(crate) struct Ping {
+    inner: Rc<Inner>,
+    id: u64,
+}
+
+impl Ping {
+    /// Ready with `Ok` once the server acknowledged the PING, or with why
+    /// the connection ended before it did.
+    pub(crate) fn poll_acked(
+        &mut self,
+        cx: &mut std::task::Context<'_>,
+    ) -> Poll<Result<(), String>> {
+        let mut st = self.inner.state.borrow_mut();
+        let st = &mut *st;
+        let Some(p) = st.pings.get_mut(&self.id) else {
+            return Poll::Ready(Err(st
+                .dead
+                .clone()
+                .unwrap_or_else(|| "the connection ended".to_owned())));
+        };
+        if p.acked {
+            return Poll::Ready(Ok(()));
+        }
+        if let Some(dead) = &st.dead {
+            return Poll::Ready(Err(dead.clone()));
+        }
+        p.waker = Some(cx.waker().clone());
+        Poll::Pending
+    }
+}
+
+impl Drop for Ping {
+    fn drop(&mut self) {
+        if let Ok(mut st) = self.inner.state.try_borrow_mut() {
+            st.pings.remove(&self.id);
+            if st.pings.is_empty() {
+                // The idle timeout applies again: the connection's task
+                // works out its deadline anew.
+                st.poke();
+            }
+        }
+    }
+}
+
+/// A PING sent and not yet given up.
+struct PingState {
+    acked: bool,
+    waker: Option<Waker>,
 }
 
 /// One request and its response. Dropped before the response has ended,
@@ -245,6 +340,15 @@ impl Stream {
         self.head
             .as_ref()
             .expect("the head is read before anything asks for it")
+    }
+
+    /// The head's field positions, taken once for the response the caller
+    /// builds: nothing here reads them after.
+    pub(crate) fn take_fields(&mut self) -> Vec<(Range<usize>, Range<usize>)> {
+        self.head
+            .as_mut()
+            .map(|head| std::mem::take(&mut head.fields))
+            .unwrap_or_default()
     }
 
     /// The length of the body, when known: none for a `HEAD` request or
@@ -437,15 +541,34 @@ struct Block {
 
 /// A header block, decoded and checked.
 #[derive(Default)]
-struct Decoded {
-    status: Option<u16>,
-    bytes: Vec<u8>,
-    fields: Vec<(Range<usize>, Range<usize>)>,
+pub(super) struct Decoded {
+    pub(super) status: Option<u16>,
+    pub(super) bytes: Vec<u8>,
+    pub(super) fields: Vec<(Range<usize>, Range<usize>)>,
     /// Decoded size, counted as for `SETTINGS_MAX_HEADER_LIST_SIZE`.
-    size: usize,
-    content_length: Option<u64>,
-    malformed: Option<&'static str>,
+    pub(super) size: usize,
+    pub(super) content_length: Option<u64>,
+    pub(super) malformed: Option<&'static str>,
 }
+
+impl Decoded {
+    fn clear(&mut self) {
+        self.status = None;
+        self.bytes.clear();
+        self.fields.clear();
+        self.size = 0;
+        self.content_length = None;
+        self.malformed = None;
+    }
+}
+
+/// The decode buffer a connection keeps between header blocks; one that
+/// grew past this (a huge head) is let go.
+const KEEP_DECODED: usize = 4096;
+
+/// The write buffer a connection keeps for the next write; one that grew
+/// past this (request bodies) is let go.
+const KEEP_OUT: usize = 4096;
 
 /// A connection error: what the GOAWAY says, and the message requests get.
 struct ConnError {
@@ -467,14 +590,41 @@ fn reason_name(code: u32) -> String {
     }
 }
 
+/// Hashes the stream ids that key [`State::streams`]. The client picks
+/// them itself (odd, counting up), so no server can choose ids that
+/// collide; SipHash, the default, costs about a hundred instructions a
+/// lookup, and a request makes seven. Multiplying by an odd constant keeps
+/// distinct ids distinct in the low bits, and mixes them into the high
+/// bits the table also uses.
+#[derive(Default)]
+struct IdHash(u64);
+
+impl Hasher for IdHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0 ^ u64::from(n)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
 /// The protocol state of a connection, without I/O: frames in, frames out.
 struct State {
     encoder: Encoder,
     decoder: Decoder,
     /// Frames to write.
     out: Vec<u8>,
+    /// The last buffer written, kept empty for the next `out`.
+    spare: Vec<u8>,
     next_id: u32,
-    streams: HashMap<u32, StreamState>,
+    streams: HashMap<u32, StreamState, BuildHasherDefault<IdHash>>,
     /// Streams with request body to send, served in turn.
     sending: VecDeque<u32>,
     /// Streams whose streamed request body has sent its last piece and
@@ -496,9 +646,15 @@ struct State {
     /// Why the connection can carry nothing more; set when it ends.
     dead: Option<String>,
     block: Option<Block>,
+    /// Where header blocks are decoded, kept between blocks so a response
+    /// head costs one exact allocation and trailers none.
+    decoded: Decoded,
     max_head_size: usize,
     /// No stream open since then.
     idle_since: Instant,
+    /// The PINGs the client sent and still waits for, by their payload.
+    pings: HashMap<u64, PingState>,
+    next_ping: u64,
     /// The connection's task: woken when there is something for it to do.
     driver: Option<Waker>,
     poked: bool,
@@ -510,8 +666,9 @@ impl State {
             encoder: Encoder::new(),
             decoder: Decoder::new(TABLE_SIZE),
             out: Vec::new(),
+            spare: Vec::new(),
             next_id: 1,
-            streams: HashMap::new(),
+            streams: HashMap::default(),
             sending: VecDeque::new(),
             pulling: Vec::new(),
             peer_max_streams: INITIAL_MAX_STREAMS,
@@ -524,8 +681,11 @@ impl State {
             goaway: None,
             dead: None,
             block: None,
+            decoded: Decoded::default(),
             max_head_size,
             idle_since: Instant::now(),
+            pings: HashMap::new(),
+            next_ping: 0,
             driver: None,
             poked: false,
         }
@@ -561,6 +721,13 @@ impl State {
             && self.goaway.is_none()
             && self.next_id <= MAX_STREAM_ID
             && self.streams.len() < self.peer_max_streams as usize
+    }
+
+    /// Nothing in progress: no stream, and no PING waiting for its
+    /// acknowledgement (a probe in flight is not idleness, and must not be
+    /// ended by the idle timeout).
+    fn is_idle(&self) -> bool {
+        self.dead.is_none() && self.streams.is_empty() && self.pings.is_empty()
     }
 
     fn reading(&self) -> bool {
@@ -641,6 +808,37 @@ impl State {
         }
         self.poke();
         id
+    }
+
+    /// Queues a PING whose payload is a number of its own, and wakes the
+    /// connection's task to send it; returns that number, or `None` once
+    /// the connection is over.
+    fn ping(&mut self) -> Option<u64> {
+        if self.dead.is_some() {
+            return None;
+        }
+        self.next_ping += 1;
+        let id = self.next_ping;
+        frame::write_ping(&mut self.out, false, &id.to_be_bytes());
+        self.pings.insert(
+            id,
+            PingState {
+                acked: false,
+                waker: None,
+            },
+        );
+        self.poke();
+        Some(id)
+    }
+
+    /// Ends the connection on the client's side: GOAWAY, then nothing more.
+    fn retire(&mut self, message: &str) {
+        if self.dead.is_some() {
+            return;
+        }
+        frame::write_goaway(&mut self.out, 0, Reason::NoError, b"");
+        self.end(message.to_owned(), false);
+        self.poke();
     }
 
     /// Takes the next piece from the source of every streamed request
@@ -937,6 +1135,11 @@ impl State {
         }
         self.block = None;
         self.sending.clear();
+        for p in self.pings.values_mut() {
+            if let Some(w) = p.waker.take() {
+                w.wake();
+            }
+        }
     }
 
     fn frame(&mut self, head: Head, payload: &[u8]) -> Result<(), ConnError> {
@@ -1169,18 +1372,31 @@ impl State {
     /// the block is for, so every block is decoded.
     fn decode(&mut self, block: &[u8]) -> Result<Decoded, ConnError> {
         let max = self.max_head_size;
-        let mut d = Decoded::default();
-        self.decoder
-            .decode(block, |name, value| check_field(&mut d, max, name, value))
-            .map_err(|e| ConnError {
+        let mut d = std::mem::take(&mut self.decoded);
+        d.clear();
+        let result = self
+            .decoder
+            .decode(block, |name, value| check_field(&mut d, max, name, value));
+        if let Err(e) = result {
+            self.decoded = d;
+            return Err(ConnError {
                 reason: Reason::Compression,
                 detail: format!("a header block could not be decoded: {}", e.0),
-            })?;
+            });
+        }
         Ok(d)
     }
 
     fn header_block(&mut self, id: u32, end_stream: bool, block: &[u8]) -> Result<(), ConnError> {
         let d = self.decode(block)?;
+        let result = self.decoded_block(id, end_stream, &d);
+        if d.bytes.capacity() <= KEEP_DECODED && d.fields.capacity() <= KEEP_DECODED / 64 {
+            self.decoded = d;
+        }
+        result
+    }
+
+    fn decoded_block(&mut self, id: u32, end_stream: bool, d: &Decoded) -> Result<(), ConnError> {
         let max = self.max_head_size;
         let Some(s) = self.streams.get_mut(&id) else {
             // A stream given up: the block only mattered to the table.
@@ -1273,8 +1489,8 @@ impl State {
         s.content_length = d.content_length;
         s.head = Some(ResponseHead {
             status,
-            bytes: d.bytes,
-            fields: d.fields,
+            bytes: d.bytes.clone(),
+            fields: d.fields.clone(),
             content_length: d.content_length,
         });
         if end_stream {
@@ -1410,6 +1626,21 @@ impl State {
         }
         if !head.has(frame::ACK) {
             frame::write_ping(&mut self.out, true, payload);
+            return Ok(());
+        }
+        // An acknowledgement of one of ours; any other is ignored.
+        let id = u64::from_be_bytes(payload.try_into().expect("8 bytes, checked above"));
+        if let Some(p) = self.pings.get_mut(&id) {
+            if !p.acked {
+                p.acked = true;
+                if let Some(w) = p.waker.take() {
+                    w.wake();
+                }
+                // The server answered: the connection counts as used.
+                if self.streams.is_empty() {
+                    self.idle_since = Instant::now();
+                }
+            }
         }
         Ok(())
     }
@@ -1513,8 +1744,9 @@ impl State {
     }
 }
 
-/// Checks one decoded field of a response head and keeps it.
-fn check_field(d: &mut Decoded, max: usize, name: &[u8], value: &[u8]) {
+/// Checks one decoded field of a response head and keeps it. HTTP/3 holds
+/// response fields to the same rules (RFC 9114, section 4.2).
+pub(super) fn check_field(d: &mut Decoded, max: usize, name: &[u8], value: &[u8]) {
     d.size += name.len() + value.len() + 32;
     if d.malformed.is_some() {
         return;
@@ -1603,7 +1835,7 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
     let mut timer = pin!(sleep_until(Instant::now() + settings.idle_timeout));
     if false {
         // Names the type of the write future for `write`.
-        write.set(Some(socket.write_all(Vec::new())));
+        write.set(Some(socket.write_all_back(Vec::new())));
     }
     loop {
         let (out, over, reading, idle_since) = {
@@ -1622,14 +1854,17 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
                     st.end("the server closed the connection (GOAWAY)".into(), false);
                 }
             }
-            let out = (write.is_none() && !st.out.is_empty()).then(|| mem::take(&mut st.out));
+            let out = (write.is_none() && !st.out.is_empty()).then(|| {
+                let spare = mem::take(&mut st.spare);
+                mem::replace(&mut st.out, spare)
+            });
             st.poked = false;
             // Once the connection is over, only the last write is waited for.
-            let idle_since = (st.dead.is_none() && st.streams.is_empty()).then_some(st.idle_since);
+            let idle_since = st.is_idle().then_some(st.idle_since);
             (out, st.dead.is_some(), st.reading(), idle_since)
         };
         if let Some(out) = out {
-            write.set(Some(socket.write_all(out)));
+            write.set(Some(socket.write_all_back(out)));
             write_deadline = Some(Instant::now() + settings.write_timeout);
         }
         if over && write.is_none() {
@@ -1673,11 +1908,15 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
         })
         .await;
         match woke {
-            Wake::Wrote(Ok(())) => {
+            Wake::Wrote((Ok(()), mut buf)) => {
                 write.set(None);
                 write_deadline = None;
+                if buf.capacity() <= KEEP_OUT {
+                    buf.clear();
+                    inner.state.borrow_mut().spare = buf;
+                }
             }
-            Wake::Wrote(Err(e)) => {
+            Wake::Wrote((Err(e), _)) => {
                 write.set(None);
                 inner
                     .state
@@ -1718,10 +1957,7 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
                     );
                     break;
                 }
-                if st.streams.is_empty()
-                    && st.dead.is_none()
-                    && st.idle_since + settings.idle_timeout <= now
-                {
+                if st.is_idle() && st.idle_since + settings.idle_timeout <= now {
                     frame::write_goaway(&mut st.out, 0, Reason::NoError, b"");
                     st.end("the connection was idle for too long".into(), false);
                 }
@@ -1971,6 +2207,11 @@ pub(crate) mod fuzzing {
                     }
                 }
                 9 => match flags % 4 {
+                    // Now and then the acknowledgement of a PING the
+                    // client sent (theirs are numbered from 1).
+                    0 if flags & 0x20 != 0 => {
+                        frame::write_ping(&mut out, true, &u64::from(d.byte() % 4).to_be_bytes())
+                    }
                     0 => frame::write_ping(&mut out, flags & 0x10 != 0, &[d.byte(); 8]),
                     1 => {
                         frame::write_head(&mut out, 5, frame::PRIORITY, 0, stream);
@@ -2208,10 +2449,9 @@ pub(crate) mod fuzzing {
                     let increment = frame::read_u32(payload);
                     assert!(increment > 0 && increment <= 0x7fff_ffff);
                 }
-                frame::PING => {
-                    assert!(head.has(frame::ACK));
-                    ping_acks += 1;
-                }
+                // The client's own PINGs, and its answers to the server's.
+                frame::PING if !head.has(frame::ACK) => assert_eq!(payload.len(), 8),
+                frame::PING => ping_acks += 1,
                 frame::SETTINGS => {
                     assert!(head.has(frame::ACK));
                     settings_acks += 1;
@@ -2244,6 +2484,7 @@ pub(crate) mod fuzzing {
         }
         let mut out = Vec::new();
         let mut pending = Vec::new();
+        let mut pings = Vec::new();
         let mut at = 0;
         let mut responses = 0;
         loop {
@@ -2280,8 +2521,26 @@ pub(crate) mod fuzzing {
                         responses += read(&mut st, id, a.pick(&[usize::MAX, 1, 16_384]));
                     }
                 }
+                5 => {
+                    if let Some(id) = awake(&mut st, State::ping) {
+                        pings.push(id);
+                    }
+                }
+                6 if a.byte() % 16 == 0 => awake(&mut st, |st| st.retire("retired")),
                 // Nobody reads for a while.
                 _ => {}
+            }
+            // A PING is acknowledged only by an ACK with its payload, and
+            // forgotten once given up.
+            for &id in &pings {
+                if let Some(p) = st.pings.get(&id) {
+                    assert!(!p.acked || id < 4, "PING {id} acknowledged");
+                }
+            }
+            if a.byte() % 4 == 0 {
+                if let Some(id) = pings.pop() {
+                    st.pings.remove(&id);
+                }
             }
             check_state(&st);
             st.fill();
@@ -2305,6 +2564,31 @@ mod tests {
             check_field(&mut d, max, n, v);
         }
         d
+    }
+
+    #[test]
+    fn the_kept_decode_buffer_starts_clean_for_each_block() {
+        let mut st = State::new(16 * 1024);
+        let mut encoder = Encoder::new();
+        let mut bad = Vec::new();
+        encoder.begin(&mut bad);
+        encoder.status(200, &mut bad);
+        encoder.field(b"x-one", b"1", Index::No, &mut bad);
+        encoder.field(b"connection", b"close", Index::No, &mut bad);
+        let d = st.decode(&bad).ok().expect("decodable");
+        assert!(d.malformed.is_some());
+        st.decoded = d;
+        let mut good = Vec::new();
+        encoder.begin(&mut good);
+        encoder.status(204, &mut good);
+        encoder.field(b"x-two", b"2", Index::No, &mut good);
+        let d = st.decode(&good).ok().expect("decodable");
+        assert_eq!(d.malformed, None);
+        assert_eq!(d.status, Some(204));
+        assert_eq!(d.content_length, None);
+        assert_eq!(d.fields.len(), 1);
+        assert_eq!(&d.bytes[d.fields[0].0.clone()], b"x-two");
+        assert_eq!(&d.bytes[d.fields[0].1.clone()], b"2");
     }
 
     #[test]

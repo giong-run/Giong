@@ -47,20 +47,20 @@ instructions per request.
 | `spawn` | spawn a task that returns at once and await it | 1,405 | 1,124 |
 | `yield` | `yield_now`: one trip through the run queue | 501 | 361 |
 | `oneshot` | a oneshot channel: create, send, receive | 280 | 280 |
-| `channel` | a round trip between two tasks over two bounded channels | 1,764 | 1,484 |
+| `channel` | a round trip between two tasks over two bounded channels | 1,721 | 1,446 |
 | `timeout` | a timeout around a future that is ready at once | 100 | 100 |
 | `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,624 | 4,510 |
 | `udp-echo` | a 64-byte datagram to an echo task and back | 4,138 | 4,832 |
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 196 | 248 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 9,416 | 10,276 |
-| `http1-client` | giong-http client and server, HTTP/1.1 | 30,939 | 31,990 |
-| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 43,563 | 44,449 |
-| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 373,372 | 374,185 |
-| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 43,175 | 44,191 |
-| `web` | a giong-web router with a path parameter, raw client | 13,381 | 14,254 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 8,642 | 9,507 |
+| `http1-client` | giong-http client and server, HTTP/1.1 | 22,139 | 23,184 |
+| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 30,231 | 31,129 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 241,317 | 242,171 |
+| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 34,251 | 35,268 |
+| `web` | a giong-web router with a path parameter, raw client | 11,596 | 12,459 |
 | `redis-get` | giong-redis `GET` against a fake server | 8,349 | 8,926 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,224 | 10,838 |
-| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 14,137 | 14,751 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 10,241 | 10,855 |
+| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,711 | 14,326 |
 
 `udp-echo` went down with the UDP changes of 0.9 (#139, #142): 5,358 to 4,137 on io_uring and
 5,031 to 4,783 on epoll, counted with glibc's malloc as all counts were until 2026-11-20, with
@@ -85,6 +85,11 @@ in time, the epoll round trip got faster (`bench/core.sh` `tcp-rr` 5,741 to 5,30
 idle connection takes one allocation fewer (two with TLS); the task and its future now share
 one. Its heap grew by 40 to 64 bytes for `idle-http1` and `idle-h2` (1.0% to 2.7%), and moved
 by less than 20 bytes for `idle-https`.
+
+#227 (a channel receive or send that is ready at once counts against the task's budget)
+also stopped the bounded channel calling its grant and wake-up functions when no sender
+waits: `channel` 1,756 to 1,721 on io_uring and 1,481 to 1,446 on epoll, measured on the
+same machine before and after; the other cases did not move by more than 0.02%.
 
 ### The allocator is not counted as glibc's
 
@@ -125,17 +130,21 @@ operation here (2% per request with ten streams and 4.5% with a hundred under `h
 fewer requests per second on bare metal), inside a 1% limit. Its counts repeat within 0.1%.
 
 Three more cases measure memory, outside valgrind: `idle-http1`, `idle-h2` and `idle-https`
-open 2,000 idle connections to a giong-http server in the process (from another thread, with
-blocking std sockets, which own no heap) and record how much the live heap and the resident
-set grew per connection. For `idle-https` that thread does each TLS handshake and one
-keep-alive request with rustls, then drops its TLS state and keeps the socket, so the heap
-that stays is the server's (the server cannot tell; nothing is sent). Its allocation count, like
-the other cases', covers both ends, handshakes included. The heap count is exact: it
+open 2,000 idle connections to a giong-http server in the process (from a child process,
+`bench-instr idle-client`, with blocking std sockets) and record how much the live heap and
+the resident set grew per connection. The clients are in another process so that the server's
+descriptors are numbered in the order it accepts them: the driver keeps a table indexed by
+descriptor number, and with the clients on a thread of the same process the two ends took
+numbers in scheduling order, so the table grew by different steps from run to run (2,166 or
+2,211 heap bytes per `idle-http1` connection from the same build, 2026-11-22). For
+`idle-https` the child does each TLS handshake and one keep-alive request with rustls, then
+drops its TLS state and keeps the socket (the server cannot tell; nothing is sent). Every count
+is the server's alone, handshakes included. The heap count is exact: it
 repeats within a byte per connection, and within 0.04% across GitHub's runners (Intel and AMD,
 two clouds; item 6 of [`conditions.txt`](../results/instr/conditions.txt)). Its limit is 1%,
 and the baseline's idle rows are taken from a CI run, not from a development machine, where
 the kernel build alone moved `idle-http1` by 1.3%. The resident set moves with the
-allocator's choices (2.7% between rounds for `idle-h2`); its limit is 10%. For `idle-h2` the thread sends the preface, SETTINGS and
+allocator's choices (2.7% between rounds for `idle-h2`); its limit is 10%. For `idle-h2` the child sends the preface, SETTINGS and
 one `GET /` on each connection and reads the answer, as `bench/h2.sh` does: until 0.9 it sent no
 request, and missed that 0.8.0 kept each connection's memory for streams for a second after a
 request (6,852 heap and 7,371 resident bytes per connection on 0.8.0 with the request, against

@@ -13,6 +13,10 @@ use giong::net::TcpListener;
 use giong::time::sleep;
 use giong_http::{Handler, Request, Response, Server};
 
+#[path = "support/quiet_panics.rs"]
+mod quiet_panics;
+use quiet_panics::quiet_expected_panics;
+
 // ------------------------------------------------------------------ harness
 
 struct TestServer {
@@ -26,6 +30,7 @@ impl TestServer {
     where
         H: Handler + Clone + Send + Sync,
     {
+        quiet_expected_panics();
         let rt = giong::Builder::new()
             .workers(1)
             .shutdown_grace(Duration::from_secs(20))
@@ -107,6 +112,14 @@ struct Client {
 impl Client {
     fn send(&mut self, bytes: impl AsRef<[u8]>) {
         self.stream.write_all(bytes.as_ref()).unwrap();
+    }
+
+    /// Whether the server has sent something (or closed), without waiting.
+    fn answered(&self) -> bool {
+        self.stream.set_nonblocking(true).unwrap();
+        let peeked = self.stream.peek(&mut [0u8; 1]);
+        self.stream.set_nonblocking(false).unwrap();
+        !matches!(peeked, Err(e) if e.kind() == std::io::ErrorKind::WouldBlock)
     }
 
     /// Reads more input; `false` at end of stream (or on a reset).
@@ -477,6 +490,41 @@ fn keep_alive_follows_the_protocol_version_and_connection_header() {
 }
 
 #[test]
+fn a_successful_answer_to_connect_closes_the_connection() {
+    // After a 2xx to CONNECT, the client and every proxy on the way treat
+    // the connection as a tunnel (RFC 9110, section 9.3.6), but the server
+    // has none to give: bytes that a proxy in front passes on blindly as
+    // tunnel data must not be read as requests it never saw.
+    let server = default_server();
+    let mut c = server.client();
+    c.send(
+        "CONNECT db.internal:5432 HTTP/1.1\r\nHost: db.internal:5432\r\n\r\n\
+         GET /admin HTTP/1.1\r\nHost: t\r\n\r\n",
+    );
+    let r = c.reply();
+    assert_eq!(r.status, 200);
+    assert_eq!(r.header("connection"), Some("close"));
+    c.expect_closed();
+
+    // A refusal leaves the connection as it was.
+    let refuse = |req: Request| async move {
+        if req.method() == "CONNECT" {
+            Response::new(405)
+        } else {
+            Response::text("ok")
+        }
+    };
+    let server = TestServer::start(Server::new(), refuse);
+    let mut c = server.client();
+    c.send(
+        "CONNECT db.internal:5432 HTTP/1.1\r\nHost: db.internal:5432\r\n\r\n\
+         GET / HTTP/1.1\r\nHost: t\r\n\r\n",
+    );
+    assert_eq!(c.reply().status, 405);
+    assert_eq!(c.reply().text(), "ok");
+}
+
+#[test]
 fn head_and_bodiless_statuses_send_no_body() {
     let server = default_server();
     let mut c = server.client();
@@ -606,13 +654,17 @@ fn slow_requests_time_out_and_idle_connections_are_closed() {
     c.send("POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 10\r\n\r\nabc");
     assert_eq!(c.reply().status, 408);
 
-    // A slow drip does not reset the clock.
+    // A slow drip does not reset the clock. The drip stops once the answer
+    // is there: the server discards input for only so long after it, and a
+    // line that arrives once it has closed makes its kernel answer with a
+    // reset, which macOS lets destroy the answer before it is read (seen on
+    // a slow runner, where 40 sleeps of 20 ms outlasted that time).
     let mut c = server.client();
     let start = Instant::now();
     c.send("GET / HTTP/1.1\r\n");
     for _ in 0..40 {
         std::thread::sleep(Duration::from_millis(20));
-        if c.stream.write_all(b"X-Drip: 1\r\n").is_err() {
+        if c.answered() || c.stream.write_all(b"X-Drip: 1\r\n").is_err() {
             break;
         }
     }
@@ -627,11 +679,18 @@ fn slow_requests_time_out_and_idle_connections_are_closed() {
     assert!(start.elapsed() < Duration::from_secs(5));
 
     // A connection that is used stays open past the idle timeout in total.
+    // The pauses are a sixth of the idle timeout: macOS lets a sleeping
+    // thread wake late by up to the length of its sleep (a 150 ms sleep
+    // took 300 to 310 ms on GitHub's macOS runners), so half the timeout
+    // was not enough margin.
     let mut c = server.client();
-    for i in 0..4 {
-        std::thread::sleep(Duration::from_millis(150));
+    let start = Instant::now();
+    let mut i = 0;
+    while start.elapsed() < Duration::from_millis(600) {
+        std::thread::sleep(Duration::from_millis(50));
         c.send(format!("GET /{i} HTTP/1.1\r\nHost: t\r\n\r\n"));
         assert_eq!(c.reply().status, 200);
+        i += 1;
     }
 }
 
@@ -816,8 +875,12 @@ fn shutdown_finishes_requests_in_progress_and_closes_idle_connections() {
     assert_eq!(idle.reply().text(), "done");
 
     let mut busy = server.client();
+    let sent = Instant::now();
     busy.send("GET /slow HTTP/1.1\r\nHost: t\r\n\r\n");
     std::thread::sleep(Duration::from_millis(100));
+    // A loaded machine sleeps longer, and the request is that much nearer
+    // its end when the server is told to stop.
+    let waited = sent.elapsed();
 
     let stopped_after = server.stop();
 
@@ -829,8 +892,8 @@ fn shutdown_finishes_requests_in_progress_and_closes_idle_connections() {
     idle.expect_closed();
     // The runtime waited for the slow request, not for the 20 s grace period.
     assert!(
-        stopped_after >= Duration::from_millis(250),
-        "{stopped_after:?}"
+        waited + stopped_after >= Duration::from_millis(350),
+        "{stopped_after:?} after {waited:?}"
     );
     assert!(stopped_after < Duration::from_secs(10), "{stopped_after:?}");
     assert!(TcpStream::connect(server.addr).is_err());
@@ -865,6 +928,60 @@ fn many_connections_at_once() {
     for t in threads {
         t.join().unwrap();
     }
+}
+
+/// At the limit, an idle connection over a Unix socket makes room too.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_an_idle_unix_connection_makes_room() {
+    use std::os::unix::net::UnixStream;
+
+    let path = std::env::temp_dir().join(format!("giong-http-evict-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let rt = giong::Builder::new().workers(1).build().unwrap();
+    let handle = rt.handle();
+    let (tx, rx) = mpsc::channel();
+    let server_path = path.clone();
+    let thread = std::thread::spawn(move || {
+        rt.run(move |_| {
+            let (tx, path) = (tx.clone(), server_path.clone());
+            async move {
+                let listener = giong::net::UnixListener::bind(path).unwrap();
+                tx.send(()).unwrap();
+                Server::new()
+                    .max_connections(1)
+                    .serve_unix(listener, echo)
+                    .await;
+            }
+        })
+        .unwrap();
+    });
+    rx.recv().unwrap();
+
+    let ask = |stream: &mut UnixStream, what: &str| {
+        stream
+            .write_all(format!("GET /{what} HTTP/1.1\r\nHost: t\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut got = [0u8; 4096];
+        let n = stream.read(&mut got).unwrap();
+        String::from_utf8_lossy(&got[..n]).into_owned()
+    };
+    let mut first = UnixStream::connect(&path).unwrap();
+    first
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert!(ask(&mut first, "first").contains("GET /first "));
+    let mut second = UnixStream::connect(&path).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert!(ask(&mut second, "second").contains("GET /second "));
+    // The first connection was closed to make room.
+    assert_eq!(first.read(&mut [0u8; 64]).unwrap(), 0);
+
+    handle.shutdown();
+    thread.join().unwrap();
+    let _ = std::fs::remove_file(&path);
 }
 
 #[test]
@@ -948,6 +1065,8 @@ fn handlers_see_the_client_address() {
     assert_eq!(c.reply().text(), expected);
 }
 
+/// On Windows idle connections are not closed for new clients: they wait.
+#[cfg(windows)]
 #[test]
 fn at_the_connection_limit_new_clients_wait_their_turn() {
     let server = TestServer::start(Server::new().max_connections(1), echo);
@@ -991,6 +1110,168 @@ fn at_the_connection_limit_new_clients_wait_their_turn() {
         assert_eq!(c.reply().status, 200);
         c.expect_closed();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_a_connection_mid_request_keeps_its_place() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut first = server.client();
+    // Half a request: the connection is busy, not idle, once the server
+    // has read it.
+    first.send("GET /first HTTP/1.1\r\n");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // The kernel completes the second handshake, but the server does not
+    // accept the connection while the first one is receiving a request.
+    let mut second = server.client();
+    second.send("GET /second HTTP/1.1\r\nHost: t\r\n\r\n");
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let err = second.stream.read(&mut [0u8; 64]).unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "{err}"
+    );
+
+    // The first request is answered in full. Idle after it, the first
+    // connection gives its place to the waiting one: it is closed cleanly,
+    // and the second is served.
+    first.send("Host: t\r\n\r\n");
+    let r = first.reply();
+    assert!(r.text().starts_with("GET /first "), "{}", r.text());
+    first.expect_closed();
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let r = second.reply();
+    assert!(r.text().starts_with("GET /second "), "{}", r.text());
+
+    // The slot is reused again and again.
+    drop(second);
+    for i in 0..20 {
+        let mut c = server.client();
+        c.send(format!(
+            "GET /{i} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+        ));
+        assert_eq!(c.reply().status, 200);
+        c.expect_closed();
+    }
+}
+
+/// A new connection that has not sent its first request is not idle: its
+/// client would not retry a request lost on it, so it keeps its place.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_a_new_connection_keeps_its_place_until_its_first_request() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut first = server.client();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut second = server.client();
+    second.send("GET /second HTTP/1.1\r\nHost: t\r\n\r\n");
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let err = second.stream.read(&mut [0u8; 64]).unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "{err}"
+    );
+
+    // The first connection is answered, then gives its place once idle.
+    first.send("GET /first HTTP/1.1\r\nHost: t\r\n\r\n");
+    let r = first.reply();
+    assert!(r.text().starts_with("GET /first "), "{}", r.text());
+    first.expect_closed();
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let r = second.reply();
+    assert!(r.text().starts_with("GET /second "), "{}", r.text());
+}
+
+/// At the limit, idle keep-alive connections do not keep new clients out:
+/// the one idle longest is closed to make room, as nginx does.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_the_longest_idle_connection_makes_room() {
+    let server = TestServer::start(Server::new().max_connections(3), echo);
+    let mut idle: Vec<Client> = (0..3)
+        .map(|i| {
+            let mut c = server.client();
+            c.send(format!("GET /{i} HTTP/1.1\r\nHost: t\r\n\r\n"));
+            assert_eq!(c.reply().status, 200);
+            c
+        })
+        .collect();
+    // The oldest becomes the newest idle connection again.
+    idle[0].send("GET /again HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(idle[0].reply().status, 200);
+
+    // Two new clients: connections 1 and 2, idle longest, close for them.
+    let mut fresh: Vec<Client> = (0..2)
+        .map(|i| {
+            let mut c = server.client();
+            c.send(format!("GET /new{i} HTTP/1.1\r\nHost: t\r\n\r\n"));
+            let r = c.reply();
+            assert!(
+                r.text().starts_with(&format!("GET /new{i} ")),
+                "{}",
+                r.text()
+            );
+            c
+        })
+        .collect();
+    idle[1].expect_closed();
+    idle[2].expect_closed();
+    // The others carry on.
+    idle[0].send("GET /still HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert!(idle[0].reply().text().starts_with("GET /still "));
+    for c in &mut fresh {
+        c.send("GET /more HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(c.reply().text().starts_with("GET /more "));
+    }
+}
+
+/// An idle HTTP/2 connection gives its place the same way, with a GOAWAY.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_an_idle_http2_connection_goes_away() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut h2 = server.client();
+    // The preface and an empty SETTINGS frame: a connection with no stream.
+    h2.send(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0");
+    // Wait for the server's SETTINGS: the connection is open and idle.
+    while h2.buf.len() < 9 {
+        assert!(h2.fill());
+    }
+
+    let mut c = server.client();
+    c.send("GET /new HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert!(c.reply().text().starts_with("GET /new "));
+
+    // The HTTP/2 connection got a GOAWAY, then was closed.
+    while h2.fill() {}
+    let mut frames = Vec::new();
+    let mut at = 0;
+    while at + 9 <= h2.buf.len() {
+        let len = u32::from_be_bytes([0, h2.buf[at], h2.buf[at + 1], h2.buf[at + 2]]) as usize;
+        frames.push(h2.buf[at + 3]);
+        at += 9 + len;
+    }
+    assert_eq!(frames.last(), Some(&7), "frame types {frames:?}");
 }
 
 /// Below `min_free_memory`, new connections are refused with a `503` that
@@ -1186,4 +1467,172 @@ fn the_budget_shows_in_debug_and_defaults_to_auto() {
     assert!(text.contains("max_buffered_request_bytes: auto"), "{text}");
     let text = format!("{:?}", Server::new().max_buffered_request_bytes(1234));
     assert!(text.contains("max_buffered_request_bytes: 1234"), "{text}");
+}
+
+/// Answers with the body's length and a checksum that notices any byte out
+/// of place.
+async fn checksum(req: Request) -> Response {
+    Response::text(checksum_of(req.body()))
+}
+
+fn checksum_of(body: &[u8]) -> String {
+    let sum = body.iter().enumerate().fold(0u64, |a, (i, &b)| {
+        a.wrapping_mul(31).wrapping_add(u64::from(b) ^ i as u64)
+    });
+    format!("{} {sum}", body.len())
+}
+
+/// Bodies from 64 KiB up are received straight into the request buffer
+/// (`Transport::recv_into`). Large and small requests in turn on one
+/// connection, some pipelined behind a large body, some sent in pieces or
+/// after `100 Continue`: each body arrives whole and in order.
+#[test]
+fn large_bodies_arrive_whole_between_other_requests() {
+    let server = TestServer::start(Server::new().max_body_size(4 << 20), checksum);
+    let mut c = server.client();
+    let body = |len: usize, seed: u8| -> Vec<u8> {
+        (0..len)
+            .map(|i| (i as u8).wrapping_mul(7).wrapping_add(seed))
+            .collect()
+    };
+    let post = |len: usize| format!("POST /u HTTP/1.1\r\nHost: t\r\nContent-Length: {len}\r\n\r\n");
+    for (round, &len) in [70_000usize, 10, 1 << 20, 65_536, 300_000, 3 << 20]
+        .iter()
+        .enumerate()
+    {
+        let b = body(len, round as u8);
+        // A large body, with a small request pipelined right behind it.
+        let mut bytes = post(len).into_bytes();
+        bytes.extend_from_slice(&b);
+        bytes.extend_from_slice(b"GET /after HTTP/1.1\r\nHost: t\r\n\r\n");
+        c.send(&bytes);
+        let r = c.reply();
+        assert_eq!(
+            (r.status, r.text()),
+            (200, checksum_of(&b).as_str()),
+            "round {round}"
+        );
+        let r = c.reply();
+        assert_eq!((r.status, r.text()), (200, "0 0"), "round {round}");
+        // The same body in pieces, with pauses between them.
+        c.send(post(len));
+        for piece in b.chunks(len / 3 + 1) {
+            std::thread::sleep(Duration::from_millis(5));
+            c.send(piece);
+        }
+        let r = c.reply();
+        assert_eq!(
+            (r.status, r.text()),
+            (200, checksum_of(&b).as_str()),
+            "round {round}"
+        );
+    }
+    // After `100 Continue`.
+    let b = body(500_000, 9);
+    c.send("POST /u HTTP/1.1\r\nHost: t\r\nContent-Length: 500000\r\nExpect: 100-continue\r\n\r\n");
+    while !c.buf.ends_with(b"\r\n\r\n") {
+        assert!(c.fill());
+    }
+    assert_eq!(c.buf, b"HTTP/1.1 100 Continue\r\n\r\n");
+    c.buf.clear();
+    c.send(&b);
+    let r = c.reply();
+    assert_eq!((r.status, r.text()), (200, checksum_of(&b).as_str()));
+}
+
+/// Bodies of 64 KiB and more are received straight into the request buffer,
+/// and charged against the worker's budget as they arrive, like any other:
+/// two uploads admitted together cannot both hold more than the budget.
+#[test]
+fn large_bodies_received_straight_into_the_buffer_are_charged_as_they_arrive() {
+    let server = TestServer::start(
+        Server::new().max_buffered_request_bytes(256 * 1024),
+        budgeted,
+    );
+    let head = "POST /big HTTP/1.1\r\nHost: t\r\nContent-Length: 200000\r\n\r\n";
+    // Both are admitted while nothing is held yet.
+    let mut a = server.client();
+    let mut b = server.client();
+    a.send(head);
+    b.send(head);
+    std::thread::sleep(Duration::from_millis(100));
+
+    // The first holds 150,000 bytes: a probe for as much again is refused.
+    a.send(vec![b'a'; 150_000]);
+    let refused = wait_until_refused(&server, 150_000);
+    assert_eq!(refused.status, 503);
+
+    // The second sends as much: it does not fit next to the first, and is
+    // refused once its bytes arrive.
+    let _ = b.stream.write_all(&vec![b'b'; 150_000]);
+    let cut = b.reply();
+    assert_eq!(cut.status, 503);
+    assert!(cut.text().starts_with("GIONG-E1120"), "{}", cut.text());
+
+    // The first completes.
+    a.send(vec![b'a'; 50_000]);
+    assert_eq!(a.reply().text(), "got 200000");
+}
+
+/// The write timeout counts from the last progress of a write, not from its
+/// start: a large answer to a client that keeps reading, slowly, goes out
+/// whole even when that takes far longer than the timeout. A client that
+/// stops reading loses the connection one timeout after the last progress.
+#[test]
+fn the_write_timeout_counts_from_the_last_progress() {
+    const LEN: usize = 32 << 20;
+    async fn large(_req: Request) -> Response {
+        Response::new(200).body(vec![b'x'; LEN])
+    }
+    let server = TestServer::start(Server::new().write_timeout(Duration::from_secs(1)), large);
+    // Read the whole answer: the head, then `LEN` bytes of body.
+    let read_all = |pace: Option<Duration>| {
+        let mut c = server.client();
+        c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+        let start = Instant::now();
+        let mut got = 0usize;
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut paced = 0;
+        loop {
+            match c.stream.read(&mut buf) {
+                Ok(0) | Err(_) => break,
+                Ok(n) => got += n,
+            }
+            // A pause after each 256 KiB.
+            if let Some(pace) = pace {
+                if got - paced >= buf.len() {
+                    paced = got;
+                    std::thread::sleep(pace);
+                }
+            }
+            if got > LEN {
+                break;
+            }
+        }
+        (got, start.elapsed())
+    };
+    // About 10 MB a second: some seconds for the part that does not fit in
+    // the sockets' buffers, well past the 1 s timeout. The timeout leaves
+    // room for a slow CI machine that pauses the reader now and then (a
+    // 300 ms one cut the answer on a macOS runner).
+    let (got, took) = read_all(Some(Duration::from_millis(25)));
+    assert!(
+        got > LEN,
+        "the answer was cut after {got} bytes, in {took:?}"
+    );
+    assert!(took > Duration::from_secs(2), "{took:?}");
+
+    // A client that takes nothing more after its first read is dropped.
+    let mut c = server.client();
+    c.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    let mut buf = vec![0u8; 64 * 1024];
+    let mut got = c.stream.read(&mut buf).unwrap();
+    std::thread::sleep(Duration::from_secs(3));
+    loop {
+        match c.stream.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => got += n,
+        }
+    }
+    assert!(got < LEN, "a stalled client got the whole answer");
 }

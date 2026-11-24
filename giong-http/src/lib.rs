@@ -97,11 +97,16 @@ mod date;
 #[cfg(test)]
 mod fuzz_tests;
 mod h2;
+#[cfg(any(feature = "unstable-http3", test, fuzzing))]
+mod h3;
 mod heap;
 #[cfg(any(test, fuzzing))]
 mod invariants;
 mod memory;
 mod parse;
+#[cfg(test)]
+#[path = "../tests/support/quiet_panics.rs"]
+mod quiet_panics;
 mod request;
 mod response;
 mod server;
@@ -125,12 +130,21 @@ pub(crate) fn bounded(timeout: std::time::Duration) -> std::time::Duration {
 #[cfg(fuzzing)]
 #[doc(hidden)]
 pub mod fuzzing {
+    #[cfg(all(feature = "client", feature = "unstable-http3"))]
+    pub use crate::client::fuzzing::check_alt_svc;
+    /// Hostile HTTP/3 servers for the `h3_client` target.
+    #[cfg(all(feature = "client", feature = "unstable-http3"))]
+    pub mod h3_client {
+        pub use crate::client::h3_hostile::{ask, serve, Data, Seeded, Source};
+    }
     #[cfg(feature = "client")]
     pub use crate::client::fuzzing::{
         check_h2_client, check_inflate, check_response_body, check_response_head, check_url,
     };
     pub use crate::invariants::{
-        check_chunked, check_h2_output, check_head, check_hpack, check_huffman, h2_connection,
-        h2_input,
+        check_chunked, check_h2_output, check_h3_frames, check_head, check_hpack, check_huffman,
+        check_qpack, h2_connection, h2_input,
     };
+    #[cfg(feature = "unstable-http3")]
+    pub use crate::invariants::{check_h3_response, h3_connection, h3_input, H3Input, H3Request};
 }

@@ -5,10 +5,14 @@
 mod common;
 
 use std::cell::RefCell;
+use std::future::Future;
+use std::pin::pin;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use common::*;
+#[path = "../../giong-http/tests/support/quiet_panics.rs"]
+mod quiet_panics;
 use giong::time::{sleep, timeout};
 use giong_grpc::{CallOptions, Channel, Code, Reply, Request, RequestStream, Sink, Status};
 use giong_http::client::Client;
@@ -40,6 +44,21 @@ impl Watched {
     }
 }
 
+/// Polls `call`, which must not finish, until the handler has recorded
+/// `what`, then drops it: however slow the machine, the call is cancelled
+/// only once the server is running its handler.
+async fn drive_until(watched: &Watched, what: &str, call: impl Future) {
+    let mut call = pin!(call);
+    for _ in 0..1000 {
+        if watched.seen(what) {
+            return;
+        }
+        let poll = timeout(Duration::from_millis(5), call.as_mut()).await;
+        assert!(poll.is_err(), "the call finished");
+    }
+    panic!("never saw {what:?}; saw {:?}", watched.log.borrow());
+}
+
 /// Records `0` when it is dropped.
 struct OnDrop(Watched, &'static str);
 
@@ -54,7 +73,7 @@ impl TestService for Watched {
         &self,
         _request: Request<Empty<'static>>,
     ) -> Result<Reply<Empty<'static>>, Status> {
-        panic!("as the test asks");
+        panic!("as the test asks (expected by this test)");
     }
 
     /// Never answers.
@@ -126,7 +145,7 @@ impl TestService for Watched {
             match requests.message().await {
                 Ok(Some(received)) => {
                     if received.message()?.response_status().is_some() {
-                        panic!("as the test asks");
+                        panic!("as the test asks (expected by this test)");
                     }
                     responses
                         .send(&StreamingOutputCallResponse::default())
@@ -175,6 +194,7 @@ impl TestService for Watched {
 }
 
 fn watched() -> (Watched, TestServiceClient, String) {
+    quiet_panics::quiet_expected_panics();
     let watched = Watched::default();
     let base = serve(giong_grpc::Server::new().add(TestServiceServer::new(watched.clone())));
     let client = TestServiceClient::new(Channel::new(&base).unwrap());
@@ -188,8 +208,7 @@ fn a_cancelled_unary_call_drops_its_handler() {
         let request = SimpleRequest::default();
         let call = client.unary_call(&request, CallOptions::new());
         // Dropped while the handler waits.
-        assert!(timeout(Duration::from_millis(100), call).await.is_err());
-        assert!(watched.seen("unary started"));
+        drive_until(&watched, "unary started", call).await;
         watched.eventually("unary dropped").await;
     });
 }
@@ -217,8 +236,7 @@ fn a_dropped_response_stream_drops_its_handler() {
             ..Default::default()
         };
         let call = client.streaming_output_call(&request, CallOptions::new());
-        assert!(timeout(Duration::from_millis(100), call).await.is_err());
-        assert!(watched.seen("output started"));
+        drive_until(&watched, "output started", call).await;
         watched.eventually("output dropped").await;
     });
 }

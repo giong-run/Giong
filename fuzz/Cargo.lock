@@ -51,11 +51,12 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "0.4.0"
+version = "1.4.2"
 dependencies = [
  "io-uring",
  "libc",
  "socket2",
+ "windows-sys",
 ]
 
 [[package]]

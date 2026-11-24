@@ -4,6 +4,9 @@
 //! futures dropped while the kernel still owns their buffers, and the shared
 //! receive pool running dry.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::future::Future;
 use std::net::SocketAddr;
 use std::rc::Rc;
@@ -142,6 +145,8 @@ fn dropping_an_in_flight_write_keeps_its_buffer_alive() {
     });
 }
 
+// The control message is Linux's SO_TIMESTAMPING.
+#[cfg(target_os = "linux")]
 #[test]
 fn dropping_an_in_flight_send_with_control_keeps_its_buffers_alive() {
     giong::block_on(async {
@@ -521,6 +526,7 @@ fn a_completed_but_uncollected_operation_releases_its_buffer() {
 
 /// How many descriptors of this process refer to `path`. (Counting all
 /// descriptors would see those of tests running in parallel.)
+#[cfg(target_os = "linux")]
 fn open_fds(path: &std::path::Path) -> usize {
     std::fs::read_dir("/proc/self/fd")
         .unwrap()
@@ -529,6 +535,31 @@ fn open_fds(path: &std::path::Path) -> usize {
         .count()
 }
 
+/// How many descriptors of this process refer to `path`. macOS has no
+/// `/proc`: the descriptors are listed in `/dev/fd` and `F_GETPATH` names
+/// their file, with symbolic links resolved (`/var` is `/private/var`).
+#[cfg(target_os = "macos")]
+fn open_fds(path: &std::path::Path) -> usize {
+    use std::os::unix::ffi::OsStrExt;
+    let path = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let fds: Vec<i32> = std::fs::read_dir("/dev/fd")
+        .unwrap()
+        .filter_map(|entry| entry.ok()?.file_name().to_str()?.parse().ok())
+        .collect();
+    fds.into_iter()
+        .filter(|&fd| {
+            let mut buf = [0u8; libc::PATH_MAX as usize];
+            // SAFETY: F_GETPATH writes at most PATH_MAX bytes into `buf`.
+            if unsafe { libc::fcntl(fd, libc::F_GETPATH, buf.as_mut_ptr()) } < 0 {
+                return false;
+            }
+            let len = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+            std::ffi::OsStr::from_bytes(&buf[..len]) == path.as_os_str()
+        })
+        .count()
+}
+
+#[cfg(unix)]
 #[test]
 fn a_dropped_open_closes_the_descriptor_it_produced() {
     // The result of an open is a new descriptor. When the future was
@@ -570,8 +601,14 @@ fn a_dropped_open_closes_the_descriptor_it_produced() {
     std::fs::remove_file(&path).unwrap();
 }
 
+#[cfg(unix)]
 #[test]
 fn a_dropped_close_still_closes_on_the_epoll_driver() {
+    // The system's readiness driver: kqueue on macOS works the same way.
+    #[cfg(target_os = "linux")]
+    const READINESS: giong::DriverKind = giong::DriverKind::Epoll;
+    #[cfg(target_os = "macos")]
+    const READINESS: giong::DriverKind = giong::DriverKind::Kqueue;
     // The epoll driver closes on a blocking thread. A close still waiting
     // for a thread when its future was dropped was skipped as cancelled,
     // and the descriptor stayed open with nobody owning it.
@@ -587,7 +624,7 @@ fn a_dropped_close_still_closes_on_the_epoll_driver() {
     // SAFETY: a valid C string.
     assert_eq!(unsafe { libc::mkfifo(c_fifo.as_ptr(), 0o600) }, 0);
     giong::Builder::new()
-        .driver(giong::DriverKind::Epoll)
+        .driver(READINESS)
         .block_on(async {
             let file = giong::fs::File::open(&path).await.unwrap();
             // More opens than the pool has threads (64): every thread

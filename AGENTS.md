@@ -9,17 +9,19 @@ pull requests, handoff), is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 ## What this is
 
-giong is a thread-per-core async runtime for Linux, built on io_uring, with an epoll
-driver where io_uring is blocked or the kernel is too old. It aims to be the best Rust
+giong is a thread-per-core async runtime, built on io_uring on Linux, with an epoll
+driver where io_uring is blocked or the kernel is too old, a kqueue driver on macOS (for
+development) and an I/O completion port driver on Windows (the `giong` crate only, from
+1.4). Linux is the platform it is tuned and measured on. It aims to be the best Rust
 async runtime on technical merit, replaces the Tokio ecosystem with crates of its own, and
 is built for code that agents write: strict types, coded errors with the cause and the
 fix, and an API that stays on major version 1 for many years. One Cargo
-workspace, nine crates, crates in progress for 1.1 (not published) and two examples:
+workspace, thirteen crates and three examples:
 
 | Path | Crate | What it is |
 |---|---|---|
 | `.` | `giong` | the runtime: executor, io_uring and epoll drivers, TCP/UDP/Unix sockets, files, timers, channels |
-| `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 and HTTP/2 client (proxies, gzip, streamed bodies; HTTP/2 in `src/client/h2.rs`) behind `client` |
+| `giong-http/` | `giong-http` | a strict HTTP/1.1 and HTTP/2 server library (bodies whole or streamed both ways; HTTP/2 through ALPN or prior knowledge, `src/h2/`), HTTPS behind the `tls` feature; an HTTP/1.1 and HTTP/2 client (proxies, gzip, streamed bodies; HTTP/2 in `src/client/h2.rs`) behind `client`; HTTP/3 for both behind `unstable-http3` (Rust 1.85) |
 | `giong-tls/` | `giong-tls` | TLS on rustls |
 | `giong-postgres/` | `giong-postgres` | a PostgreSQL client and per-worker pool |
 | `giong-mysql/` | `giong-mysql` | a MySQL and MariaDB client and per-worker pool |
@@ -28,9 +30,10 @@ workspace, nine crates, crates in progress for 1.1 (not published) and two examp
 | `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
 | `giong-compat/` | `giong-compat` | `Compat`: Tokio and futures-io `AsyncRead`/`AsyncWrite`/`AsyncBufRead` for giong's streams, for transport-generic crates (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`) |
 | `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server |
-| `giong-proto/` | `giong-proto` (new in 1.1, not published yet) | Protocol Buffers decoded as views over the receive buffer (no copy, no allocation); message structs for encoding; codes `GIONG-E4001`-`E4008`. `conformance/` holds Google's conformance testee and the differential tests against prost |
-| `giong-grpc-build/` | `giong-grpc-build` (new in 1.1, not published yet) | generates giong-proto messages and giong-grpc service traits, servers and clients from `.proto` files at build time, parsed in Rust by protox (no `protoc`) |
-| `giong-grpc/` | `giong-grpc` (new in 1.1, not published yet) | gRPC servers and clients on giong-http's HTTP/2: the four kinds of call, deadlines, cancellation, metadata, gzip, health and reflection; codes `GIONG-E4101`-`E4110`. `interop/run.sh` runs gRPC's interoperability cases against grpc-go (needs Go); `tests/generated/` and `src/generated/` hold generated code that `tests/generated.rs` keeps current (`GIONG_GRPC_REGENERATE=1` rewrites it) |
+| `giong-proto/` | `giong-proto` (new in 1.1) | Protocol Buffers decoded as views over the receive buffer (no copy, no allocation); message structs for encoding; codes `GIONG-E4001`-`E4008`. `conformance/` holds Google's conformance testee and the differential tests against prost |
+| `giong-grpc-build/` | `giong-grpc-build` (new in 1.1) | generates giong-proto messages and giong-grpc service traits, servers and clients from `.proto` files at build time, parsed in Rust by protox (no `protoc`) |
+| `giong-grpc/` | `giong-grpc` (new in 1.1) | gRPC servers and clients on giong-http's HTTP/2: the four kinds of call, deadlines, cancellation, metadata, gzip, health and reflection; codes `GIONG-E4101`-`E4110`. `interop/run.sh` runs gRPC's interoperability cases against grpc-go (needs Go); `tests/generated/` and `src/generated/` hold generated code that `tests/generated.rs` keeps current (`GIONG_GRPC_REGENERATE=1` rewrites it) |
+| `giong-quic/` | `giong-quic` (new in 1.3) | QUIC on giong's UDP sockets, one endpoint per worker, TLS 1.3 from rustls, the engine underneath quinn-proto; codes `GIONG-E3601`-`E3605`. Needs Rust 1.85, the one crate above giong's 1.80 |
 | `examples/proto-hello/` | `proto-hello` (not published) | giong-grpc-build and giong-proto in one small program |
 | `examples/grpc-hello/` | `grpc-hello` (not published) | a gRPC server and client: a unary method and a server stream, health and reflection |
 
@@ -80,8 +83,11 @@ listens on loopback or a Unix socket only and only reads. Details: [giong-mcp/RE
 
 ## The machine you need
 
-- **Linux 6.0 or newer with io_uring allowed**, to test both drivers. giong does not
-  build on macOS or Windows.
+- **Linux 6.0 or newer with io_uring allowed**, to test both Linux drivers. Every crate
+  also builds and passes its tests on macOS (kqueue); on Windows only the `giong` crate
+  builds (`cargo test -p giong`), and Unix sockets are `cfg(unix)`. A change to a shared
+  file in `src/driver/` or `src/sys/` must keep all three building: CI runs macOS and
+  Windows jobs, and `docs/design/portability.md` has the `cfg` rules.
 - **Docker blocks io_uring with its default seccomp profile.** Inside such a container,
   or on an older kernel, the tests still pass, but on the epoll driver only: the io_uring
   half of the suite goes untested. `tests/driver.rs` and `tests/blocked.rs` check which
@@ -105,16 +111,17 @@ Run these from the repository root. All tests use loopback; none needs the inter
 scripts/preflight.sh          # the gate before every push: every check CI runs that the changed files call for
 scripts/preflight.sh --quick  # the fast part, while iterating
 scripts/preflight.sh --against 172,173   # also merge with those open pull requests
-scripts/preflight.sh --install           # the toolchains and tools the gate needs (1.80, nightly, cargo-fuzz, semver-checks)
+scripts/preflight.sh --install           # the toolchains and tools the gate needs (CI's pinned stable, 1.80, 1.85, nightly, cargo-fuzz, semver-checks)
 
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
 cargo test -p giong-http --all-features          # its HTTPS and client tests need the features
+cargo check -p giong --target x86_64-pc-windows-msvc   # Windows, runtime crate only (rustup target add it first)
 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --workspace --all-features --no-deps
-cargo +1.80.0 check --workspace --all-features   # the minimum Rust version, libraries only
+scripts/msrv.sh                     # the minimum Rust versions (1.80, 1.85 for giong-quic), libraries only; CI runs the same
 
 scripts/check.sh test        # release build, every test 5 times; ROUNDS=1 for one pass
 scripts/check.sh fallback    # the same on the ring setups of kernels older than 6.1, then on epoll
@@ -137,9 +144,14 @@ scripts/instr.py check       # instructions per operation and heap per idle conn
 
 Continuous integration requires `all-checks` on every pull request, which passes when
 every job of the workflow passed: `lint` (fmt, clippy, doc), `msrv`, `test`, `fallback`,
-`tsan` and the jobs named below. A change is done when all of them would pass. A pull
-request is merged through the merge queue, which runs the same jobs once more on `main`
-with the pull request merged, and merges it only if they pass. `main` then moves to the
+`tsan` and the jobs named below. A change is done when all of them would pass. The `plan`
+job (`scripts/ci-scope.py`) picks how much a run does: a pull request ready for review runs
+every job once (each suite one round, two ThreadSanitizer runs), a draft runs a short set
+(lint, msrv, default features, the build, one round of the tests), and a pull request that
+changes no file a build or test reads (the site, `changelog.d/`, prose) runs `lint` and
+`msrv` only. A pull request is merged through the merge queue, which runs every job, with
+every repetition (five rounds, three ThreadSanitizer runs), on `main` with the pull request
+merged, and merges it only if they pass (docs/DEVELOPMENT.md, "CI tiers"). `main` then moves to the
 commit that run tested, so a push to `main` (`.github/workflows/main.yml`) runs the jobs
 again only when no merge queue run passed for that commit, or when the push changes one
 of the two workflows.
@@ -156,8 +168,10 @@ connection, both within 1% of `bench/instr/baseline.csv`; a change meant to move
 commits the new baseline the job prints, see `bench/instr/README.md`), `kani` (the proofs
 in `docs/kani.md`; a change to the slab, the buffer pool, `KernelBox` or the io_uring
 operation lifecycle keeps them passing), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
-profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`) and the database crates
-against other server versions (`servers`) on every pull request, and fuzzes the parsers
+profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`), HTTP/3 and QUIC with h3spec
+(`h3spec`) and the database crates against other server versions (`servers`) on every pull
+request, every crate's tests on macOS 15 and 26 (`macos.yml`) and the runtime's on Windows
+Server 2022 and 2025 (`windows-runtime.yml`), and fuzzes the parsers
 (`giong`, `giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`,
 `giong-web`, `giong-mcp`, each in its `fuzz/`) and runs the soak test every night, on the
 runner's kernel and on Linux 6.18 in QEMU; the 6.12 and 6.18 `kernels` jobs soak for a
@@ -190,7 +204,8 @@ is loaded.
 3. **`unsafe`** only with a `// SAFETY:` comment saying why it is sound, a test that would
    catch misuse, and clean `scripts/check.sh tsan` and `scripts/valgrind.sh` runs.
 4. **No new dependency** without a reason stated in the pull request. The runtime depends
-   on `io-uring`, `libc` and `socket2` only.
+   on `socket2`, plus `libc` on Unix, `io-uring` on Linux and `windows-sys` on Windows,
+   and nothing else.
 5. **Public items are documented.** Futures are not `Send` by design: tasks stay on their
    worker, and `Rc`/`RefCell` are fine. Buffers are passed by value and handed back, as in
    `write_all(buf)` returning `(io::Result<()>, buf)`.
@@ -254,7 +269,14 @@ is loaded.
 - **Pull requests in flight conflict in the merge queue.** One that merges first can put
   another out of date while the queue is testing it, and the queue ejects it. Before
   enqueueing, `scripts/preflight.sh --against <open pull requests>` names the files that
-  conflict; the usual ones are README test counts and shared platform files.
+  conflict; the usual ones are README test counts and shared platform files. Two pull
+  requests can also each pass alone and fail together: `bench/instr/baseline.csv` limits
+  are the usual case (both add a little heap to the same path). Merge `main` in and run
+  `scripts/instr.py check` again when the other one lands first.
+- **A push cancels the CI run in progress.** Push a finished step, not each edit: in
+  November 2026 more than half of all pull request runs were cancelled by the next push
+  after running a median of 7 minutes. Iterate locally (`scripts/preflight.sh --quick`, run
+  by the pre-push hook) and as a draft.
 
 - **TCP keeps no message boundaries.** On Linux 6.12 and newer, streams receive through
   packed buffer rings, and a receive ends wherever a shared buffer fills up: a test that
@@ -277,6 +299,10 @@ is loaded.
   `giong_compat::Compat`; flush after writing, as with `BufWriter`. One that needs Tokio's
   reactor, timers or `tokio::spawn` panics with "there is no reactor running": `Compat`
   cannot fix that (see `giong-compat/README.md`).
+- **gVisor is not Linux.** Its network stack records `SO_REUSEPORT` when a socket binds
+  (Linux reads it when the next socket binds), its `somaxconn` is 1024, and it has no
+  `SO_COOKIE` and no io_uring giong can use. Socket code that relies on when Linux reads
+  an option needs a run of `scripts/gvisor.sh` (CI's `gvisor` job).
 - **Benchmarks are not tests.** Do not run `bench/*.sh` to check a change unless the task
   is about performance: they take long and need a quiet machine.
 

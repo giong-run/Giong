@@ -13,7 +13,7 @@ use std::ops::Range;
 use std::rc::Rc;
 
 use crate::budget::Charge;
-use crate::parse::{is_field_value, is_token_str, same_authority, Head};
+use crate::parse::{is_field_value, is_token_str, same_authority, valid_host, Head};
 use crate::request::{BodyBytes, Request};
 use crate::trailers::Trailers;
 
@@ -58,6 +58,9 @@ pub(crate) struct Builder {
     limit: usize,
     error: Option<&'static str>,
     status: Option<u16>,
+    /// The fields are those of an HTTP/3 request: the same rules, another
+    /// version on the request.
+    h3: bool,
 }
 
 /// The fields HTTP/2 forbids because they are about one connection
@@ -121,7 +124,16 @@ impl Builder {
             limit,
             error: None,
             status: None,
+            h3: false,
         }
+    }
+
+    /// The same builder for the fields of an HTTP/3 request, which follow
+    /// the rules of HTTP/2 (RFC 9114, sections 4.2 and 4.3).
+    #[cfg(feature = "unstable-http3")]
+    pub(crate) fn http3(mut self) -> Self {
+        self.h3 = true;
+        self
     }
 
     fn fail(&mut self, why: &'static str) {
@@ -176,14 +188,20 @@ impl Builder {
                     b's'
                 }
                 b"path" => {
-                    if value.is_empty() || !value.iter().all(|&b| (0x21..=0x7e).contains(&b)) {
+                    // No fragment: it is not part of a request's target.
+                    if value.is_empty()
+                        || !value
+                            .iter()
+                            .all(|&b| (0x21..=0x7e).contains(&b) && b != b'#')
+                    {
                         return self.fail("an empty or invalid :path");
                     }
                     b'p'
                 }
                 b"authority" => {
-                    // No user name or password (RFC 9113, section 8.3.1).
-                    if !value.iter().all(|&b| (0x21..=0x7e).contains(&b)) || value.contains(&b'@') {
+                    // No user name or password (RFC 9113, section 8.3.1),
+                    // nothing but a host and a port.
+                    if !valid_host(value) {
                         return self.fail("an invalid :authority");
                     }
                     b'a'
@@ -224,6 +242,9 @@ impl Builder {
             b"host" => {
                 if self.host.is_some() {
                     return self.fail("two host header fields");
+                }
+                if !valid_host(value) {
+                    return self.fail("a host header field that is not a host and a port");
                 }
                 let start = self.scratch.len() - self.lines_from + name.len() + 2;
                 self.host = Some(start..start + value.len());
@@ -280,6 +301,15 @@ impl Builder {
             if !(value.starts_with(b"/") || (options && value == b"*")) {
                 return Built::Malformed("a :path that is neither absolute nor *");
             }
+            // RFC 9114, section 4.3.1: a request for an http or https
+            // resource names its authority, one way or the other. HTTP/2
+            // does not ask for it (RFC 9113, section 8.3.1).
+            if self.h3 && self.authority.is_none() && self.host.is_none() {
+                let scheme = self.scheme.clone().map_or(&b""[..], |s| &pseudo[s]);
+                if scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https") {
+                    return Built::Malformed("neither :authority nor a host header field");
+                }
+            }
             path
         };
         // RFC 9113, section 8.3.1. HTTP/1.1 holds an absolute target's
@@ -299,7 +329,11 @@ impl Builder {
         let target_start = buf.len();
         buf.extend_from_slice(&pseudo[target.clone()]);
         let target_end = buf.len();
-        buf.extend_from_slice(b" HTTP/2\r\n");
+        buf.extend_from_slice(if self.h3 {
+            b" HTTP/3\r\n"
+        } else {
+            b" HTTP/2\r\n"
+        });
         let headers_start = buf.len();
         if self.host.is_none() {
             if let Some(authority) = self.authority.clone().filter(|a| !a.is_empty()) {
@@ -329,6 +363,7 @@ impl Builder {
             keep_alive: true,
             expect_continue: self.expect_continue,
             h2: true,
+            h3: self.h3,
         };
         Built::Request(Request {
             buf: Rc::new(buf),
@@ -337,6 +372,7 @@ impl Builder {
             body: BodyBytes::InBuffer(len..len),
             peer,
             charge: Charge::none(),
+            early_data: false,
         })
     }
 
@@ -463,6 +499,33 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unstable-http3")]
+    #[test]
+    fn http3_asks_for_an_authority_and_http2_does_not() {
+        let bare = [(":method", "GET"), (":scheme", "https"), (":path", "/")];
+        let h3 = |fields: &[(&str, &str)]| {
+            let mut b = Builder::new(16 * 1024).http3();
+            for (n, v) in fields {
+                b.field(n.as_bytes(), v.as_bytes());
+            }
+            b.finish(None)
+        };
+        assert!(matches!(build(&bare), Built::Request(_)));
+        assert!(matches!(h3(&bare), Built::Malformed(_)));
+        for named in [(":authority", "example.com"), ("host", "example.com")] {
+            let mut fields = bare.to_vec();
+            if named.0 == "host" {
+                fields.push(named);
+            } else {
+                fields.insert(2, named);
+            }
+            assert!(matches!(h3(&fields), Built::Request(_)), "{named:?}");
+        }
+        // Another scheme may have no authority.
+        let other = [(":method", "GET"), (":scheme", "urn"), (":path", "/")];
+        assert!(matches!(h3(&other), Built::Request(_)));
+    }
+
     #[test]
     fn connect_and_options_have_their_own_targets() {
         let req = request(&[(":method", "CONNECT"), (":authority", "db:5432")]);
@@ -581,6 +644,38 @@ mod tests {
                 "{authority} was accepted"
             );
         }
+    }
+
+    #[test]
+    fn authority_host_and_path_hold_only_what_a_target_can() {
+        for authority in ["a/b", "[::1]evil.com", "a b", "a:8x", "a%zz"] {
+            let mut fields = BASE.to_vec();
+            fields[3] = (":authority", authority);
+            assert!(
+                matches!(build(&fields), Built::Malformed(_)),
+                ":authority {authority} was accepted"
+            );
+            let mut fields = BASE.to_vec();
+            fields.remove(3);
+            fields.push(("host", authority));
+            assert!(
+                matches!(build(&fields), Built::Malformed(_)),
+                "host {authority} was accepted"
+            );
+        }
+        for authority in [
+            "example.com:8443",
+            "[::1]:80",
+            "xn--bcher-kva.example",
+            "a_b",
+        ] {
+            let mut fields = BASE.to_vec();
+            fields[3] = (":authority", authority);
+            assert_eq!(request(&fields).header_str("host"), Some(authority));
+        }
+        let mut fields = BASE.to_vec();
+        fields[2] = (":path", "/a#b");
+        assert!(matches!(build(&fields), Built::Malformed(_)));
     }
 
     #[test]
