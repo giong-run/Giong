@@ -273,7 +273,6 @@ struct Analysis {
     json: Value,
 }
 
-/// What the slow requests of one route spent their time on, and why.
 /// Whether other tasks' long polls, explaining `blocked` of the slow
 /// requests' extra time, explain it better than the dominant phase does
 /// with `phase`. Both are shares of the same quantity: blocked time is
@@ -283,6 +282,7 @@ fn blocked_wins(blocked: f64, phase: f64) -> bool {
     blocked >= 0.3 && blocked >= phase * 0.8
 }
 
+/// What the slow requests of one route spent their time on, and why.
 fn analyse(
     name: &str,
     r: &RouteStats,
@@ -362,7 +362,11 @@ fn analyse(
     // Measured like the dominant phase: the share of the excess when the
     // tail stands out, else the share of the tail's time.
     let blocked_strength = match share_of_excess {
-        Some(_) => blocked.saturating_sub(fast_blocked).as_secs_f64() / excess.as_secs_f64(),
+        // At most all of it: blocked time can grow more than the total
+        // when another phase shrank.
+        Some(_) => {
+            (blocked.saturating_sub(fast_blocked).as_secs_f64() / excess.as_secs_f64()).min(1.0)
+        }
         None => blocked_share,
     };
     if blocked_wins(blocked_strength, strength) {
