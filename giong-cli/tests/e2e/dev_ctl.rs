@@ -97,8 +97,18 @@ impl Drop for StopOnDrop<'_> {
     }
 }
 
+/// Whether `pid` runs. A zombie has ended: in a container whose init does
+/// not reap, a detached runner that exited stays one.
 #[cfg(unix)]
 fn alive(pid: u32) -> bool {
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        let state = stat
+            .rfind(')')
+            .and_then(|i| stat[i + 1..].split_whitespace().next());
+        if state == Some("Z") {
+            return false;
+        }
+    }
     Command::new("kill")
         .args(["-0", &pid.to_string()])
         .stderr(Stdio::null())
@@ -297,14 +307,28 @@ fn background_with_a_broken_build_returns_the_error() {
 /// behind. Its pid can belong to any other process of this user later; giong
 /// must not report it as giong dev, refuse to start because of it, or signal
 /// it on `stop`.
+/// The start time the way giong dev records it (Linux: field 22 of
+/// /proc/<pid>/stat; elsewhere `ps -o lstart=`).
+#[cfg(unix)]
+fn started(pid: u32) -> Option<String> {
+    if cfg!(target_os = "linux") {
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = &stat[stat.rfind(')')? + 1..];
+        return rest.split_whitespace().nth(19).map(String::from);
+    }
+    let out = Command::new("ps")
+        .args(["-o", "lstart=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    Some(String::from_utf8_lossy(&out.stdout).trim().to_string()).filter(|t| !t.is_empty())
+}
+
 #[cfg(unix)]
 #[test]
-#[ignore = "known bug: giong dev trusts any live pid in a stale dev.json, reports it and signals it on stop"]
 fn a_stale_state_file_never_touches_a_process_that_reused_the_pid() {
     if !has_command("dev") {
         return;
     }
-    let dir = project("devctl-stale");
     let spawn = || -> Child {
         Command::new("sleep")
             .arg("300")
@@ -321,45 +345,56 @@ fn a_stale_state_file_never_touches_a_process_that_reused_the_pid() {
     }
     let (a, b) = (Reap(spawn()), Reap(spawn()));
     let (pa, pb) = (a.0.id(), b.0.id());
-    // As a runner that was building writes it: the shortest wait in `stop`.
-    let exe = std::fs::canonicalize("/bin/sleep").unwrap_or_else(|_| "/bin/sleep".into());
-    dir.write(
-        ".giong/dev.json",
-        &serde_json::json!({
-            "pid": pa, "service_pid": pb, "background": true, "exe": exe,
-            "started_at": 1_700_000_000_000u64, "addresses": ["127.0.0.1:1"],
-            "build": {"state": "building"}
-        })
-        .to_string(),
-    );
-    std::fs::create_dir_all(dir.join("home/run")).unwrap();
-    std::fs::write(
-        dir.join(format!("home/run/{pa}.json")),
-        serde_json::json!({"pid": pa, "root": dir.path().display().to_string(),
-                           "started_at": 1_700_000_000_000u64})
-        .to_string(),
-    )
-    .unwrap();
+    // First as an old giong wrote it (no start times), then with the start
+    // times of the two sleeps, so only the program and parent checks stand
+    // between `stop` and them.
+    for with_times in [false, true] {
+        let dir = project("devctl-stale");
+        let (ta, tb) = if with_times {
+            (started(pa), started(pb))
+        } else {
+            (None, None)
+        };
+        // As a runner that was building writes it: the shortest wait in `stop`.
+        let exe = std::fs::canonicalize("/bin/sleep").unwrap_or_else(|_| "/bin/sleep".into());
+        dir.write(
+            ".giong/dev.json",
+            &serde_json::json!({
+                "pid": pa, "service_pid": pb, "background": true, "exe": exe,
+                "pid_started": ta, "service_started": tb,
+                "started_at": 1_700_000_000_000u64, "addresses": ["127.0.0.1:1"],
+                "build": {"state": "building"}
+            })
+            .to_string(),
+        );
+        std::fs::create_dir_all(dir.join("home/run")).unwrap();
+        std::fs::write(
+            dir.join(format!("home/run/{pa}.json")),
+            serde_json::json!({"pid": pa, "root": dir.path().display().to_string(),
+                               "started_at": 1_700_000_000_000u64})
+            .to_string(),
+        )
+        .unwrap();
 
-    let out = dev(&dir, &["status"], 0).run();
-    let v = out.report("dev");
-    assert_eq!(
-        v["data"]["running"],
-        false,
-        "a `sleep` that got the pid is reported as giong dev: {}",
-        out.dump()
-    );
-    for words in [&["stop"][..], &["stop", "--all"]] {
-        let out = dev(&dir, words, 0).timeout(Duration::from_secs(90)).run();
-        out.report("dev");
-        assert!(
-            alive(pa),
-            "`giong dev {words:?}` signalled pid {pa}, a sleep that reused the pid"
+        let out = dev(&dir, &["status"], 0).run();
+        let v = out.report("dev");
+        assert_eq!(
+            v["data"]["running"],
+            false,
+            "a `sleep` that got the pid is reported as giong dev (start times: {with_times}): {}",
+            out.dump()
         );
-        assert!(
-            alive(pb),
-            "`giong dev {words:?}` signalled pid {pb}, a sleep that reused the pid"
-        );
+        for words in [&["stop"][..], &["stop", "--all"]] {
+            let out = dev(&dir, words, 0).timeout(Duration::from_secs(90)).run();
+            out.report("dev");
+            for p in [pa, pb] {
+                assert!(
+                    alive(p),
+                    "`giong dev {words:?}` signalled pid {p}, a sleep that reused the pid \
+                     (start times: {with_times})"
+                );
+            }
+        }
     }
     drop((a, b));
 }
