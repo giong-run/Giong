@@ -327,8 +327,15 @@ pub fn fake_tool(dir: &Path, name: &str, unix: &str, windows: &str) -> PathBuf {
         std::fs::write(&p, format!("@echo off\r\n{windows}\r\n")).unwrap();
         p
     } else {
+        // The script is written by `cp`, never through a file this process
+        // holds open for writing: a child another test thread forks in the
+        // meantime inherits that descriptor until it execs, and running the
+        // script then fails with ETXTBSY ("Text file busy").
         let p = dir.join(name);
-        std::fs::write(&p, format!("#!/bin/sh\n{unix}\n")).unwrap();
+        let text = dir.join(format!(".{name}.txt"));
+        std::fs::write(&text, format!("#!/bin/sh\n{unix}\n")).unwrap();
+        let cp = Command::new("cp").arg(&text).arg(&p).status().expect("cp");
+        assert!(cp.success(), "cp {} {}", text.display(), p.display());
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
