@@ -21,6 +21,8 @@
 # changelog.d/http-request-cost.md; the other rows matched main there. The
 # allocation rows of idle-h2 and idle-https are from this change's CI run
 # (two fewer allocations per idle HTTP/2 and HTTPS connection).
+# web instructions: scripts/instr.py on the same kind of VM after the
+# request path changes of changelog.d/perf-web-request-path.md.
 # http1 instructions and idle-http1/idle-h2 heap_bytes: #309, which marks
 # connections idle and busy for the accept loop, measured locally on main
 # d495025 and on #309 merged with it (the same tree): +85 instructions per
@@ -28,6 +30,8 @@
 # connection and +32.5 per HTTP/2, on a main that had grown +0.6% and +16
 # bytes since those rows were taken. The io_uring idle-http1 midpoint moved
 # by the epoll growth (+32.5 bytes).
+# web instructions: #309 merged with main b87bb04, measured locally: +71
+# per request against main (+0.61% io_uring, +0.58% epoll).
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1397.4,1
 io_uring,spawn,allocations,1.000,1
@@ -55,7 +59,7 @@ io_uring,h2-streams,instructions,253592.7,0.5
 io_uring,h2-streams,allocations,286.005,0.5
 io_uring,https,instructions,34649.5,1
 io_uring,https,allocations,19.035,1
-io_uring,web,instructions,12711.4,1
+io_uring,web,instructions,11668.6,1
 io_uring,web,allocations,3.000,1
 io_uring,redis-get,instructions,8350.1,1
 io_uring,redis-get,allocations,2.000,1
@@ -98,7 +102,7 @@ epoll,h2-streams,instructions,254714.6,0.5
 epoll,h2-streams,allocations,286.005,0.5
 epoll,https,instructions,35667.0,1
 epoll,https,allocations,19.000,1
-epoll,web,instructions,13570.6,1
+epoll,web,instructions,12532.6,1
 epoll,web,allocations,3.000,1
 epoll,redis-get,instructions,8920.7,1
 epoll,redis-get,allocations,2.000,1

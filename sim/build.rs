@@ -109,8 +109,11 @@ fn main() {
         let mut wrappers = String::new();
         let mut pending: Vec<String> = Vec::new();
         let mut in_test = false;
+        let mut last = String::new();
         for line in src.lines() {
             let t = line.trim_start();
+            // The line before this one.
+            let prev = std::mem::replace(&mut last, line.to_string());
             if line == "mod common;" {
                 writeln!(
                     body,
@@ -123,6 +126,11 @@ fn main() {
             if line == "#[test]" {
                 in_test = true;
                 pending.clear();
+                // A test only some systems build (`#[cfg(windows)]` above
+                // `#[test]`): its wrapper is built only where it is.
+                if prev.starts_with("#[cfg(") {
+                    pending.push(prev);
+                }
                 continue;
             }
             if in_test
