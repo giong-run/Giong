@@ -525,11 +525,17 @@ fn a_runtime_in_windows_container_mode_is_refused() {
     use std::os::unix::fs::PermissionsExt;
     let p = Project::new("wincontainers", "giong-postgres = \"1.5\"\n");
     let fake = p.dir.join("fake-docker");
+    let source = p.dir.join("fake-docker.txt");
     std::fs::write(
-        &fake,
+        &source,
         "#!/bin/sh\ncase \"$*\" in\n  *OSType*) echo windows ;;\n  info*) echo 27.5.1 ;;\n  *) echo \"unexpected: $*\" >&2; exit 1 ;;\nesac\n",
     )
     .unwrap();
+    // The executable is written by cp, not by this process: a child another
+    // test thread forks while this process holds it open for writing would
+    // keep it open, and running it would fail with ETXTBSY.
+    let copied = Command::new("cp").arg(&source).arg(&fake).status().unwrap();
+    assert!(copied.success());
     std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
     let out = Command::new(env!("CARGO_BIN_EXE_giong"))
         .args(["db", "up", "--json"])
