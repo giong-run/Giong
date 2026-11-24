@@ -2,7 +2,8 @@
 //!
 //! A channel is a pair of byte rings in memory both processes map, one per
 //! direction, set up over a Unix socket. Sending a message copies it into
-//! the ring; receiving hands out the bytes where they lie. While both sides
+//! the ring; receiving copies it out (or, from a peer you trust, hands out
+//! the bytes where they lie: [`Receiver::recv_in_place`]). While both sides
 //! are busy no system call is made at all; a side that runs out of messages
 //! (or of room) sleeps on an eventfd and is woken only when the other side
 //! sees it sleeping. Compared with a Unix socket, this removes the kernel
@@ -45,9 +46,11 @@
 //! The peer process can write into the shared memory at any time; giong
 //! checks every position and length it reads from there, so a broken or
 //! hostile peer makes the channel fail with `GIONG-E0091`, and cannot make
-//! this process read or write outside the mapping. It can change the bytes
-//! of a message it already sent while you read them, so treat message
-//! contents like data read from a socket.
+//! this process read or write outside the mapping. [`Receiver::recv`] copies
+//! each message out of the shared memory, so the bytes you read are this
+//! process's own and do not change under you; treat them like data read from
+//! a socket. [`Receiver::recv_in_place`] skips the copy, for a peer you
+//! trust.
 //!
 //! **Ending.** Dropping a [`Sender`] ends the stream of messages the other
 //! side receives ([`Receiver::recv`] returns `Ok(None)` once it has read the
@@ -564,28 +567,86 @@ pub struct Receiver {
     wake: usize,
     watch: Watch,
     shared: Rc<Shared>,
+    /// The last message [`recv`](Self::recv) copied out of the ring.
+    copy: Vec<u8>,
 }
 
 impl Receiver {
     /// The next message, or `None` once the other side dropped its
     /// [`Sender`] and every message it sent was received.
     ///
-    /// The message is read in place, in the shared memory; dropping it
-    /// gives its room back to the sender. Fails with `GIONG-E0094` when the
-    /// other process went away without dropping its sender (after the
-    /// messages it sent before), and `GIONG-E0091` when it corrupted the
-    /// channel.
+    /// The message is copied out of the shared memory into a buffer the
+    /// receiver keeps (as large as the largest message received, so no
+    /// allocation once it has grown), and its room goes back to the sender
+    /// at once. The peer process can write into the shared memory at any
+    /// time; the copy is this process's own, so the bytes cannot change
+    /// while the message is read, whatever the peer does. Fails with
+    /// `GIONG-E0094` when the other process went away without dropping its
+    /// sender (after the messages it sent before), and `GIONG-E0091` when it
+    /// corrupted the channel.
+    ///
+    /// For large messages from a peer this process trusts,
+    /// [`recv_in_place`](Self::recv_in_place) reads them where they lie.
     ///
     /// Cancel safe: if the future is dropped, no message is lost.
     pub async fn recv(&mut self) -> io::Result<Option<Message<'_>>> {
+        let Some((ptr, len, total)) = self.next_record().await? else {
+            return Ok(None);
+        };
+        self.copy.clear();
+        self.copy.reserve(len);
+        // SAFETY: `ring.peek` checked that the `len` bytes at `ptr` lie
+        // inside the mapping, which the receiver keeps alive, and `copy` has
+        // room for them. A misbehaving peer may write them during the copy,
+        // which then holds a mix of old and new bytes; it is ours, and stays
+        // as it is.
+        unsafe {
+            ptr::copy_nonoverlapping(ptr, self.copy.as_mut_ptr(), len);
+            self.copy.set_len(len);
+        }
+        self.release(total);
+        Ok(Some(Message {
+            body: Body::Copied(&self.copy),
+        }))
+    }
+
+    /// Like [`recv`](Self::recv), but the message is read where it lies, in
+    /// the shared memory, without a copy; dropping it gives its room back to
+    /// the sender. Worth it for large messages (16 KiB and up) from a peer
+    /// this process trusts.
+    ///
+    /// Cancel safe: if the future is dropped, no message is lost.
+    ///
+    /// # Safety
+    ///
+    /// The peer process must not write to the bytes of a message it has
+    /// sent until the message returned here is dropped. giong's
+    /// [`Sender`] never does; a broken or hostile program at the other end
+    /// could. The message is a `&[u8]`, which Rust assumes does not change
+    /// while it is borrowed: code that checks a byte and then uses it may
+    /// read it twice, so a peer that changes it in between can make that
+    /// code read or write out of bounds. Use [`recv`](Self::recv) unless
+    /// every program that can connect to the socket is trusted.
+    pub async unsafe fn recv_in_place(&mut self) -> io::Result<Option<Message<'_>>> {
+        let Some((ptr, len, total)) = self.next_record().await? else {
+            return Ok(None);
+        };
+        Ok(Some(Message {
+            body: Body::InPlace {
+                rx: self,
+                ptr,
+                len,
+                total,
+            },
+        }))
+    }
+
+    /// The next record in the ring, as `Ring::peek` gives it, waiting for
+    /// one; `None` once the stream ended. Cancel safe.
+    async fn next_record(&mut self) -> io::Result<Option<(*const u8, usize, u64)>> {
         loop {
-            if let Some((ptr, len, total)) = self.ring.peek().map_err(corrupt)? {
-                return Ok(Some(Message {
-                    rx: self,
-                    ptr,
-                    len,
-                    total,
-                }));
+            if let Some(record) = self.ring.peek().map_err(corrupt)? {
+                return Ok(Some(record));
             }
             let closed = self.ring.dir().flags.0.load(Ordering::Acquire) & PRODUCER_CLOSED != 0;
             if closed || self.watch.gone {
@@ -721,35 +782,50 @@ impl std::fmt::Debug for Receiver {
     }
 }
 
-/// A received message, in the channel's shared memory. Dropping it gives
-/// its room back to the sender.
+/// A received message: a copy the receiver keeps
+/// ([`Receiver::recv`]), or the bytes in the channel's shared memory
+/// ([`Receiver::recv_in_place`]), whose room goes back to the sender when
+/// it is dropped.
 pub struct Message<'a> {
-    rx: &'a mut Receiver,
-    ptr: *const u8,
-    len: usize,
-    total: u64,
+    body: Body<'a>,
+}
+
+enum Body<'a> {
+    Copied(&'a [u8]),
+    InPlace {
+        rx: &'a mut Receiver,
+        ptr: *const u8,
+        len: usize,
+        total: u64,
+    },
 }
 
 impl Deref for Message<'_> {
     type Target = [u8];
 
     fn deref(&self) -> &[u8] {
-        // SAFETY: `ring.peek` checked that the bytes lie inside the mapping,
-        // which the receiver keeps alive; the producer does not reuse them
-        // until `release`.
-        unsafe { std::slice::from_raw_parts(self.ptr, self.len) }
+        match self.body {
+            Body::Copied(bytes) => bytes,
+            // SAFETY: `ring.peek` checked that the bytes lie inside the
+            // mapping, which the receiver keeps alive; the producer does not
+            // reuse them until `release`, and the caller of `recv_in_place`
+            // promised that the peer does not write them before.
+            Body::InPlace { ptr, len, .. } => unsafe { std::slice::from_raw_parts(ptr, len) },
+        }
     }
 }
 
 impl Drop for Message<'_> {
     fn drop(&mut self) {
-        self.rx.release(self.total);
+        if let Body::InPlace { rx, total, .. } = &mut self.body {
+            rx.release(*total);
+        }
     }
 }
 
 impl std::fmt::Debug for Message<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("Message").field("len", &self.len).finish()
+        f.debug_struct("Message").field("len", &self.len()).finish()
     }
 }
 
@@ -794,6 +870,7 @@ fn halves(shared: Shared, connector: bool) -> io::Result<(Sender, Receiver)> {
             wake: rx_wake,
             watch: rx_watch,
             shared,
+            copy: Vec::new(),
         },
     ))
 }
@@ -1242,6 +1319,61 @@ fn check_eventfd(fd: RawFd) -> Result<(), &'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A channel within this process: the connector's halves and the
+    /// listener's.
+    async fn channel() -> ((Sender, Receiver), (Sender, Receiver)) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        let path =
+            std::env::temp_dir().join(format!("giong-ipc-unit-{}-{n}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = IpcListener::bind(&path, 1 << 16).unwrap();
+        let accept = crate::spawn(async move { listener.accept().await.unwrap() });
+        let client = connect(&path, 1 << 16).await.unwrap();
+        let server = accept.await.unwrap();
+        let _ = std::fs::remove_file(&path);
+        (client, server)
+    }
+
+    /// A peer that writes over a message it has sent, as a hostile process
+    /// can, while the receiver holds it.
+    fn overwrite_first_message(tx: &Sender, len: usize) {
+        // SAFETY: the first message of a fresh ring lies there, inside the
+        // mapping, which `tx` keeps alive.
+        unsafe { ptr::write_bytes(tx.ring.first_message_for_test(), b'X', len) };
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create or sendmsg")]
+    fn a_received_message_stays_the_same_while_the_peer_writes_into_the_ring() {
+        crate::block_on(async {
+            let ((mut tx, _client_rx), (_server_tx, mut rx)) = channel().await;
+            tx.send(b"ok to read").await.unwrap();
+            let msg = rx.recv().await.unwrap().unwrap();
+            assert_eq!(&*msg, b"ok to read");
+            overwrite_first_message(&tx, 10);
+            assert_eq!(&*msg, b"ok to read", "the bytes changed under a &[u8]");
+        });
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create or sendmsg")]
+    fn a_message_read_in_place_is_the_shared_memory_itself() {
+        crate::block_on(async {
+            let ((mut tx, _client_rx), (_server_tx, mut rx)) = channel().await;
+            tx.send(b"in place").await.unwrap();
+            // SAFETY: the test reads the message only after the overwrite,
+            // never while the peer writes; it shows what a peer that breaks
+            // the contract can do.
+            let msg = unsafe { rx.recv_in_place() }.await.unwrap().unwrap();
+            overwrite_first_message(&tx, 8);
+            assert_eq!(&*msg, b"XXXXXXXX");
+            drop(msg);
+            tx.send(b"next").await.unwrap();
+            assert_eq!(&*rx.recv().await.unwrap().unwrap(), b"next");
+        });
+    }
 
     /// A pipe whose write end goes over a socket pair into a [`Received`],
     /// as a client's descriptors do; returns the read end. The read end sees

@@ -1501,7 +1501,11 @@ fn parent(pid: u64) -> Option<u64> {
             .ok()?;
         String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::winproc::parent(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         None

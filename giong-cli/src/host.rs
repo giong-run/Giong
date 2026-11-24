@@ -84,6 +84,27 @@ pub fn run(cmd: &mut Command) -> Result<String, ToolError> {
     run_within(cmd, TOOL_TIMEOUT)
 }
 
+/// Stops a tool that ran out of time, with what it started: on Windows a
+/// `.cmd` wrapper's children outlive the wrapper (#382). On Unix the tool's
+/// children keep only its own pipes, which giong no longer reads.
+fn kill_tree(child: &mut std::process::Child) {
+    #[cfg(windows)]
+    {
+        // By full path: Windows looks in giong's own folder and PATH first.
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let taskkill = std::path::Path::new(&root)
+            .join("System32")
+            .join("taskkill.exe");
+        let _ = Command::new(taskkill)
+            .args(["/T", "/F", "/PID", &child.id().to_string()])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+    }
+    let _ = child.kill();
+}
+
 fn run_within(cmd: &mut Command, timeout: Duration) -> Result<String, ToolError> {
     let program = cmd.get_program().to_os_string();
     if timed_out_before(&program) {
@@ -114,7 +135,7 @@ fn run_within(cmd: &mut Command, timeout: Duration) -> Result<String, ToolError>
             Ok(Some(s)) => break s,
             Ok(None) if start.elapsed() < timeout => std::thread::sleep(Duration::from_millis(5)),
             _ => {
-                let _ = child.kill();
+                kill_tree(&mut child);
                 let _ = child.wait();
                 if let Ok(mut t) = TIMED_OUT.lock() {
                     t.push(program);

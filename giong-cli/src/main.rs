@@ -29,12 +29,17 @@ mod state;
 mod template;
 mod watch;
 mod web_client;
+#[cfg(windows)]
+mod winproc;
 
 use std::process::ExitCode;
 
 use crate::report::fail;
 
 fn main() -> ExitCode {
+    // Nothing giong starts may hold the caller's pipe open (#378, #382).
+    #[cfg(windows)]
+    noinherit::keep_std_handles();
     let mut argv = Vec::new();
     for (i, a) in std::env::args_os().skip(1).enumerate() {
         match a.into_string() {
