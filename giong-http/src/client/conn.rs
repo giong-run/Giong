@@ -305,20 +305,34 @@ impl Conn {
     }
 
     /// Sends `request` and reads the head of the response to it, after
-    /// any 1xx (informational) responses.
+    /// any 1xx (informational) responses. `reused` says the connection
+    /// carried a request before.
     pub(crate) async fn send(
         &mut self,
         request: Vec<u8>,
+        reused: bool,
         head_request: bool,
         max_head_size: usize,
         what: &str,
     ) -> Result<Answer, Failure> {
         if let Err(e) = self.stream.write_all(request).await {
-            return Err(Failure::NothingReceived(Error::io(
+            let error = Error::io(
                 ErrorKind::Closed,
                 format!("{what}: sending the request failed"),
                 e,
-            )));
+            );
+            // The server may have answered (413, 401...) and closed without
+            // reading the rest of the body: its answer says more than the
+            // broken pipe. A 408 on a kept-alive connection is the server
+            // closing it while idle (RFC 9110 15.5.9), before it read this
+            // request: that one is sent again as before.
+            return match read_answer(self, head_request, max_head_size, what).await {
+                Ok(mut answer) if !(reused && answer.head.status == 408) => {
+                    answer.body.reusable = false;
+                    Ok(answer)
+                }
+                _ => Err(Failure::NothingReceived(error)),
+            };
         }
         read_answer(self, head_request, max_head_size, what).await
     }

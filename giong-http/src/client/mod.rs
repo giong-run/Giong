@@ -1261,6 +1261,7 @@ impl Client {
                                 .conn()
                                 .send(
                                     request.clone(),
+                                    reused,
                                     method == "HEAD",
                                     config.max_head_size,
                                     &what,
@@ -2146,14 +2147,11 @@ fn decode_error(what: &str, e: DecodeError) -> Error {
 
 /// A request that may have been processed is not sent again.
 fn not_sent_again(e: Error, method: &str) -> Error {
-    Error::new(
-        ErrorKind::Closed,
-        format!(
-            "{e}; the connection had been used before, so the server probably closed it as \
-             the request was sent. A {method} request is not sent again by itself, because the \
-             server may have processed it: retry if that is safe"
-        ),
-    )
+    e.advise(format!(
+        "the connection had been used before, so the server probably closed it as the \
+         request was sent. A {method} request is not sent again by itself, because the server \
+         may have processed it: retry if that is safe"
+    ))
 }
 
 /// The fields of an HTTP/2 request after its pseudo-headers: the same as
