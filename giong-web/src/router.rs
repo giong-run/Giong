@@ -12,6 +12,7 @@ use crate::error::Rendered;
 use crate::next::{BoxHandler, Chain, DynMiddleware, Endpoint};
 use crate::req::RouteInfo;
 use crate::route::{Captures, Lookup, Method, Params, Pattern, Table};
+use crate::routes::{Alive, RouteEntry, RouteList};
 use crate::{log, Error, Middleware, Next, Req};
 
 struct RouteDef<S> {
@@ -383,6 +384,7 @@ impl<S: 'static> Router<S> {
         let mut table = Table::default();
         let top: Box<Chain<S>> = self.middleware.into_boxed_slice();
         let mut routes = Vec::with_capacity(self.routes.len());
+        let mut listing = Vec::with_capacity(self.routes.len());
         let mut streams = false;
         for (i, def) in self.routes.into_iter().enumerate() {
             let stream = def.stream.or(self.stream);
@@ -390,8 +392,17 @@ impl<S: 'static> Router<S> {
             let traced_as =
                 giong::observe::Route::new(&format!("{} {}", def.method.as_str(), def.pattern));
             // Duplicates were refused when the routes were added.
-            let _ = table.insert(&def.pattern, def.method, i);
+            let _ = table.insert(&def.pattern, def.method.clone(), i);
             let chain: Box<Chain<S>> = top.iter().cloned().chain(def.middleware).collect();
+            listing.push(RouteEntry::new(
+                def.method.as_str(),
+                def.pattern.to_string().into(),
+                def.pattern.names().into(),
+                def.pattern.ends_with_catch_all(),
+                stream,
+                chain.len(),
+                def.added_at,
+            ));
             routes.push(Route {
                 traced_as,
                 info: Rc::new(RouteInfo {
@@ -415,6 +426,7 @@ impl<S: 'static> Router<S> {
             let chain: Box<Chain<S>> = top.iter().cloned().chain(scope.middleware).collect();
             scope_chains.push(chain);
         }
+        let (listing, alive) = RouteList::new(listing);
         App {
             state: Rc::new(state),
             table,
@@ -423,6 +435,8 @@ impl<S: 'static> Router<S> {
             scopes,
             scope_chains: scope_chains.into(),
             streams,
+            listing,
+            _alive: alive,
         }
     }
 }
@@ -481,6 +495,10 @@ pub struct App<S = ()> {
     scope_chains: Box<[Box<Chain<S>>]>,
     /// Some route reads its body as a stream.
     streams: bool,
+    /// What [`App::routes`] reports, made once by `build`.
+    listing: Rc<RouteList>,
+    /// Keeps the listing in [`RouteList::live`] while the app exists.
+    _alive: Rc<Alive>,
 }
 
 impl<S: 'static> App<S> {
@@ -557,6 +575,13 @@ impl<S: 'static> App<S> {
             }
         }
         resp
+    }
+
+    /// The routes this app serves, in the order they were added, for tools:
+    /// see [`RouteList`]. Made once when the router was built; reading it
+    /// costs nothing on the request path.
+    pub fn routes(&self) -> &RouteList {
+        &self.listing
     }
 
     /// The middleware of route `i`.
