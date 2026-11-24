@@ -32,7 +32,7 @@ checksum = "4e7648175b45a9a48536d676f68d918270699102aa8dab5496df06904c914600"
 
 [[package]]
 name = "giong"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "io-uring",
  "libc",
@@ -42,14 +42,15 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "giong",
+ "libc",
 ]
 
 [[package]]
 name = "giong-web"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "giong",
  "giong-http",

@@ -103,7 +103,8 @@ run_tsan() {
     # itself still runs under TSan in
     # sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down, whose
     # signal goes to a thread sleeping in nanosleep, which TSan intercepts.
-    local skip=(--skip sigterm_triggers_a_graceful_shutdown --skip sigterm_still_works_after_worker_0_returned)
+    local skip=(--skip sigterm_triggers_a_graceful_shutdown --skip sigterm_still_works_after_worker_0_returned
+        --skip a_second_signal_ends_a_process_whose_shutdown_hangs)
     # `--cfg giong_tsan` makes giong close sockets with close(2) instead of
     # IORING_OP_CLOSE, which TSan cannot see (see Driver::close_fd).
     for round in $(seq 1 "$ROUNDS"); do
