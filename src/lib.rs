@@ -113,6 +113,8 @@ pub mod fs;
 #[cfg(windows)]
 #[path = "fs/windows.rs"]
 pub mod fs;
+#[cfg(target_os = "linux")]
+pub mod ipc;
 pub mod lane;
 pub mod net;
 pub mod observe;
