@@ -257,6 +257,101 @@ Calls that return the kernel's `ENOBUFS` as it is, with no code, as on Linux:
 
 [All error codes](README.md)
 "#),
+    (90, r#"# GIONG-E0090: IPC message too large
+
+Raised by `giong::ipc::Sender::send`. In code: `giong::error::Code::IpcMessageTooLarge`.
+
+## What happened
+
+The message is longer than the channel carries. A message may take at most a quarter of the channel's capacity (the capacity of one direction, chosen by `giong::ipc::connect`), less 8 bytes for its record head, so that it always fits in the ring even when it has to start again at the beginning. `Sender::max_message` says the limit. Nothing was sent.
+
+## How to fix it
+
+- Connect with a larger capacity: a channel of `1 << 22` bytes (4 MiB per direction) takes messages up to 1 MiB minus 8 bytes. The listener must allow it (`IpcListener::bind`'s limit).
+- Or split large payloads into several messages, or send them another way (a file, a pipe) and send a short message that names them.
+
+[All error codes](README.md)
+"#),
+    (91, r#"# GIONG-E0091: IPC channel memory corrupted
+
+Raised by `giong::ipc::Sender::send` and `giong::ipc::Receiver::recv`. In code: `giong::error::Code::IpcCorrupted`.
+
+## What happened
+
+The other process wrote something into the channel's shared memory that breaks its rules: a read or write position out of range, or a message length that points past the data written. giong checks every position and length it reads from shared memory, so it stopped instead of reading or writing outside the channel. The message says which value was wrong. The channel cannot be trusted any more.
+
+Causes: the other process writes into the mapping by its own means, runs a giong version with another channel layout under the same protocol version (a bug), or is hostile.
+
+## How to fix it
+
+- Drop both halves and connect again.
+- Check that the other process uses `giong::ipc` of the same giong version and does not touch the shared memory itself.
+- If both sides are unchanged giong code, report it with both versions: it is a bug.
+
+[All error codes](README.md)
+"#),
+    (92, r#"# GIONG-E0092: IPC capacity out of range
+
+Raised by `giong::ipc::connect`, `giong::ipc::IpcListener::bind` and `IpcListener::accept`. In code: `giong::error::Code::IpcCapacity`.
+
+## What happened
+
+An IPC channel's capacity (the bytes of one direction's ring) must be a power of two from 4096 to 2^30 (1 GiB), and at most the limit the listener was bound with. Either the number given is not such a power of two, or the connecting process asked for more than the listener allows; the listener then refuses the channel and keeps listening. Both processes map twice the capacity plus a page, so the limit bounds the memory a client can make the listener map.
+
+## How to fix it
+
+- Pass a power of two, such as `1 << 20` (1 MiB per direction).
+- Connect with a capacity no larger than the listener's limit, or raise the limit in `IpcListener::bind`.
+
+[All error codes](README.md)
+"#),
+    (93, r#"# GIONG-E0093: IPC handshake failed
+
+Raised by `giong::ipc::connect` and `giong::ipc::IpcListener::accept`. In code: `giong::error::Code::IpcHandshake`.
+
+## What happened
+
+Setting up the channel over the Unix socket failed: the other end is not a giong IPC endpoint, speaks another protocol version, sent a malformed handshake, closed the connection during it, or passed shared memory that is not sealed against resizing, has the wrong size, or wake-up descriptors that are not eventfds. The message says which. On the listener, only this connection is refused; it keeps accepting.
+
+## How to fix it
+
+- Connect `giong::ipc::connect` to a socket bound with `giong::ipc::IpcListener::bind`, not to another kind of Unix socket.
+- Run the same giong version (or at least the same IPC protocol version) on both sides.
+
+[All error codes](README.md)
+"#),
+    (94, r#"# GIONG-E0094: IPC peer process gone
+
+Raised by `giong::ipc::Sender::send` and `giong::ipc::Receiver::recv`. In code: `giong::error::Code::IpcPeerGone`.
+
+## What happened
+
+The other process of the channel closed its end of the channel's Unix socket without dropping its halves first: it exited or crashed. `recv` returns every message the other process had sent before this error. `send` fails with it once it has seen the other process go, which it checks when the channel is full and it has to wait for room: while there is room, a message to a peer that is gone is written into the ring and `send` returns `Ok`, as a write to a socket whose peer has just died can.
+
+A peer that drops its `Sender` normally ends the channel with `Ok(None)` from `recv` instead.
+
+## How to fix it
+
+- Treat it like a connection reset: drop both halves and connect again once the other process is back.
+- Find out why the other process ended (its logs, exit status) if it was not expected to.
+
+[All error codes](README.md)
+"#),
+    (95, r#"# GIONG-E0095: IPC receiver closed
+
+Raised by `giong::ipc::Sender::send`. In code: `giong::error::Code::IpcReceiverClosed`.
+
+## What happened
+
+The other side dropped its `Receiver`, so nothing reads this direction of the channel any more. The message was not sent. Messages sent before the receiver was dropped may not have been read.
+
+## How to fix it
+
+- Stop sending on this channel and drop the `Sender`.
+- If the other side should keep reading, find out why it dropped its receiver (it finished, or an error ended its loop).
+
+[All error codes](README.md)
+"#),
     (100, r#"# GIONG-E0100: invalid address
 
 Raised by `giong::net`, when an address is given as a string, or when a host name is given to a function that takes an IP address. In code: `giong::error::Code::InvalidAddress`.
