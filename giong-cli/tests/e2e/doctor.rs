@@ -173,7 +173,7 @@ fn nightly_and_odd_version_strings_are_read() {
 #[test]
 #[cfg_attr(
     windows,
-    ignore = "known bug: on Windows giong doctor waits more than 30 s on a rustc that hangs (each call waits the full 20 s tool timeout)"
+    ignore = "known bug #382: on Windows the hanging tool inherits giong's own output pipe and holds it after giong gives up"
 )]
 fn a_hanging_rustc_does_not_hang_doctor() {
     let dir = TempDir::new("doctor-hang");
