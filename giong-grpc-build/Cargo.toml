@@ -1,6 +1,6 @@
 [package]
 name = "giong-grpc-build"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Generates giong-proto views and gRPC service descriptions from .proto files at build time, with no protoc to install"
