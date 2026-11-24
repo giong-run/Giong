@@ -55,28 +55,35 @@ fn an_accepted_channel_s_descriptors_are_close_on_exec() {
         let server = giong::spawn(async move { listener.accept().await.unwrap() });
         let client = ipc::connect(&path.0, 4096).await.unwrap();
         let channel = server.await.unwrap();
+        // Only memfds and eventfds: other tests of this binary run at the
+        // same time, and what the standard library or the C library opens
+        // for them is not this test's business. Every memfd and eventfd
+        // the tests create themselves is close-on-exec.
+        let mut seen = 0;
         for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
-            let fd: RawFd = entry
-                .unwrap()
-                .file_name()
-                .to_str()
-                .unwrap()
-                .parse()
-                .unwrap();
-            if fd <= 2 {
+            let entry = entry.unwrap();
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            let target = target.to_string_lossy();
+            if !target.starts_with("/memfd:") && target != "anon_inode:[eventfd]" {
                 continue;
             }
+            let fd: RawFd = entry.file_name().to_str().unwrap().parse().unwrap();
             // SAFETY: only reads the flags of a descriptor number.
             let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
-            // read_dir's own descriptor may be closed by now.
+            // Another test may have closed it since.
             if flags >= 0 {
+                seen += 1;
                 assert_ne!(
                     flags & libc::FD_CLOEXEC,
                     0,
-                    "descriptor {fd} is inherited by exec"
+                    "descriptor {fd} ({target}) is inherited by exec"
                 );
             }
         }
+        // Both ends of the channel are in this process.
+        assert!(seen >= 2, "found {seen} memfds and eventfds");
         drop((client, channel));
     });
 }
