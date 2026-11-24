@@ -634,6 +634,9 @@ pub fn background(args: &Args, argv: &[String]) -> Result<Report, Failure> {
         .stderr(err)
         .env(BACKGROUND_VAR, "1");
     detach(&mut cmd);
+    // The runner must not hold the caller's pipe open (#378).
+    #[cfg(windows)]
+    crate::noinherit::keep_std_handles();
     let mut child = cmd.spawn().map_err(|e| {
         Failure::new(
             Code::USAGE,
