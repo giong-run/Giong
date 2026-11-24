@@ -8,7 +8,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 
-use crate::harness::{giong, grep_files, has_command, new_package, TempDir};
+use crate::harness::{giong, grep_files, has_command, new_package, toolchain, TempDir};
 
 fn workspace() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -109,7 +109,10 @@ fn new_dry_run_writes_nothing() {
 /// the project passes its own `giong doctor` (fast dev profile, no Tokio).
 #[test]
 fn every_template_writes_a_project_cargo_reads_and_doctor_accepts() {
-    if !has_command("new") {
+    // It reads the project with cargo.
+    if !has_command("new")
+        || !toolchain("every_template_writes_a_project_cargo_reads_and_doctor_accepts")
+    {
         return;
     }
     let combos: &[&[&str]] = &[
@@ -167,7 +170,8 @@ fn every_template_writes_a_project_cargo_reads_and_doctor_accepts() {
 /// writes nothing, or writes a project cargo reads. Never half a project.
 #[test]
 fn odd_names_are_refused_or_give_a_valid_package() {
-    if !has_command("new") {
+    // It reads the project with cargo.
+    if !has_command("new") || !toolchain("odd_names_are_refused_or_give_a_valid_package") {
         return;
     }
     for name in [
@@ -236,7 +240,8 @@ fn new_never_writes_over_a_directory_with_files() {
 /// wrote, and merges into an `.mcp.json` that has other servers.
 #[test]
 fn ai_init_is_idempotent_and_keeps_what_people_wrote() {
-    if !has_command("ai") {
+    // It reads the project with cargo.
+    if !has_command("ai") || !toolchain("ai_init_is_idempotent_and_keeps_what_people_wrote") {
         return;
     }
     let dir = TempDir::new("ai-init");
@@ -352,7 +357,8 @@ fn ai_init_leaves_files_it_cannot_read_alone() {
 #[cfg(unix)]
 #[test]
 fn ai_init_with_claude_md_linked_to_agents_md() {
-    if !has_command("ai") {
+    // It reads the project with cargo.
+    if !has_command("ai") || !toolchain("ai_init_with_claude_md_linked_to_agents_md") {
         return;
     }
     let dir = TempDir::new("ai-symlink");
@@ -381,7 +387,8 @@ fn ai_init_with_claude_md_linked_to_agents_md() {
 /// an agent told to run a missing command wastes a turn on E5000.
 #[test]
 fn agent_files_name_only_commands_that_exist() {
-    if !has_command("ai") {
+    // It reads the project with cargo.
+    if !has_command("ai") || !toolchain("agent_files_name_only_commands_that_exist") {
         return;
     }
     let dir = TempDir::new("ai-commands");
@@ -437,7 +444,10 @@ fn looks_like_command(text: &str, i: usize) -> bool {
 /// nothing with --dry-run, and has nothing left to do on a second run.
 #[test]
 fn fix_applies_what_the_compiler_suggests_and_dry_run_writes_nothing() {
-    if !has_command("fix") {
+    // It reads the project with cargo.
+    if !has_command("fix")
+        || !toolchain("fix_applies_what_the_compiler_suggests_and_dry_run_writes_nothing")
+    {
         return;
     }
     let dir = TempDir::new("fix");
@@ -481,7 +491,8 @@ fn fix_applies_what_the_compiler_suggests_and_dry_run_writes_nothing() {
 /// green suite exit 0, and .env reaches the tests (values with spaces too).
 #[test]
 fn test_reports_failures_by_name_and_loads_dotenv() {
-    if !has_command("test") {
+    // It reads the project with cargo.
+    if !has_command("test") || !toolchain("test_reports_failures_by_name_and_loads_dotenv") {
         return;
     }
     let dir = TempDir::new("gtest");
@@ -524,7 +535,6 @@ fn test_reports_failures_by_name_and_loads_dotenv() {
 /// its giong-mcp port. Only the Dockerfile, where a container needs it, may
 /// say 0.0.0.0.
 #[test]
-#[ignore = "known bug: the templates default LISTEN to 0.0.0.0 (security audit point 1)"]
 fn a_new_service_listens_on_loopback_outside_its_container() {
     if !has_command("new") {
         return;
