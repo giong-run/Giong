@@ -18,6 +18,7 @@ mod pages;
 mod procs;
 mod project;
 mod report;
+mod state;
 mod watch;
 
 use std::process::ExitCode;

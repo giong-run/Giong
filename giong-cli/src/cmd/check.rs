@@ -186,7 +186,7 @@ fn clippy_installed(dir: &Path) -> bool {
 
 /// The last build of a `giong dev` that runs in this project.
 fn dev_build(root: &Path) -> Option<Value> {
-    let text = std::fs::read_to_string(root.join(".giong").join("dev.json")).ok()?;
+    let text = crate::state::read_to_string(&crate::state::dir(root).join("dev.json")).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     Some(json!({"build": v["build"], "service_pid": v["service_pid"], "listen": v["listen"]}))
 }
