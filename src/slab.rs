@@ -103,6 +103,18 @@ impl<T> Slab<T> {
         })
     }
 
+    /// Like [`iter_mut`](Self::iter_mut), with each value's key.
+    #[cfg(target_os = "linux")]
+    pub(crate) fn iter_keyed_mut(&mut self) -> impl Iterator<Item = (usize, &mut T)> {
+        self.entries
+            .iter_mut()
+            .enumerate()
+            .filter_map(|(key, e)| match e {
+                Entry::Occupied(val) => Some((key, val)),
+                Entry::Vacant(_) => None,
+            })
+    }
+
     /// Removes and returns every value, leaving the slab empty.
     pub(crate) fn take_all(&mut self) -> Vec<T> {
         let entries = mem::take(&mut self.entries);

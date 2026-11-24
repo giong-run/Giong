@@ -45,20 +45,23 @@
 # locally on 86d1fab: tcp-echo 3663.0 io_uring, 4554.4 epoll; udp-echo
 # 4160.4, 4862.6). #182's own cost against that main: 0 and +13 (+0.29%)
 # for tcp-echo, +5 (+0.12%, +0.10%) for udp-echo.
+# The io_uring spawn, yield, channel, tcp-echo and udp-echo instruction rows:
+# re-measured for #322 (the #336 re-land, #379) on main cdc3669 with it merged,
+# 3 rounds on a dev VM whose other rows match main's to the decimal.
 driver,case,metric,value,tolerance_pct
-io_uring,spawn,instructions,1376.4,1
+io_uring,spawn,instructions,1346.4,1
 io_uring,spawn,allocations,1.000,1
-io_uring,yield,instructions,496.2,1
+io_uring,yield,instructions,481.2,1
 io_uring,yield,allocations,0.000,1
 io_uring,oneshot,instructions,278.1,1
 io_uring,oneshot,allocations,1.000,1
-io_uring,channel,instructions,1721.4,1
+io_uring,channel,instructions,1690.4,1
 io_uring,channel,allocations,0.000,1
 io_uring,timeout,instructions,98.1,1
 io_uring,timeout,allocations,0.000,1
-io_uring,tcp-echo,instructions,3663.0,1
+io_uring,tcp-echo,instructions,3612.0,1
 io_uring,tcp-echo,allocations,1.000,1
-io_uring,udp-echo,instructions,4165.4,1
+io_uring,udp-echo,instructions,4110.4,1
 io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,191.7,1
 io_uring,file-read,allocations,0.000,1

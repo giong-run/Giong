@@ -725,17 +725,12 @@ impl StreamSocket {
                         return Poll::Ready(Ok(buf));
                     }
                     MultiPoll::NeedArm => {
-                        if !wait_for_pool(&mut driver, cx, false) {
+                        let once = self.bulk.get() > 0;
+                        if !wait_for_pool(&mut driver, cx, once) {
                             return Poll::Pending;
                         }
                         let fd = self.sock.as_raw_fd();
-                        driver.arm_multi(
-                            key,
-                            MultiIo::Recv {
-                                fd,
-                                once: self.bulk.get() > 0,
-                            },
-                        );
+                        driver.arm_multi(key, MultiIo::Recv { fd, once });
                     }
                     MultiPoll::Pending => {
                         if driver.kind() == crate::DriverKind::IoUring && self.end_was_missed() {
@@ -1355,16 +1350,18 @@ impl Drop for StreamSocket {
     }
 }
 
-/// Makes sure the kernel has a pool buffer to receive into before a multishot
-/// receive (of datagrams, or of a stream) is armed. Returns `false` if the
-/// caller has to wait for one (its waker is registered with the pool).
-pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>, datagram: bool) -> bool {
-    if !driver.ensure_recv_buffer(datagram) {
+/// Makes sure the kernel has a pool buffer to receive into before a receive
+/// is armed: `whole` for one that takes whole buffers (of datagrams, or of a
+/// stream one buffer at a time), else a multishot stream receive. Returns
+/// `false` if the caller has to wait for one (its waker is registered with
+/// the pool).
+pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>, whole: bool) -> bool {
+    if !driver.ensure_recv_buffer(whole) {
         // The pool is exhausted. Reclaim buffers that hold unread data of
         // other sockets ...
         driver.evacuate();
     }
-    if !driver.ensure_recv_buffer(datagram) {
+    if !driver.ensure_recv_buffer(whole) {
         // ... and if user code holds all the rest, wait for one to come back
         // instead of spinning on ENOBUFS.
         driver.pool().wait(cx.waker());
