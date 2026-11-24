@@ -76,7 +76,8 @@ fn tool(
 }
 
 pub(crate) fn list() -> Value {
-    json!([
+    #[allow(unused_mut)]
+    let mut tools = vec![
         tool(
             "overview",
             "Overview",
@@ -138,7 +139,21 @@ pub(crate) fn list() -> Value {
             schema::profile(),
             false,
         ),
-    ])
+    ];
+    #[cfg(feature = "web")]
+    tools.push(tool(
+        "routes",
+        "Routes",
+        "The HTTP routes the service serves: every giong-web app alive on each worker, \
+             with method, pattern, path parameters, whether the body is streamed, the number \
+             of middleware and the line that added the route. Workers that serve the same \
+             routes are grouped. HEAD is answered by a path's GET route and OPTIONS by the \
+             router, unless routes for them are listed.",
+        json!({}),
+        schema::routes(),
+        true,
+    ));
+    Value::Array(tools)
 }
 
 /// `None` for an unknown tool; `Err` for a call the tool refuses, with a
@@ -160,6 +175,11 @@ pub(crate) async fn call(
             Err(e) => Err(e),
         },
         "profile" => profile(state, args).await,
+        #[cfg(feature = "web")]
+        "routes" => match no_args(args) {
+            Ok(()) => Ok(routes(state).await),
+            Err(e) => Err(e),
+        },
         _ => return None,
     })
 }
@@ -626,6 +646,55 @@ async fn sources(state: &State) -> Value {
             json!(
                 "nothing is registered: giong-postgres, giong-mysql and giong-redis pools \
                    register themselves; other code can with giong::observe::register"
+            ),
+        );
+    }
+    out
+}
+
+/// Every giong-web app alive on each worker; workers serving the same
+/// routes are grouped.
+#[cfg(feature = "web")]
+async fn routes(state: &State) -> Value {
+    let lists = ask_all(state, || async {
+        giong_web::RouteList::live()
+            .iter()
+            .map(|l| l.to_json())
+            .collect::<Vec<String>>()
+    })
+    .await;
+    // Keyed by the app's JSON, in the order first seen.
+    let mut apps: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut unanswered = Vec::new();
+    for (w, answer) in lists.into_iter().enumerate() {
+        match answer {
+            Ok(list) => {
+                for json in list {
+                    match apps.iter_mut().find(|(j, _)| *j == json) {
+                        Some((_, workers)) => workers.push(w),
+                        None => apps.push((json, vec![w])),
+                    }
+                }
+            }
+            Err(e) => unanswered.push(json!({ "worker": w, "error": e })),
+        }
+    }
+    let apps: Vec<Value> = apps
+        .into_iter()
+        .map(|(j, workers)| {
+            let parsed: Value = serde_json::from_str(&j).unwrap_or_else(
+                |e| json!({ "routes": [], "error": format!("unreadable route list: {e}") }),
+            );
+            json!({ "workers": workers, "routes": parsed["routes"].clone() })
+        })
+        .collect();
+    let mut out = json!({ "apps": apps, "unanswered": unanswered });
+    if out["apps"].as_array().is_some_and(Vec::is_empty) {
+        out.as_object_mut().expect("object").insert(
+            "note".into(),
+            json!(
+                "no giong-web app is alive on any worker: the service builds none, builds it \
+                 after this call, or serves HTTP without giong-web"
             ),
         );
     }

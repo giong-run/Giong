@@ -25,6 +25,9 @@ cd "$(dirname "$0")/.."
 
 server="$(realpath "${1:-target/release/examples/defaults}")"
 image="${IMAGE:-ubuntu:24.04}"
+# Pulled first, with retries: `docker run` would pull it once, without any.
+docker image inspect "$image" > /dev/null 2>&1 ||
+    scripts/ci-net.sh retry -n 5 -t 300 -- docker pull -q "$image" > /dev/null
 memory="${MEMORY:-48m}"
 runs="${RUNS:-1:epoll 4:epoll 1:io_uring 4:io_uring}"
 conns="${CONNS:-30000}"

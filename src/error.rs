@@ -168,6 +168,24 @@ codes! {
     /// `raw_os_error` stays reachable.
     NetworkBuffersExhausted = 28, OutOfMemory, "the system ran out of network buffers";
 
+    // ------------------------------------------------------------ ipc
+    /// An IPC message is longer than the channel takes: a quarter of its
+    /// capacity, less 8 bytes.
+    IpcMessageTooLarge = 90, InvalidInput, "IPC message too large";
+    /// The other process wrote into an IPC channel's shared memory outside
+    /// the rules (positions or lengths out of range).
+    IpcCorrupted = 91, InvalidData, "IPC channel memory corrupted";
+    /// An IPC capacity is not a power of two from 4 KiB to 1 GiB, or is
+    /// above the listener's limit.
+    IpcCapacity = 92, InvalidInput, "IPC capacity out of range";
+    /// The other end of the Unix socket is not a giong IPC endpoint of the
+    /// same protocol version, or sent a malformed handshake.
+    IpcHandshake = 93, InvalidData, "IPC handshake failed";
+    /// The other process of an IPC channel went away without closing it.
+    IpcPeerGone = 94, ConnectionReset, "IPC peer process gone";
+    /// The other side of an IPC channel dropped its receiver.
+    IpcReceiverClosed = 95, BrokenPipe, "IPC receiver closed";
+
     // ------------------------------------------------- network and names
     /// A `"host:port"` string is not one.
     InvalidAddress = 100, InvalidInput, "invalid address";

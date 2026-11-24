@@ -238,6 +238,39 @@ pub(crate) fn sources() -> Value {
     )
 }
 
+#[cfg(feature = "web")]
+pub(crate) fn routes() -> Value {
+    object(
+        json!({
+            "apps": array(object(
+                json!({
+                    "workers": array(int()),
+                    "routes": array(object(
+                        json!({
+                            "method": text(),
+                            "pattern": text(),
+                            "params": array(text()),
+                            "catch_all": { "type": "boolean" },
+                            "stream_limit": or_null(int()),
+                            "middleware": int(),
+                            "added_at": text(),
+                        }),
+                        &["method", "pattern", "params", "catch_all", "stream_limit",
+                          "middleware", "added_at"],
+                    )),
+                }),
+                &["workers", "routes"],
+            )),
+            "unanswered": array(object(
+                json!({ "worker": int(), "error": text() }),
+                &["worker", "error"],
+            )),
+            "note": text(),
+        }),
+        &["apps", "unanswered"],
+    )
+}
+
 pub(crate) fn profile() -> Value {
     let row = |share: &str| {
         let mut props = json!({
