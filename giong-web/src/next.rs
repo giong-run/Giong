@@ -93,9 +93,12 @@ pub(crate) enum Endpoint<'a, S> {
 }
 
 impl<S> Endpoint<'_, S> {
-    async fn call(self, req: Req<S>) -> Result<Response, Error> {
+    /// The answer of an endpoint that is not a handler, which needs no
+    /// waiting.
+    fn answer(self, req: &Req<S>) -> Result<Response, Error> {
         match self {
-            Endpoint::Handler(handler) => guarded(Who::Handler, || handler(req)).await,
+            // `Next::run` starts handlers itself.
+            Endpoint::Handler(_) => unreachable!("a handler is started, not answered"),
             Endpoint::NotFound(hint) => {
                 let mut detail = format!("no route for {} {}", req.method(), cut(req.path()));
                 if let Some(hint) = hint {
@@ -145,15 +148,25 @@ impl<S: 'static> Next<'_, S> {
     /// they had done stays done.
     pub async fn run(self, req: Req<S>) -> Response {
         let id = req.id_buf();
-        let result = match self.chain.split_first() {
+        // The next middleware or the handler is started here and its
+        // future awaited in this one, with no async layer in between: each
+        // layer would move the request (some 330 bytes) into its own state.
+        let started = match self.chain.split_first() {
             Some((first, rest)) => {
                 let next = Next {
                     chain: rest,
                     endpoint: self.endpoint,
                 };
-                guarded(Who::Middleware, || first.call_dyn(req, next)).await
+                start(Who::Middleware, || first.call_dyn(req, next))
             }
-            None => self.endpoint.call(req).await,
+            None => match self.endpoint {
+                Endpoint::Handler(handler) => start(Who::Handler, || handler(req)),
+                endpoint => Err(endpoint.answer(&req)),
+            },
+        };
+        let result = match started {
+            Ok(caught) => caught.await,
+            Err(done) => done,
         };
         match result {
             Ok(resp) => resp,
@@ -169,8 +182,9 @@ enum Who {
     Middleware,
 }
 
-/// Starts a handler or a middleware with `start` and runs the future it
-/// returns, turning a panic in either into a `500` (`GIONG-E1210`).
+/// Starts a handler or a middleware with `start`, giving the future it
+/// returns, to be awaited, ready to turn a panic in a poll into a `500`
+/// (`GIONG-E1210`); `Err` holds that `500` when `start` itself panicked.
 ///
 /// A panic would otherwise unwind through giong-http's connection task and
 /// drop the connection with every request on it (over HTTP/2, those of the
@@ -184,14 +198,14 @@ enum Who {
 /// updated, the same risk as with any server that keeps running after a
 /// panic. A `RefCell` borrow ends as the panic unwinds; a `Mutex` is
 /// poisoned, as it would be on a thread.
-async fn guarded<'a>(
+fn start<'a>(
     who: Who,
     start: impl FnOnce() -> BoxFuture<'a, Result<Response, Error>>,
-) -> Result<Response, Error> {
+) -> Result<Caught<'a>, Result<Response, Error>> {
     // A closure may run code of its own before it returns its future.
     match catch_unwind(AssertUnwindSafe(start)) {
-        Ok(fut) => Caught { fut, who }.await,
-        Err(payload) => Err(panicked(who, &*payload)),
+        Ok(fut) => Ok(Caught { fut, who }),
+        Err(payload) => Err(Err(panicked(who, &*payload))),
     }
 }
 
@@ -209,8 +223,8 @@ impl Future for Caught<'_> {
         let fut = &mut self.fut;
         match catch_unwind(AssertUnwindSafe(|| fut.as_mut().poll(cx))) {
             Ok(poll) => poll,
-            // `guarded` awaits this once, so the future that panicked is not
-            // polled again; it is dropped with `Caught`.
+            // `Next::run` awaits this once, so the future that panicked is
+            // not polled again; it is dropped with `Caught`.
             Err(payload) => Poll::Ready(Err(panicked(who, &*payload))),
         }
     }

@@ -1,6 +1,6 @@
 [package]
 name = "giong-cli"
-version = "1.4.0"
+version = "1.4.2"
 edition = "2021"
 rust-version = "1.80"
 description = "The giong command: start, run, check and ship services on the Gióng async runtime"
@@ -36,6 +36,6 @@ unsafe_code = "forbid"
 # drive the `giong` binary against it. Unix only: giong-web does not build on
 # Windows.
 [target.'cfg(unix)'.dev-dependencies]
-giong = { path = "..", version = "1.4.0" }
-giong-web = { path = "../giong-web", version = "1.4.0" }
-giong-mcp = { path = "../giong-mcp", version = "1.4.0", features = ["web"] }
+giong = { path = "..", version = "1.4.2" }
+giong-web = { path = "../giong-web", version = "1.4.2" }
+giong-mcp = { path = "../giong-mcp", version = "1.4.2", features = ["web"] }

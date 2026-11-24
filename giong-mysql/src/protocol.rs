@@ -478,10 +478,10 @@ pub(crate) fn err(payload: &[u8]) -> Result<Err<'_>, Error> {
 }
 
 /// A column definition (`Protocol::ColumnDefinition41`), the parts this
-/// crate uses.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct ColumnDef {
-    pub name: Box<str>,
+/// crate uses, read in place: the name borrows the packet.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ColumnDefRef<'a> {
+    pub name: &'a str,
     pub collation: u16,
     pub length: u32,
     pub ty: ColumnType,
@@ -489,7 +489,7 @@ pub(crate) struct ColumnDef {
     pub decimals: u8,
 }
 
-pub(crate) fn column_def(payload: &[u8]) -> Result<ColumnDef, Error> {
+pub(crate) fn column_def_ref(payload: &[u8]) -> Result<ColumnDefRef<'_>, Error> {
     let mut r = Reader::new(payload);
     let what = "a column definition";
     for _ in 0..4 {
@@ -497,8 +497,7 @@ pub(crate) fn column_def(payload: &[u8]) -> Result<ColumnDef, Error> {
         r.lenenc_bytes(what)?;
     }
     let name = std::str::from_utf8(r.lenenc_bytes(what)?)
-        .map_err(|_| Error::protocol("the server sent a column name that is not UTF-8"))?
-        .into();
+        .map_err(|_| Error::protocol("the server sent a column name that is not UTF-8"))?;
     r.lenenc_bytes(what)?; // original name
     r.lenenc(what)?; // length of the fixed fields, always 0x0C
     let collation = r.u16(what)?;
@@ -506,7 +505,7 @@ pub(crate) fn column_def(payload: &[u8]) -> Result<ColumnDef, Error> {
     let ty = ColumnType::from_code(r.u8(what)?);
     let flags = r.u16(what)?;
     let decimals = r.u8(what)?;
-    Ok(ColumnDef {
+    Ok(ColumnDefRef {
         name,
         collation,
         length,

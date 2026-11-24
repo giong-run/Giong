@@ -71,6 +71,19 @@ const IOV_MAX: usize = 1024;
 /// The most one `sendfile` call is asked for (Linux sends at most this much
 /// in one call anyway).
 const SENDFILE_MAX: u64 = 0x7fff_f000;
+/// The most one send on a stream hands to the kernel. Windows takes an
+/// overlapped send whole while the socket's buffer has any room, whatever
+/// its size and however long the peer has stopped reading: a 512 MiB write
+/// to a peer that reads nothing completed at once, and the kernel then held
+/// all of it, out of reach of a write timeout that counts from the last
+/// progress. A megabyte at a time keeps what a stalled peer pins near the
+/// socket's buffer, and costs one completion per megabyte. Elsewhere a send
+/// takes what the buffer holds, so only Windows' 32-bit counts limit it.
+const STREAM_SEND_MAX: usize = if cfg!(windows) {
+    1 << 20
+} else {
+    i32::MAX as usize
+};
 /// Bytes `send_file` sends before it lets the worker's other tasks run.
 #[cfg(unix)]
 const SENDFILE_YIELD: u64 = 512 * 1024;
@@ -889,11 +902,11 @@ impl StreamSocket {
                 crate::sys::io_vec(unsafe { buf.as_ptr().add(skip) }, buf.len() - skip)
             })
             .collect();
-        // Windows reports a transfer's count as a signed 32-bit number: a
-        // send of more than that in one call is cut to it, a short write.
+        // A send on Windows takes at most `STREAM_SEND_MAX` bytes: a longer
+        // one is cut there, a short write.
         #[cfg(windows)]
         {
-            let mut room = i32::MAX as usize;
+            let mut room = STREAM_SEND_MAX;
             let mut keep = 0;
             for v in iov.iter_mut() {
                 if room == 0 {
@@ -1221,7 +1234,7 @@ impl StreamSocket {
 
     async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
         debug_assert!(offset <= buf.len());
-        let len = (buf.len() - offset).min(i32::MAX as usize) as u32;
+        let len = (buf.len() - offset).min(STREAM_SEND_MAX) as u32;
         let hold = self.send_hold(&buf, len as usize);
         // SAFETY: `offset <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(offset) };

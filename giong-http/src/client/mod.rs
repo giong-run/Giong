@@ -828,8 +828,7 @@ impl Client {
                 if pool::has_usable_h2(&pool) {
                     return Ok(Version::Http2);
                 }
-                drop(pool);
-                match self.checkout(&route, false).await? {
+                match self.checkout(&route, pool, false).await? {
                     Checkout::Retry => continue,
                     Checkout::H2(_) | Checkout::Shared(_) => return Ok(Version::Http2),
                     Checkout::H1(mut lease) => {
@@ -1070,9 +1069,13 @@ impl Client {
     /// A connection on `route`: an idle one unless `fresh`, otherwise a
     /// new one, waiting in line while the origin has as many open as
     /// allowed. A new connection that speaks HTTP/2 joins the pool, shared.
-    async fn checkout(&self, route: &Route, fresh: bool) -> Result<Checkout, Error> {
+    async fn checkout(
+        &self,
+        route: &Route,
+        pool: pool::Shared,
+        fresh: bool,
+    ) -> Result<Checkout, Error> {
         let config = &self.shared.config;
-        let pool = self.host(route);
         let prior_knowledge =
             config.http2_prior_knowledge && !route.origin.https && route.proxy.is_none();
         let taken = pool::acquire(
@@ -1159,7 +1162,7 @@ impl Client {
         let config = &self.shared.config;
         let streamed = source.is_some();
         let route = self.route(url);
-        let what = format!("{method} {url}");
+        let what = url.describe(method);
         let decompress = config.decompress
             && !headers
                 .iter()
@@ -1215,9 +1218,8 @@ impl Client {
             let pool = self.host(&route);
             let checkout = match pool::h2_with_room(&pool) {
                 Some(conn) => Checkout::Shared(conn),
-                None => self.checkout(&route, fresh).await?,
+                None => self.checkout(&route, pool, fresh).await?,
             };
-            drop(pool);
             let (conn, reused) = match checkout {
                 Checkout::Retry => continue,
                 Checkout::Shared(conn) => (conn, true),
@@ -1258,7 +1260,8 @@ impl Client {
                             lease
                                 .conn()
                                 .send(
-                                    request.clone(),
+                                    request,
+                                    reused,
                                     method == "HEAD",
                                     config.max_head_size,
                                     &what,
@@ -1336,7 +1339,8 @@ impl Client {
             };
             match stream.response().await {
                 Ok(()) => {
-                    let head = h2_head(stream.head());
+                    let fields = stream.take_fields();
+                    let head = h2_head(stream.head(), fields);
                     #[cfg(feature = "unstable-http3")]
                     if route.proxy.is_none() {
                         self.note_alt_svc(url, &head, &stream.head().bytes);
@@ -1452,8 +1456,9 @@ impl Client {
                     drop(stream);
                     conn.handshake().await;
                 }
-                Ok(stream) => {
-                    let head = h2_head(stream.head());
+                Ok(mut stream) => {
+                    let fields = stream.take_fields();
+                    let head = h2_head(stream.head(), fields);
                     self.note_alt_svc(url, &head, &stream.head().bytes);
                     return Ok(Pending::new(
                         None,
@@ -1863,9 +1868,9 @@ struct Pending {
     body: Body,
     /// Set when the body is compressed and the client asked for that.
     inflate: Option<Box<Inflate>>,
-    url: String,
-    /// `METHOD url`, for messages.
+    /// `METHOD url`, for messages; the URL is its tail, from `url_at`.
     what: String,
+    url_at: usize,
 }
 
 /// The body of a response, over either protocol.
@@ -1982,14 +1987,21 @@ impl Pending {
                 });
             }
         }
+        // The method is a token: the first space ends it.
+        let url_at = what.find(' ').map_or(0, |i| i + 1);
+        debug_assert_eq!(what[url_at..], url.text());
         Self {
             lease,
             head,
             body,
             inflate,
-            url: url.to_string(),
             what,
+            url_at,
         }
+    }
+
+    fn url(&self) -> &str {
+        &self.what[self.url_at..]
     }
 
     fn version(&self) -> Version {
@@ -2107,7 +2119,8 @@ impl Pending {
             fields: self.head.fields,
             body_start: start,
             data,
-            url: self.url,
+            url: self.what,
+            url_at: self.url_at,
         })
     }
 }
@@ -2134,14 +2147,11 @@ fn decode_error(what: &str, e: DecodeError) -> Error {
 
 /// A request that may have been processed is not sent again.
 fn not_sent_again(e: Error, method: &str) -> Error {
-    Error::new(
-        ErrorKind::Closed,
-        format!(
-            "{e}; the connection had been used before, so the server probably closed it as \
-             the request was sent. A {method} request is not sent again by itself, because the \
-             server may have processed it: retry if that is safe"
-        ),
-    )
+    e.advise(format!(
+        "the connection had been used before, so the server probably closed it as the \
+         request was sent. A {method} request is not sent again by itself, because the server \
+         may have processed it: retry if that is safe"
+    ))
 }
 
 /// The fields of an HTTP/2 request after its pseudo-headers: the same as
@@ -2190,11 +2200,11 @@ fn h2_fields(
 }
 
 /// The head of an HTTP/2 response, as the rest of the client reads heads.
-fn h2_head(head: &h2::ResponseHead) -> Head {
+fn h2_head(head: &h2::ResponseHead, fields: Vec<(Range<usize>, Range<usize>)>) -> Head {
     Head {
         status: head.status,
         minor: 1,
-        fields: head.fields.clone(),
+        fields,
         len: head.bytes.len(),
         content_length: head.content_length,
         chunked: false,
@@ -2280,7 +2290,7 @@ fn encode_request(
     if proxy.is_some() {
         // Absolute form, for a proxy (RFC 9112 section 3.2.2).
         out.extend_from_slice(b"http://");
-        out.extend_from_slice(url.host_header().as_bytes());
+        url.push_host_header(&mut out);
     }
     out.extend_from_slice(url.target.as_bytes());
     out.extend_from_slice(b" HTTP/1.1\r\n");
@@ -2291,7 +2301,7 @@ fn encode_request(
     }
     if !has("host") {
         out.extend_from_slice(b"Host: ");
-        out.extend_from_slice(url.host_header().as_bytes());
+        url.push_host_header(&mut out);
         out.extend_from_slice(b"\r\n");
     }
     if !has("user-agent") && !user_agent.is_empty() {
@@ -2313,7 +2323,9 @@ fn encode_request(
     if streamed {
         out.extend_from_slice(b"Transfer-Encoding: chunked\r\n");
     } else if body.is_some() || matches!(method, "POST" | "PUT" | "PATCH") {
-        out.extend_from_slice(format!("Content-Length: {body_len}\r\n").as_bytes());
+        out.extend_from_slice(b"Content-Length: ");
+        crate::response::push_number(&mut out, body_len);
+        out.extend_from_slice(b"\r\n");
     }
     out.extend_from_slice(b"\r\n");
     if let Some(body) = body {
@@ -2490,7 +2502,7 @@ impl RequestBuilder {
         let url = self.url?;
         let client = self.client;
         let timeout = self.timeout.unwrap_or(client.shared.config.timeout);
-        let what = format!("{} {url}", self.method);
+        let what = url.describe(&self.method);
         let run = async {
             let pending = client
                 .run(
@@ -2528,7 +2540,7 @@ impl RequestBuilder {
         let url = self.url?;
         let client = self.client;
         let timeout = self.timeout.unwrap_or(client.shared.config.timeout);
-        let what = format!("{} {url}", self.method);
+        let what = url.describe(&self.method);
         let run = client.run(self.method, url, self.headers, self.body, self.source, true);
         match giong::time::timeout(timeout, run).await {
             Ok(Ok(pending)) => Ok(StreamingResponse {
@@ -2648,7 +2660,9 @@ pub struct Response {
     data: Vec<u8>,
     fields: Vec<(Range<usize>, Range<usize>)>,
     body_start: usize,
+    /// `METHOD url`: the URL is its tail, from `url_at`.
     url: String,
+    url_at: usize,
 }
 
 impl Response {
@@ -2683,7 +2697,7 @@ impl Response {
             self.status,
             format!(
                 "{} answered {} {}: {shown:?}{more}",
-                self.url,
+                self.url(),
                 self.status,
                 crate::response::reason(self.status)
             ),
@@ -2720,7 +2734,7 @@ impl Response {
                 ErrorKind::Decode,
                 format!(
                     "the body of {} is not UTF-8 text ({e}); read it with Response::body",
-                    self.url
+                    self.url()
                 ),
             )
         })
@@ -2733,7 +2747,7 @@ impl Response {
 
     /// The URL that answered, after any redirects.
     pub fn url(&self) -> &str {
-        &self.url
+        &self.url[self.url_at..]
     }
 }
 
@@ -2742,7 +2756,7 @@ impl fmt::Debug for Response {
         f.debug_struct("Response")
             .field("status", &self.status)
             .field("version", &self.version)
-            .field("url", &self.url)
+            .field("url", &self.url())
             .field("headers", &self.fields.len())
             .field("body", &self.body().len())
             .finish()
@@ -2819,7 +2833,7 @@ impl StreamingResponse {
             status,
             format!(
                 "{} answered {status} {}",
-                self.pending().url,
+                self.pending().url(),
                 crate::response::reason(status)
             ),
         ))
@@ -2845,7 +2859,7 @@ impl StreamingResponse {
 
     /// The URL that answered, after any redirects.
     pub fn url(&self) -> &str {
-        &self.pending().url
+        self.pending().url()
     }
 
     /// The trailer fields the server sent after the body: in a last
@@ -2963,7 +2977,7 @@ impl fmt::Debug for StreamingResponse {
         let p = self.pending();
         f.debug_struct("StreamingResponse")
             .field("status", &p.head.status)
-            .field("url", &p.url)
+            .field("url", &p.url())
             .field("decompressing", &p.inflate.is_some())
             .finish()
     }

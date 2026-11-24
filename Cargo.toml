@@ -1,6 +1,6 @@
 [package]
 name = "giong"
-version = "1.4.0"
+version = "1.4.2"
 edition = "2021"
 rust-version = "1.80"
 description = "Gióng — a thread-per-core async runtime for Linux, built on io_uring, with an epoll fallback"
@@ -37,6 +37,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Storage_FileSystem",
     "Win32_System_Console",
     "Win32_System_IO",
+    "Win32_System_LibraryLoader",
     "Win32_System_Memory",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
@@ -83,6 +84,7 @@ windows-sys = { version = "0.61", features = [
     "Win32_Networking_WinSock",
     "Win32_Security",
     "Win32_Storage_FileSystem",
+    "Win32_System_Console",
     "Win32_System_LibraryLoader",
     "Win32_System_Pipes",
     "Win32_System_ProcessStatus",
