@@ -803,9 +803,7 @@ async fn exchange(server: SocketAddr, name: &str, qtype: u16) -> io::Result<Answ
         SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
     };
-    // Not `UdpSocket::bind`: its SO_REUSEPORT would let the kernel give two
-    // concurrent queries the same port, and their answers could cross.
-    let socket = UdpSocket::from_std(std::net::UdpSocket::bind(local)?);
+    let socket = UdpSocket::from_std(query_socket(local)?);
     // Connected: the kernel drops datagrams from anyone but the server.
     socket.connect(server)?;
     let (res, query) = socket.send(query).await;
@@ -823,6 +821,31 @@ async fn exchange(server: SocketAddr, name: &str, qtype: u16) -> io::Result<Answ
         }
         return Ok(answer);
     }
+}
+
+/// A UDP socket on a fresh port of its own, for one query.
+///
+/// Not `UdpSocket::bind`: its `SO_REUSEPORT` would let the kernel give two
+/// concurrent queries the same port, and their answers could cross.
+#[cfg(unix)]
+fn query_socket(local: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    std::net::UdpSocket::bind(local)
+}
+
+/// A UDP socket on a fresh port of its own, for one query.
+///
+/// Its bind is exclusive (`SO_EXCLUSIVEADDRUSE`). Without that, Windows lets
+/// any other socket, of any process, bind the same port on a more specific
+/// address (`127.0.0.1`, the adapter's own) and take the datagrams sent to
+/// it: the answer goes to that socket and the lookup waits out its timeout.
+/// Runs of many test processes at once caught local DNS servers doing it.
+#[cfg(windows)]
+fn query_socket(local: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+    crate::sys::set_exclusive_address(&sock)?;
+    sock.bind(&local.into())?;
+    Ok(sock.into())
 }
 
 async fn exchange_tcp(
@@ -1403,6 +1426,17 @@ pub(crate) mod fuzzing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(windows)]
+    #[test]
+    fn no_other_socket_can_take_a_query_sockets_port() {
+        let socket = query_socket((Ipv4Addr::UNSPECIFIED, 0).into()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        // A more specific address on the same port: Windows lets such a
+        // bind take the port's datagrams unless the first bind is exclusive.
+        let taken = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port));
+        assert!(taken.is_err(), "bound {:?} over the query's port", taken);
+    }
 
     /// The threads that read the system stamps, for the test below.
     #[cfg(windows)]

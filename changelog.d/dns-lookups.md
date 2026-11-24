@@ -10,3 +10,10 @@
   queries used to hold the `A` records for the whole timeout, 5 seconds by default, on
   every lookup. Addresses of one family found that way are cached for at most 30 seconds.
   Fixes [#265](https://github.com/giong-run/Giong/issues/265).
+
+### Fixed
+
+- **giong**: on Windows, the resolver's query sockets bind their port exclusively
+  (`SO_EXCLUSIVEADDRUSE`). Before, another socket of any process could bind the same port
+  on a more specific address, such as `127.0.0.1`, and take the answers sent to it: the
+  lookup then waited out its timeout, or lost one address family.
