@@ -174,6 +174,19 @@ impl Held {
     /// what a copy that still listens means.
     pub(crate) fn release_lent(self) {
         let mut ports = ports();
+        #[cfg(any(target_os = "macos", giong_libkqueue))]
+        if let Some((addr, shared)) = self.shared {
+            // As in `release`: the last socket of the address removes the
+            // map's entry, whose own duplicate would otherwise keep the
+            // address bound and listening with no one accepting. Without
+            // the shutdown, since a lent copy may still listen.
+            if Arc::strong_count(&shared) == 2 {
+                shared_sockets().remove(&(self.proto, addr));
+            }
+            let port = ports.entry((self.proto, self.port)).or_default();
+            port.live = port.live.saturating_sub(1);
+            return;
+        }
         let port = ports.entry((self.proto, self.port)).or_default();
         port.live = port.live.saturating_sub(1);
         port.released = true;
@@ -718,6 +731,41 @@ mod tests {
         assert!(!shared_sockets().contains_key(&(Proto::Tcp, addr)));
         let (third, third_hold) = tcp(addr).unwrap();
         third_hold.unwrap().release(&third);
+    }
+
+    /// A listener whose descriptor was lent out gives the address up too:
+    /// the map's duplicate goes with the last of them, so nothing is left
+    /// listening once every copy is closed.
+    #[test]
+    #[cfg(any(target_os = "macos", giong_libkqueue))]
+    fn the_last_lent_tcp_listener_of_an_address_removes_the_shared_socket() {
+        let tcp = |addr: SocketAddr| {
+            bind(Proto::Tcp, addr, true, || {
+                Socket::new(Domain::for_address(addr), Type::STREAM, Some(Protocol::TCP))
+            })
+        };
+        let addr = std::net::TcpListener::bind("127.0.0.1:0")
+            .unwrap()
+            .local_addr()
+            .unwrap();
+        let (first, hold) = tcp(addr).unwrap();
+        first.listen(16).unwrap();
+        let (second, second_hold) = tcp(addr).unwrap();
+
+        hold.unwrap().release_lent();
+        drop(first);
+        assert!(shared_sockets().contains_key(&(Proto::Tcp, addr)));
+
+        second_hold.unwrap().release_lent();
+        drop(second);
+        assert!(!shared_sockets().contains_key(&(Proto::Tcp, addr)));
+        assert_eq!(known(addr).live, 0);
+        // Every copy is closed, so a client is refused instead of waiting
+        // in a backlog no one accepts from.
+        assert_eq!(
+            std::net::TcpStream::connect(addr).unwrap_err().kind(),
+            io::ErrorKind::ConnectionRefused
+        );
     }
 
     #[test]
