@@ -93,30 +93,95 @@ impl Url {
         }
     }
 
-    /// The host as it goes in a URL or a `Host` header: IPv6 in brackets.
-    fn host_in_url(&self) -> String {
-        if self.host.contains(':') {
-            format!("[{}]", self.host)
-        } else {
-            self.host.clone()
+    /// Appends the value of the `Host` header: the host (IPv6 in
+    /// brackets), and the port unless it is the scheme's default. Written
+    /// piece by piece, as [`push_text`](Self::push_text) is: the client
+    /// does this for every request, where `format!` costs several times
+    /// as much.
+    pub(crate) fn push_host_header(&self, out: &mut impl Text) {
+        let bracketed = self.host.contains(':');
+        if bracketed {
+            out.put("[");
+        }
+        out.put(&self.host);
+        if bracketed {
+            out.put("]");
+        }
+        if self.port != self.default_port() {
+            out.put(":");
+            push_port(out, self.port);
         }
     }
 
-    /// The value of the `Host` header: the host, and the port unless it is
-    /// the scheme's default.
+    /// The value of the `Host` header (see
+    /// [`push_host_header`](Self::push_host_header)).
     pub(crate) fn host_header(&self) -> String {
-        if self.port == self.default_port() {
-            self.host_in_url()
-        } else {
-            format!("{}:{}", self.host_in_url(), self.port)
+        let mut out = String::with_capacity(self.host.len() + 8);
+        self.push_host_header(&mut out);
+        out
+    }
+
+    /// Appends the URL as text, as `Display` writes it.
+    pub(crate) fn push_text(&self, out: &mut impl Text) {
+        out.put(if self.https { "https://" } else { "http://" });
+        self.push_host_header(out);
+        out.put(&self.target);
+    }
+
+    /// `"{method} {url}"`, which names a request in the client's errors.
+    pub(crate) fn describe(&self, method: &str) -> String {
+        let mut out =
+            String::with_capacity(method.len() + self.host.len() + self.target.len() + 18);
+        out.push_str(method);
+        out.push(' ');
+        self.push_text(&mut out);
+        out
+    }
+
+    /// The URL as text, as `Display` writes it.
+    pub(crate) fn text(&self) -> String {
+        let mut out = String::with_capacity(self.host.len() + self.target.len() + 16);
+        self.push_text(&mut out);
+        out
+    }
+}
+
+/// Text the URL's pieces are appended to: a `String`, or the bytes of a
+/// request head.
+pub(crate) trait Text {
+    fn put(&mut self, s: &str);
+}
+
+impl Text for String {
+    fn put(&mut self, s: &str) {
+        self.push_str(s);
+    }
+}
+
+impl Text for Vec<u8> {
+    fn put(&mut self, s: &str) {
+        self.extend_from_slice(s.as_bytes());
+    }
+}
+
+fn push_port(out: &mut impl Text, mut port: u16) {
+    let mut digits = [0u8; 5];
+    let mut at = digits.len();
+    loop {
+        at -= 1;
+        digits[at] = b'0' + (port % 10) as u8;
+        port /= 10;
+        if port == 0 {
+            break;
         }
     }
+    // ASCII digits.
+    out.put(std::str::from_utf8(&digits[at..]).unwrap_or_default());
 }
 
 impl fmt::Display for Url {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let scheme = if self.https { "https" } else { "http" };
-        write!(f, "{scheme}://{}{}", self.host_header(), self.target)
+        f.write_str(&self.text())
     }
 }
 
