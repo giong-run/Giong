@@ -1,0 +1,59 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+{{#if db}}
+    services:
+{{#if postgres}}
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: {{crate}}
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+{{/if}}
+{{#if mysql}}
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: {{crate}}
+        ports: ["3306:3306"]
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1 -pmysql" --health-interval 2s --health-timeout 5s --health-retries 60
+{{/if}}
+{{#if redis}}
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 5s --health-retries 30
+{{/if}}
+    env:
+{{#if postgres}}
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/{{crate}}
+{{/if}}
+{{#if mysql}}
+      DATABASE_URL: mysql://root:mysql@127.0.0.1:3306/{{crate}}
+{{/if}}
+{{#if redis}}
+      REDIS_URL: redis://127.0.0.1:6379
+{{/if}}
+{{/if}}
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install stable --profile minimal --component clippy,rustfmt
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo fmt --check
+      - run: cargo clippy --all-targets -- -D warnings
+      # On io_uring, the runner's kernel permitting, then on the epoll driver
+      # that containers with Docker's default seccomp profile get.
+      - run: cargo test
+      - run: cargo test
+        env:
+          GIONG_DRIVER: epoll

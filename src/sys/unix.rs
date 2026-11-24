@@ -194,10 +194,25 @@ fn monotonic_ns() -> u64 {
         .max(1)
 }
 
+/// The handler giong installs for `SIGINT` and `SIGTERM`.
+extern "C" fn on_signal(signal: libc::c_int) {
+    on_shutdown_signal(signal);
+}
+
+/// What the handler does for `SIGINT` and `SIGTERM`: rings the bell that
+/// requests a shutdown, and ends the process on a second signal while that
+/// shutdown has not finished. Also called by the handler of
+/// [`crate::signal`] when that one is installed for these signals, so it
+/// does nothing unless a runtime handles them
+/// ([`Builder::shutdown_on_signals`](crate::Builder::shutdown_on_signals)).
+///
 /// Async-signal-safe: only `clock_gettime(2)` and `write(2)`, with `errno`
 /// preserved, and for a second signal `getpid(2)`, `sigaction(2)` and
 /// `raise(3)` or `_exit(2)`.
-extern "C" fn on_signal(signal: libc::c_int) {
+pub(crate) fn on_shutdown_signal(signal: libc::c_int) {
+    if !SIGNALS_IN_USE.load(Ordering::Acquire) {
+        return;
+    }
     let now = monotonic_ns();
     if let Err(first) = FIRST_SIGNAL.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
     {
@@ -234,7 +249,10 @@ extern "C" fn on_signal(signal: libc::c_int) {
         }
         return;
     }
-    let fd = SIGNAL_FD.load(Ordering::Relaxed);
+    // `Acquire`: `crate::signal` may install its handler before a runtime
+    // creates the bell, so no `sigaction` orders the bell's creation before
+    // this load.
+    let fd = SIGNAL_FD.load(Ordering::Acquire);
     if fd >= 0 {
         let errno = super::errno_location();
         // SAFETY: `errno` is the calling thread's, valid for reads and
@@ -303,12 +321,25 @@ impl SignalGuard {
             libc::sigemptyset(&mut action.sa_mask);
             let mut old_int: libc::sigaction = mem::zeroed();
             let mut old_term: libc::sigaction = mem::zeroed();
-            if libc::sigaction(libc::SIGINT, &action, &mut old_int) != 0 {
+            // Where giong::signal's handler is installed it rings the bell
+            // too (see `on_shutdown_signal`), so it stays: the old action is
+            // then read, not replaced.
+            let int_action = if crate::signal::handled(libc::SIGINT) {
+                std::ptr::null()
+            } else {
+                &action as *const libc::sigaction
+            };
+            let term_action = if crate::signal::handled(libc::SIGTERM) {
+                std::ptr::null()
+            } else {
+                &action as *const libc::sigaction
+            };
+            if libc::sigaction(libc::SIGINT, int_action, &mut old_int) != 0 {
                 let err = io::Error::last_os_error();
                 SIGNALS_IN_USE.store(false, Ordering::SeqCst);
                 return Err(err);
             }
-            if libc::sigaction(libc::SIGTERM, &action, &mut old_term) != 0 {
+            if libc::sigaction(libc::SIGTERM, term_action, &mut old_term) != 0 {
                 let err = io::Error::last_os_error();
                 libc::sigaction(libc::SIGINT, &old_int, std::ptr::null_mut());
                 SIGNALS_IN_USE.store(false, Ordering::SeqCst);
@@ -332,10 +363,16 @@ impl SignalGuard {
 
 impl Drop for SignalGuard {
     fn drop(&mut self) {
-        // SAFETY: restores the dispositions saved in `install`.
+        // SAFETY: restores the dispositions saved in `install`, except where
+        // giong::signal's handler has been installed since (or was before):
+        // it must stay for its listeners.
         unsafe {
-            libc::sigaction(libc::SIGINT, &self.old_int, std::ptr::null_mut());
-            libc::sigaction(libc::SIGTERM, &self.old_term, std::ptr::null_mut());
+            if !crate::signal::handled(libc::SIGINT) {
+                libc::sigaction(libc::SIGINT, &self.old_int, std::ptr::null_mut());
+            }
+            if !crate::signal::handled(libc::SIGTERM) {
+                libc::sigaction(libc::SIGTERM, &self.old_term, std::ptr::null_mut());
+            }
         }
         SIGNALS_IN_USE.store(false, Ordering::SeqCst);
     }

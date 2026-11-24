@@ -20,8 +20,10 @@ mod procs;
 mod project;
 mod record;
 mod report;
+mod scaffold;
 mod service;
 mod sha256;
+mod template;
 mod watch;
 mod web_client;
 

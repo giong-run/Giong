@@ -44,6 +44,50 @@ fn msg_for(i: u32, max: usize) -> Vec<u8> {
         .collect()
 }
 
+/// The descriptors a listener receives in a handshake (the memfd and the
+/// eventfds) are close-on-exec, like every other descriptor here, so a
+/// program this process starts does not inherit them.
+#[test]
+fn an_accepted_channel_s_descriptors_are_close_on_exec() {
+    let path = SockPath::new();
+    giong::block_on(async {
+        let listener = IpcListener::bind(&path.0, 1 << 16).unwrap();
+        let server = giong::spawn(async move { listener.accept().await.unwrap() });
+        let client = ipc::connect(&path.0, 4096).await.unwrap();
+        let channel = server.await.unwrap();
+        // Only memfds and eventfds: other tests of this binary run at the
+        // same time, and what the standard library or the C library opens
+        // for them is not this test's business. Every memfd and eventfd
+        // the tests create themselves is close-on-exec.
+        let mut seen = 0;
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let entry = entry.unwrap();
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            let target = target.to_string_lossy();
+            if !target.starts_with("/memfd:") && target != "anon_inode:[eventfd]" {
+                continue;
+            }
+            let fd: RawFd = entry.file_name().to_str().unwrap().parse().unwrap();
+            // SAFETY: only reads the flags of a descriptor number.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            // Another test may have closed it since.
+            if flags >= 0 {
+                seen += 1;
+                assert_ne!(
+                    flags & libc::FD_CLOEXEC,
+                    0,
+                    "descriptor {fd} ({target}) is inherited by exec"
+                );
+            }
+        }
+        // Both ends of the channel are in this process.
+        assert!(seen >= 2, "found {seen} memfds and eventfds");
+        drop((client, channel));
+    });
+}
+
 #[test]
 fn messages_of_every_size_arrive_in_order_both_ways() {
     let path = SockPath::new();

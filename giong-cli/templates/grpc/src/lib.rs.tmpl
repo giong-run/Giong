@@ -1,0 +1,61 @@
+//! The gRPC service: one method of the `Greeter` trait for each rpc of
+//! `proto/service.proto`.
+
+use giong_grpc::{Code, Reply, Request, Sink, Status};
+
+/// The code `build.rs` generated from `proto/service.proto`.
+pub mod pb {
+    include!(concat!(env!("OUT_DIR"), "/giong_proto.rs"));
+}
+
+use pb::{{crate}}::v1::greeter::Greeter;
+use pb::{{crate}}::v1::{HelloReply, HelloRequest};
+
+/// The most messages `SayHelloMany` sends for one call.
+pub const MAX_COUNT: u32 = 1000;
+
+/// The service. Built once per worker, so it can hold per-worker state
+/// (pools, caches) without locks.
+pub struct Hello;
+
+impl Greeter for Hello {
+    async fn say_hello(
+        &self,
+        request: Request<HelloRequest<'static>>,
+    ) -> Result<Reply<HelloReply<'static>>, Status> {
+        // A view over the bytes received: `name()` borrows from them.
+        let name = request.message()?.name();
+        if name.is_empty() {
+            return Err(Status::new(Code::InvalidArgument, "name must not be empty"));
+        }
+        Reply::new(&HelloReply {
+            message: &format!("Hello, {name}!"),
+            ..Default::default()
+        })
+    }
+
+    async fn say_hello_many(
+        &self,
+        request: Request<HelloRequest<'static>>,
+        mut responses: Sink<HelloReply<'static>>,
+    ) -> Result<(), Status> {
+        let message = request.message()?;
+        if message.count() > MAX_COUNT {
+            return Err(Status::new(
+                Code::InvalidArgument,
+                format!("count must be at most {MAX_COUNT}"),
+            ));
+        }
+        for n in 1..=message.count() {
+            // Waits while the client is slow to read; fails, and ends this
+            // handler, once the client is gone.
+            responses
+                .send(&HelloReply {
+                    message: &format!("Hello, {} ({n})!", message.name()),
+                    ..Default::default()
+                })
+                .await?;
+        }
+        Ok(())
+    }
+}

@@ -9,6 +9,7 @@ use crate::args::{distance, Args, Flag};
 use crate::code::Code;
 use crate::report::{Failure, Report};
 
+pub mod ai;
 pub mod bench;
 pub mod check;
 pub mod clean;
@@ -19,12 +20,15 @@ pub mod devctl;
 pub mod doctor;
 pub mod env;
 pub mod explain;
+pub mod fix;
 pub mod help;
 pub mod image;
 pub mod mcp;
+pub mod new;
 pub mod openapi;
 pub mod record;
 pub mod routes;
+pub mod test;
 pub mod top;
 pub mod version;
 
@@ -50,6 +54,10 @@ pub const COMMANDS: &[&Command] = &[
     &dev::COMMAND,
     &check::COMMAND,
     &doctor::COMMAND,
+    &new::COMMAND,
+    &ai::COMMAND,
+    &fix::COMMAND,
+    &test::COMMAND,
     &bench::COMMAND,
     &db::COMMAND,
     &env::COMMAND,

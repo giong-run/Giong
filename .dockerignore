@@ -1,0 +1,8 @@
+# What `docker build` with the repository as context leaves out
+# (examples/rest-api/Dockerfile): build output and the parts no image needs.
+target/
+**/target/
+.git/
+bench/results/
+site/
+fuzz/

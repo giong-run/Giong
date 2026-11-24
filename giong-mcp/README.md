@@ -57,7 +57,7 @@ In code, `giong_mcp::Config::tcp("127.0.0.1:7777").token(secret).start(&handle)`
 
 | Tool | Answers |
 |---|---|
-| `overview` | The process (resident memory, threads, open descriptors against the limit, uptime), the runtime (workers, shutdown, profiling), each worker's state, I/O driver, live tasks, busy share and polls per second over the last second, and warnings. |
+| `overview` | The process (resident memory, threads, open descriptors against the limit, uptime), the limits a container puts on it (on Linux: CPUs, CPU quota, memory, `pids.max`, soft and hard open files), the runtime (workers and `workers_from`: one per CPU, one per whole CPU of the quota, or set by the program; shutdown, profiling), each worker's state, I/O driver, live tasks, busy share and polls per second over the last second, and warnings. |
 | `workers` | Each worker in detail: counters since start (event-loop turns, polls, sleeps, idle time, spawned tasks), rates over the last second, timers, I/O operations in flight, receive buffers, draining, and the task a blocked worker is stuck in. |
 | `tasks` | Live tasks grouped by the line that spawned them, across workers or for one (`worker`, `limit`). A count that keeps growing at one line is a leak. |
 | `sources` | What registered sources report, summed over workers and per worker: giong-postgres, giong-mysql and giong-redis pools (open, taken, connecting, in flight, waiting, opened, connect errors, timeouts) and anything registered with `giong::observe::register`. |
