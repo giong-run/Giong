@@ -10,6 +10,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [1.4.2] - 2026-11-24
 
+Faster requests and the rest of the fixes from the review of 1.4.0, with nothing new to
+learn. A client request over HTTP/1.1 or HTTP/2 costs about a quarter fewer CPU instructions,
+a giong-web request 13% fewer, a gRPC unary call 22% fewer and an HTTP/3 request 6.6% fewer,
+and giong-quic no longer slows a busy connection for every idle one beside it. On Windows, a
+TCP write to a peer that stopped reading now waits for it instead of handing the kernel the
+whole buffer, timers fire within a millisecond or two instead of 15.6 ms late, and a waiting
+UDP receive holds no buffer. At `max_connections`, giong-http closes the connection idle
+longest for a new client instead of leaving it in the listen queue. Database pools no longer
+open a connection attempt for every call while their server is down, and giong-mysql takes
+turns at `max_prepared_stmt_count` instead of failing. A second Ctrl+C or SIGTERM now ends a
+process whose shutdown hangs. No API is removed or changed.
+
 ### Changed
 
 - **giong-http**: the client no longer copies a request, body included, every time it sends
@@ -26,15 +38,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
   13,711 instructions per query (2.96% fewer) on io_uring, 14,744 to 14,326 on epoll;
   giong-postgres 16 to 14 allocations, instructions unchanged (10,249 to 10,241).
   Both counts include the fake server's own allocations.
-- **giong-http**: at `Server::max_connections`, the server closes the connection that has
-  been idle longest (HTTP/1.1 between requests, HTTP/2 with no request open) when a new
-  client arrives, as nginx does with keep-alive connections, instead of leaving the new
-  client in the listen queue until a connection closes on its own, up to `idle_timeout`
-  later. A client, or many browsers, holding the limit in idle keep-alive connections no
-  longer locks every new client out. A connection receiving or answering a request is never
-  closed for this, nor an HTTP/1.1 connection that has not sent its first request yet, nor
-  one whose next request has already arrived. On Linux and macOS; on Windows the server
-  still waits. It costs an idle connection 16 to 32 bytes and a request under 1% more CPU instructions (`bench/instr`).
+- **giong-http**: at `Server::max_connections`, the server closes the connection that has been
+  idle longest (HTTP/1.1 between requests, HTTP/2 with no request open) when a new client
+  arrives, as nginx does with keep-alive connections, instead of leaving the new client in the
+  listen queue until a connection closes on its own, up to `idle_timeout` later. A client, or
+  many browsers, holding the limit in idle keep-alive connections no longer locks every new
+  client out. A connection receiving or answering a request is never closed for this, nor an
+  HTTP/1.1 connection that has not sent its first request yet, nor one whose next request has
+  already arrived. On Linux and macOS; on Windows the server still waits. It costs an idle
+  connection 16 to 32 bytes and a request under 1% more CPU instructions (`bench/instr`).
   Fixes [#266](https://github.com/giong-run/Giong/issues/266).
 - **giong-grpc**: a unary call costs 22% fewer CPU instructions, client and server counted
   together (88,317 to 68,941 on one worker over loopback). The client no longer copies the
@@ -59,23 +71,23 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 - **giong-http**: a request from the client to the server costs a quarter fewer CPU
   instructions, both ends counted, over HTTP/1.1 and HTTP/2 (`bench/instr`, io_uring:
   `http1-client` 30,851 to 22,570, `h2` 43,481 to 31,631, `h2-streams` 372,328 to 253,593,
-  `https` 42,927 to 34,649; heap allocations per request 33 to 13 over HTTP/1.1 and 48 to
-  29 over HTTP/2). The client no longer formats the URL and the `Host` header with `format!` for every request (four
-  times each), and looks the route's pool up once instead of twice; the HPACK encoder finds
-  a name in the static table with one `match` instead of comparing it with all 61 entries;
-  the HTTP/2 and HTTP/3 servers read a response's header fields without a UTF-8 check and
-  substring searches; the HTTP/2 client keys its streams with a cheap hash of the ids it
-  picks itself instead of SipHash; header names are checked against a table; and a
-  response's first header field is written into a buffer allocated once instead of grown
-  three times. The HTTP/1.1 server alone costs 8% less (`http1` 9,421 to 8,642, heap
-  allocations per request 3 to 1), and a giong-web route 5% less (`web` 13,414 to 12,711, allocations 5 to 3).
-- **giong-web**: a request costs about 8% fewer instructions (the `web` case of
-  `bench/instr`: 12,711 to 11,596 on io_uring, 13,571 to 12,459 on epoll; 7.7% fewer with two
-  middleware, measured before the header-buffer change of `http-request-cost.md`). `Req` is 328 bytes instead of 416 (the first four path parameters are kept
-  inline, more on the heap), `Next::run` starts the next middleware or the handler without
-  an async layer of its own, which each moved the request, and a path parameter is cut from
-  the request target without finding the path again. Routes find `/` with a byte search.
-  ([#331](https://github.com/giong-run/Giong/issues/331)).
+  `https` 42,927 to 34,649; heap allocations per request 33 to 13 over HTTP/1.1 and 48 to 29
+  over HTTP/2). The client no longer formats the URL and the `Host` header with `format!` for
+  every request (four times each), and looks the route's pool up once instead of twice; the
+  HPACK encoder finds a name in the static table with one `match` instead of comparing it with
+  all 61 entries; the HTTP/2 and HTTP/3 servers read a response's header fields without a
+  UTF-8 check and substring searches; the HTTP/2 client keys its streams with a cheap hash of
+  the ids it picks itself instead of SipHash; header names are checked against a table; and a
+  response's first header field is written into a buffer allocated once instead of grown three
+  times. The HTTP/1.1 server alone costs 8% less (`http1` 9,421 to 8,642, heap allocations per
+  request 3 to 1), and a giong-web route 5% less (`web` 13,414 to 12,711, allocations 5 to 3).
+- **giong-web**: a request costs about 8% fewer instructions (the `web` case of `bench/instr`:
+  12,711 to 11,596 on io_uring, 13,571 to 12,459 on epoll; 7.7% fewer with two middleware,
+  measured before the HTTP/1.1 header change above). `Req` is 328 bytes instead of 416 (the
+  first four path parameters are kept inline, more on the heap), `Next::run` starts the next
+  middleware or the handler without an async layer of its own, which each moved the request,
+  and a path parameter is cut from the request target without finding the path again. Routes
+  find `/` with a byte search. ([#331](https://github.com/giong-run/Giong/issues/331)).
 - **giong-http**: `Request::path` and `Request::query` find the path and the query with a
   byte search, and look for a scheme and host only in a target that does not start with
   `/` ([#331](https://github.com/giong-run/Giong/issues/331)).
