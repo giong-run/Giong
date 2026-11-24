@@ -710,6 +710,26 @@ def devkit_band():
 </section>'''
 
 
+def devkit_bench():
+    """The benchmarks page's dev kit section, once a release has the giong command."""
+    if not any(e[0] == "cli" for e in DOCS):
+        return ""
+    d = C.DEVKIT_BENCH
+    blocks = []
+    for t in d["tables"]:
+        head = "".join(f"<th>{h}</th>" for h in t["head"])
+        rows = "".join("<tr>" + "".join(f"<td>{ilm(v)}</td>" for v in r) + "</tr>" for r in t["rows"])
+        blocks.append(
+            f'<h3>{t["title"]}</h3><p>{ilm(t["note"])}</p>'
+            f'<div class="table-scroll" tabindex="0" role="region" aria-label="{html.escape(t["title"])}">'
+            f'<table class="cmp"><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
+            f'<p class="chart-src">Method and raw data: <a href="{BLOB}{t["src"]}">{t["src"]}</a></p>')
+    return f'''<section class="band" id="devkit"><div class="wrap">
+  {head_block("dev kit", d["h2"], d["lede"])}
+  {"".join(blocks)}
+</div></section>'''
+
+
 def next_band():
     """Where the next releases are going: the first milestones that have not shipped."""
     ahead = [m for m in MILESTONES if m["state"] != "done" and m["ver"]][:4]
@@ -1228,10 +1248,23 @@ def doc_page(entry):
     return page, page_md
 
 
+def skill_extra():
+    """{reference name: (path, dir)}: the giong command's README and the guides, when the
+    release has them, so an agent with the skill has the dev kit offline too."""
+    out = {}
+    if any(e[0] == "cli" for e in DOCS):
+        out["giong-cli"] = ("giong-cli/README.md", "giong-cli")
+    for e in DOCS:
+        if e[4] == "Guides":
+            out[e[0].replace("/", "-")] = (e[2], e[3])
+    return out
+
+
 def skill_install():
     s = C.SKILL
-    files = ["SKILL.md", "references/best-practices.md", "references/deployment.md",
-             "references/errors.md"] + [f"references/{e[0]}.md" for e in DOCS if e[6]]
+    files = (["SKILL.md", "references/best-practices.md", "references/deployment.md",
+              "references/errors.md"] + [f"references/{e[0]}.md" for e in DOCS if e[6]]
+             + [f"references/{n}.md" for n in skill_extra()])
     tree = "giong/\n" + "\n".join(f"  {f}" for f in files)
     return f'''<section class="skill">
   <div class="skill-cta">
@@ -1271,6 +1304,10 @@ def skill_zip():
     for e in DOCS:
         if e[6]:
             files[f"giong/references/{e[0]}.md"] = absolute_links(released(e[2]), e[3])
+    for name, (path, d) in skill_extra().items():
+        text = released(path)
+        if text is not None:
+            files[f"giong/references/{name}.md"] = absolute_links(text, d)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name in sorted(files):
@@ -1659,6 +1696,7 @@ def benchmarks():
   <div class="charts">{charts}</div>
 </div></section>
 {build_band()}
+{devkit_bench()}
 <section class="band" id="caveats"><div class="wrap caveats">
   <h2>What these numbers do not show</h2>
   <ul>{caveats}</ul>
@@ -2123,13 +2161,14 @@ def llms_full():
     docs += [(f"{d}/README.md", d) for _, d in released_crates() if d != "."]
     docs.insert(1, ("docs/BEST_PRACTICES.md", "docs"))
     docs += [(f"examples/{C.SERVICE[0]}/README.md", f"examples/{C.SERVICE[0]}")]
+    docs += [(e[2], e[3]) for e in DOCS if e[4] == "Guides"]
     docs += [("docs/DEPLOYMENT.md", "docs"), ("docs/errors/README.md", "docs/errors")]
     index = released("docs/errors/README.md") or ""
     docs += [(f"docs/errors/{page}", "docs/errors")
              for page in dict.fromkeys(re.findall(r"\]\((E\d{4}\.md)\)", index))]
     parts = [f"""# giong {VERSION}: the documentation in one file
 
-> The README of every crate and of the example service, the best practices, the deployment notes and every
+> The README of every crate and of the example service, the best practices, the guides, the deployment notes and every
 > error code page of giong {VERSION}, as released in {TAG}. Links point at the same
 > release. The short index is {SITE}llms.txt.
 """]

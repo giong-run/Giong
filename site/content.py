@@ -346,6 +346,29 @@ DEVKIT = dict(
     ],
 )
 
+# The benchmarks page's dev kit section; every number from the folder in `src`.
+DEVKIT_BENCH = dict(
+    h2="The dev kit, measured",
+    lede="What `giong dev` and a project from `giong new` cost and save, from runs whose raw output is in the repository.",
+    tables=[
+        dict(title="Restarts under load",
+             note=("`giong dev` saved 100 times while 16 clients kept opening new connections; Linux 6.18 "
+                   "VM, 4 vCPU, io_uring. Not measured on epoll."),
+             head=["Requests", "Failed", "Save to serving, median", "p90"],
+             rows=[["102,061", "0", "0.752 s", "0.789 s"]],
+             src="bench/results/dev-restarts/README.md"),
+        dict(title="The dev profile of a new project",
+             note=("`giong new shop --db postgres,redis --tls` against the same project with Cargo's "
+                   "default profile; median of three interleaved rounds. A debugger shows no variable "
+                   "values in dependency frames."),
+             head=["", "Cargo's default", "`giong new` profile", "Change"],
+             rows=[["Clean debug build", "15.33 s", "12.61 s", "-18%"],
+                   ["Target directory", "640 MB", "296 MB", "-54%"],
+                   ["Rebuild after a one-line change", "0.57 s", "0.44 s", "-23%"]],
+             src="bench/results/devkit/template-profile/README.md"),
+    ],
+)
+
 BUILD = dict(
     h2="Light enough to build in seconds",
     lede=("giong's stack is its own crates, with no macros in the runtime or the framework. The "
@@ -767,6 +790,15 @@ DOC_PAGES = [
     ("guides/safe-defaults", "Safe defaults of the dev kit", "docs/guides/safe-defaults.md", "Guides",
      "What the `giong` command keeps safe by default: loopback only, a dashboard token, secrets out "
      "of recordings, read-only agents, development code out of production."),
+    ("guides/database", "Use a database", "docs/guides/database.md", "Guides",
+     "A development database in one command, forward-only migrations, and one pool per worker."),
+    ("guides/testing", "Test a service", "docs/guides/testing.md", "Guides",
+     "Async unit tests, handler tests without a socket, recorded requests replayed, and `giong test` "
+     "on both drivers."),
+    ("guides/ship", "Ship a service", "docs/guides/ship.md", "Guides",
+     "Measure the change, build an image without Docker, and the few settings production needs."),
+    ("guides/from-tokio", "Coming from Tokio", "docs/guides/from-tokio.md", "Guides",
+     "The runtime model, Tokio's names in giong, and the giong crate for each job."),
     ("deployment", "Deployment", "docs/DEPLOYMENT.md", "Operate",
      "io_uring in Docker, Docker Compose and Kubernetes, the locked-memory limit, kernel quirks, "
      "restarting on the same port."),
@@ -810,10 +842,16 @@ CLI_LLMS = """`giong` (`curl -fsSL https://giong.run/install.sh | sh`, or `cargo
 starts, runs, checks and ships a giong service. Every command takes `--json` and answers with
 one document whose findings carry a `GIONG-E` code, the place in the source, the cause and the
 fix; exit status 0 (nothing wrong), 1 (an error found) or 2 (the command could not run).
-To develop, a project has one runner: `giong dev --background` once (it returns when the service
-serves on 127.0.0.1 and rebuilds on every save), then `giong dev status --json` and
-`giong dev logs`, and `giong dev stop` at the end. Not `cargo run`, a release build, Docker or a
-second terminal. Run `giong check --json` before calling a change done."""
+
+Local development is one runner per project, like `npm run dev`:
+- `giong dev --background` at the start: it builds, starts the service, waits until it serves,
+  prints `http://127.0.0.1:PORT` and returns (or reports the one already running for the project).
+- Edit the code: the runner rebuilds and swaps the service by itself. Test with `curl` on that
+  address.
+- `giong dev status --json` gives `state`, `urls` and the last build's first error
+  (`build.error`); `giong dev logs` the service's output; `giong dev stop` at the end.
+- Never `cargo run`, `cargo build --release`, Docker or a second terminal for the service.
+- Run `giong check --json` before calling a change done."""
 CLI_TASKS = [
     ("Start a project", "giong new api --template web --db postgres", "new"),
     ("Teach the project to coding agents", "giong ai init", "ai"),
