@@ -117,16 +117,19 @@ impl Code {
     }
 
     /// The number, such as 5000.
+    #[allow(dead_code)] // read by giong ai and new (#217)
     pub fn number(self) -> u16 {
         self.number
     }
 
     /// The name, such as `Usage`; empty for a runtime code.
+    #[allow(dead_code)] // read by giong ai and new (#217)
     pub fn name(self) -> &'static str {
         self.name
     }
 
     /// The one-line summary.
+    #[allow(dead_code)] // read by giong ai and new (#217)
     pub fn summary(self) -> &'static str {
         self.summary
     }

@@ -111,16 +111,13 @@ impl Dashboard {
         Err(last.unwrap_or_else(|| io::Error::from(io::ErrorKind::AddrInUse)))
     }
 
-    pub fn local_addr(&self) -> SocketAddr {
-        self.addr
-    }
-
     /// The address to open in a browser, with this start's token.
     pub fn url(&self) -> String {
         format!("http://{}/#t={}", self.addr, self.token)
     }
 
     /// The token the API needs in `X-Giong-Dashboard`.
+    #[cfg(test)]
     pub fn token(&self) -> &str {
         &self.token
     }

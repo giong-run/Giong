@@ -221,14 +221,6 @@ pub fn run(
     Ok(out)
 }
 
-/// Whether a missing value is a missing environment variable.
-pub fn env_missing(m: &Missing) -> Option<&str> {
-    match m {
-        Missing::Env(v) => Some(v),
-        _ => None,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::super::case::{Expect, Request};

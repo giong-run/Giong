@@ -38,11 +38,6 @@ impl Side {
             .find(|(n, _)| n == name)
             .map(|(_, v)| v.as_str())
     }
-
-    /// Whether the body was recorded whole.
-    pub fn complete(&self) -> bool {
-        !self.truncated && !self.streamed
-    }
 }
 
 /// One recorded request and its answer.
