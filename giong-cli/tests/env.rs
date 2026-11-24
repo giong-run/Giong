@@ -30,7 +30,14 @@ impl Project {
     fn giong(&self, args: &[&str], env: &[(&str, &str)]) -> (i32, Value) {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_giong"));
         cmd.args(args).arg("--json").current_dir(&self.dir);
-        for k in ["PORT", "DATABASE_URL", "API_TOKEN", "EXTRA"] {
+        for k in [
+            "PORT",
+            "DATABASE_URL",
+            "API_TOKEN",
+            "EXTRA",
+            "SECRET",
+            "CLOUD_ID",
+        ] {
             cmd.env_remove(k);
         }
         for (k, v) in env {
@@ -149,6 +156,20 @@ fn show_masks_secrets_and_names_sources() {
     assert_eq!(key(&v, "PORT")["value"], "2", "the last .env line wins");
     assert_eq!(key(&v, "API_TOKEN")["value"], "abc def");
 
+    // A committed .env.example can list any key: a value only the process
+    // environment holds is shown as set, whatever its name, unless revealed.
+    p.write(
+        ".env.example",
+        "PORT=\nDATABASE_URL=\nAPI_TOKEN=\nCLOUD_ID=\n",
+    );
+    let (_, v) = p.giong(&["env"], &[("CLOUD_ID", "abc123")]);
+    assert_eq!(key(&v, "CLOUD_ID")["source"], "environment");
+    assert_eq!(key(&v, "CLOUD_ID")["value"], "*** (set in the environment)");
+    assert!(!v.to_string().contains("abc123"));
+    let (_, v) = p.giong(&["env", "--reveal"], &[("CLOUD_ID", "abc123")]);
+    assert_eq!(key(&v, "CLOUD_ID")["value"], "abc123");
+    p.write(".env.example", "PORT=\nDATABASE_URL=\nAPI_TOKEN=\n");
+
     let (code, v) = p.giong(&["env", "check"], &[]);
     assert_eq!(code, 0, "{v}");
     assert_eq!(
@@ -205,4 +226,26 @@ fn bad_lines_and_usage_mistakes() {
         assert_eq!(code, 2, "{args:?}: {v}");
         assert_eq!(v["error"]["code"], "GIONG-E5000", "{args:?}");
     }
+}
+
+/// A cloned repository can commit `.env -> ~/.aws/credentials`: giong env
+/// neither reads nor writes through it.
+#[cfg(unix)]
+#[test]
+fn a_linked_dotenv_is_refused() {
+    let p = Project::new("linked");
+    let outside = p.dir.with_extension("outside");
+    std::fs::write(&outside, "SECRET=hunter2\n").unwrap();
+    p.write(".env.example", "SECRET=\n");
+    std::os::unix::fs::symlink(&outside, p.dir.join(".env")).unwrap();
+    for args in [&["env"][..], &["env", "init"], &["env", "get", "SECRET"]] {
+        let (code, v) = p.giong(args, &[]);
+        assert_eq!(code, 2, "{args:?}: {v}");
+        assert!(!v.to_string().contains("hunter2"), "{v}");
+    }
+    assert_eq!(
+        std::fs::read_to_string(&outside).unwrap(),
+        "SECRET=hunter2\n"
+    );
+    std::fs::remove_file(&outside).unwrap();
 }

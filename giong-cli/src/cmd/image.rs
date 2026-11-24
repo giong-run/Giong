@@ -414,7 +414,30 @@ fn collect(root: &Path, rel: &str, out: &mut Vec<Entry>) -> Result<(), Failure> 
         return Err(bad(format!("{rel:?} is not a path inside the project")));
     }
     let full = root.join(p);
-    let meta = std::fs::metadata(&full).map_err(|e| bad(format!("{rel}: {e}")))?;
+    let mut meta = std::fs::symlink_metadata(&full).map_err(|e| bad(format!("{rel}: {e}")))?;
+    if meta.file_type().is_symlink() {
+        // A cloned repository can commit a link to any file on this machine
+        // (static/x -> ~/.ssh/id_rsa): only a link to a file inside the
+        // project goes in, as a copy of that file.
+        let target = std::fs::canonicalize(&full).map_err(|e| bad(format!("{rel}: {e}")))?;
+        let inside = std::fs::canonicalize(root).is_ok_and(|r| target.starts_with(r));
+        meta = std::fs::metadata(&target).map_err(|e| bad(format!("{rel}: {e}")))?;
+        if !inside || !meta.is_file() {
+            return Err(Failure::new(
+                Code::IMAGE_ADD,
+                format!(
+                    "{rel} is a link to {}, {}",
+                    target.display(),
+                    if inside {
+                        "a folder"
+                    } else {
+                        "outside the project"
+                    }
+                ),
+                "giong image adds a link only when it points at a file inside the project: replace the link with the files, or leave it out of --add",
+            ));
+        }
+    }
     let clean: String = p
         .components()
         .filter_map(|c| match c {
@@ -764,7 +787,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
         ))?,
     };
     let port = port_flag.unwrap_or_else(|| {
-        std::fs::read_to_string(root.join(".env.example"))
+        crate::state::read_to_string(&root.join(".env.example"))
             .ok()
             .and_then(|t| port_from_example(&t))
             .unwrap_or(8080)
@@ -1185,6 +1208,44 @@ mod tests {
             at += 512 + size.div_ceil(512) * 512;
         }
         out
+    }
+
+    /// A cloned repository can commit `static/key -> ~/.ssh/id_rsa`: only a
+    /// link to a file inside the project goes into the image.
+    #[cfg(unix)]
+    #[test]
+    fn links_out_of_the_project_stay_out_of_the_image() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("giongimagelinks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("proj");
+        std::fs::create_dir_all(root.join("static")).unwrap();
+        std::fs::write(base.join("id_rsa"), "secret").unwrap();
+        std::fs::write(root.join("static/a.txt"), "a").unwrap();
+        symlink("a.txt", root.join("static/b.txt")).unwrap();
+        let mut out = Vec::new();
+        collect(&root, "static", &mut out).unwrap();
+        let paths: Vec<_> = out.iter().map(|e| e.path.as_str()).collect();
+        assert_eq!(
+            paths,
+            ["app/static", "app/static/a.txt", "app/static/b.txt"]
+        );
+
+        symlink(base.join("id_rsa"), root.join("static/key")).unwrap();
+        let e = collect(&root, "static", &mut Vec::new()).unwrap_err();
+        assert_eq!(e.code, Code::IMAGE_ADD);
+        assert!(e.what.contains("outside the project"), "{}", e.what);
+        std::fs::remove_file(root.join("static/key")).unwrap();
+
+        // A link to a folder is refused even inside: it can loop.
+        symlink(".", root.join("static/loop")).unwrap();
+        let e = collect(&root, "static", &mut Vec::new()).unwrap_err();
+        assert!(e.what.contains("a folder"), "{}", e.what);
+        std::fs::remove_file(root.join("static/loop")).unwrap();
+
+        symlink(&base, root.join("up")).unwrap();
+        assert!(collect(&root, "up", &mut Vec::new()).is_err());
+        std::fs::remove_dir_all(&base).unwrap();
     }
 
     #[test]

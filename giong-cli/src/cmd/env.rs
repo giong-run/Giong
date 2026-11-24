@@ -29,11 +29,13 @@ pub const COMMAND: Command = Command {
             with no value anywhere is an error (GIONG-E5016), a key only in .env is a \
             warning (add it to .env.example so others know), a line .env cannot parse is an \
             error. init: writes .env from .env.example when there is none. get: one value, \
-            the environment first, then .env (for scripts: giong env get DATABASE_URL).",
+            the environment first, then .env (for scripts: giong env get DATABASE_URL). \
+            show prints a value that only the environment sets as set, without the value, \
+            unless --reveal is given.",
     flags: &[Flag {
         name: "reveal",
         kind: Kind::Switch,
-        help: "show: print secret values instead of masking them",
+        help: "show: print secret values, and values only the environment sets, instead of masking them",
     }],
     max_words: 2,
     run,
@@ -144,6 +146,9 @@ pub fn shown(key: &str, value: &str, reveal: bool) -> String {
     value.to_string()
 }
 
+/// What `show` prints for a value only the process environment sets.
+const ENV_ONLY: &str = "*** (set in the environment)";
+
 /// Where a key's value comes from.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Source {
@@ -207,10 +212,20 @@ fn root() -> Result<std::path::PathBuf, Failure> {
     })
 }
 
-fn read(path: &Path) -> (Vec<Var>, Vec<dotenv::BadLine>, bool) {
-    match dotenv::read(path) {
-        Some((v, b)) => (v, b, true),
-        None => (Vec::new(), Vec::new(), false),
+/// The variables of a `.env`-style file, never read through a link (a
+/// cloned repository can commit `.env -> ~/.aws/credentials`).
+fn read(path: &Path) -> Result<(Vec<Var>, Vec<dotenv::BadLine>, bool), Failure> {
+    match crate::state::read_to_string(path) {
+        Ok(text) => {
+            let (v, b) = dotenv::parse(&text);
+            Ok((v, b, true))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok((Vec::new(), Vec::new(), false)),
+        Err(e) => Err(Failure::new(
+            Code::USAGE,
+            format!("cannot read {}: {e}", path.display()),
+            "make it a plain file in the project",
+        )),
     }
 }
 
@@ -221,8 +236,8 @@ fn process_env(key: &str) -> Option<String> {
 fn run(args: &Args) -> Result<Report, Failure> {
     let sub = args.words.first().map(String::as_str).unwrap_or("show");
     let root = root()?;
-    let (example, bad_example, has_example) = read(&root.join(".env.example"));
-    let (dot, bad_dot, has_dot) = read(&root.join(".env"));
+    let (example, bad_example, has_example) = read(&root.join(".env.example"))?;
+    let (dot, bad_dot, has_dot) = read(&root.join(".env"))?;
     let mut r = Report::new("env");
     r.data("action", json!(sub));
     match sub {
@@ -238,17 +253,18 @@ fn run(args: &Args) -> Result<Report, Failure> {
                      and commit it",
                 ));
             } else {
-                let text = std::fs::read_to_string(root.join(".env.example")).unwrap_or_default();
+                let text =
+                    crate::state::read_to_string(&root.join(".env.example")).unwrap_or_default();
                 let path = root.join(".env");
-                std::fs::write(&path, text).map_err(|e| {
+                // .env will hold secrets: owner-only, never committed, and
+                // never written through a link.
+                crate::state::replace_private(&path, text.as_bytes()).map_err(|e| {
                     Failure::new(
                         Code::USAGE,
                         format!("cannot write {}: {e}", path.display()),
                         "check that the project directory is writable",
                     )
                 })?;
-                // .env will hold secrets: owner-only, and never committed.
-                super::db::restrict(&path);
                 let ignored = super::db::ignore_secrets(&root)?;
                 r.line("wrote .env from .env.example; fill in the empty values.");
                 if !ignored.is_empty() {
@@ -315,7 +331,18 @@ fn run(args: &Args) -> Result<Report, Failure> {
             Source::DotEnv(v) => (".env", Some(v.as_str())),
             Source::Missing => ("missing", None),
         };
-        let show = value.map(|v| shown(&row.key, v, reveal));
+        // A committed .env.example chooses which keys are listed, so a value
+        // that only the process environment holds (AWS_ACCESS_KEY_ID, or
+        // anything the name check misses) is not printed unless asked for.
+        let env_only =
+            matches!(row.source, Source::Environment(_)) && !dot.iter().any(|d| d.key == row.key);
+        let show = value.map(|v| {
+            if env_only && !reveal {
+                ENV_ONLY.to_string()
+            } else {
+                shown(&row.key, v, reveal)
+            }
+        });
         if sub == "show" {
             r.line(format!(
                 "{:width$}  {:<11}  {}",

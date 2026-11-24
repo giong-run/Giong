@@ -32,6 +32,7 @@ use crate::dotenv;
 use crate::project::find_manifest_dir;
 use crate::report::{Failure, Finding, Report, Severity};
 use crate::sha256;
+use crate::state;
 
 pub const COMMAND: Command = Command {
     name: "db",
@@ -259,14 +260,19 @@ pub fn read_state(root: &Path) -> Vec<Started> {
 /// The entries of `.giong/db.json` that are left out, with why. A cloned
 /// repository can commit that file, and its fields name the program run, the
 /// volume mounted, the image started and the database dropped.
-pub fn rejected_state(root: &Path) -> Vec<(Engine, String)> {
+pub fn rejected_state(root: &Path) -> Vec<(Option<Engine>, String)> {
     load_state(root).1
 }
 
-fn load_state(root: &Path) -> (Vec<Started>, Vec<(Engine, String)>) {
+fn load_state(root: &Path) -> (Vec<Started>, Vec<(Option<Engine>, String)>) {
     let (mut good, mut bad) = (Vec::new(), Vec::new());
-    let Ok(text) = std::fs::read_to_string(state_path(root)) else {
-        return (good, bad);
+    let text = match state::read_to_string(&state_path(root)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return (good, bad),
+        Err(e) => {
+            bad.push((None, format!("it cannot be read: {e}")));
+            return (good, bad);
+        }
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
         return (good, bad);
@@ -277,10 +283,10 @@ fn load_state(root: &Path) -> (Vec<Started>, Vec<(Engine, String)>) {
             continue;
         }
         match Started::from_json(e, &v[e.name()]) {
-            None => bad.push((e, "it lacks fields giong db up writes".to_string())),
+            None => bad.push((Some(e), "it lacks fields giong db up writes".to_string())),
             Some(s) => match s.problem(&project, root) {
                 None => good.push(s),
-                Some(why) => bad.push((e, why)),
+                Some(why) => bad.push((Some(e), why)),
             },
         }
     }
@@ -336,34 +342,19 @@ fn write_state(root: &Path, all: &[Started]) -> Result<(), Failure> {
         m.insert(s.engine.name().into(), s.to_json());
     }
     let path = state_path(root);
+    // Never through a link: the project can come from a cloned repository.
     let write = || -> std::io::Result<()> {
-        std::fs::create_dir_all(path.parent().expect("parent"))?;
+        state::ensure(root)?;
         if all.is_empty() {
             match std::fs::remove_file(&path) {
                 Err(e) if e.kind() != std::io::ErrorKind::NotFound => return Err(e),
                 _ => return Ok(()),
             }
         }
-        let tmp = path.with_extension("json.tmp");
-        std::fs::write(
-            &tmp,
-            serde_json::to_string_pretty(&Value::Object(m))? + "\n",
-        )?;
-        restrict(&tmp);
-        std::fs::rename(&tmp, &path)
+        let text = serde_json::to_string_pretty(&Value::Object(m))? + "\n";
+        state::replace_private(&path, text.as_bytes())
     };
     write().map_err(|e| io_failure(&path, e))
-}
-
-/// Makes a file that holds a password readable by its owner only.
-pub(crate) fn restrict(path: &Path) {
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
-    }
-    #[cfg(not(unix))]
-    let _ = path;
 }
 
 fn io_failure(path: &Path, e: std::io::Error) -> Failure {
@@ -881,7 +872,9 @@ fn runner(root: &Path, want: Option<Engine>) -> Result<Runner, Failure> {
         .ok()
         .filter(|u| !u.is_empty())
         .or_else(|| {
-            dotenv::read(&root.join(".env"))
+            state::read_to_string(&root.join(".env"))
+                .ok()
+                .map(|t| dotenv::parse(&t))
                 .and_then(|(vars, _)| vars.into_iter().find(|v| v.key == key).map(|v| v.value))
                 .filter(|u| !u.is_empty())
         });
@@ -1205,14 +1198,17 @@ pub fn error_line(stderr: &str) -> Option<u32> {
 /// and leaves every other line as it is.
 pub fn set_env(root: &Path, key: &str, value: &str) -> Result<(), Failure> {
     let path = root.join(".env");
-    let text = match std::fs::read_to_string(&path) {
+    // Neither file is read or written through a link: a cloned repository
+    // can commit .env -> ~/.bashrc.
+    let text = match state::read_to_string(&path) {
         Ok(t) => t,
-        Err(_) => std::fs::read_to_string(root.join(".env.example")).unwrap_or_default(),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            state::read_to_string(&root.join(".env.example")).unwrap_or_default()
+        }
+        Err(e) => return Err(io_failure(&path, e)),
     };
     let new = set_env_text(&text, key, value);
-    std::fs::write(&path, new).map_err(|e| io_failure(&path, e))?;
-    restrict(&path);
-    Ok(())
+    state::replace_private(&path, new.as_bytes()).map_err(|e| io_failure(&path, e))
 }
 
 pub fn set_env_text(text: &str, key: &str, value: &str) -> String {
@@ -1244,7 +1240,11 @@ pub fn set_env_text(text: &str, key: &str, value: &str) -> String {
 /// hold the database's password.
 pub(crate) fn ignore_secrets(root: &Path) -> Result<Vec<String>, Failure> {
     let path = root.join(".gitignore");
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
+    let text = match state::read_to_string(&path) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(io_failure(&path, e)),
+    };
     let has = |p: &str| {
         text.lines().any(|l| {
             l.trim() == p || l.trim() == format!("/{p}") || l.trim() == p.trim_end_matches('/')
@@ -1263,7 +1263,7 @@ pub(crate) fn ignore_secrets(root: &Path) -> Result<Vec<String>, Failure> {
         }
     }
     if !added.is_empty() {
-        std::fs::write(&path, new).map_err(|e| io_failure(&path, e))?;
+        state::replace(&path, new.as_bytes()).map_err(|e| io_failure(&path, e))?;
     }
     Ok(added)
 }
@@ -1806,6 +1806,8 @@ fn new_migration(args: &Args, root: &Path, rep: &mut Report) -> Result<(), Failu
     let files = read_migrations(&dir)?;
     let next = files.last().map_or(1, |m| m.version + 1);
     let file = format!("{next:04}_{name}.sql");
+    // A linked migrations folder would put the file somewhere else.
+    state::check_dir(&dir).map_err(|e| io_failure(&dir, e))?;
     std::fs::create_dir_all(&dir).map_err(|e| io_failure(&dir, e))?;
     let path = dir.join(&file);
     let text = format!(
@@ -1886,10 +1888,12 @@ fn run(args: &Args) -> Result<Report, Failure> {
             Finding::new(
                 Code::DB_NOT_MANAGED,
                 Severity::Warning,
-                format!(
-                    "the {} entry of .giong/db.json is ignored: {why}",
-                    engine.name()
-                ),
+                match engine {
+                    Some(e) => {
+                        format!("the {} entry of .giong/db.json is ignored: {why}", e.name())
+                    }
+                    None => format!(".giong/db.json is ignored: {why}"),
+                },
             )
             .detail(
                 "giong db up never writes such an entry; a cloned repository can commit one to \
@@ -1942,6 +1946,57 @@ fn run(args: &Args) -> Result<Report, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A cloned repository can commit `.env` or the state file's temporary
+    /// name as a link: giong db never writes through one.
+    #[cfg(unix)]
+    #[test]
+    fn links_in_the_project_are_not_written_through() {
+        use std::os::unix::fs::symlink;
+        let base = std::env::temp_dir().join(format!("giongdblinks-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&base);
+        let root = base.join("proj");
+        std::fs::create_dir_all(root.join(".giong")).unwrap();
+        let target = base.join("bashrc");
+        std::fs::write(&target, "mine").unwrap();
+
+        symlink(&target, root.join(".env")).unwrap();
+        assert!(set_env(&root, "DATABASE_URL", "postgres://h/d").is_err());
+        assert!(ignore_secrets(&root).is_ok());
+        std::fs::remove_file(root.join(".env")).unwrap();
+
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
+        symlink(&target, root.join(".gitignore")).unwrap();
+        assert!(ignore_secrets(&root).is_err());
+        std::fs::remove_file(root.join(".gitignore")).unwrap();
+
+        let tmp = format!("db.json.{}", std::process::id());
+        symlink(&target, root.join(".giong").join(&tmp)).unwrap();
+        let s = Started {
+            engine: Engine::Postgres,
+            runtime: "docker".into(),
+            container: "c".into(),
+            volume: "v".into(),
+            image: "postgres:17".into(),
+            port: 5432,
+            user: "u".into(),
+            password: "p".into(),
+            database: "d".into(),
+        };
+        write_state(&root, &[s]).unwrap();
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        assert!(!std::fs::symlink_metadata(state_path(&root))
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        // A linked .giong folder is refused outright.
+        std::fs::remove_dir_all(root.join(".giong")).unwrap();
+        symlink(&base, root.join(".giong")).unwrap();
+        assert!(write_state(&root, &[]).is_err());
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "mine");
+        std::fs::remove_dir_all(&base).unwrap();
+    }
 
     #[test]
     fn migration_names() {

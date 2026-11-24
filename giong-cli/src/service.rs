@@ -95,7 +95,7 @@ pub struct DevState {
 impl DevState {
     /// Reads `.giong/dev.json` under `root`; `None` when there is none.
     pub fn read(root: &Path) -> Option<DevState> {
-        let text = std::fs::read_to_string(root.join(".giong").join("dev.json")).ok()?;
+        let text = crate::state::read_to_string(&root.join(".giong").join("dev.json")).ok()?;
         let v: Value = serde_json::from_str(&text).ok()?;
         let path = |k: &str| v[k].as_str().filter(|s| !s.is_empty()).map(PathBuf::from);
         Some(DevState {

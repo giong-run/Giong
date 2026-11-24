@@ -28,6 +28,8 @@ serde_json = "1"
 # inheritable for the spawn only, without `unsafe` here.
 [target.'cfg(unix)'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }
+# O_NOFOLLOW for giong's own files in .giong (src/state.rs); socket2 uses it too.
+libc = "0.2"
 
 [lints.rust]
 unsafe_code = "forbid"
