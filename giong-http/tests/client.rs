@@ -371,9 +371,79 @@ fn a_kept_alive_connection_closing_as_the_request_goes_is_retried_only_when_safe
         client.post(&base2).send().await.unwrap();
         let e = client.post(&base2).send().await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Closed);
-        assert!(e.to_string().contains("not sent again by itself"), "{e}");
+        let text = e.to_string();
+        assert!(text.contains("not sent again by itself"), "{e}");
+        // The code and its link are said once, at the start and the end.
+        assert!(text.starts_with("GIONG-E1106: POST "), "{e}");
+        assert_eq!(text.matches("GIONG-E1106").count(), 1, "{e}");
+        assert_eq!(text.matches(" See https://").count(), 1, "{e}");
         assert!(e.is_transient());
         let _ = base;
+    });
+}
+
+#[test]
+fn an_answer_sent_before_the_body_was_read_is_the_response() {
+    giong::block_on(async {
+        // The server answers 413 as soon as it sees the head, and closes
+        // without reading the 20 MB body: sending the rest fails, and the
+        // answer is what the client gets, not the broken pipe.
+        let base = scripted(|_, stream| async move {
+            let chunk = stream.recv().await.unwrap();
+            assert!(chunk.starts_with(b"POST "));
+            write(
+                &stream,
+                b"HTTP/1.1 413 Content Too Large\r\nContent-Length: 8\r\n\
+                  Connection: close\r\n\r\ntoo big!",
+            )
+            .await;
+        });
+        let client = Client::new();
+        let body = vec![b'x'; 20 << 20];
+        let response = client.post(&base).body(body).send().await.unwrap();
+        assert_eq!(response.status(), 413);
+        assert_eq!(response.text().unwrap(), "too big!");
+
+        // A 408 on a kept-alive connection is the server closing it while
+        // idle, before it read the request: that request is sent again on
+        // a new connection, when it is safe to.
+        let base = scripted(|n, stream| async move {
+            let mut buf = Vec::new();
+            if n == 0 {
+                read_request(&stream, &mut buf).await;
+                write(
+                    &stream,
+                    b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\n\r\nfirst",
+                )
+                .await;
+                let _ = stream.recv().await;
+                write(
+                    &stream,
+                    b"HTTP/1.1 408 Request Timeout\r\nContent-Length: 0\r\n\
+                      Connection: close\r\n\r\n",
+                )
+                .await;
+            } else {
+                // The request sent again carries the whole body.
+                let request = read_request(&stream, &mut buf).await.unwrap();
+                let body = &request[request.find("\r\n\r\n").unwrap() + 4..];
+                let answer = format!("retry {} {}", body.len(), body.bytes().all(|b| b == b'x'));
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\n\r\n",
+                    answer.len()
+                );
+                write(&stream, (head + &answer).as_bytes()).await;
+            }
+        });
+        assert_eq!(
+            client.put(&base).send().await.unwrap().text().unwrap(),
+            "first"
+        );
+        let response = client.put(&base).body(vec![b'x'; 20 << 20]).send();
+        assert_eq!(
+            response.await.unwrap().text().unwrap(),
+            format!("retry {} true", 20 << 20)
+        );
     });
 }
 

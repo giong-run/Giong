@@ -500,6 +500,21 @@ fn handlers_see_the_client_address_over_tls() {
     assert_eq!(c.reply().text(), expected);
 }
 
+/// At the limit, an idle TLS connection makes room for a new client: it
+/// ends its session cleanly.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_an_idle_tls_connection_makes_room() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut first = server.client();
+    first.send("GET /first HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(first.reply().text(), "GET /first body=");
+    let mut second = server.client();
+    second.send("GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(second.reply().text(), "GET /second body=");
+    first.expect_closed();
+}
+
 #[test]
 fn the_connection_limit_counts_tls_connections() {
     let server = TestServer::start(Server::new().max_connections(1), echo);

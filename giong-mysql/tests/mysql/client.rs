@@ -458,6 +458,37 @@ fn a_cached_statement_follows_schema_changes() {
         let row = client.query_one(sql, &[]).await.unwrap();
         assert_eq!(row.len(), 2);
         assert_eq!(row.columns()[1].name(), "b");
+        // A run that describes the same columns as the last one shares
+        // them; any change shows, wherever it is.
+        let names = |row: &giong_mysql::Row| -> Vec<String> {
+            row.columns().iter().map(|c| c.name().to_owned()).collect()
+        };
+        let again = client.query_one(sql, &[]).await.unwrap();
+        assert_eq!(names(&again), ["a", "b"]);
+        assert!(std::ptr::eq(row.columns(), again.columns()));
+        for (alter, want) in [
+            ("RENAME COLUMN b TO c", &["a", "c"][..]),
+            ("RENAME COLUMN a TO z", &["z", "c"][..]),
+            ("DROP COLUMN c", &["z"][..]),
+            ("ADD COLUMN d INT FIRST", &["d", "z"][..]),
+        ] {
+            client
+                .batch_execute(&format!("ALTER TABLE schema_change {alter}"))
+                .await
+                .unwrap();
+            let row = client.query_one(sql, &[]).await.unwrap();
+            assert_eq!(names(&row), want, "{alter}");
+        }
+        let row = client.query_one(sql, &[]).await.unwrap();
+        assert_eq!(row.get::<Option<i32>>(0).unwrap(), None);
+        assert_eq!(row.get::<i32>(1).unwrap(), 1);
+        // A type change with the same name shows too.
+        client
+            .batch_execute("ALTER TABLE schema_change MODIFY COLUMN z BIGINT")
+            .await
+            .unwrap();
+        let row = client.query_one(sql, &[]).await.unwrap();
+        assert_eq!(row.get::<i64>(1).unwrap(), 1);
     });
 }
 
@@ -952,12 +983,14 @@ fn a_statement_given_up_inside_a_transaction_stops_the_commit() {
         tx.execute("INSERT INTO given_up VALUES (1)", &[])
             .await
             .unwrap();
+        // Prepared now, so that the timed run below is sent at its first
+        // poll: a statement given up while it is still being prepared never
+        // ran, and rightly leaves the transaction free to commit. On a busy
+        // machine the prepare alone can take the 20 ms.
+        let sleepy = "INSERT INTO given_up SELECT SLEEP(?) + 2";
+        tx.execute(sleepy, &[&0.0f64]).await.unwrap();
         // It still runs on the server, after the caller stopped waiting.
-        let late = timeout(
-            Duration::from_millis(20),
-            tx.execute("INSERT INTO given_up SELECT SLEEP(0.2) + 2", &[]),
-        )
-        .await;
+        let late = timeout(Duration::from_millis(20), tx.execute(sleepy, &[&0.2f64])).await;
         assert!(late.is_err());
         let e = tx.commit().await.unwrap_err();
         assert!(e.to_string().contains("given up"), "{e}");
