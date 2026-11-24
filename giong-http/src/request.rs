@@ -168,21 +168,34 @@ impl Request {
     /// and a URL with no path has the path `/`.
     pub fn path(&self) -> &str {
         let target = self.target();
-        let target = match crate::parse::split_absolute(target.as_bytes()) {
-            // `split_absolute` cuts at ASCII bytes, so `rest` is a suffix
-            // of the target on a character boundary.
-            Some((_, _, rest)) if !target.starts_with('/') => match rest.first() {
-                Some(b'/') => &target[target.len() - rest.len()..],
-                _ => "/",
-            },
-            _ => target,
+        // Origin form (`/path?query`), the common case, needs no split.
+        let target = if target.starts_with('/') {
+            target
+        } else {
+            match crate::parse::split_absolute(target.as_bytes()) {
+                // `split_absolute` cuts at ASCII bytes, so `rest` is a
+                // suffix of the target on a character boundary.
+                Some((_, _, rest)) => match rest.first() {
+                    Some(b'/') => &target[target.len() - rest.len()..],
+                    _ => "/",
+                },
+                None => target,
+            }
         };
-        target.split('?').next().unwrap_or(target)
+        // `?` is ASCII: the first such byte is where the query starts.
+        match target.bytes().position(|b| b == b'?') {
+            Some(q) => &target[..q],
+            None => target,
+        }
     }
 
     /// The query string, without the leading `?`.
     pub fn query(&self) -> Option<&str> {
-        self.target().split_once('?').map(|(_, query)| query)
+        let target = self.target();
+        target
+            .bytes()
+            .position(|b| b == b'?')
+            .map(|q| &target[q + 1..])
     }
 
     /// The HTTP version the request came with.
@@ -203,8 +216,9 @@ impl Request {
 
     /// The first value of the header `name` (case-insensitive).
     pub fn header(&self, name: &str) -> Option<&[u8]> {
-        self.headers()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        // Compared as bytes: no UTF-8 check of every name on the way.
+        header_lines(&self.head_bytes()[self.head.headers.clone()])
+            .find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
             .map(|(_, value)| value)
     }
 

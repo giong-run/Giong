@@ -506,3 +506,26 @@ fn random_sections_keep_the_invariants() {
     }
     assert!(decoded > 1000, "only {decoded} sections decoded");
 }
+
+/// `static_named` finds the entries a scan of the table finds, and nothing
+/// for a name the table does not have.
+#[test]
+fn static_named_finds_what_a_scan_of_the_table_finds() {
+    for (name, _) in STATIC {
+        let scan: Vec<u8> = (0..99u8)
+            .filter(|&i| STATIC[usize::from(i)].0 == name)
+            .collect();
+        assert_eq!(qpack::static_named(name.as_bytes()), &scan[..], "{name}");
+    }
+    for name in [
+        "",
+        ":",
+        "x-request-id",
+        "content-",
+        "Content-Type",
+        ":status2",
+        "age ",
+    ] {
+        assert!(qpack::static_named(name.as_bytes()).is_empty(), "{name:?}");
+    }
+}

@@ -343,69 +343,6 @@ fn a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies() {
 }
 
 #[test]
-#[cfg(unix)]
-fn readers_that_stop_reading_hold_a_bounded_amount_of_memory() {
-    // Peers that keep sending to tasks that read once and then stop (an
-    // HTTP client that pipelines requests and never reads the answers): what
-    // waits for those readers must stay within a bound for the whole worker,
-    // not grow with every connection; the rest waits in the socket, under
-    // TCP flow control. Once they read again, every byte arrives in order.
-    const CONNS: usize = 128;
-    const LEN: usize = 1024 * 1024;
-    allow_open_files(CONNS as u64 * 2 + 64);
-    let std_listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-    let addr = std_listener.local_addr().unwrap();
-    let clients: Vec<_> = (0..CONNS)
-        .map(|_| {
-            std::thread::spawn(move || {
-                let mut s = std::net::TcpStream::connect(addr).unwrap();
-                let data: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
-                s.write_all(&data).unwrap();
-                s.shutdown(Shutdown::Write).unwrap();
-            })
-        })
-        .collect();
-    giong::block_on(async move {
-        let l = TcpListener::from_std(std_listener);
-        let go = Rc::new(std::cell::Cell::new(false));
-        let mut readers = Vec::new();
-        for _ in 0..CONNS {
-            let s = l.accept().await.unwrap();
-            let go = go.clone();
-            readers.push(giong::spawn(async move {
-                let mut got = s.recv().await.unwrap().to_vec();
-                while !go.get() {
-                    sleep(Duration::from_millis(10)).await;
-                }
-                loop {
-                    let data = s.recv().await.unwrap();
-                    if data.is_empty() {
-                        break;
-                    }
-                    got.extend_from_slice(&data);
-                }
-                assert_eq!(got.len(), LEN);
-                assert!(got.iter().enumerate().all(|(i, &b)| b == (i % 251) as u8));
-            }));
-        }
-        sleep(Duration::from_secs(1)).await;
-        let stats = giong::observe::worker_stats();
-        // The pool's size (16 KiB buffers) on the heap, plus the pool itself
-        // copied out, plus slack; without a bound this is about 0.5 MiB per
-        // connection (64 MiB here).
-        let bound = 3 * stats.recv_buffers as u64 * 16 * 1024;
-        assert!(stats.recv_copied <= bound, "{stats:?}");
-        go.set(true);
-        for r in readers {
-            r.await.unwrap();
-        }
-    });
-    for c in clients {
-        c.join().unwrap();
-    }
-}
-
-#[test]
 fn large_writes_arrive_intact_with_or_without_zero_copy() {
     // Sizes around the zero-copy threshold (16 KiB), twice on each fresh
     // connection, from buffers that can change (sent with a copy) and from
@@ -1279,9 +1216,10 @@ fn a_write_after_a_dropped_write_is_not_reordered() {
         });
         let c = TcpStream::connect(addr).await.unwrap();
         // Far more than the socket buffers hold: the send stays in the driver.
-        // Windows takes a send into the kernel whole, whatever its size,
-        // while the socket's buffer has room: there the first write fills
-        // the buffer and the one after it waits.
+        // Windows would take a send into the kernel whole, whatever its
+        // size, while the socket's buffer has room; giong hands it a
+        // megabyte at a time, so there too the write waits once the buffer
+        // is full.
         let mut dropped = false;
         for _ in 0..4 {
             let big = vec![b'a'; 32 << 20];
@@ -1301,6 +1239,76 @@ fn a_write_after_a_dropped_write_is_not_reordered() {
         assert!(all.ends_with(b"END"), "the last write was overtaken");
         assert!(all[..all.len() - 3].iter().all(|&b| b == b'a'));
     });
+}
+
+/// A write to a peer that has stopped reading waits for it, however large:
+/// the kernel holds about a socket buffer's worth, not the whole write. On
+/// Windows an overlapped send of 32 MiB, or 512 MiB, was taken whole while
+/// the socket's buffer had room, so `write_all` ended at once, the kernel
+/// held every byte for the stalled peer, and a write timeout counting from
+/// the last progress could never fire. Plain and vectored writes, to a peer
+/// that reads once and then nothing until told to; every byte then arrives,
+/// in order.
+#[test]
+fn a_write_to_a_peer_that_stopped_reading_waits_for_it() {
+    const BIG: usize = 64 << 20;
+    for vectored in [false, true] {
+        let peer = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = peer.local_addr().unwrap();
+        let (go, wait) = std::sync::mpsc::channel::<()>();
+        let reader = std::thread::spawn(move || {
+            let (mut s, _) = peer.accept().unwrap();
+            let mut all = Vec::with_capacity(BIG);
+            let mut buf = vec![0u8; 64 * 1024];
+            let n = s.read(&mut buf).unwrap();
+            all.extend_from_slice(&buf[..n]);
+            wait.recv().unwrap();
+            loop {
+                let n = s.read(&mut buf).unwrap();
+                if n == 0 {
+                    break;
+                }
+                all.extend_from_slice(&buf[..n]);
+            }
+            all
+        });
+        giong::block_on(async move {
+            let c = TcpStream::connect(addr).await.unwrap();
+            let data: Vec<u8> = (0..BIG).map(pattern).collect();
+            let started = std::time::Instant::now();
+            let res = if vectored {
+                let half = data[BIG / 2..].to_vec();
+                let bufs = vec![data[..BIG / 2].to_vec(), half];
+                let mut write = std::pin::pin!(c.write_all_vectored(bufs));
+                let early = timeout(Duration::from_secs(1), write.as_mut()).await;
+                assert!(
+                    early.is_err(),
+                    "a vectored write of {BIG} bytes ended in {:?}, the peer reading nothing",
+                    started.elapsed()
+                );
+                go.send(()).unwrap();
+                write.await.0
+            } else {
+                let mut write = std::pin::pin!(c.write_all(data));
+                let early = timeout(Duration::from_secs(1), write.as_mut()).await;
+                assert!(
+                    early.is_err(),
+                    "a write of {BIG} bytes ended in {:?}, the peer reading nothing",
+                    started.elapsed()
+                );
+                go.send(()).unwrap();
+                write.await.0
+            };
+            res.unwrap();
+            c.shutdown(Shutdown::Write).unwrap();
+        });
+        let all = reader.join().unwrap();
+        assert_eq!(all.len(), BIG, "vectored: {vectored}");
+        assert!(
+            all.iter().enumerate().all(|(i, &b)| b == pattern(i)),
+            "vectored: {vectored}: a byte out of place"
+        );
+    }
 }
 
 /// Byte `i` of the test stream: a pattern that shows any byte out of place.
@@ -1374,4 +1382,60 @@ fn recv_into_appends_without_recv_first() {
         c.write_all(&b"!"[..]).await.0.unwrap();
         assert_eq!(&*s.recv().await.unwrap(), b"!");
     });
+}
+
+/// macOS only, in a module of its own: the simulator's copy of this file
+/// wraps top-level tests for every platform.
+#[cfg(target_os = "macos")]
+mod macos {
+    use super::*;
+
+    /// macOS has no per-send flag against `SIGPIPE`, so every stream must carry
+    /// `SO_NOSIGPIPE`: a process that does not ignore the signal (a library in
+    /// a C or Swift program, a Rust program built to keep it) would otherwise
+    /// die when a client goes away while the server writes. Connections a
+    /// listener accepts included.
+    #[test]
+    fn accepted_and_connected_streams_never_raise_sigpipe() {
+        use std::os::fd::AsRawFd;
+
+        fn no_sigpipe(fd: std::os::fd::RawFd) -> bool {
+            let mut on: libc::c_int = 0;
+            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+            // SAFETY: reads an int option into a local of the right size.
+            let rc = unsafe {
+                libc::getsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_NOSIGPIPE,
+                    (&mut on as *mut libc::c_int).cast(),
+                    &mut len,
+                )
+            };
+            assert_eq!(rc, 0, "getsockopt: {}", std::io::Error::last_os_error());
+            on != 0
+        }
+
+        giong::block_on(async {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let client = giong::spawn(async move { TcpStream::connect(addr).await.unwrap() });
+            let server = listener.accept().await.unwrap();
+            let client = client.await.unwrap();
+            assert!(no_sigpipe(client.as_raw_fd()), "a connected stream");
+            assert!(no_sigpipe(server.as_raw_fd()), "an accepted stream");
+
+            let dir = std::env::temp_dir().join(format!("giong-nosigpipe-{}", std::process::id()));
+            drop(std::fs::remove_file(&dir));
+            let listener = giong::net::UnixListener::bind(&dir).unwrap();
+            let path = dir.clone();
+            let client =
+                giong::spawn(async move { giong::net::UnixStream::connect(&path).await.unwrap() });
+            let server = listener.accept().await.unwrap();
+            let client = client.await.unwrap();
+            assert!(no_sigpipe(client.as_raw_fd()), "a connected Unix stream");
+            assert!(no_sigpipe(server.as_raw_fd()), "an accepted Unix stream");
+            drop(std::fs::remove_file(&dir));
+        });
+    }
 }

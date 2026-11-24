@@ -11,6 +11,8 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use common::*;
+#[path = "../../giong-http/tests/support/quiet_panics.rs"]
+mod quiet_panics;
 use giong::time::{sleep, timeout};
 use giong_grpc::{CallOptions, Channel, Code, Reply, Request, RequestStream, Sink, Status};
 use giong_http::client::Client;
@@ -71,7 +73,7 @@ impl TestService for Watched {
         &self,
         _request: Request<Empty<'static>>,
     ) -> Result<Reply<Empty<'static>>, Status> {
-        panic!("as the test asks");
+        panic!("as the test asks (expected by this test)");
     }
 
     /// Never answers.
@@ -143,7 +145,7 @@ impl TestService for Watched {
             match requests.message().await {
                 Ok(Some(received)) => {
                     if received.message()?.response_status().is_some() {
-                        panic!("as the test asks");
+                        panic!("as the test asks (expected by this test)");
                     }
                     responses
                         .send(&StreamingOutputCallResponse::default())
@@ -192,6 +194,7 @@ impl TestService for Watched {
 }
 
 fn watched() -> (Watched, TestServiceClient, String) {
+    quiet_panics::quiet_expected_panics();
     let watched = Watched::default();
     let base = serve(giong_grpc::Server::new().add(TestServiceServer::new(watched.clone())));
     let client = TestServiceClient::new(Channel::new(&base).unwrap());
