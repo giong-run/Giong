@@ -26,6 +26,8 @@ pub(crate) struct Limits {
     pub(crate) open_files_hard: Option<u64>,
 }
 
+/// The limits of this process. They are read from `/proc` and the cgroup
+/// file systems, so on systems other than Linux every field is `None`.
 pub(crate) fn limits() -> Limits {
     let own = fs::read_to_string("/proc/self/cgroup").unwrap_or_default();
     let mut l = limits_in(Path::new("/sys/fs/cgroup"), &own);
@@ -280,7 +282,10 @@ mod tests {
         assert_eq!(count_cpus("x"), None);
     }
 
+    /// The limits are read from `/proc`, so only Linux has them; elsewhere
+    /// every field is `None`.
     #[test]
+    #[cfg(target_os = "linux")]
     fn this_process() {
         let l = limits();
         assert!(l.cpus.unwrap() >= 1);
