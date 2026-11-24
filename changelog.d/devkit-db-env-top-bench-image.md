@@ -13,6 +13,8 @@
   `.giong/db.json` entry `giong db up` could not have written (another runtime, another
   checkout's container or volume, an image or names outside the plain forms) is ignored with
   a warning (`GIONG-E5048`), and a new container takes only an official image from the file.
+  Docker in Windows-container mode is refused up front with the switch to make
+  (`GIONG-E5040`).
 - **giong-cli**: `giong env` shows every key of `.env.example`, `.env` and the environment
   with where its value comes from, secrets masked; `giong env check` reports keys with no
   value at the line of `.env.example` that lists them, keys only in `.env`, and lines `.env`
@@ -33,7 +35,8 @@
   Dockerfile: one layer with the release binary, CA certificates and a nonroot user, no
   shell, static with musl when that target is installed. The same source gives the same
   digest. `--load` hands it to Docker or Podman, `--push` to skopeo, crane, Docker or
-  Podman. A link under an `--add` path goes in only when it points at a file inside the
+  Podman. Every `--add` path must resolve inside the project, so a linked folder cannot
+  pull in files from elsewhere, and a link goes in only when it points at a file inside the
   project.
 - **giong-cli**: `giong db`, `env` and `bench` never read or write `.env`, `.gitignore` or
   their files in `.giong/` through a symbolic link, which a cloned repository could commit.

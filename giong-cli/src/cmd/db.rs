@@ -507,12 +507,20 @@ fn container_runtime() -> Result<String, Failure> {
         None => vec!["docker".into(), "podman".into()],
     };
     let mut tried = Vec::new();
+    let mut windows = false;
     for c in &candidates {
         let out = Proc::new(c)
             .args(["info", "--format", "{{.ServerVersion}}"])
             .stdin(Stdio::null())
             .output();
         match out {
+            // Docker Desktop on Windows answers in Windows-container mode
+            // too, where no database image pulls: say so instead of failing
+            // later on a pull.
+            Ok(o) if o.status.success() && windows_containers(c) => {
+                windows = true;
+                tried.push(format!("{c}: runs Windows containers"));
+            }
             Ok(o) if o.status.success() => return Ok(c.clone()),
             Ok(o) => tried.push(format!(
                 "{c}: {}",
@@ -524,6 +532,18 @@ fn container_runtime() -> Result<String, Failure> {
             Err(e) => tried.push(format!("{c}: {e}")),
         }
     }
+    if windows {
+        return Err(Failure::new(
+            Code::NO_CONTAINER_RUNTIME,
+            format!(
+                "no container runtime runs Linux containers ({})",
+                tried.join("; ")
+            ),
+            "switch Docker Desktop to Linux containers (its tray icon: Switch to Linux \
+             containers), or set DATABASE_URL to a database you run yourself and use giong db \
+             migrate",
+        ));
+    }
     Err(Failure::new(
         Code::NO_CONTAINER_RUNTIME,
         format!("no container runtime answers ({})", tried.join("; ")),
@@ -531,6 +551,20 @@ fn container_runtime() -> Result<String, Failure> {
          machine start), or set DATABASE_URL to a database you run yourself and use giong db \
          migrate",
     ))
+}
+
+/// Whether `runtime` runs Windows containers. Podman has no `OSType` and runs
+/// only Linux containers, so a failed query counts as no.
+fn windows_containers(runtime: &str) -> bool {
+    Proc::new(runtime)
+        .args(["info", "--format", "{{.OSType}}"])
+        .stdin(Stdio::null())
+        .output()
+        .is_ok_and(|o| o.status.success() && is_windows_os_type(&o.stdout))
+}
+
+fn is_windows_os_type(out: &[u8]) -> bool {
+    String::from_utf8_lossy(out).trim() == "windows"
 }
 
 fn runtime_cmd(runtime: &str, args: &[&str]) -> Result<std::process::Output, Failure> {
