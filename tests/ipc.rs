@@ -90,12 +90,30 @@ fn an_accepted_channel_s_descriptors_are_close_on_exec() {
 
 #[test]
 fn messages_of_every_size_arrive_in_order_both_ways() {
+    every_size_both_ways(false);
+}
+
+#[test]
+fn messages_of_every_size_read_in_place_arrive_in_order_both_ways() {
+    every_size_both_ways(true);
+}
+
+/// The listener echoes what it reads, with `recv_in_place` when `in_place`.
+fn every_size_both_ways(in_place: bool) {
     let path = SockPath::new();
     giong::block_on(async {
         let listener = IpcListener::bind(&path.0, 1 << 16).unwrap();
         let server = giong::spawn(async move {
             let (mut tx, mut rx) = listener.accept().await.unwrap();
-            while let Some(m) = rx.recv().await.unwrap() {
+            loop {
+                let m = if in_place {
+                    // SAFETY: the peer is this test, sending with giong's
+                    // `Sender`, which never writes a message it has sent.
+                    unsafe { rx.recv_in_place() }.await.unwrap()
+                } else {
+                    rx.recv().await.unwrap()
+                };
+                let Some(m) = m else { break };
                 let copy = m.to_vec();
                 drop(m);
                 tx.send(&copy).await.unwrap();
