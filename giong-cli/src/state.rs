@@ -58,12 +58,26 @@ fn link(path: &Path) -> io::Error {
     )
 }
 
-/// Opens `path` (a file in a `.giong` folder) with `options`, refusing a
-/// link at `path` or at its folder.
-fn open(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
-    if let Some(parent) = path.parent() {
-        check_dir(parent)?;
+/// Refuses a link at any folder from `path`'s parent up to and including
+/// the `.giong` folder it is in (just the parent for a path outside one).
+fn check_folders(path: &Path) -> io::Result<()> {
+    let inside = path
+        .ancestors()
+        .skip(1)
+        .any(|a| a.file_name() == Some(".giong".as_ref()));
+    for folder in path.ancestors().skip(1) {
+        check_dir(folder)?;
+        if !inside || folder.file_name() == Some(".giong".as_ref()) {
+            break;
+        }
     }
+    Ok(())
+}
+
+/// Opens `path` (a file in a `.giong` folder) with `options`, refusing a
+/// link at `path` or at a folder between it and `.giong`.
+fn open(path: &Path, options: &mut OpenOptions) -> io::Result<File> {
+    check_folders(path)?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -197,6 +211,15 @@ mod tests {
         assert!(create(&dir(&project).join("dev.log")).is_err());
         assert!(read(&dir(&project).join("dev.log")).is_err());
         assert!(fs::read_dir(&elsewhere).unwrap().next().is_none());
+        // A file further down a linked .giong is refused too.
+        fs::create_dir_all(elsewhere.join("bench")).unwrap();
+        let nested = dir(&project).join("bench").join("service.log");
+        assert!(create(&nested).is_err());
+        assert!(read(&nested).is_err());
+        assert!(fs::read_dir(elsewhere.join("bench"))
+            .unwrap()
+            .next()
+            .is_none());
         let _ = fs::remove_dir_all(&root);
     }
 }
