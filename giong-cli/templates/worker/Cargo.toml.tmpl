@@ -1,0 +1,21 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+giong = { {{src_giong}} }
+giong-mcp = { {{src_giong_mcp}} }
+{{#if postgres}}
+giong-postgres = { {{src_giong_postgres}} }
+{{/if}}
+{{#if mysql}}
+giong-mysql = { {{src_giong_mysql}} }
+{{/if}}
+{{#if redis}}
+giong-redis = { {{src_giong_redis}} }
+{{/if}}
+serde_json = "1"
+
+{{profiles}}

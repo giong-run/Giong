@@ -9,14 +9,18 @@ use crate::args::{distance, Args, Flag};
 use crate::code::Code;
 use crate::report::{Failure, Report};
 
+pub mod ai;
 pub mod check;
 pub mod clean;
 pub mod dev;
 pub mod devctl;
 pub mod doctor;
 pub mod explain;
+pub mod fix;
 pub mod help;
 pub mod mcp;
+pub mod new;
+pub mod test;
 pub mod version;
 
 /// A command of `giong`.
@@ -41,6 +45,10 @@ pub const COMMANDS: &[&Command] = &[
     &dev::COMMAND,
     &check::COMMAND,
     &doctor::COMMAND,
+    &new::COMMAND,
+    &ai::COMMAND,
+    &fix::COMMAND,
+    &test::COMMAND,
     &explain::COMMAND,
     &clean::COMMAND,
     &mcp::COMMAND,

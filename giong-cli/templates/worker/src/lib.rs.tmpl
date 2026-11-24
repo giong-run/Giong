@@ -1,0 +1,324 @@
+{{#if redis}}
+//! The jobs and the loop that runs them: each worker takes jobs from a Redis
+//! list (`BRPOP`), runs them, and moves the ones that fail to a second list.
+{{/if}}
+{{#if postgres}}
+//! The jobs and the loop that runs them: each worker claims queued rows of
+//! the `jobs` table in PostgreSQL (`FOR UPDATE SKIP LOCKED`, so workers and
+//! copies of the service never take the same job), runs them, and retries
+//! the ones that fail, a few times, later each time.
+{{/if}}
+{{#if mysql}}
+//! The jobs and the loop that runs them: each worker claims queued rows of
+//! the `jobs` table in MySQL (`FOR UPDATE SKIP LOCKED`, so workers and copies
+//! of the service never take the same job), runs them, and retries the ones
+//! that fail, a few times, later each time.
+{{/if}}
+{{#if !db}}
+//! The job and the loop that runs it: one worker runs `tick` every interval
+//! until the service is asked to stop.
+{{/if}}
+//!
+//! `main.rs` reads the configuration and starts the workers; this file is
+//! what they run, which the tests run too.
+
+use std::time::Duration;
+
+{{#if db}}
+/// What a job asks for, as the JSON text that was queued:
+/// `{"kind": "greet", "name": "Ada"}`.
+///
+/// Add your own kinds here. A job that returns an error is retried (or set
+/// aside); one that panics stops its worker's loop, as any panic would.
+pub fn run_job(payload: &str) -> Result<String, String> {
+    let job: serde_json::Value =
+        serde_json::from_str(payload).map_err(|e| format!("not JSON: {e}"))?;
+    match job["kind"].as_str() {
+        Some("greet") => {
+            let name = job["name"]
+                .as_str()
+                .filter(|n| !n.is_empty())
+                .ok_or("greet needs a name")?;
+            Ok(format!("Hello, {name}!"))
+        }
+        Some(other) => Err(format!("no job of kind {other:?}")),
+        None => Err("the job has no \"kind\"".into()),
+    }
+}
+
+/// How a run of the loop went, for the log and the tests.
+#[derive(Debug, PartialEq, Eq)]
+pub enum Outcome {
+    /// A job ran and succeeded.
+    Done(String),
+    /// A job ran and failed; it will be retried, or was set aside.
+    Failed(String),
+    /// Nothing was waiting.
+    Idle,
+}
+
+{{/if}}
+{{#if redis}}
+/// Where the jobs wait, and where the failed ones go.
+#[derive(Clone)]
+pub struct Queue {
+    pub pending: String,
+    pub failed: String,
+}
+
+impl Queue {
+    pub fn named(name: &str) -> Queue {
+        Queue {
+            pending: format!("jobs:{name}"),
+            failed: format!("jobs:{name}:failed"),
+        }
+    }
+}
+
+/// Waits up to `wait` for a job on the list, runs it, and records a failure.
+pub async fn run_next(
+    conn: &mut giong_redis::Client,
+    queue: &Queue,
+    wait: Duration,
+) -> Result<Outcome, giong_redis::Error> {
+    use giong_redis::cmd;
+    // BRPOP blocks the connection: it is this task's own (`Pool::take`).
+    let popped: Option<(String, String)> = conn
+        .query_blocking(&cmd("BRPOP").arg(&queue.pending).arg(wait.as_secs().max(1)))
+        .await?;
+    let Some((_list, payload)) = popped else {
+        return Ok(Outcome::Idle);
+    };
+    match run_job(&payload) {
+        Ok(result) => Ok(Outcome::Done(result)),
+        Err(error) => {
+            let record = serde_json::json!({ "job": payload, "error": error }).to_string();
+            conn.query::<i64>(&cmd("LPUSH").arg(&queue.failed).arg(record))
+                .await?;
+            Ok(Outcome::Failed(error))
+        }
+    }
+}
+
+/// The loop of one worker, until the service is asked to stop. A Redis that
+/// cannot be reached is retried every few seconds.
+pub async fn work(pool: giong_redis::Pool, queue: Queue) {
+    while !giong::is_shutting_down() {
+        let mut conn = match giong::until_shutdown(pool.take()).await {
+            None => return,
+            Some(Ok(conn)) => conn,
+            Some(Err(e)) => {
+                eprintln!("{{name}}: redis: {e}; retrying in 5 s");
+                let _ = giong::until_shutdown(giong::time::sleep(Duration::from_secs(5))).await;
+                continue;
+            }
+        };
+        loop {
+            // Cancelling a blocking command closes its connection, so a
+            // shutdown never leaves a job half taken.
+            match giong::until_shutdown(run_next(&mut conn, &queue, Duration::from_secs(5))).await {
+                None => return,
+                Some(Ok(Outcome::Done(result))) => log("done", &result),
+                Some(Ok(Outcome::Failed(error))) => log("failed", &error),
+                Some(Ok(Outcome::Idle)) => {}
+                Some(Err(e)) => {
+                    eprintln!("{{name}}: redis: {e}");
+                    break; // A fresh connection.
+                }
+            }
+        }
+    }
+}
+{{/if}}
+{{#if sql}}
+/// After this many failed runs a job is set aside (`state = 'failed'`).
+pub const MAX_ATTEMPTS: i32 = 5;
+
+/// The tables, created at startup when they are missing.
+pub const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
+
+/// Puts a job on a queue; returns its id.
+{{/if}}
+{{#if postgres}}
+pub async fn enqueue(
+    db: &giong_postgres::Pool,
+    queue: &str,
+    payload: &str,
+) -> Result<i64, giong_postgres::Error> {
+    let row = db
+        .query_one(
+            "INSERT INTO jobs (queue, payload) VALUES ($1, $2) RETURNING id",
+            &[&queue, &payload],
+        )
+        .await?;
+    row.get(0)
+}
+
+/// Claims the oldest job that is due, runs it, and records the outcome.
+pub async fn run_next(
+    db: &giong_postgres::Pool,
+    queue: &str,
+) -> Result<Outcome, giong_postgres::Error> {
+    // One statement, so no transaction is needed: the row is locked, skipped
+    // by every other claimer, and marked as running in one step.
+    let claimed = db
+        .query_opt(
+            "UPDATE jobs SET state = 'running', attempts = attempts + 1
+             WHERE id = (SELECT id FROM jobs
+                         WHERE queue = $1 AND state = 'queued' AND run_after <= now()
+                         ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED)
+             RETURNING id, payload, attempts",
+            &[&queue],
+        )
+        .await?;
+    let Some(row) = claimed else {
+        return Ok(Outcome::Idle);
+    };
+    let (id, payload, attempts): (i64, &str, i32) = (row.get(0)?, row.get(1)?, row.get(2)?);
+    match run_job(payload) {
+        Ok(result) => {
+            db.execute("UPDATE jobs SET state = 'done' WHERE id = $1", &[&id])
+                .await?;
+            Ok(Outcome::Done(result))
+        }
+        Err(error) => {
+            // Retried after 2, 4, 8... seconds, then set aside.
+            let backoff = 2f64.powi(attempts);
+            db.execute(
+                "UPDATE jobs SET last_error = $2,
+                    state = CASE WHEN attempts >= $3 THEN 'failed' ELSE 'queued' END,
+                    run_after = now() + make_interval(secs => $4)
+                 WHERE id = $1",
+                &[&id, &error, &MAX_ATTEMPTS, &backoff],
+            )
+            .await?;
+            Ok(Outcome::Failed(error))
+        }
+    }
+}
+{{/if}}
+{{#if mysql}}
+pub async fn enqueue(
+    db: &giong_mysql::Pool,
+    queue: &str,
+    payload: &str,
+) -> Result<i64, giong_mysql::Error> {
+    let id = db
+        .insert(
+            "INSERT INTO jobs (queue, payload) VALUES (?, ?)",
+            &[&queue, &payload],
+        )
+        .await?
+        .unwrap_or(0);
+    Ok(id as i64)
+}
+
+/// Claims the oldest job that is due, runs it, and records the outcome.
+pub async fn run_next(
+    db: &giong_mysql::Pool,
+    queue: &str,
+) -> Result<Outcome, giong_mysql::Error> {
+    // MySQL has no UPDATE ... RETURNING: the claim is a short transaction on
+    // a connection of this task's own.
+    let (id, payload, attempts) = {
+        let mut conn = db.get().await?;
+        let tx = conn.transaction().await?;
+        let row = tx
+            .query_opt(
+                "SELECT id, payload, attempts FROM jobs
+                 WHERE queue = ? AND state = 'queued' AND run_after <= UTC_TIMESTAMP(6)
+                 ORDER BY id LIMIT 1 FOR UPDATE SKIP LOCKED",
+                &[&queue],
+            )
+            .await?;
+        let Some(row) = row else {
+            tx.commit().await?;
+            return Ok(Outcome::Idle);
+        };
+        let (id, payload, attempts): (i64, String, i32) =
+            (row.get(0)?, row.get(1)?, row.get(2)?);
+        tx.execute(
+            "UPDATE jobs SET state = 'running', attempts = attempts + 1 WHERE id = ?",
+            &[&id],
+        )
+        .await?;
+        tx.commit().await?;
+        (id, payload, attempts + 1)
+    };
+    match run_job(&payload) {
+        Ok(result) => {
+            db.execute("UPDATE jobs SET state = 'done' WHERE id = ?", &[&id])
+                .await?;
+            Ok(Outcome::Done(result))
+        }
+        Err(error) => {
+            // Retried after 2, 4, 8... seconds, then set aside.
+            let backoff = 1i64 << attempts.clamp(1, 20);
+            db.execute(
+                "UPDATE jobs SET last_error = ?,
+                    state = IF(attempts >= ?, 'failed', 'queued'),
+                    run_after = UTC_TIMESTAMP(6) + INTERVAL ? SECOND
+                 WHERE id = ?",
+                &[&error, &MAX_ATTEMPTS, &backoff, &id],
+            )
+            .await?;
+            Ok(Outcome::Failed(error))
+        }
+    }
+}
+{{/if}}
+{{#if sql}}
+
+/// The loop of one worker, until the service is asked to stop: runs jobs
+/// while there are some, then looks again every `poll`.
+{{/if}}
+{{#if postgres}}
+pub async fn work(db: giong_postgres::Pool, queue: String, poll: Duration) {
+{{/if}}
+{{#if mysql}}
+pub async fn work(db: giong_mysql::Pool, queue: String, poll: Duration) {
+{{/if}}
+{{#if sql}}
+    while !giong::is_shutting_down() {
+        // A job that has started is finished before the worker stops.
+        match run_next(&db, &queue).await {
+            Ok(Outcome::Done(result)) => log("done", &result),
+            Ok(Outcome::Failed(error)) => log("failed", &error),
+            Ok(Outcome::Idle) => {
+                let _ = giong::until_shutdown(giong::time::sleep(poll)).await;
+            }
+            Err(e) => {
+                eprintln!("{{name}}: database: {e}; retrying in 5 s");
+                let _ = giong::until_shutdown(giong::time::sleep(Duration::from_secs(5))).await;
+            }
+        }
+    }
+}
+{{/if}}
+{{#if !db}}
+/// The work done every interval. Replace it with yours; keep it short or
+/// give the other tasks a turn with `giong::yield_now().await`, since a long
+/// computation holds up the worker it runs on.
+pub async fn tick(count: u64) -> String {
+    format!("tick {count}")
+}
+
+/// Runs `tick` every `interval` until the service is asked to stop, or
+/// `limit` ticks when one is given (for tests).
+pub async fn work(interval: Duration, limit: Option<u64>) -> u64 {
+    let mut count = 0;
+    while limit.map_or(true, |l| count < l) {
+        if giong::until_shutdown(giong::time::sleep(interval)).await.is_none() {
+            break;
+        }
+        count += 1;
+        log("tick", &tick(count).await);
+    }
+    count
+}
+{{/if}}
+
+/// One JSON line on stdout.
+fn log(event: &str, detail: &str) {
+    println!("{}", serde_json::json!({ "event": event, "detail": detail }));
+}
