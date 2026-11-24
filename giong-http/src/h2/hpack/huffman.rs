@@ -18,23 +18,40 @@ pub(crate) fn encoded_len(src: &[u8]) -> usize {
 }
 
 /// Appends `src`, Huffman coded, to `out`.
+#[cfg(any(test, fuzzing))]
 pub(crate) fn encode(src: &[u8], out: &mut Vec<u8>) {
-    out.reserve(encoded_len(src));
+    encode_into(src, encoded_len(src), out);
+}
+
+/// [`encode`], for a caller that knows the coded length (`encoded_len`).
+pub(crate) fn encode_into(src: &[u8], coded_len: usize, out: &mut Vec<u8>) {
+    let start = out.len();
+    out.resize(start + coded_len, 0);
+    let dst = &mut out[start..];
+    let mut at = 0;
+    // The bits not written yet are the low `bits` of `acc`: fewer than 32,
+    // so a code (30 bits at most) always fits above them.
     let mut acc: u64 = 0;
     let mut bits: u32 = 0;
     for &b in src {
         let (code, len) = CODES[b as usize];
         acc = (acc << len) | u64::from(code);
         bits += u32::from(len);
-        while bits >= 8 {
-            bits -= 8;
-            out.push((acc >> bits) as u8);
+        if bits >= 32 {
+            bits -= 32;
+            dst[at..at + 4].copy_from_slice(&((acc >> bits) as u32).to_be_bytes());
+            at += 4;
         }
+    }
+    while bits >= 8 {
+        bits -= 8;
+        dst[at] = (acc >> bits) as u8;
+        at += 1;
     }
     if bits > 0 {
         // Pad with the most significant bits of EOS: all ones.
         let pad = 8 - bits;
-        out.push(((acc << pad) as u8) | ((1u8 << pad) - 1));
+        dst[at] = ((acc << pad) as u8) | ((1u8 << pad) - 1);
     }
 }
 
@@ -52,10 +69,11 @@ const EMIT: u8 = 1;
 const FAIL: u8 = 2;
 
 struct Machine {
-    steps: Vec<[Step; 16]>,
+    /// By state and nibble: a state is a `u8`, so indexing needs no check.
+    steps: Box<[[Step; 16]; 256]>,
     /// Whether input may end in this state: the bits since the last symbol
     /// are fewer than eight and all ones (a prefix of EOS).
-    may_end: Vec<bool>,
+    may_end: [bool; 256],
 }
 
 fn machine() -> &'static Machine {
@@ -93,7 +111,7 @@ fn build() -> Machine {
     }
     assert_eq!(inner.len(), 256, "HPACK's code has 257 symbols");
     // Inner nodes reached from the root by fewer than eight one bits.
-    let mut may_end = vec![false; 256];
+    let mut may_end = [false; 256];
     let mut node = 0usize;
     for _ in 0..8 {
         may_end[state_of[node] as usize] = true;
@@ -103,7 +121,7 @@ fn build() -> Machine {
         }
     }
 
-    let mut steps = vec![[Step::default(); 16]; 256];
+    let mut steps = Box::new([[Step::default(); 16]; 256]);
     for (state, &start) in inner.iter().enumerate() {
         for nibble in 0..16u8 {
             let mut node = start;
@@ -132,23 +150,33 @@ fn build() -> Machine {
 /// padding longer than seven bits, or padding that is not all ones.
 pub(crate) fn decode(src: &[u8], out: &mut Vec<u8>) -> Result<(), ()> {
     let machine = machine();
-    out.reserve(src.len() * 8 / 5);
+    // Each step emits one symbol at most, and no code is shorter than five
+    // bits: at most `8 * len / 5` symbols. Every step writes its symbol at
+    // `at` and moves on only if it emitted one, so there is one place more.
+    let start = out.len();
+    out.resize(start + src.len() * 8 / 5 + 1, 0);
+    let dst = &mut out[start..];
+    let mut at = 0;
     let mut state = 0u8;
+    // Checked once, at the end: a failed step goes on from some state, and
+    // the result is thrown away.
+    let mut flags = 0u8;
     for &b in src {
-        for nibble in [b >> 4, b & 0x0f] {
-            let step = machine.steps[state as usize][nibble as usize];
-            if step.flags & FAIL != 0 {
-                return Err(());
-            }
-            if step.flags & EMIT != 0 {
-                out.push(step.symbol);
-            }
-            state = step.next;
-        }
+        let step = machine.steps[usize::from(state)][usize::from(b >> 4)];
+        dst[at] = step.symbol;
+        at += usize::from(step.flags & EMIT);
+        flags |= step.flags;
+        let step = machine.steps[usize::from(step.next)][usize::from(b & 0x0f)];
+        dst[at] = step.symbol;
+        at += usize::from(step.flags & EMIT);
+        flags |= step.flags;
+        state = step.next;
     }
-    if machine.may_end[state as usize] {
+    out.truncate(start + at);
+    if flags & FAIL == 0 && machine.may_end[state as usize] {
         Ok(())
     } else {
+        out.truncate(start);
         Err(())
     }
 }
