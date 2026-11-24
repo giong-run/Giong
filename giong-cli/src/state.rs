@@ -51,23 +51,27 @@ fn link(path: &Path) -> io::Error {
     io::Error::new(
         io::ErrorKind::InvalidInput,
         format!(
-            "{} is a symbolic link, and giong does not follow links in .giong \
-             (remove it; giong recreates its files)",
+            "{} is a symbolic link, which giong does not follow (it could name a file \
+             outside the project); remove it, and giong writes its own files again",
             path.display()
         ),
     )
 }
 
 /// Refuses a link at any folder from `path`'s parent up to and including
-/// the `.giong` folder it is in (just the parent for a path outside one).
+/// the `.giong` folder it is in. A path outside `.giong` has no folder to
+/// check: the project folder itself may be reached through a link.
 fn check_folders(path: &Path) -> io::Result<()> {
     let inside = path
         .ancestors()
         .skip(1)
         .any(|a| a.file_name() == Some(".giong".as_ref()));
+    if !inside {
+        return Ok(());
+    }
     for folder in path.ancestors().skip(1) {
         check_dir(folder)?;
-        if !inside || folder.file_name() == Some(".giong".as_ref()) {
+        if folder.file_name() == Some(".giong".as_ref()) {
             break;
         }
     }
