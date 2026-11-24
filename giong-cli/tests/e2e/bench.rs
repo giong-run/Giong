@@ -126,8 +126,14 @@ fn a_fixed_delay_is_measured_as_that_delay() {
     if !has_command("bench") {
         return;
     }
-    let url = serve(Arc::new(|_, s: &mut TcpStream| {
+    // The handler times its own sleep: on a starved machine the 20 ms sleep
+    // itself overruns, and then no latency bound can judge giong bench.
+    let slowest_sleep_us = Arc::new(AtomicU64::new(0));
+    let slowest = Arc::clone(&slowest_sleep_us);
+    let url = serve(Arc::new(move |_, s: &mut TcpStream| {
+        let t = Instant::now();
         std::thread::sleep(Duration::from_millis(20));
+        slowest.fetch_max(t.elapsed().as_micros() as u64, Ordering::Relaxed);
         s.write_all(OK).map(|()| true)
     }));
     let (out, v) = bench(
@@ -151,24 +157,30 @@ fn a_fixed_delay_is_measured_as_that_delay() {
         "p50 {p50} µs for a 20 ms handler\n{}",
         out.dump()
     );
-    // GIONG-E5062: the generator itself ran late, so this machine is too busy
-    // for its numbers to be judged (a loaded CI runner overruns the
-    // handler's sleep too). giong bench said so; that is the right answer.
+    assert_eq!(r["failed"], 0, "{}", out.dump());
+    // The upper bound needs a machine that keeps time: none of the handler's
+    // sleeps took twice as long as asked (past that, connections fall behind
+    // their schedule and latency from the due time rightly grows), and giong
+    // bench did not report its own generator late (GIONG-E5062).
+    let slowest = slowest_sleep_us.load(Ordering::Relaxed);
     let lagged = v["findings"]
         .as_array()
         .into_iter()
         .flatten()
         .any(|f| f["code"] == "GIONG-E5062");
-    if lagged {
-        eprintln!("a_fixed_delay_is_measured_as_that_delay: generator lag reported, upper bound not checked (p50 {p50} µs)");
-    } else {
-        assert!(
-            p50 < 60_000.0,
-            "p50 {p50} µs for a 20 ms handler\n{}",
-            out.dump()
+    if lagged || slowest >= 40_000 {
+        eprintln!(
+            "a_fixed_delay_is_measured_as_that_delay: this machine does not keep time \
+             (slowest 20 ms sleep {slowest} µs, generator lag reported: {lagged}); \
+             upper bound not checked (p50 {p50} µs)"
         );
+        return;
     }
-    assert_eq!(r["failed"], 0, "{}", out.dump());
+    assert!(
+        p50 < 60_000.0,
+        "p50 {p50} µs for a 20 ms handler\n{}",
+        out.dump()
+    );
 }
 
 #[test]
