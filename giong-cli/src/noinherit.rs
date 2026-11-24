@@ -1,17 +1,19 @@
-//! Keeps this process's standard handles out of a detached runner (Windows).
+//! Keeps this process's standard handles out of the processes it starts
+//! (Windows).
 //!
-//! std starts every child with `bInheritHandles = TRUE`, so the child also
-//! receives each inheritable handle this process holds. A caller that reads
-//! `giong dev --background` through a pipe hands giong an inheritable write
-//! end as stdout: the runner, which outlives the command, would hold it too,
-//! and the caller would wait for the runner to exit instead of for the
-//! command (#378). Clearing `HANDLE_FLAG_INHERIT` on giong's own standard
-//! handles just before the runner is spawned keeps them in this process.
-//! Children given `Stdio::inherit()` later are unaffected: std duplicates the
-//! handle into an inheritable one for them.
+//! std starts every child with `bInheritHandles = TRUE`, so the child, and
+//! its children, also receive each inheritable handle this process holds. A
+//! caller that reads giong through a pipe hands giong an inheritable write
+//! end as stdout, so anything giong starts that outlives the command would
+//! hold the caller's pipe open: the `giong dev --background` runner (#378),
+//! or the grandchild of a tool giong gave up on after its timeout (#382).
+//! The caller would then wait for those instead of for giong. Clearing
+//! `HANDLE_FLAG_INHERIT` on giong's own standard handles once, first thing in
+//! `main`, keeps them in this process. Children given `Stdio::inherit()` are
+//! unaffected: std duplicates the handle into an inheritable one for them.
 //!
-//! The only `unsafe` in giong-cli; `[lints.rust] unsafe_code = "deny"` keeps
-//! it to this module.
+//! With `winproc`, one of the two modules of giong-cli that use `unsafe`;
+//! `[lints.rust] unsafe_code = "deny"` keeps it to them.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
