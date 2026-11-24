@@ -104,6 +104,9 @@ mod heap;
 mod invariants;
 mod memory;
 mod parse;
+#[cfg(test)]
+#[path = "../tests/support/quiet_panics.rs"]
+mod quiet_panics;
 mod request;
 mod response;
 mod server;

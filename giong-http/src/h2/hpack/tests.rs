@@ -369,3 +369,34 @@ fn the_encoder_round_trips_through_the_decoder() {
     let got = decode_all(&mut dec, &out).unwrap();
     assert_eq!(got, pairs(&[("x-custom", "value")]));
 }
+
+#[test]
+fn static_names_finds_the_entries_a_scan_of_the_table_finds() {
+    let scan = |name: &[u8]| {
+        let found: Vec<usize> = (0..STATIC.len())
+            .filter(|&i| STATIC[i].0.as_bytes() == name)
+            .collect();
+        found
+            .first()
+            .map(|&first| (first, found[found.len() - 1] + 1))
+    };
+    for &(name, _) in &STATIC {
+        assert_eq!(
+            static_names(name.as_bytes()),
+            scan(name.as_bytes()),
+            "{name}"
+        );
+    }
+    for name in [
+        "",
+        ":",
+        "x-request-id",
+        "accept-",
+        "acceptx",
+        "Accept",
+        ":status2",
+        "via ",
+    ] {
+        assert_eq!(static_names(name.as_bytes()), None, "{name:?}");
+    }
+}

@@ -13,6 +13,10 @@ use giong::net::TcpListener;
 use giong::time::sleep;
 use giong_http::{Handler, Request, Response, Server};
 
+#[path = "support/quiet_panics.rs"]
+mod quiet_panics;
+use quiet_panics::quiet_expected_panics;
+
 // ------------------------------------------------------------------ harness
 
 struct TestServer {
@@ -26,6 +30,7 @@ impl TestServer {
     where
         H: Handler + Clone + Send + Sync,
     {
+        quiet_expected_panics();
         let rt = giong::Builder::new()
             .workers(1)
             .shutdown_grace(Duration::from_secs(20))

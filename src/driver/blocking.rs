@@ -12,6 +12,12 @@
 //! writer, a hung network filesystem) holds up only its own thread. A
 //! finished job pushes its result onto its worker's [`Completions`] and pokes
 //! the worker's eventfd.
+//!
+//! When every thread is busy, jobs wait their turn. If no job finishes for
+//! [`STALL`] while jobs wait, the busy threads are taken to be stuck, and a
+//! thread starts for each waiting job, at most doubling the pool per stall
+//! and up to [`LIMIT`] threads in all: [`MAX_THREADS`] stuck jobs then hold
+//! up nothing but themselves.
 
 use std::collections::VecDeque;
 #[cfg(unix)]
@@ -30,6 +36,15 @@ use crate::runtime::lock;
 /// filesystem can tie up.
 pub(super) const MAX_THREADS: usize = 64;
 
+/// The most blocking threads at once when [`MAX_THREADS`] of them are
+/// stuck, as Tokio's blocking pool has.
+const LIMIT: usize = 512;
+
+/// How long jobs wait with every thread busy and none finishing before one
+/// more thread starts. Disks under load finish something far more often,
+/// and a job stuck for good waits this long once.
+const STALL: Duration = Duration::from_millis(100);
+
 /// How long a thread waits for work before it ends.
 const IDLE: Duration = Duration::from_secs(10);
 
@@ -39,6 +54,11 @@ struct State {
     jobs: VecDeque<Job>,
     threads: usize,
     idle: usize,
+    /// Jobs finished so far, so that the watcher can tell stuck threads
+    /// from busy ones.
+    done: u64,
+    /// Set while a watcher thread runs.
+    watching: bool,
 }
 
 struct Pool {
@@ -53,6 +73,8 @@ fn pool() -> &'static Pool {
             jobs: VecDeque::new(),
             threads: 0,
             idle: 0,
+            done: 0,
+            watching: false,
         }),
         work: Condvar::new(),
     })
@@ -73,15 +95,23 @@ pub(super) fn spawn(job: Job) {
         return;
     }
     if state.threads >= MAX_THREADS {
-        // Every thread is busy: the job waits its turn.
+        // Every thread is busy: the job waits its turn, and a watcher
+        // starts another thread if the busy ones turn out to be stuck.
+        if !state.watching {
+            state.watching = true;
+            drop(state);
+            let started = thread::Builder::new()
+                .name("giong-blocking-watch".into())
+                .spawn(|| watch(self::pool()));
+            if started.is_err() {
+                lock(&pool.state).watching = false;
+            }
+        }
         return;
     }
     state.threads += 1;
     drop(state);
-    let started = thread::Builder::new()
-        .name("giong-blocking".into())
-        .spawn(|| work(self::pool()));
-    if started.is_err() {
+    if !start(pool) {
         let mut state = lock(&pool.state);
         state.threads -= 1;
         if state.threads == 0 {
@@ -96,6 +126,14 @@ pub(super) fn spawn(job: Job) {
     }
 }
 
+/// Starts a blocking thread, already counted in `threads`.
+fn start(pool: &'static Pool) -> bool {
+    thread::Builder::new()
+        .name("giong-blocking".into())
+        .spawn(move || work(pool))
+        .is_ok()
+}
+
 fn work(pool: &'static Pool) {
     let mut state = lock(&pool.state);
     loop {
@@ -103,6 +141,7 @@ fn work(pool: &'static Pool) {
             drop(state);
             job();
             state = lock(&pool.state);
+            state.done += 1;
             continue;
         }
         state.idle += 1;
@@ -116,6 +155,37 @@ fn work(pool: &'static Pool) {
             state.threads -= 1;
             return;
         }
+    }
+}
+
+/// Runs while jobs wait with every thread busy. A [`STALL`] in which no job
+/// finished means the busy threads are stuck (a FIFO with no writer, a hung
+/// network filesystem): a thread starts for each waiting job, so the jobs
+/// behind them run.
+fn watch(pool: &'static Pool) {
+    let mut seen = lock(&pool.state).done;
+    loop {
+        thread::sleep(STALL);
+        let mut state = lock(&pool.state);
+        if state.jobs.is_empty() {
+            state.watching = false;
+            return;
+        }
+        if state.done == seen {
+            // A thread for each job that no idle thread will take, so that
+            // a few jobs behind stuck ones wait one stall, not one each; at
+            // most as many as run already, so that a long queue on a slow
+            // but working disk grows the pool by doubling, not in one step.
+            let more = (state.jobs.len().saturating_sub(state.idle))
+                .min(state.threads.max(1))
+                .min(LIMIT.saturating_sub(state.threads));
+            state.threads += more;
+            drop(state);
+            let started = (0..more).take_while(|_| start(pool)).count();
+            state = lock(&pool.state);
+            state.threads -= more - started;
+        }
+        seen = state.done;
     }
 }
 

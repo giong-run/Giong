@@ -56,9 +56,9 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Networking::WinSock::{
     bind, closesocket, getsockname, getsockopt, ioctlsocket, recv, recvfrom, setsockopt,
-    TransmitFile, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv, WSARecvFrom, WSASend,
-    WSASendMsg, WSASendTo, WSASocketW, AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX,
-    LPFN_CONNECTEX, LPFN_WSARECVMSG, MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR,
+    TransmitFile, WSAGetLastError, WSAGetOverlappedResult, WSAIoctl, WSARecv, WSASend, WSASendMsg,
+    WSASendTo, WSASocketW, AF_INET6, FIONBIO, INVALID_SOCKET, LPFN_ACCEPTEX, LPFN_CONNECTEX,
+    LPFN_WSARECVMSG, MSG_PEEK, MSG_TRUNC, SIO_GET_EXTENSION_FUNCTION_POINTER, SOCKADDR,
     SOCKADDR_IN, SOCKADDR_IN6, SOCKADDR_STORAGE, SOCKET, SOCK_STREAM, SOL_SOCKET, SO_TYPE,
     SO_UPDATE_ACCEPT_CONTEXT, SO_UPDATE_CONNECT_CONTEXT, WSABUF, WSAECONNABORTED, WSAECONNRESET,
     WSAEINVAL, WSAEMSGSIZE, WSAENOTCONN, WSAEOPNOTSUPP, WSAEWOULDBLOCK, WSAID_ACCEPTEX,
@@ -74,6 +74,8 @@ use windows_sys::Win32::System::IO::{
     CancelIoEx, CreateIoCompletionPort, GetOverlappedResult, GetQueuedCompletionStatusEx,
     PostQueuedCompletionStatus, OVERLAPPED, OVERLAPPED_ENTRY,
 };
+
+mod alarm;
 
 use super::budget::spend_budget;
 use super::{Io, MultiIo, MultiKind, MultiPoll, Park, Start, BUFFER_SHIFT, F_BUFFER, F_MORE};
@@ -226,19 +228,6 @@ struct Record {
     /// A blocking job's flag, which a job that has not started yet checks.
     cancel: Option<Arc<super::blocking::Cancel>>,
     accepting: Option<Box<Accepting>>,
-    datagram: Option<Box<Datagram>>,
-}
-
-/// What a datagram receive that waits in the kernel writes to: the buffer,
-/// laid out as the readers of a multishot `recvmsg` expect it (see
-/// [`MultiIo::RecvMsg`]), and the two values Winsock fills in when the
-/// datagram arrives. Boxed, so that they stay where the kernel was told.
-struct Datagram {
-    buf: Vec<u8>,
-    /// Bytes in front of the payload: the header and the address field.
-    overhead: usize,
-    from_len: i32,
-    flags: u32,
 }
 
 /// Whether an overlapped call that returned `code` ended at once with a
@@ -347,8 +336,6 @@ struct Multi {
     /// An accept that completed and was not collected yet, or the error
     /// that ended a receive.
     accepted: Option<i32>,
-    /// A datagram that arrived while its receive waited in the kernel.
-    data: Option<RecvBuf>,
     /// Set by [`Iocp::finish_multi`]: nothing new is started.
     last: bool,
 }
@@ -389,6 +376,9 @@ pub(crate) struct Iocp {
     accept_ex: LPFN_ACCEPTEX,
     connect_ex: LPFN_CONNECTEX,
     recv_msg: LPFN_WSARECVMSG,
+    /// Ends a wait at the next timer to the microsecond, where the wait's
+    /// own timeout ends on a 15.6 ms clock tick (see [`alarm`]).
+    alarm: Option<alarm::Alarm>,
 }
 
 fn last_error() -> i32 {
@@ -440,6 +430,7 @@ impl Iocp {
             accept_ex: None,
             connect_ex: None,
             recv_msg: None,
+            alarm: alarm::Alarm::new(),
         })
     }
 
@@ -569,7 +560,6 @@ impl Iocp {
             reading: false,
             cancel: None,
             accepting: None,
-            datagram: None,
         }))
     }
 
@@ -1007,7 +997,6 @@ impl Iocp {
             wakers: Vec::new(),
             pending: ptr::null_mut(),
             accepted: None,
-            data: None,
             last: false,
         }))
     }
@@ -1067,10 +1056,6 @@ impl Iocp {
             // the next `AcceptEx` takes the next one, as Unix does.
         }
         if multi.last {
-            // What the receive in flight took is still the reader's.
-            if let Some(data) = multi.data.take() {
-                return MultiPoll::Data(data);
-            }
             if !multi.pending.is_null() {
                 multi.wait(waker);
             }
@@ -1079,9 +1064,6 @@ impl Iocp {
         let Some(io) = multi.io else {
             return MultiPoll::NeedArm;
         };
-        if let Some(data) = multi.data.take() {
-            return MultiPoll::Data(data);
-        }
         if !multi.pending.is_null() {
             multi.wait(waker);
             return MultiPoll::Pending;
@@ -1180,11 +1162,13 @@ impl Iocp {
     /// sender's address in a field of `name_len` bytes.
     ///
     /// A datagram that is already there is read into a pool buffer at once.
-    /// Otherwise the receive waits in the kernel. A receive of zero bytes
-    /// cannot do the waiting, as it does for a stream: it would take the
-    /// datagram and throw it away. So the waiting receive has a buffer, and
-    /// that buffer is on the heap: a socket that waits must not hold a pool
-    /// buffer, or enough idle sockets would hold them all.
+    /// Otherwise a receive of zero bytes with `MSG_PEEK` waits in the
+    /// kernel: it completes when a datagram is there and leaves it in the
+    /// socket (a plain zero-byte receive would take it and throw it away),
+    /// and the next poll reads it. So a socket that waits holds no buffer,
+    /// as a stream does (libuv waits the same way); a buffer per waiting
+    /// receive cost every idle socket its own, and every wait an
+    /// allocation.
     fn poll_recv_msg(
         &mut self,
         key: usize,
@@ -1197,135 +1181,97 @@ impl Iocp {
             return MultiPoll::Item(e);
         }
         let overhead = DATAGRAM_HEADER + name_len;
-        let Some((bid, buf, len)) = self.pool.next_free() else {
-            // No pool buffer: the caller waits for one, then arms again.
-            self.disarm(key);
-            return MultiPoll::NeedArm;
-        };
-        if len <= overhead {
-            // Receive buffers too small to hold even the address.
-            self.disarm(key);
-            return MultiPoll::Item(-WSAEINVAL);
-        }
-        let room = len - overhead;
-        let mut from_len = name_len as i32;
-        // SAFETY: `buf` is a free pool buffer of `len` bytes: the payload
-        // goes behind the header and the address field, the address into
-        // its field. The socket is non-blocking.
-        let n = unsafe {
-            recvfrom(
-                socket,
-                buf.add(overhead),
-                room.min(i32::MAX as usize) as i32,
-                0,
-                buf.add(DATAGRAM_HEADER).cast(),
-                &mut from_len,
-            )
-        };
-        let res = if n >= 0 { n } else { -wsa_error() };
-        if res != -WSAEWOULDBLOCK {
-            // SAFETY: the pool buffer is longer than the header.
-            return match unsafe { finish_datagram(buf, from_len, res, room) } {
-                Ok(payload) => {
-                    self.pool.take_next();
-                    let len = (overhead + payload) as u32;
-                    MultiPoll::Data(RecvBuf::pooled(self.pool.clone(), bid, 0, len))
-                }
-                Err(e) => {
-                    self.disarm(key);
-                    MultiPoll::Item(e)
-                }
+        // At most twice: a wait that completes inside its call says a
+        // datagram is there now.
+        for _ in 0..2 {
+            let Some((bid, buf, len)) = self.pool.next_free() else {
+                // No pool buffer: the caller waits for one, then arms again.
+                self.disarm(key);
+                return MultiPoll::NeedArm;
             };
-        }
-        // Nothing there: wait for the next datagram in the kernel.
-        let record = Self::record(socket as HANDLE, true, State::Multi(key), 0);
-        let mut datagram = Box::new(Datagram {
-            buf: vec![0u8; len],
-            overhead,
-            from_len: name_len as i32,
-            flags: 0,
-        });
-        let wsabuf = WSABUF {
-            len: room.min(u32::MAX as usize) as u32,
-            // SAFETY: `overhead < len`, within the buffer.
-            buf: unsafe { datagram.buf.as_mut_ptr().add(overhead) },
-        };
-        // SAFETY: the buffer, the address field and the two values the
-        // kernel writes are in the boxed `Datagram`, which the record owns
-        // until its completion; the record lives until then too.
-        let rc = unsafe {
-            let from = datagram.buf.as_mut_ptr().add(DATAGRAM_HEADER).cast();
-            let from_len = ptr::addr_of_mut!(datagram.from_len);
-            let flags = ptr::addr_of_mut!(datagram.flags);
-            (*record).datagram = Some(datagram);
-            WSARecvFrom(
-                socket,
-                &wsabuf,
-                1,
-                ptr::null_mut(),
-                flags,
-                from,
-                from_len,
-                record.cast(),
-                None,
-            )
-        };
-        let done = match wsa(rc) {
-            ref r if self.reported_later(socket as HANDLE, r) => {
-                self.inflight += 1;
-                let multi = self.multi(key);
-                multi.pending = record;
-                multi.wait(waker);
-                return MultiPoll::Pending;
+            if len <= overhead {
+                // Receive buffers too small to hold even the address.
+                self.disarm(key);
+                return MultiPoll::Item(-WSAEINVAL);
             }
-            // A datagram arrived in between. Finished within the call, so
-            // the port reports nothing.
-            Ok(()) => {
-                // SAFETY: the operation completed; this reads its count.
-                unsafe { (*record).overlapped.InternalHigh as i32 }
-            }
-            Err(code) if ended_with_a_warning(code) => {
-                // Cut off, inside the call: the datagram is in the buffer,
-                // but a packet may still name the record, which lingers.
-                // SAFETY: the call has ended; the kernel no longer writes
-                // to the record or the datagram it owned.
-                let mut datagram = unsafe {
-                    (*record).state = State::Lingering;
-                    (*record).datagram.take().expect("a datagram receive")
-                };
-                self.lingering.insert(record as usize);
-                return match Self::datagram(&mut datagram, -code) {
-                    Ok(data) => MultiPoll::Data(data),
+            let room = len - overhead;
+            let mut from_len = name_len as i32;
+            // SAFETY: `buf` is a free pool buffer of `len` bytes: the payload
+            // goes behind the header and the address field, the address into
+            // its field. The socket is non-blocking.
+            let n = unsafe {
+                recvfrom(
+                    socket,
+                    buf.add(overhead),
+                    room.min(i32::MAX as usize) as i32,
+                    0,
+                    buf.add(DATAGRAM_HEADER).cast(),
+                    &mut from_len,
+                )
+            };
+            let res = if n >= 0 { n } else { -wsa_error() };
+            if res != -WSAEWOULDBLOCK {
+                // SAFETY: the pool buffer is longer than the header.
+                return match unsafe { finish_datagram(buf, from_len, res, room) } {
+                    Ok(payload) => {
+                        self.pool.take_next();
+                        let len = (overhead + payload) as u32;
+                        MultiPoll::Data(RecvBuf::pooled(self.pool.clone(), bid, 0, len))
+                    }
                     Err(e) => {
                         self.disarm(key);
                         MultiPoll::Item(e)
                     }
                 };
             }
-            Err(code) => -code,
-        };
-        // SAFETY: nothing is in flight for this record.
-        let mut record = unsafe { Box::from_raw(record) };
-        let mut datagram = record.datagram.take().expect("a datagram receive");
-        match Self::datagram(&mut datagram, done) {
-            Ok(data) => MultiPoll::Data(data),
-            Err(e) => {
-                self.disarm(key);
-                MultiPoll::Item(e)
+            // Nothing there: wait in the kernel for the next datagram.
+            let record = Self::record(socket as HANDLE, true, State::Multi(key), 0);
+            let wsabuf = WSABUF {
+                len: 0,
+                buf: ptr::null_mut(),
+            };
+            let (mut transferred, mut flags) = (0u32, MSG_PEEK as u32);
+            // SAFETY: a length of 0 touches no memory; the record lives
+            // until its completion.
+            let rc = unsafe {
+                WSARecv(
+                    socket,
+                    &wsabuf,
+                    1,
+                    &mut transferred,
+                    &mut flags,
+                    record.cast(),
+                    None,
+                )
+            };
+            match wsa(rc) {
+                ref r if self.reported_later(socket as HANDLE, r) => {
+                    self.inflight += 1;
+                    let multi = self.multi(key);
+                    multi.pending = record;
+                    multi.wait(waker);
+                    return MultiPoll::Pending;
+                }
+                // A datagram longer than nothing, there now: the peek ended
+                // inside the call with a warning status, which may still
+                // queue a packet, so the record lingers until it comes.
+                Err(code) if ended_with_a_warning(code) => {
+                    // SAFETY: the call has ended; the kernel no longer
+                    // writes to the record.
+                    unsafe { (*record).state = State::Lingering };
+                    self.lingering.insert(record as usize);
+                }
+                // A datagram (of zero bytes) arrived in between, or the
+                // socket has an error, which the read that follows reports.
+                _ => {
+                    // SAFETY: nothing is in flight for this record.
+                    drop(unsafe { Box::from_raw(record) });
+                }
             }
         }
-    }
-
-    /// The datagram a waiting receive completed with (`res`), as its
-    /// reader takes it.
-    fn datagram(datagram: &mut Datagram, res: i32) -> Result<RecvBuf, i32> {
-        let room = datagram.buf.len() - datagram.overhead;
-        // SAFETY: the buffer is longer than the header.
-        let payload =
-            unsafe { finish_datagram(datagram.buf.as_mut_ptr(), datagram.from_len, res, room) }?;
-        let mut buf = mem::take(&mut datagram.buf);
-        buf.truncate(datagram.overhead + payload);
-        Ok(RecvBuf::heap(buf))
+        // Ready twice and empty twice: another reader took the datagram.
+        waker.wake_by_ref();
+        MultiPoll::Pending
     }
 
     fn poll_accept(&mut self, key: usize, listener: SOCKET, waker: &Waker) -> MultiPoll {
@@ -1494,17 +1440,24 @@ impl Iocp {
         let mut n = if self.ready > 0 {
             mem::take(&mut self.ready)
         } else {
-            self.collect(match mode {
+            let timeout = match mode {
                 Park::Poll => 0,
                 Park::Wait(None) => u32::MAX, // INFINITE
-                // Rounded up: waking before the deadline would spin until
-                // it. Windows may still end a wait early by its clock
-                // tick; the event loop then waits again for what is left.
-                Park::Wait(Some(d)) => d
-                    .as_nanos()
-                    .div_ceil(1_000_000)
-                    .min(u128::from(u32::MAX - 1)) as u32,
-            })
+                Park::Wait(Some(d)) => match self.alarm.as_ref().map(|a| a.set(self.port.0, d)) {
+                    Some(alarm::Set::Expired) => 0,
+                    // The alarm ends the wait on time. The timeout stays,
+                    // rounded up so that it never ends the wait first:
+                    // waking before the deadline would spin until it.
+                    // Windows may still end a wait early by its clock
+                    // tick; the event loop then waits again for what is
+                    // left.
+                    _ => d
+                        .as_nanos()
+                        .div_ceil(1_000_000)
+                        .min(u128::from(u32::MAX - 1)) as u32,
+                },
+            };
+            self.collect(timeout)
         };
         loop {
             for i in 0..n {
@@ -1513,6 +1466,10 @@ impl Iocp {
                 // from the wait is all it asks.
                 if !entry.lpOverlapped.is_null() {
                     self.complete(entry);
+                } else if entry.lpCompletionKey == alarm::KEY {
+                    if let Some(alarm) = &self.alarm {
+                        alarm.rang();
+                    }
                 }
             }
             if n < BATCH {
@@ -1604,19 +1561,11 @@ impl Iocp {
                         Self::accepted(&mut record).unwrap_or_else(|e| e)
                     }
                 });
-                let datagram = record
-                    .datagram
-                    .take()
-                    .map(|mut d| Self::datagram(&mut d, res));
                 let multi = self.multi(key);
                 multi.pending = ptr::null_mut();
-                match datagram {
-                    Some(Ok(data)) => multi.data = Some(data),
-                    Some(Err(e)) => multi.accepted = Some(e),
-                    None => {}
-                }
-                // A zero-byte receive that failed leaves nothing: the read
-                // that follows meets the same error and reports it.
+                // A zero-byte receive (or peek) that failed leaves nothing:
+                // the read that follows meets the same error and reports
+                // it.
                 if let Some(res) = accepted {
                     multi.accepted = Some(res);
                 }
@@ -1798,15 +1747,19 @@ mod tests {
         let target = path.clone();
         crate::Builder::new()
             .block_on(async move {
-                let removal = crate::time::timeout(
-                    Duration::from_millis(50),
-                    crate::fs::remove_file(&target),
-                )
-                .await;
+                // Polled once, so that it is queued, then dropped at once:
+                // a timed wait could outlast the pool's stall check, which
+                // starts a thread for a job queued behind stuck ones.
+                let mut removal = Box::pin(crate::fs::remove_file(&target));
+                use std::future::Future;
+                let polled =
+                    std::future::poll_fn(|cx| std::task::Poll::Ready(removal.as_mut().poll(cx)))
+                        .await;
                 assert!(
-                    removal.is_err(),
-                    "the removal ran with every thread busy: {removal:?}"
+                    polled.is_pending(),
+                    "the removal ran with every thread busy: {polled:?}"
                 );
+                drop(removal);
                 std::fs::write(&target, b"second").unwrap();
                 drop(release);
                 // Time for the queued job to be taken, had it not been cancelled.

@@ -147,6 +147,45 @@ fn the_server_wide_limit_on_prepared_statements_is_handled() {
     });
 }
 
+#[test]
+fn many_tasks_at_the_prepared_statement_limit_all_get_their_statements() {
+    run_odd(|_, odd| async move {
+        prepared_at_most(odd, 0).await;
+        let _limit = Global::set(odd, "max_prepared_stmt_count", "8");
+        // Far more distinct statements in flight at once than the server
+        // holds: prepares wait their turn instead of failing.
+        for capacity in [64, 2, 0] {
+            let config = odd.tcp(SHA2_USER).statement_cache_capacity(capacity);
+            let pool = Pool::new(config, 2);
+            let tasks: Vec<_> = (0..2000i64)
+                .map(|i| {
+                    let pool = pool.clone();
+                    giong::spawn(async move {
+                        let sql = format!("SELECT {} + ?", i % 41);
+                        let row = pool.query_one(&sql, &[&1i64]).await?;
+                        Ok::<_, giong_mysql::Error>(row.get::<i64>(0).unwrap())
+                    })
+                })
+                .collect();
+            let mut failed = Vec::new();
+            for (i, task) in tasks.into_iter().enumerate() {
+                match task.await.unwrap() {
+                    Ok(v) => assert_eq!(v, (i as i64 % 41) + 1),
+                    Err(e) => failed.push(e.to_string()),
+                }
+            }
+            assert!(
+                failed.is_empty(),
+                "capacity {capacity}: {} of 2000 failed, first: {}",
+                failed.len(),
+                failed[0]
+            );
+            drop(pool);
+            prepared_at_most(odd, 0).await;
+        }
+    });
+}
+
 /// The connection id a new connection to `port` gets, from its greeting.
 async fn next_connection_id(port: u16) -> u32 {
     let conn = TcpStream::connect(("127.0.0.1", port)).await.unwrap();

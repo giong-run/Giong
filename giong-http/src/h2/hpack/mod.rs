@@ -33,6 +33,67 @@ const STATIC: [(&str, &str); 61] = [
     ("user-agent", ""), ("vary", ""), ("via", ""), ("www-authenticate", ""),
 ];
 
+/// The entries of [`STATIC`] named `name`, as a range of positions (entries
+/// with the same name are next to each other). One `match` on the name: a
+/// scan of the table compared up to 61 names for every field encoded.
+fn static_names(name: &[u8]) -> Option<(usize, usize)> {
+    Some(match name {
+        b":authority" => (0, 1),
+        b":method" => (1, 3),
+        b":path" => (3, 5),
+        b":scheme" => (5, 7),
+        b":status" => (7, 14),
+        b"accept-charset" => (14, 15),
+        b"accept-encoding" => (15, 16),
+        b"accept-language" => (16, 17),
+        b"accept-ranges" => (17, 18),
+        b"accept" => (18, 19),
+        b"access-control-allow-origin" => (19, 20),
+        b"age" => (20, 21),
+        b"allow" => (21, 22),
+        b"authorization" => (22, 23),
+        b"cache-control" => (23, 24),
+        b"content-disposition" => (24, 25),
+        b"content-encoding" => (25, 26),
+        b"content-language" => (26, 27),
+        b"content-length" => (27, 28),
+        b"content-location" => (28, 29),
+        b"content-range" => (29, 30),
+        b"content-type" => (30, 31),
+        b"cookie" => (31, 32),
+        b"date" => (32, 33),
+        b"etag" => (33, 34),
+        b"expect" => (34, 35),
+        b"expires" => (35, 36),
+        b"from" => (36, 37),
+        b"host" => (37, 38),
+        b"if-match" => (38, 39),
+        b"if-modified-since" => (39, 40),
+        b"if-none-match" => (40, 41),
+        b"if-range" => (41, 42),
+        b"if-unmodified-since" => (42, 43),
+        b"last-modified" => (43, 44),
+        b"link" => (44, 45),
+        b"location" => (45, 46),
+        b"max-forwards" => (46, 47),
+        b"proxy-authenticate" => (47, 48),
+        b"proxy-authorization" => (48, 49),
+        b"range" => (49, 50),
+        b"referer" => (50, 51),
+        b"refresh" => (51, 52),
+        b"retry-after" => (52, 53),
+        b"server" => (53, 54),
+        b"set-cookie" => (54, 55),
+        b"strict-transport-security" => (55, 56),
+        b"transfer-encoding" => (56, 57),
+        b"user-agent" => (57, 58),
+        b"vary" => (58, 59),
+        b"via" => (59, 60),
+        b"www-authenticate" => (60, 61),
+        _ => return None,
+    })
+}
+
 /// The default size of a dynamic table, and the largest one we keep in
 /// either direction.
 pub(crate) const TABLE_SIZE: usize = 4096;
@@ -481,16 +542,16 @@ impl Encoder {
     /// Encodes one field. `name` must be lowercase.
     pub(crate) fn field(&mut self, name: &[u8], value: &[u8], index: Index, out: &mut Vec<u8>) {
         let mut name_index = 0;
-        for (i, &(n, v)) in STATIC.iter().enumerate() {
-            if n.as_bytes() == name {
-                if v.as_bytes() == value && index != Index::Never {
-                    write_int(out, 0x80, 7, i + 1);
-                    return;
-                }
-                if name_index == 0 {
-                    name_index = i + 1;
+        if let Some((first, end)) = static_names(name) {
+            if index != Index::Never {
+                for (i, &(_, v)) in STATIC.iter().enumerate().take(end).skip(first) {
+                    if v.as_bytes() == value {
+                        write_int(out, 0x80, 7, i + 1);
+                        return;
+                    }
                 }
             }
+            name_index = first + 1;
         }
         if index != Index::Never {
             for (i, entry) in self.table.entries.iter().enumerate() {

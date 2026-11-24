@@ -153,3 +153,32 @@ pub mod errno {
     #[cfg(windows)]
     pub const NO_PEER: i32 = 10057;
 }
+
+/// How many times [`wake_latency_within`] measures before it gives up.
+pub const WAKE_TRIES: usize = 3;
+
+/// Runs a wake-up latency measurement, which returns the worst delay it saw,
+/// until one comes in under `bound`, at most [`WAKE_TRIES`] times. `Err`
+/// holds every try's worst when all of them were slow.
+///
+/// A hosted runner can stop a thread for hundreds of milliseconds at a
+/// time (a busy shared VM), and a single sample of that would fail a test
+/// meant to catch a slow wake-up path. A slow path is slow on every try, so
+/// it still fails; a lost wake-up fails each test's own deadline at once.
+pub fn wake_latency_within(
+    bound: std::time::Duration,
+    mut measure: impl FnMut() -> std::time::Duration,
+) -> Result<std::time::Duration, Vec<std::time::Duration>> {
+    let mut tries = Vec::with_capacity(WAKE_TRIES);
+    for _ in 0..WAKE_TRIES {
+        let worst = measure();
+        if worst < bound {
+            if !tries.is_empty() {
+                eprintln!("wake-up latency: slow tries {tries:?} before {worst:?}");
+            }
+            return Ok(worst);
+        }
+        tries.push(worst);
+    }
+    Err(tries)
+}
