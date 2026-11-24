@@ -118,7 +118,10 @@ fn alive(pid: u32) -> bool {
 
 #[test]
 fn with_nothing_running_status_logs_and_stop_say_so_and_succeed() {
-    if !has_command("dev") {
+    // Finding the project asks cargo.
+    if !has_command("dev")
+        || !toolchain("with_nothing_running_status_logs_and_stop_say_so_and_succeed")
+    {
         return;
     }
     let dir = project("devctl-idle");
@@ -184,7 +187,7 @@ fn background_and_once_do_not_go_together() {
 #[test]
 #[cfg_attr(
     windows,
-    ignore = "known bug: on Windows the background runner inherits the caller's output pipe, so a piped caller never sees --background end"
+    ignore = "known bug #378: on Windows the background runner inherits the caller's output pipe, so a piped caller never sees --background end"
 )]
 fn background_serves_reports_logs_and_stops() {
     if !has_command("dev") || !toolchain("background_serves_reports_logs_and_stops") {
@@ -281,7 +284,7 @@ fn background_serves_reports_logs_and_stops() {
 #[test]
 #[cfg_attr(
     windows,
-    ignore = "known bug: on Windows the background runner inherits the caller's output pipe, so a piped caller never sees --background end"
+    ignore = "known bug #378: on Windows the background runner inherits the caller's output pipe, so a piped caller never sees --background end"
 )]
 fn background_with_a_broken_build_returns_the_error() {
     if !has_command("dev") || !toolchain("background_with_a_broken_build_returns_the_error") {
