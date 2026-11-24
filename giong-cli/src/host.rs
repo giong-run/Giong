@@ -134,7 +134,7 @@ fn run_within(cmd: &mut Command, timeout: Duration) -> Result<String, ToolError>
 }
 
 /// Whether a program can be started.
-#[allow(dead_code)] // called by giong db and image (#220)
+#[cfg(test)] // the tests skip where a tool is missing
 pub fn exists(program: &str, args: &[&str]) -> bool {
     !matches!(
         run(Command::new(program).args(args)),
