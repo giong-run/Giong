@@ -72,6 +72,44 @@ runs the same version (`--install` installs it; the gate warns when it is missin
 the pin in a pull request of its own after each Rust release, fixing what the new lints
 find in the same pull request.
 
+## When CI fails outside the code
+
+**The CI gate.** Required on `main`: one commit status, `CI gate`, which
+`.github/workflows/ci-gate.yml` sets when a run of CI starts (pending) and ends. It
+passes exactly when the run passed. When the run failed only outside the code, it reruns
+the failed jobs of that same run, and only those (GitHub adds the jobs that wait for
+them, such as `all-checks`), at most twice, while the merge queue keeps the pull request
+in place; the jobs that passed keep their result. Before it, the first failed required
+job removed the pull request from the queue and every group behind it started again from
+nothing (release 1.4.1 lost three queue runs that way on 2026-11-23).
+
+What counts as outside the code (`scripts/ci-gate.py`, tested by
+`scripts/test_ci_gate.py`): a failed step whose name starts with `net: `, GitHub's own
+setup steps (checkout, toolchain, caches, artifacts), a runner GitHub lost, a job that
+ran out of time inside a `net: ` step. Everything else fails the gate at once: a test, a
+lint, a build, and a job that ran out of time anywhere else, since a hang is a bug. **A
+failing test is never rerun to pass**, with the one exception the project's rules make: a
+known flake whose issue is open with a fix on its way, listed in
+`.github/known-flakes.txt`, is rerun once, and the run's summary names the issue.
+
+**Naming a step `net: `** is a promise that it only fetches or installs: it goes through
+`scripts/ci-net.sh` (retries with a time limit on every try, `fetch` with a SHA-256) or
+`.github/actions/apt-install`. Never put a build or a test in such a step: the gate would
+rerun its failures.
+
+**Mirrors off the hot path.** Ubuntu packages come from a cache of their `.deb` files
+(`.github/actions/apt-install`, `scripts/ci-apt.sh`), keyed by the runner image and
+falling back to another image version's files when they still install (GitHub serves
+several image versions at once), so a job goes to an Ubuntu mirror about once a week
+instead of every run. The database servers of
+the `servers` job (`scripts/ci-servers.sh`), h2spec, cargo-semver-checks and kani-verifier
+are cached the same way. A new apt package goes through the action, never a bare
+`apt-get`.
+
+**Starting CI again by hand.** Use "Re-run failed jobs" on the run (or
+`gh run rerun --failed`), never a new push or a new enqueue: the jobs that passed keep
+their result. On a test failure, read the log and fix the cause first.
+
 ## One change, start to finish
 
 1. **Take one item** from the backlog of your line of work (see [The backlog](#the-backlog)).

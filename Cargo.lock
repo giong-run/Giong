@@ -401,6 +401,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "giong-cli"
+version = "1.4.2"
+dependencies = [
+ "serde_json",
+ "socket2",
+]
+
+[[package]]
 name = "giong-compat"
 version = "1.4.2"
 dependencies = [
@@ -472,6 +480,7 @@ version = "1.4.2"
 dependencies = [
  "giong",
  "giong-http",
+ "giong-web",
  "libc",
  "serde_json",
 ]
