@@ -213,6 +213,23 @@ A future that had started an I/O operation (a read, a write, a connect, a file o
 
 [All error codes](README.md)
 "#),
+    (14, r#"# GIONG-E0014: the compute lane is full
+
+Raised by `giong::try_spawn_compute` and `Handle::try_spawn_compute`. In code: `giong::error::Code::ComputeBusy`. Its `io::ErrorKind` is `WouldBlock`.
+
+## What happened
+
+Every thread of the compute lane was busy and as many closures as `Builder::compute_backlog` allows (by default four per compute thread) were already waiting for one. The new closure was dropped without running. `giong::spawn_compute`, which never refuses, would have queued it behind the others.
+
+## How to fix it
+
+- Under overload this is the intended answer: shed the request (an HTTP server answers 503 with `Retry-After`) instead of queueing work that will finish too late to matter.
+- If the lane is behind all the time, the machine needs more CPU for this work: give it more compute threads (`Builder::compute_threads`), fewer workers so those threads get CPUs of their own, or make each job cheaper.
+- If short bursts are refused while the average load is fine, raise `Builder::compute_backlog` so a burst can wait.
+- `Handle::lane_stats()` shows the compute lane's busy threads and queued closures.
+
+[All error codes](README.md)
+"#),
     (20, r#"# GIONG-E0020: a worker thread could not be started
 
 Raised by the runtime, by `Runtime::run`. In code: `giong::error::Code::ThreadLimit`.
@@ -254,6 +271,38 @@ Calls that return the kernel's `ENOBUFS` as it is, with no code, as on Linux:
 - Cap the number of connections that can hold unread data at once (a semaphore around the work, or a lower connection limit on the server).
 - Lower `SO_RCVBUF` and `SO_SNDBUF` if the program raised them.
 - `netstat -m` shows how many requests for network buffers were denied. If the error comes with little in use, treat it as transient: try the operation again later, or on a new connection.
+
+[All error codes](README.md)
+"#),
+    (80, r#"# GIONG-E0080: the budget is at its limit
+
+Raised by `Budget::try_spawn`, `Budget::try_reserve` and `Budget::try_spawn_compute` in `giong::budget`, and by `giong::try_spawn_compute` inside a task of a budget. In code: `giong::error::Code::BudgetFull`. Its `io::ErrorKind` is `WouldBlock`.
+
+## What happened
+
+The budget (one tenant's share of the runtime) already holds as much as one of its `Limits` allows: tasks alive, bytes reserved, or compute closures queued and running; or other calls already wait for room in it. The message names the budget, the limit, what is in use and how many wait. The work was dropped without running. The waiting forms (`Budget::spawn`, `Budget::reserve`, `Budget::spawn_compute`) would have waited their turn instead.
+
+## How to fix it
+
+- Under overload this is the intended answer: the tenant has as much in progress as it may, so shed the request (an HTTP server answers 503 with `Retry-After`) rather than queue work for it. Other tenants are not affected.
+- If the tenant's normal load needs more, raise its limits with `Budget::set_limits`.
+- To wait for room instead of refusing, use the waiting form of the call, bounded with `giong::time::timeout`.
+- `Budget::stats()` shows what each resource of the budget holds, its peak, and how many calls waited or were refused.
+
+[All error codes](README.md)
+"#),
+    (81, r#"# GIONG-E0081: a reservation larger than the budget
+
+Raised by `Budget::reserve` and `Budget::try_reserve` in `giong::budget`. In code: `giong::error::Code::BudgetTooSmall`. Its `io::ErrorKind` is `InvalidInput`.
+
+## What happened
+
+The reservation asked for more bytes than the budget's whole memory limit (`Limits::memory`). It could never be granted, however long it waited, so it failed at once instead of waiting forever.
+
+## How to fix it
+
+- Raise the budget's memory limit above the largest reservation its work makes (`Budget::set_limits`).
+- Or reserve in parts: a request body can be reserved as it arrives, in chunks, with each chunk's reservation kept until the body is dropped.
 
 [All error codes](README.md)
 "#),
