@@ -784,6 +784,7 @@ fn detach(cmd: &mut Process) {
 
 /// The process that listens on `port`, when this machine says: its pid and
 /// command line.
+#[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
 pub fn port_owner(port: u16) -> Option<(u32, String)> {
     #[cfg(target_os = "linux")]
     {
@@ -872,6 +873,7 @@ fn linux_port_owner(port: u16) -> Option<(u32, String)> {
 
 /// What to say about the process that holds `port`: who it is and how to
 /// stop it, naming the project when a `giong dev` started it.
+#[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
 pub fn port_owner_fix(port: u16) -> Option<String> {
     let (pid, command) = port_owner(port)?;
     let shown = if command.is_empty() {
