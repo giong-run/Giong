@@ -38,6 +38,9 @@ enum Reply {
 struct FakeDns {
     addr: SocketAddr,
     queries: Arc<Mutex<Vec<(String, u16)>>>,
+    /// What the UDP side did and when, for a test to print when its answer
+    /// is not what the timing should give.
+    events: Arc<Mutex<Vec<(Instant, String)>>>,
 }
 
 impl FakeDns {
@@ -86,8 +89,9 @@ impl FakeDns {
             .unwrap_or_else(|| panic!("no free UDP and TCP port pair; last refusal: {refusal:?}"));
         drop((busy_tcp, busy_udp));
         let queries = Arc::new(Mutex::new(Vec::new()));
+        let events = Arc::new(Mutex::new(Vec::new()));
 
-        let (t, q) = (table.clone(), queries.clone());
+        let (t, q, ev) = (table.clone(), queries.clone(), events.clone());
         std::thread::spawn(move || {
             let mut buf = [0u8; 512];
             loop {
@@ -96,19 +100,26 @@ impl FakeDns {
                     // Windows reports a "port unreachable" answer to an
                     // earlier reply (its asker had gone) on the next
                     // receive; the server carries on.
-                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => continue,
+                    Err(err) if err.kind() == std::io::ErrorKind::ConnectionReset => {
+                        record(&ev, format!("receive: {err}"));
+                        continue;
+                    }
                     Err(_) => return,
                 };
                 let Some((reply, delay)) = answer(&buf[..n], &t, &q, false) else {
                     continue;
                 };
+                let what = format!("type {} for {from}", qtype_of(&reply));
+                record(&ev, format!("query {what}"));
                 if delay.is_zero() {
-                    let _ = udp.send_to(&reply, from);
+                    let sent = udp.send_to(&reply, from);
+                    record(&ev, format!("answer {what} sent: {sent:?}"));
                 } else {
-                    let udp = udp.try_clone().unwrap();
+                    let (udp, ev) = (udp.try_clone().unwrap(), ev.clone());
                     std::thread::spawn(move || {
                         std::thread::sleep(delay);
-                        let _ = udp.send_to(&reply, from);
+                        let sent = udp.send_to(&reply, from);
+                        record(&ev, format!("answer {what} sent: {sent:?}"));
                     });
                 }
             }
@@ -132,7 +143,26 @@ impl FakeDns {
                 }
             }
         });
-        Self { addr, queries }
+        Self {
+            addr,
+            queries,
+            events,
+        }
+    }
+
+    /// The UDP side's events, each with its time since `since`.
+    fn timeline(&self, since: Instant) -> String {
+        self.events
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(at, what)| {
+                format!(
+                    "\n  {:>4} ms  {what}",
+                    at.saturating_duration_since(since).as_millis()
+                )
+            })
+            .collect()
     }
 
     fn count(&self, name: &str) -> usize {
@@ -159,6 +189,19 @@ impl FakeDns {
             .timeout(Duration::from_secs(5));
         Resolver::new(cfg)
     }
+}
+
+fn record(events: &Mutex<Vec<(Instant, String)>>, what: String) {
+    events.lock().unwrap().push((Instant::now(), what));
+}
+
+/// The type in the question of a query or an answer to it.
+fn qtype_of(message: &[u8]) -> u16 {
+    let mut pos = 12;
+    while message[pos] != 0 {
+        pos += 1 + message[pos] as usize;
+    }
+    u16::from_be_bytes([message[pos + 1], message[pos + 2]])
 }
 
 fn encode_name(name: &str) -> Vec<u8> {
@@ -643,8 +686,19 @@ fn a_slow_server_gets_a_grace_as_long_as_its_first_answer() {
         ),
     ]);
     giong::block_on(async {
+        let started = Instant::now();
         let got = dns.resolver("").lookup_ip("far.test").await.unwrap();
-        assert_eq!(got, ips(&["2001:db8::6", "192.0.2.6"]));
+        // On a miss, when each answer left the server and when the lookup
+        // ended tell a lost or failed exchange (the lookup ends with the
+        // other answer, ~450 ms) from one that never saw its answer (the
+        // grace ends it, ~900 ms) and from a late server.
+        assert_eq!(
+            got,
+            ips(&["2001:db8::6", "192.0.2.6"]),
+            "the lookup ended after {:?}; the server:{}",
+            started.elapsed(),
+            dns.timeline(started)
+        );
     });
 }
 
