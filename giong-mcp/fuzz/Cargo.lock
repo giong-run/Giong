@@ -64,6 +64,7 @@ name = "giong-http"
 version = "1.4.1"
 dependencies = [
  "giong",
+ "libc",
 ]
 
 [[package]]
