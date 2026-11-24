@@ -158,7 +158,6 @@ pub struct Row {
     pub key: String,
     pub in_example: bool,
     pub source: Source,
-    pub example_value: Option<String>,
     /// The line of `.env.example` that lists the key (1 when it is not there).
     pub example_line: u32,
 }
@@ -183,7 +182,6 @@ pub fn rows(example: &[Var], dot: &[Var], env: &dyn Fn(&str) -> Option<String>) 
             };
             Row {
                 in_example: ex.is_some(),
-                example_value: ex.map(|v| v.value.clone()),
                 example_line: ex.map_or(1, |v| v.line),
                 key,
                 source,
