@@ -1104,18 +1104,22 @@ fn slow_requests_blame_a_pool_that_makes_requests_wait() {
         let verdict = &checkout["verdict"];
         assert_eq!(verdict["cause"], "pool_wait", "{answer}");
         assert_ne!(verdict["confidence"], "low", "{answer}");
-        assert!(
-            verdict["share_of_excess"].as_f64().unwrap() > 0.8,
-            "{answer}"
-        );
+        // What the verdict is built from: the phase that grew most from the
+        // faster half to the tail, by the whole 30 ms wait. Not its share
+        // of the excess: a stall of the runner (47 ms on macOS, #387) grows
+        // the tail's query and blocked time too, and with a dozen requests
+        // in the tail it took the share from about 0.95 to 0.67.
+        assert_eq!(verdict["phase"], "pool", "{answer}");
+        let grew = |phase: &str| {
+            let key = format!("{phase}_ms");
+            checkout["tail"][&key].as_f64().unwrap()
+                - checkout["faster_half"][&key].as_f64().unwrap()
+        };
+        assert!(grew("pool") >= 29.0, "{answer}");
         assert!(verdict["suggestion"]
             .as_str()
             .unwrap()
             .contains("postgres pool"));
-        assert!(
-            checkout["tail"]["pool_ms"].as_f64().unwrap() >= 29.0,
-            "{answer}"
-        );
         assert_eq!(checkout["slowest"][0]["pool"]["what"], "postgres");
         assert_eq!(checkout["slowest"][0]["protocol"], "http/1.1");
         assert!(answer["summary"]
@@ -1197,8 +1201,12 @@ fn slow_requests_name_the_route_that_blocks_the_worker() {
             "{answer}"
         );
         assert_eq!(fast["slowest"][0]["blocked_by"]["route"], "GET /report");
+        // The slowest request, which the verdict is built from, spent its
+        // time behind the hold. Not the tail's mean: latencies are bucketed
+        // to a quarter, so on a slow runner (#381) the tail took in hundreds
+        // of `/fast` requests that were never behind one of the few holds.
         assert!(
-            fast["tail"]["blocked_ms"].as_f64().unwrap() >= 10.0,
+            fast["slowest"][0]["blocked_ms"].as_f64().unwrap() >= 10.0,
             "{answer}"
         );
         let lp = &answer["long_polls"][0];

@@ -32,9 +32,9 @@ API reference is on docs.rs (`https://docs.rs/<crate>`); the index for models is
    immutable data, atomics, `giong::sync::{mpsc, oneshot}`, or Tokio's `sync` module
    (`tokio = { version = "1", default-features = false, features = ["sync"] }`).
 4. **Never block a worker.** No `std::fs`, `std::net`, `std::thread::sleep` or long loops
-   on it. Use `giong::fs`, `giong::net`, `giong::time`. There is no `spawn_blocking`: run
-   blocking or heavy work on `std::thread::spawn` and await a `giong::sync::oneshot`. Call
-   `giong::yield_now().await` in long loops.
+   on it. Use `giong::fs`, `giong::net`, `giong::time`. Blocking calls go to
+   `giong::spawn_blocking(f).await`, CPU-heavy work to `giong::spawn_compute(f).await`
+   (threads below the workers' priority). Call `giong::yield_now().await` in long loops.
 5. **`bind` takes IP addresses**: `TcpListener::bind("0.0.0.0:8080")`, never
    `"localhost:8080"` (`GIONG-E0100`). Every worker binds the same port. `TcpStream::connect`
    resolves names itself; `giong::net::lookup_host` resolves them without blocking.
@@ -93,7 +93,7 @@ running": replace it, or run it on a Tokio runtime in a thread of its own behind
 | `#[tokio::main]` | `giong::Builder::new().build()?.run(\|_\| async { .. })` or `giong::block_on` |
 | `tokio::spawn` | `giong::spawn` (stays on the worker; no `Send`); `Handle::spawn_on` / `spawn_balanced` for other workers |
 | `tokio::join!`, `select!` | `futures::join!`, `futures::select!` |
-| `spawn_blocking` | `std::thread::spawn` + `giong::sync::oneshot` |
+| `spawn_blocking` | `giong::spawn_blocking` for blocking calls, `giong::spawn_compute` for CPU-heavy work |
 | `Arc<Mutex<T>>` in handlers | `Rc<RefCell<T>>` per worker, or a channel |
 | `tokio::time::interval` | a loop around `giong::time::sleep_until(next)` |
 | `tokio::signal::ctrl_c()` | `Builder::shutdown_on_signals(true)` + `giong::shutdown_signal().await` |

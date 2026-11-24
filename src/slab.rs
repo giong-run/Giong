@@ -37,6 +37,25 @@ impl<T> Slab<T> {
         key
     }
 
+    /// [`insert`](Self::insert), always inlined: for the spawn path, where
+    /// the call costs more than the body. A copy, not a call from `insert`,
+    /// so that the driver's calls keep the compiler's own inlining choice.
+    #[inline(always)]
+    pub(crate) fn insert_inline(&mut self, val: T) -> usize {
+        let key = self.next;
+        if key == self.entries.len() {
+            self.entries.push(Entry::Occupied(val));
+            self.next = key + 1;
+        } else {
+            match mem::replace(&mut self.entries[key], Entry::Occupied(val)) {
+                Entry::Vacant(next) => self.next = next,
+                Entry::Occupied(_) => unreachable!("slab free list points at an occupied slot"),
+            }
+        }
+        self.len += 1;
+        key
+    }
+
     pub(crate) fn remove(&mut self, key: usize) -> Option<T> {
         match self.entries.get_mut(key) {
             Some(entry @ Entry::Occupied(_)) => {

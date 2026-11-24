@@ -122,18 +122,26 @@ pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
 /// (49152 and up), so that no socket of a test running beside this one is
 /// given it in the meantime; one given it after a datagram to a closed
 /// ephemeral port went unanswered on a runner.
+///
+/// The returned socket holds the same port number for TCP, which leaves
+/// UDP datagrams to it refused, and claims the port from other test
+/// processes: their UDP probe of it (a bind, closed again) would take a
+/// datagram sent there in the meantime, without "port unreachable". Runs
+/// of 40 test processes started at once caught that.
 #[cfg(windows)]
 pub fn refusing_udp_addr() -> (Socket, SocketAddr) {
     let start = 20_000 + (std::process::id() as u16 % 1000) * 20;
     // Below the ports `shared_port` takes.
-    let addr = (0..4_500u16)
+    (0..4_500u16)
         .map(|i| SocketAddr::from(([127, 0, 0, 1], start + i)))
-        .find(|addr| {
+        .find_map(|addr| {
+            let claim = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+            claim.bind(&addr.into()).ok()?;
             let probe = Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap();
-            probe.bind(&(*addr).into()).is_ok()
+            probe.bind(&addr.into()).ok()?;
+            Some((claim, addr))
         })
-        .expect("no free UDP port below the ephemeral range");
-    (Socket::new(Domain::IPV4, Type::DGRAM, None).unwrap(), addr)
+        .expect("no free UDP port below the ephemeral range")
 }
 
 /// Error numbers the tests compare against, as each system spells them.

@@ -101,10 +101,12 @@ mod executor;
 mod kbox;
 mod notify;
 mod op;
+mod pool;
 mod runtime;
 mod slab;
 mod sys;
 
+pub mod budget;
 pub mod error;
 #[cfg(unix)]
 pub mod fs;
@@ -113,6 +115,7 @@ pub mod fs;
 pub mod fs;
 #[cfg(target_os = "linux")]
 pub mod ipc;
+pub mod lane;
 pub mod net;
 pub mod observe;
 #[cfg(target_os = "linux")]
@@ -125,6 +128,7 @@ pub mod time;
 pub use buf::{IoBuf, IoBufMut, RecvBuf};
 pub use driver::{ChosenBy, DriverChoice, DriverKind, IoUringFeature, KernelWorkaround};
 pub use executor::{spawn, yield_now, JoinError, JoinHandle, RemoteJoinHandle};
+pub use lane::{spawn_blocking, spawn_compute, try_spawn_compute, BlockingHandle};
 pub use runtime::{
     block_on, driver_choice, driver_kind, handle, is_shutting_down, shutdown_signal, try_worker_id,
     until_shutdown, worker_id, Builder, Handle, Runtime, ShutdownSignal, UntilShutdown,

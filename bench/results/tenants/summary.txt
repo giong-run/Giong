@@ -1,0 +1,15 @@
+# 2026-11-21T04:06:43Z 6.18.44-fc-v726 4 CPUs: Intel(R) Xeon(R) Processor @ 2.10GHz; cgroup v1; B 100/s on 10 conns, deadline 50 ms, 20 s; rounds 1-2 from one run (it stopped one row short), round 3 from a second run
+scenario driver    mode        B solo ok  B overload ok    kept  B p99 ms     A ok  peak MiB  OOM
+cpu      epoll     global           2000              0    0.0%   10209.5    13378        20    0
+cpu      epoll     isolated         2000           2000  100.0%       4.4     8344        18    0
+cpu      epoll     shared           2000              0    0.0%   10080.6    13380        20    0
+cpu      io_uring  global           2000              0    0.0%   10158.5    13378        20    0
+cpu      io_uring  isolated         2000           2000  100.0%       4.4     8355        18    0
+cpu      io_uring  shared           2000              0    0.0%   10149.0    13381        20    0
+memory   epoll     global           2000              0    0.0%     231.9    28517        67    0
+memory   epoll     isolated         2000           2000  100.0%       4.4    30020        47    0
+memory   epoll     shared           1999              0    0.0%       nan       12       128    3
+memory   io_uring  global           2000              0    0.0%     232.8    28455        68    0
+memory   io_uring  isolated         2000           2000  100.0%       3.1    29980        42    0
+memory   io_uring  shared           2000              0    0.0%       nan        4       128    3
+kept = B's in-deadline successes under overload / solo (medians over rounds); A ok = total over the run
