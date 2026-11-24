@@ -415,28 +415,31 @@ fn collect(root: &Path, rel: &str, out: &mut Vec<Entry>) -> Result<(), Failure> 
     }
     let full = root.join(p);
     let mut meta = std::fs::symlink_metadata(&full).map_err(|e| bad(format!("{rel}: {e}")))?;
-    if meta.file_type().is_symlink() {
-        // A cloned repository can commit a link to any file on this machine
-        // (static/x -> ~/.ssh/id_rsa): only a link to a file inside the
-        // project goes in, as a copy of that file.
-        let target = std::fs::canonicalize(&full).map_err(|e| bad(format!("{rel}: {e}")))?;
-        let inside = std::fs::canonicalize(root).is_ok_and(|r| target.starts_with(r));
+    // A cloned repository can commit a link to anything on this machine
+    // (static/x -> ~/.ssh/id_rsa, or static -> ~ with --add static/x): every
+    // entry must resolve inside the project, a link only to a file there,
+    // which goes in as a copy of that file.
+    let target = std::fs::canonicalize(&full).map_err(|e| bad(format!("{rel}: {e}")))?;
+    let inside = std::fs::canonicalize(root).is_ok_and(|r| target.starts_with(r));
+    let link = meta.file_type().is_symlink();
+    if link {
         meta = std::fs::metadata(&target).map_err(|e| bad(format!("{rel}: {e}")))?;
-        if !inside || !meta.is_file() {
-            return Err(Failure::new(
-                Code::IMAGE_ADD,
-                format!(
-                    "{rel} is a link to {}, {}",
-                    target.display(),
-                    if inside {
-                        "a folder"
-                    } else {
-                        "outside the project"
-                    }
-                ),
-                "giong image adds a link only when it points at a file inside the project: replace the link with the files, or leave it out of --add",
-            ));
-        }
+    }
+    if !inside || (link && !meta.is_file()) {
+        return Err(Failure::new(
+            Code::IMAGE_ADD,
+            format!(
+                "{rel} {} {}, {}",
+                if link { "is a link to" } else { "resolves to" },
+                target.display(),
+                if inside {
+                    "a folder"
+                } else {
+                    "outside the project"
+                }
+            ),
+            "giong image adds a link only when it points at a file inside the project: replace the link with the files, or leave it out of --add",
+        ));
     }
     let clean: String = p
         .components()
@@ -458,7 +461,7 @@ fn collect(root: &Path, rel: &str, out: &mut Vec<Entry>) -> Result<(), Failure> 
             collect(root, &format!("{clean}/{n}"), out)?;
         }
     } else if meta.is_file() {
-        let data = std::fs::read(&full).map_err(|e| bad(format!("{rel}: {e}")))?;
+        let data = std::fs::read(&target).map_err(|e| bad(format!("{rel}: {e}")))?;
         #[cfg(unix)]
         let mode = {
             use std::os::unix::fs::PermissionsExt;
@@ -1245,6 +1248,9 @@ mod tests {
 
         symlink(&base, root.join("up")).unwrap();
         assert!(collect(&root, "up", &mut Vec::new()).is_err());
+        // A file reached through a linked folder outside is refused too.
+        let e = collect(&root, "up/id_rsa", &mut Vec::new()).unwrap_err();
+        assert!(e.what.contains("outside the project"), "{}", e.what);
         std::fs::remove_dir_all(&base).unwrap();
     }
 

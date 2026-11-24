@@ -516,3 +516,34 @@ fn a_planted_state_file_is_ignored() {
     let mounts = String::from_utf8_lossy(&mounts.stdout).to_string();
     assert!(!mounts.split_whitespace().any(|m| m == "/"), "{mounts}");
 }
+
+/// Docker Desktop on Windows answers in Windows-container mode as well,
+/// where no database image pulls: giong db up says so up front.
+#[cfg(unix)]
+#[test]
+fn a_runtime_in_windows_container_mode_is_refused() {
+    use std::os::unix::fs::PermissionsExt;
+    let p = Project::new("wincontainers", "giong-postgres = \"1.5\"\n");
+    let fake = p.dir.join("fake-docker");
+    std::fs::write(
+        &fake,
+        "#!/bin/sh\ncase \"$*\" in\n  *OSType*) echo windows ;;\n  info*) echo 27.5.1 ;;\n  *) echo \"unexpected: $*\" >&2; exit 1 ;;\nesac\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(&fake, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let out = Command::new(env!("CARGO_BIN_EXE_giong"))
+        .args(["db", "up", "--json"])
+        .current_dir(&p.dir)
+        .env("GIONG_CONTAINER_RUNTIME", &fake)
+        .env_remove("DATABASE_URL")
+        .output()
+        .unwrap();
+    let r: Value = serde_json::from_slice(&out.stdout).unwrap();
+    assert_ne!(out.status.code(), Some(0), "{r}");
+    assert_eq!(r["error"]["code"].as_str(), Some("GIONG-E5040"), "{r}");
+    let message = r["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("runs Windows containers"), "{r}");
+    let fix = r["error"]["fix"].as_str().unwrap_or_default();
+    assert!(fix.contains("Switch to Linux containers"), "{r}");
+    assert!(!p.dir.join(".giong/db.json").exists());
+}
