@@ -97,6 +97,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
 /// cargo check's findings and giong's own, with their edits, printing
 /// nothing: what `giong fix` applies (it runs clippy itself).
 /// `cargo_args` go to cargo (`--features x`).
+#[allow(dead_code)] // called by giong fix (#217)
 pub fn findings(project: &Project, cargo_args: &[String]) -> Result<Vec<Finding>, Failure> {
     let (cargo, _) = cargo_findings(project, "check", cargo_args)?;
     let source = source_findings(project);
