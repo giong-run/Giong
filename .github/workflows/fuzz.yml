@@ -6,9 +6,11 @@ name: Fuzz
 # router and request handling, giong-mcp's request handling, giong-grpc's
 # message framing, gzip, timeouts, status messages, metadata and descriptors, the PostgreSQL,
 # MySQL and Redis protocol readers, and what giong-tls reads of the peer's
-# records around kernel TLS. Every night each target runs for 10 minutes and
+# records around kernel TLS, giong-quic's packets and giong-proto's decoder
+# against the reference one. Every night each target runs for 10 minutes and
 # its corpus is kept in the Actions cache, so the corpus keeps growing. A pull
-# request gets a one-minute run of the targets of the crates it changes (one
+# request gets a one-minute run of the targets of the crates it changes, and
+# of the targets that go through them (one
 # target of each crate when it changes this file), and a push to main a
 # one-minute run of every target, which catches a change in one crate that
 # breaks another's target. A crash fails the job and uploads the input that
@@ -28,10 +30,17 @@ on:
       - "giong-tls/**"
       - "giong-mcp/**"
       - "giong-grpc/**"
+      - "giong-grpc-build/**"
+      - "giong-proto/**"
+      - "giong-quic/**"
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
+      - "scripts/fuzz-reach.py"
+  # A draft skips these jobs (they are not required checks); marking it ready
+  # for review runs them.
   pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
     paths:
       - "giong-http/**"
       - "giong-postgres/**"
@@ -41,9 +50,13 @@ on:
       - "giong-tls/**"
       - "giong-mcp/**"
       - "giong-grpc/**"
+      - "giong-grpc-build/**"
+      - "giong-proto/**"
+      - "giong-quic/**"
       - "src/**"
       - "fuzz/**"
       - ".github/workflows/fuzz.yml"
+      - "scripts/fuzz-reach.py"
   workflow_dispatch:
     inputs:
       seconds:
@@ -60,6 +73,7 @@ concurrency:
 jobs:
   # Which targets to run: all of them, except on a pull request.
   plan:
+    if: ${{ !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
     outputs:
       matrix: ${{ steps.plan.outputs.matrix }}
@@ -123,9 +137,10 @@ jobs:
           )
           if [ "$EVENT" = pull_request ]; then
             changed=$(git diff --name-only HEAD^1 HEAD)
-            if grep -qx '.github/workflows/fuzz.yml' <<<"$changed"; then
-              # A change to this file: one target of each crate, enough to
-              # see that every crate's fuzz job still runs.
+            if grep -qxE '\.github/workflows/fuzz\.yml|scripts/fuzz-reach\.py' <<<"$changed"; then
+              # A change to this file or to fuzz-reach.py: one target of
+              # each crate, enough to see that every crate's fuzz job still
+              # runs.
               all=$(jq -c 'group_by(.crate) | map(.[0])' <<<"$all")
               crates=$(jq -c '[.[].crate]' <<<"$all")
             else
@@ -134,6 +149,12 @@ jobs:
               crates=$(sed -n -e 's#^\(src\|fuzz\)/.*#giong#p' -e 's#^\(giong-[a-z0-9-]*\)/.*#\1#p' <<<"$changed" \
                 | sort -u | jq -R . | jq -c -s .)
             fi
+            # The targets that go through a changed crate run too
+            # (giong-http's go through giong-quic, giong-web's through
+            # giong-http...): scripts/fuzz-reach.py follows the path
+            # dependencies of each fuzz package. A change to the core crate
+            # does not spread; a push to main runs every target.
+            crates=$(python3 scripts/fuzz-reach.py "$crates")
             all=$(jq -c --argjson crates "$crates" '[.[] | select(.crate as $c | $crates | index($c))]' <<<"$all")
           fi
           echo "Targets: $(jq -r 'map(.crate + " " + .target) | join(", ")' <<<"$all")"

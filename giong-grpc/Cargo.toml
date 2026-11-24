@@ -1,6 +1,6 @@
 [package]
 name = "giong-grpc"
-version = "1.3.0"
+version = "1.4.2"
 edition = "2021"
 rust-version = "1.80"
 description = "gRPC for the giong thread-per-core runtime: servers and clients over giong-http's HTTP/2, messages read as giong-proto views without copies"
@@ -12,10 +12,10 @@ keywords = ["grpc", "rpc", "protobuf", "io-uring", "async"]
 categories = ["network-programming", "asynchronous", "web-programming"]
 
 [dependencies]
-giong = { path = "..", version = "1.3.0" }
-giong-http = { path = "../giong-http", version = "1.3.0", features = ["client"] }
-giong-proto = { path = "../giong-proto", version = "1.3.0" }
-giong-tls = { path = "../giong-tls", version = "1.3.0" }
+giong = { path = "..", version = "1.4.2" }
+giong-http = { path = "../giong-http", version = "1.4.2", features = ["client"] }
+giong-proto = { path = "../giong-proto", version = "1.4.2" }
+giong-tls = { path = "../giong-tls", version = "1.4.2" }
 # gzip message compression: deflate in pure Rust, already a dependency of
 # giong-http's client.
 miniz_oxide = "0.9"

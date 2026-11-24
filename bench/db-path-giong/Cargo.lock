@@ -61,23 +61,25 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.3.0"
+version = "1.4.2"
 dependencies = [
  "io-uring",
  "libc",
  "socket2",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
 name = "giong-http"
-version = "1.3.0"
+version = "1.4.2"
 dependencies = [
  "giong",
+ "libc",
 ]
 
 [[package]]
 name = "giong-mysql"
-version = "1.3.0"
+version = "1.4.2"
 dependencies = [
  "giong",
  "giong-tls",
@@ -87,7 +89,7 @@ dependencies = [
 
 [[package]]
 name = "giong-postgres"
-version = "1.3.0"
+version = "1.4.2"
 dependencies = [
  "giong",
  "giong-tls",
@@ -97,7 +99,7 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "1.3.0"
+version = "1.4.2"
 dependencies = [
  "giong",
  "libc",
@@ -108,7 +110,7 @@ dependencies = [
 
 [[package]]
 name = "giong-web"
-version = "1.3.0"
+version = "1.4.2"
 dependencies = [
  "giong",
  "giong-http",

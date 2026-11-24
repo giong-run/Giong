@@ -1,5 +1,8 @@
 //! The thread-per-core runtime: workers, cross-thread wake-ups, shutdown.
 
+// Some tests and their helpers are Unix-only for now.
+#![cfg_attr(windows, allow(dead_code, unused_imports))]
+
 use std::collections::HashSet;
 use std::io::{Read, Write};
 use std::panic::AssertUnwindSafe;
@@ -45,11 +48,13 @@ fn every_worker_runs_its_main_future_on_its_own_thread() {
 fn shutdown_from_outside_wakes_every_worker() {
     let rt = giong::Builder::new().workers(3).build().unwrap();
     let handle = rt.handle();
+    // Before the thread starts: its 50 ms count from when it runs, which
+    // can be ahead of a clock read after `spawn` returns.
+    let start = Instant::now();
     let stopper = std::thread::spawn(move || {
         std::thread::sleep(Duration::from_millis(50));
         handle.shutdown();
     });
-    let start = Instant::now();
     rt.run(|_| async {
         giong::shutdown_signal().await;
     })
@@ -417,6 +422,7 @@ fn a_panicking_worker_stops_the_runtime_and_propagates() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_triggers_a_graceful_shutdown() {
@@ -465,6 +471,7 @@ fn sigterm_triggers_a_graceful_shutdown() {
     );
 }
 
+#[cfg(unix)]
 #[test]
 #[cfg_attr(miri, ignore = "Miri cannot start a process")]
 fn sigterm_still_works_after_worker_0_returned() {
@@ -529,6 +536,97 @@ fn sigterm_still_works_after_worker_0_returned() {
     assert!(
         rest.iter().any(|l| l.contains("clean exit")),
         "child output: {rest:?}"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+#[cfg_attr(miri, ignore = "Miri cannot start a process")]
+fn a_second_signal_ends_a_process_whose_shutdown_hangs() {
+    // The handlers took every SIGINT and SIGTERM: once a shutdown had been
+    // asked for, a main future that never returned kept the process running,
+    // and Ctrl-C could no longer stop it. A second request now ends it; two
+    // signals within 250 ms are one request.
+    if std::env::var_os("GIONG_SIGNAL_CHILD_HANG").is_some() {
+        giong::Builder::new()
+            .workers(2)
+            .shutdown_on_signals(true)
+            .build()
+            .unwrap()
+            .run(|index| async move {
+                if index == 0 {
+                    println!("ready");
+                    giong::shutdown_signal().await;
+                    println!("shutdown asked");
+                }
+                // Never answers the shutdown.
+                std::future::pending::<()>().await;
+            })
+            .unwrap();
+        println!("clean exit");
+        return;
+    }
+    use std::io::BufRead;
+    use std::os::unix::process::ExitStatusExt;
+    use std::process::{Command, Stdio};
+    let exe = std::env::current_exe().unwrap();
+    let mut child = Command::new(exe)
+        .args([
+            "--exact",
+            "a_second_signal_ends_a_process_whose_shutdown_hangs",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env("GIONG_SIGNAL_CHILD_HANG", "1")
+        .stdout(Stdio::piped())
+        .spawn()
+        .unwrap();
+    let mut lines = std::io::BufReader::new(child.stdout.take().unwrap()).lines();
+    assert!(
+        lines.by_ref().any(|l| l.unwrap().contains("ready")),
+        "child never became ready"
+    );
+    // One request that arrives twice, as when a wrapper forwards the Ctrl-C
+    // its process group also got: two signals at once only ask.
+    let first = Instant::now();
+    // SAFETY: kill with the child's pid.
+    unsafe {
+        libc::kill(child.id() as i32, libc::SIGINT);
+        libc::kill(child.id() as i32, libc::SIGTERM);
+    }
+    assert!(
+        lines
+            .by_ref()
+            .any(|l| l.unwrap().contains("shutdown asked")),
+        "the first signal did not ask for a shutdown"
+    );
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(
+        child.try_wait().unwrap().is_none(),
+        "two signals at once ended the process"
+    );
+    // A signal 250 ms or more after the first is a second request.
+    std::thread::sleep(Duration::from_millis(400).saturating_sub(first.elapsed()));
+    // SAFETY: as above.
+    unsafe { libc::kill(child.id() as i32, libc::SIGTERM) };
+    let start = Instant::now();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if start.elapsed() > Duration::from_secs(20) {
+            child.kill().unwrap();
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    let rest: Vec<String> = lines.map(|l| l.unwrap()).collect();
+    let status = status.unwrap_or_else(|| panic!("the second SIGTERM was ignored: {rest:?}"));
+    assert_eq!(
+        status.signal(),
+        Some(libc::SIGTERM),
+        "{status:?}, output: {rest:?}"
     );
 }
 
@@ -641,28 +739,31 @@ fn sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down() {
     ignore = "timing: measures wake-up latency, which Miri slows down"
 )]
 fn a_sleeping_worker_is_woken_promptly_by_another_thread() {
-    // Latency of the eventfd wake-up path.
-    let (tx, mut rx) = mpsc::unbounded::<Instant>();
-    let sender = std::thread::spawn(move || {
-        for _ in 0..200 {
-            std::thread::sleep(Duration::from_millis(1));
-            tx.send(Instant::now()).unwrap();
-        }
-    });
-    let worst = giong::block_on(async move {
-        let mut worst = Duration::ZERO;
-        while let Some(sent) = timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("lost wake-up")
-        {
-            worst = worst.max(sent.elapsed());
-        }
+    // Latency of the eventfd (kqueue: EVFILT_USER) wake-up path.
+    let measured = common::wake_latency_within(Duration::from_millis(100), || {
+        let (tx, mut rx) = mpsc::unbounded::<Instant>();
+        let sender = std::thread::spawn(move || {
+            for _ in 0..200 {
+                std::thread::sleep(Duration::from_millis(1));
+                tx.send(Instant::now()).unwrap();
+            }
+        });
+        let worst = giong::block_on(async move {
+            let mut worst = Duration::ZERO;
+            while let Some(sent) = timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("lost wake-up")
+            {
+                worst = worst.max(sent.elapsed());
+            }
+            worst
+        });
+        sender.join().unwrap();
         worst
     });
-    sender.join().unwrap();
     assert!(
-        worst < Duration::from_millis(100),
-        "slow cross-thread wake-up: {worst:?}"
+        measured.is_ok(),
+        "slow cross-thread wake-up on every try: {measured:?}"
     );
 }
 

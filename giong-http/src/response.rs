@@ -414,9 +414,13 @@ impl Response {
     fn push_header(&mut self, name: &str, value: &str) {
         let managed = ["content-length", "transfer-encoding", "connection", "date"];
         if !managed.iter().any(|m| name.eq_ignore_ascii_case(m)) {
+            let value = value.trim();
+            // One allocation for the field: four `extend`s into an empty
+            // buffer grow it three times.
+            self.headers.reserve(name.len() + value.len() + 4);
             self.headers.extend_from_slice(name.as_bytes());
             self.headers.extend_from_slice(b": ");
-            self.headers.extend_from_slice(value.trim().as_bytes());
+            self.headers.extend_from_slice(value.as_bytes());
             self.headers.extend_from_slice(b"\r\n");
         }
     }
@@ -441,6 +445,25 @@ impl Response {
             .unwrap_or("")
             .split_terminator("\r\n")
             .filter_map(|line| line.split_once(": "))
+    }
+
+    /// The header fields as bytes, as [`headers`](Self::headers) gives them,
+    /// for the HTTP/2 and HTTP/3 servers to encode with every response: no
+    /// UTF-8 check and no substring search, as `header` wrote each line (a
+    /// token, which has no `:`, then `": "`, then a value without CR or LF).
+    pub(crate) fn header_fields(&self) -> impl Iterator<Item = (&[u8], &[u8])> {
+        let mut rest = &self.headers[..];
+        std::iter::from_fn(move || loop {
+            if rest.is_empty() {
+                return None;
+            }
+            let end = rest.iter().position(|&b| b == b'\r').unwrap_or(rest.len());
+            let line = &rest[..end];
+            rest = rest.get(end + 2..).unwrap_or_default();
+            if let Some(colon) = line.iter().position(|&b| b == b':') {
+                return Some((&line[..colon], line.get(colon + 2..).unwrap_or_default()));
+            }
+        })
     }
 
     /// The first value of the header field `name` (case-insensitive), as
@@ -579,7 +602,7 @@ impl Response {
     }
 }
 
-fn push_number(out: &mut Vec<u8>, mut n: usize) {
+pub(crate) fn push_number(out: &mut Vec<u8>, mut n: usize) {
     let mut digits = [0u8; 20];
     let mut at = digits.len();
     loop {
@@ -838,5 +861,22 @@ mod tests {
             .try_header("X-Text", "café")
             .unwrap();
         assert_eq!(resp.get_header("x-text"), Some("café"));
+    }
+
+    #[test]
+    fn header_fields_are_the_headers_as_bytes() {
+        let resp = Response::new(200)
+            .header("X-A", "1: two")
+            .header("Set-Cookie", "a=b; Path=/")
+            .header("X-Empty", "")
+            .header("Content-Length", "5");
+        let fields: Vec<_> = resp.header_fields().collect();
+        let text: Vec<_> = resp
+            .headers()
+            .map(|(n, v)| (n.as_bytes(), v.as_bytes()))
+            .collect();
+        assert_eq!(fields, text);
+        assert_eq!(fields.len(), 3);
+        assert!(Response::new(204).header_fields().next().is_none());
     }
 }

@@ -2,6 +2,7 @@
 
 use std::cell::Cell;
 use std::hash::{BuildHasher, Hasher};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 
 use crate::req::IdBuf;
@@ -13,10 +14,13 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// request in the log.
 ///
 /// Ids are 32 lowercase hexadecimal digits, 128 bits like a UUID: 16 chosen
-/// at random when the process starts, 4 for the worker (`ffff` off a giong
-/// worker) and 12 counting that worker's requests. Two processes share the
-/// random part with even odds only after some five billion starts, and a
-/// worker's counter takes years to wrap. Making one takes no lock and no
+/// at random when the process starts and 16 counting the process's ids, so
+/// that no two ids of one process are the same, whatever thread or runtime
+/// made them. Each thread reserves 65,536 numbers of the count at a time,
+/// so the count is shared without a lock: two threads' ids interleave in
+/// blocks rather than in the order they were made. Two processes share the
+/// random part with even odds only after some five billion starts, and the
+/// count does not wrap in practice. Making one takes no lock and no
 /// system call. The length and the digits are part of the format, changed
 /// only in a breaking release; what the parts mean is for reading a log,
 /// not for parsing.
@@ -91,24 +95,37 @@ impl<S: 'static> Middleware<S> for RequestId {
     }
 }
 
+/// How many numbers of the count a thread reserves at a time.
+const BLOCK: u64 = 1 << 16;
+
+/// The first number of the next block a thread reserves.
+static NEXT_BLOCK: AtomicU64 = AtomicU64::new(0);
+
 thread_local! {
-    static COUNTER: Cell<u64> = const { Cell::new(0) };
+    /// The next number this thread gives and the end of its block (both 0
+    /// before its first id, which reserves one).
+    static COUNTER: Cell<(u64, u64)> = const { Cell::new((0, 0)) };
 }
 
-/// A new id: process prefix, worker, counter.
+/// A new id: process prefix, then the process's count.
 pub(crate) fn generate() -> IdBuf {
     static PREFIX: OnceLock<u64> = OnceLock::new();
     let prefix = *PREFIX.get_or_init(prefix);
-    let worker = giong::try_worker_id().map_or(0xffff, |w| w as u64 & 0xffff);
+    // One count for the process, not one per thread or worker: two
+    // runtimes in one process each have a worker 0, and per-thread counters
+    // all start at the same number.
     let count = COUNTER.with(|c| {
-        let n = c.get().wrapping_add(1);
-        c.set(n);
-        n
+        let (mut next, mut end) = c.get();
+        if next == end {
+            next = NEXT_BLOCK.fetch_add(BLOCK, Ordering::Relaxed);
+            end = next + BLOCK;
+        }
+        c.set((next + 1, end));
+        next
     });
     let mut digits = [0u8; 32];
     hex(&mut digits[..16], prefix);
-    hex(&mut digits[16..20], worker);
-    hex(&mut digits[20..], count);
+    hex(&mut digits[16..], count);
     // Hexadecimal digits are always a valid id.
     IdBuf::new(std::str::from_utf8(&digits).unwrap_or("0")).expect("hex digits")
 }
@@ -148,9 +165,35 @@ mod tests {
             .bytes()
             .all(|c| matches!(c, b'0'..=b'9' | b'a'..=b'f')));
         assert_ne!(a.as_str(), b.as_str());
-        // The same process and thread: the same 64 random bits and worker.
-        assert_eq!(a.as_str()[..20], b.as_str()[..20]);
-        assert_eq!(&a.as_str()[16..20], "ffff", "not on a giong worker");
+        // The same process: the same 64 random bits; the same thread: the
+        // next number.
+        assert_eq!(a.as_str()[..16], b.as_str()[..16]);
+        let count = |id: &IdBuf| u64::from_str_radix(&id.as_str()[16..], 16).unwrap();
+        assert_eq!(count(&b), count(&a) + 1);
+    }
+
+    /// Threads that are not giong workers, and the workers of two runtimes
+    /// (each has a worker 0), make ids of their own.
+    #[test]
+    fn ids_made_on_different_threads_differ() {
+        let ids: Vec<IdBuf> = (0..8)
+            .map(|_| std::thread::spawn(generate))
+            .chain((0..4).map(|_| {
+                std::thread::spawn(|| {
+                    giong::Builder::new()
+                        .workers(1)
+                        .block_on(async { generate() })
+                        .unwrap()
+                })
+            }))
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|t| t.join().unwrap())
+            .collect();
+        let mut seen: Vec<&str> = ids.iter().map(IdBuf::as_str).collect();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), ids.len(), "{seen:?}");
     }
 
     #[test]
