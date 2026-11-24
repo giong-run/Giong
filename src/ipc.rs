@@ -1210,6 +1210,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create or sendmsg")]
     fn a_received_message_stays_the_same_while_the_peer_writes_into_the_ring() {
         crate::block_on(async {
             let ((mut tx, _client_rx), (_server_tx, mut rx)) = channel().await;
@@ -1222,6 +1223,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no memfd_create or sendmsg")]
     fn a_message_read_in_place_is_the_shared_memory_itself() {
         crate::block_on(async {
             let ((mut tx, _client_rx), (_server_tx, mut rx)) = channel().await;
