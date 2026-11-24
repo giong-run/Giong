@@ -102,6 +102,11 @@ long runs replays with `GIONG_SIM_SEED=<seed> GIONG_SIM_SOAK_DAYS=3650`.
 - **Signals, control messages, FIFOs and pipes, and real blocking calls.**
   The tests that need them are skipped in `suite`, each with its reason.
 - **The wall clock.** `CLOCK_REALTIME` starts at 2030-01-01 in every run.
+- **Threads' CPU time.** A thread's CPU-time clock (`pthread_getcpuclockid`)
+  is refused with `EINVAL`, so balanced listeners, which read the workers'
+  CPU time, go by counts of tasks as on a runtime whose workers are all
+  idle. The CPU-time rule is checked by unit tests in `src/net/balance.rs`
+  with made-up CPU time; unit tests are not in `suite`.
 - **Memory pressure.** giong-http's low-memory refusal
   (`Server::min_free_memory`) reads the host's `/proc/meminfo` and cgroup
   files, which are real here; the scenarios turn it off (`0`) so that what

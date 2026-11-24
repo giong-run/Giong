@@ -1,0 +1,18 @@
+skew-closed: 30 rounds of before, 30 of balanced; quartiles of the rounds (p25 / median / p75)
+metric                             before                  balanced  U test p
+probe_rps           30596 / 31510 / 31928     30352 / 30822 / 31506      0.06
+p50_us                       70 / 71 / 73              72 / 73 / 75      0.00
+p99_us                    498 / 510 / 525           501 / 504 / 508      0.11
+p999_us                   678 / 714 / 747           665 / 744 / 860      0.14
+max_us                4246 / 7430 / 10002       5248 / 6011 / 11262      0.29
+probe_conns            6119 / 6302 / 6386        6070 / 6164 / 6301      0.06
+hot_rps                3348 / 3402 / 3532        3456 / 3481 / 3511      0.05
+
+range of the rounds (min to max)
+probe_rps                  27420 to 33660            29590 to 32035
+p50_us                           68 to 77                  70 to 77
+p99_us                         484 to 547                476 to 532
+p999_us                        612 to 848               620 to 2289
+max_us                      2949 to 16831             3905 to 19795
+probe_conns                  5484 to 6732              5918 to 6407
+hot_rps                      3238 to 3598              3358 to 3538

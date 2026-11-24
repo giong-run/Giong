@@ -8,16 +8,38 @@
 //! member's `accept` takes it from there. Only the descriptor crosses
 //! threads: the receiving worker wraps it in its own `TcpStream`, and the
 //! stream's I/O starts on that worker's ring.
+//!
+//! Which member looks less busy is decided in two steps. First by how busy
+//! each worker has been lately: the CPU time its thread used in the last
+//! few milliseconds, less the time it spent spinning for work, as a share
+//! of the time that passed, sampled at most every
+//! [`SAMPLE_EVERY_NS`] by whichever member accepts a connection (see
+//! [`Busy`]), plus the expected cost of the work it took on since. Workers
+//! within [`BAND`] of the least busy one count as equally busy; among
+//! those, by counts of tasks, as before (see `RuntimeShared::score`). So a
+//! worker with thousands of idle connections still gets new ones while a
+//! worker with a few hot ones is saturated, and when every worker is about
+//! as busy, connection counts decide. When every worker is saturated
+//! ([`SATURATED`]), how busy says nothing more: a connection goes to a
+//! member with clearly less work waiting ([`BACKLOG_MARGIN`]), and
+//! otherwise counts decide again, but never in favour of a member whose
+//! task polls take clearly longer than the accepting worker's ([`SLOWER`]):
+//! a new connection there waits behind long-running work at every turn,
+//! and its counts mislead (it is the busy worker the idle connections were
+//! sent away from). Where a worker's CPU time is not read (macOS, Windows,
+//! Miri, the simulation), every worker looks idle and counts decide, as
+//! before.
 
 use std::collections::VecDeque;
 use std::io;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::task::{Context, Poll, Waker};
 
 use socket2::Socket;
 
+use crate::observe::clock_ns;
 use crate::runtime::{self, lock, RuntimeShared};
 
 /// How much busier than the least busy member a worker must look before it
@@ -32,12 +54,212 @@ const MARGIN: usize = 2;
 /// only have been woken by that connection; see `busier_than_another`.
 const ONE_QUEUE: bool = cfg!(any(target_os = "macos", giong_libkqueue));
 
+/// One whole core, in the parts-per-million unit busy shares are kept in.
+const CORE: u64 = 1_000_000;
+
+/// How often how busy each worker has been is measured again, at most: a
+/// sample costs one system call per worker (reading its CPU time), made by
+/// the member that accepts a connection once the last sample is this old.
+const SAMPLE_EVERY_NS: u64 = 5_000_000;
+
+/// A sample this much older than the last one replaces it instead of being
+/// averaged with it: what the workers did that long ago says little.
+const STALE_NS: u64 = 4 * SAMPLE_EVERY_NS;
+
+/// Workers whose expected busy share is within this much of the least busy
+/// one count as equally busy (5% of a core). Wide enough that measurement
+/// noise does not move connections; narrow enough that a worker busy 40% of
+/// the time does not get the same share of new connections as one busy 20%.
+const BAND: u64 = CORE / 20;
+
+/// When even the least busy member is expected to be this busy (80% of a
+/// core), every member counts as saturated, and new connections go by
+/// backlog, then by counts (see [`BACKLOG_MARGIN`] and [`SLOWER`]).
+const SATURATED: u64 = CORE * 8 / 10;
+
+/// When every member is saturated, how much more backlog than another
+/// member the accepting worker must have before it hands a connection
+/// over. Hot connections keep a worker's backlog moving between 0 and a few;
+/// a smaller margin hands connections over on that noise and ends up
+/// spreading hot connections evenly, which leaves light ones waiting behind
+/// as many hot ones wherever they land (`bench/placement.sh`, mixed); a
+/// larger one lets a queue of short requests build up on one worker
+/// (skewed, back to back). Backlog is runnable tasks plus work sent but
+/// not taken in yet.
+const BACKLOG_MARGIN: usize = 2;
+
+/// When every member is saturated and backlogs do not decide, counts never
+/// favour a member whose average task poll took more than this many
+/// quarters (125%) of the accepting worker's: wide enough that workers
+/// running the same kind of work, measured with some noise, still even out
+/// their counts.
+const SLOWER: u64 = 5;
+
+/// The least each task taken on since the last sample is expected to cost
+/// (0.1% of a core), so that a burst of new connections within one sample
+/// does not all go to the worker that was least busy when it began, even
+/// when every connection measured so far was idle. Kept small, so that
+/// counts of tasks still decide among workers that are about as busy: one
+/// worker must take on 50 connections more than another within one sample
+/// before this alone makes it look clearly busier.
+const MIN_COST: u64 = CORE / 1000;
+
 /// The balanced listeners of one runtime on one address.
 struct Group {
     rt: Arc<RuntimeShared>,
     addr: SocketAddr,
     /// One per worker of the runtime, by worker index.
     mailboxes: Vec<Mailbox>,
+    busy: Busy,
+}
+
+/// How busy each worker of the group's runtime has been lately: the CPU
+/// time of its thread, which the kernel keeps, less the time it spent
+/// spinning for work (see `RuntimeShared::busy_ns_of`). CPU time rather
+/// than time awake, so that a worker whose thread waits for a core on a
+/// crowded machine does not look busy for it. Nothing is added to the
+/// workers' own loops; members take a sample when they accept a connection
+/// and the last one is old enough, one at a time, and never wait for each
+/// other. All values are hints, read and written with relaxed atomics.
+struct Busy {
+    /// When the last sample was taken, on [`clock_ns`]; 0 before the first.
+    taken_at: AtomicU64,
+    /// A member is taking a sample; the others use the last one.
+    sampling: AtomicBool,
+    /// What each live task cost on average in the last sample, in parts per
+    /// million of a core, at least [`MIN_COST`]: the expected cost of a
+    /// connection a worker took on since.
+    per_task: AtomicU64,
+    workers: Vec<WorkerBusy>,
+}
+
+/// In `WorkerBusy::busy_at`: the worker's CPU time could not be read at the
+/// last sample, so the next one has nothing to compare with.
+const NO_BASE: u64 = u64::MAX;
+
+struct WorkerBusy {
+    /// The worker's busy nanoseconds at the last sample, or [`NO_BASE`].
+    busy_at: AtomicU64,
+    /// Its live tasks at the last sample.
+    tasks_at: AtomicUsize,
+    /// The share of its time it was busy, in parts per million: averaged
+    /// over the last samples.
+    share: AtomicU64,
+    /// Its task polls at the last sample.
+    polls_at: AtomicU64,
+    /// The CPU time an average task poll took, in nanoseconds: averaged
+    /// over the last samples; 0 until measured.
+    poll_ns: AtomicU64,
+}
+
+impl Busy {
+    fn new(workers: usize) -> Self {
+        Self {
+            taken_at: AtomicU64::new(0),
+            sampling: AtomicBool::new(false),
+            per_task: AtomicU64::new(MIN_COST),
+            workers: (0..workers)
+                .map(|_| WorkerBusy {
+                    busy_at: AtomicU64::new(NO_BASE),
+                    tasks_at: AtomicUsize::new(0),
+                    share: AtomicU64::new(0),
+                    polls_at: AtomicU64::new(0),
+                    poll_ns: AtomicU64::new(0),
+                })
+                .collect(),
+        }
+    }
+
+    /// Takes a new sample if the last one is at least [`SAMPLE_EVERY_NS`]
+    /// old and no other member is taking one.
+    fn refresh(&self, rt: &RuntimeShared) {
+        let now = clock_ns();
+        let last = self.taken_at.load(Ordering::Acquire);
+        if last != 0 && now.saturating_sub(last) < SAMPLE_EVERY_NS {
+            return;
+        }
+        if self.sampling.swap(true, Ordering::Acquire) {
+            return;
+        }
+        // Another member may have finished a sample in the meantime.
+        let last = self.taken_at.load(Ordering::Acquire);
+        if last == 0 || now.saturating_sub(last) >= SAMPLE_EVERY_NS {
+            self.sample(rt, now, last);
+        }
+        self.sampling.store(false, Ordering::Release);
+    }
+
+    fn sample(&self, rt: &RuntimeShared, now: u64, last: u64) {
+        let (mut busy_sum, mut tasks_sum) = (0u64, 0u64);
+        for (i, w) in self.workers.iter().enumerate() {
+            let (tasks, _, _) = rt.counts_of(i);
+            w.tasks_at.store(tasks, Ordering::Relaxed);
+            let polls = rt.polls_of(i);
+            let polls_was = w.polls_at.swap(polls, Ordering::Relaxed);
+            // A worker whose CPU time cannot be read (not started, ended, or
+            // Miri) counts as idle: then counts of tasks decide.
+            let Some((busy, started)) = rt.busy_ns_of(i) else {
+                w.busy_at.store(NO_BASE, Ordering::Relaxed);
+                w.share.store(0, Ordering::Relaxed);
+                continue;
+            };
+            let busy_was = w.busy_at.swap(busy, Ordering::Relaxed);
+            // With no sample of the worker to compare with (the group's
+            // first, or its CPU time could not be read at the last one), it
+            // is measured since it started: so a member accepting while
+            // another takes the group's second sample does not go by
+            // figures never measured.
+            let based = last != 0 && busy_was != NO_BASE;
+            let (busy_was, polls_was, window) = if based {
+                (busy_was, polls_was, now.saturating_sub(last))
+            } else {
+                (0, 0, now.saturating_sub(started))
+            };
+            if window == 0 {
+                continue;
+            }
+            let fresh = based && window <= STALE_NS;
+            // Spinning is taken off by wall time, so the figure can go down
+            // after a spin during which the thread was descheduled: that
+            // counts as no work.
+            let worked = busy.saturating_sub(busy_was).min(window);
+            let now_share = (u128::from(worked) * u128::from(CORE) / u128::from(window)) as u64;
+            let share = if fresh {
+                (w.share.load(Ordering::Relaxed) + now_share) / 2
+            } else {
+                now_share
+            };
+            w.share.store(share, Ordering::Relaxed);
+            if let Some(now_poll) = worked.checked_div(polls.wrapping_sub(polls_was)) {
+                let was = w.poll_ns.load(Ordering::Relaxed);
+                let poll_ns = if fresh && was != 0 {
+                    (was + now_poll) / 2
+                } else {
+                    now_poll
+                };
+                w.poll_ns.store(poll_ns, Ordering::Relaxed);
+            }
+            busy_sum += share;
+            tasks_sum += tasks as u64;
+        }
+        let per_task = (busy_sum / tasks_sum.max(1)).max(MIN_COST);
+        self.per_task.store(per_task, Ordering::Relaxed);
+        self.taken_at.store(now, Ordering::Release);
+    }
+
+    /// How busy worker `i` is expected to be: its busy share in the last
+    /// sample, plus the average cost of a task for each task it took on
+    /// since, each task it has to run, and each piece of work sent to it
+    /// that it has not taken in yet.
+    fn expected(&self, rt: &RuntimeShared, i: usize) -> u64 {
+        let w = &self.workers[i];
+        let (tasks, queued, incoming) = rt.counts_of(i);
+        let new = tasks.saturating_sub(w.tasks_at.load(Ordering::Relaxed));
+        let pending = (new + queued + incoming) as u64;
+        w.share
+            .load(Ordering::Relaxed)
+            .saturating_add(pending.saturating_mul(self.per_task.load(Ordering::Relaxed)))
+    }
 }
 
 struct Mailbox {
@@ -90,10 +312,15 @@ impl Member {
                             inbox: Mutex::new(Inbox::default()),
                         })
                         .collect();
+                    let busy = Busy::new(rt.workers());
+                    // How busy each worker has been since it started, until
+                    // the next sample.
+                    busy.refresh(&rt);
                     let group = Arc::new(Group {
                         rt,
                         addr,
                         mailboxes,
+                        busy,
                     });
                     groups.push(Arc::downgrade(&group));
                     group
@@ -146,13 +373,60 @@ impl Member {
         }
     }
 
-    /// Another member that looks clearly less busy than this worker.
+    /// Another member that looks clearly less busy than this worker: first
+    /// by how busy the workers have been lately, then, among those about as
+    /// busy as the least busy one, by their counts of tasks.
     fn busier_than_another(&self) -> Option<usize> {
         let group = &*self.group;
         let rt = &group.rt;
+        let busy = &group.busy;
+        busy.refresh(rt);
         let member =
             |i: usize| i != self.worker && group.mailboxes[i].listeners.load(Ordering::Acquire) > 0;
-        let (target, other) = if ONE_QUEUE {
+        let mine = busy.expected(rt, self.worker);
+        let least = (0..group.mailboxes.len())
+            .filter(|&i| member(i))
+            .map(|i| busy.expected(rt, i))
+            .min()?
+            .min(mine);
+        if least >= SATURATED {
+            // Every member is busy: how busy says nothing more. First, a
+            // member with clearly less work waiting.
+            let backlog = |i: usize| {
+                let (_, queued, incoming) = rt.counts_of(i);
+                queued + incoming
+            };
+            let n = group.mailboxes.len();
+            let target = (1..n)
+                .map(|k| (self.worker + k) % n)
+                .filter(|&i| member(i))
+                .min_by_key(|&i| backlog(i))?;
+            if backlog(self.worker) > backlog(target) + BACKLOG_MARGIN {
+                return Some(target);
+            }
+            // Then counts, as when every member is about as busy, among the
+            // members whose polls are not clearly longer than this worker's.
+            let poll_ns = |i: usize| busy.workers[i].poll_ns.load(Ordering::Relaxed);
+            let limit = poll_ns(self.worker).saturating_mul(SLOWER) / 4;
+            let (target, other) = self.least_by_counts(|i| member(i) && poll_ns(i) <= limit)?;
+            return (rt.score(self.worker) > other + MARGIN).then_some(target);
+        }
+        let limit = least.saturating_add(BAND);
+        let (target, other) =
+            self.least_by_counts(|i| member(i) && busy.expected(rt, i) <= limit)?;
+        if mine > limit {
+            // Clearly busier than another member, whatever the counts.
+            return Some(target);
+        }
+        (rt.score(self.worker) > other + MARGIN).then_some(target)
+    }
+
+    /// The member among `eligible` that counts of tasks favour, and the
+    /// figure this worker's `score` must exceed by [`MARGIN`] to hand a
+    /// connection to it.
+    fn least_by_counts(&self, eligible: impl Fn(usize) -> bool) -> Option<(usize, usize)> {
+        let rt = &self.group.rt;
+        if ONE_QUEUE {
             // The other members were woken by this very connection, so
             // being awake says nothing about them: counting it would pick
             // the wrong member, and let this worker keep connections until
@@ -161,14 +435,13 @@ impl Member {
             let n = rt.workers();
             (1..n)
                 .map(|k| (self.worker + k) % n)
-                .filter(|&i| member(i))
+                .filter(|&i| eligible(i))
                 .map(|i| (i, rt.work(i)))
-                .min_by_key(|&(_, work)| work)?
+                .min_by_key(|&(_, work)| work)
         } else {
-            let target = rt.least_loaded_of(None, member)?;
-            (target, rt.score(target))
-        };
-        (rt.score(self.worker) > other + MARGIN).then_some(target)
+            let target = rt.least_loaded_of(None, eligible)?;
+            Some((target, rt.score(target)))
+        }
     }
 }
 
@@ -285,5 +558,114 @@ mod tests {
         })
         .unwrap();
         assert_eq!(*result.lock().unwrap(), Some((true, 0)));
+    }
+
+    /// Two workers with balanced listeners: worker 0 holds 50 idle tasks
+    /// (think idle keep-alive connections), worker 1 one task that never
+    /// lets it rest (think a few hot connections). By counts of tasks worker
+    /// 1 looks far less busy; by how busy the workers have been, worker 0 is
+    /// the one with room. Every new connection must go to worker 0, whichever
+    /// listener the kernel picks for it. The workers' CPU time is made up
+    /// (worker 1 busy all the time, worker 0 never), so that the test does
+    /// not depend on how the machine schedules threads: on a crowded runner
+    /// the busy worker can get no CPU for tens of milliseconds, and then
+    /// really is idle.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_saturated_worker_with_few_tasks_loses_new_connections_to_a_quiet_one_with_many() {
+        use std::time::{Duration, Instant};
+
+        use crate::observe::clock_ns;
+
+        const CONNECTIONS: usize = 8;
+        let _fake = crate::runtime::fake_cpu::set(Some(|worker, started| {
+            if worker == 1 {
+                clock_ns().saturating_sub(started)
+            } else {
+                0
+            }
+        }));
+        let rt = crate::Builder::new().workers(2).build().unwrap();
+        let handle = rt.handle();
+        let counts = Arc::new(Mutex::new([0usize; 2]));
+        let port = Arc::new(Mutex::new(0u16));
+        let bound = Arc::new(Barrier::new(2));
+        let ready = Arc::new(Barrier::new(3));
+        let (client_ready, client_port) = (ready.clone(), port.clone());
+        let client = std::thread::spawn(move || {
+            client_ready.wait();
+            let port = *client_port.lock().unwrap();
+            (0..CONNECTIONS)
+                .map(|_| {
+                    std::thread::sleep(Duration::from_millis(7));
+                    std::net::TcpStream::connect(("127.0.0.1", port)).unwrap()
+                })
+                .collect::<Vec<_>>()
+        });
+        let (c, p) = (counts.clone(), port.clone());
+        rt.run(move |worker| {
+            let (counts, port, bound, ready, handle) = (
+                c.clone(),
+                p.clone(),
+                bound.clone(),
+                ready.clone(),
+                handle.clone(),
+            );
+            async move {
+                if worker == 0 {
+                    for _ in 0..50 {
+                        drop(crate::spawn(crate::shutdown_signal()));
+                    }
+                } else {
+                    drop(crate::spawn(async {
+                        while !crate::is_shutting_down() {
+                            let start = Instant::now();
+                            while start.elapsed() < Duration::from_micros(500) {
+                                std::hint::spin_loop();
+                            }
+                            crate::yield_now().await;
+                        }
+                    }));
+                }
+                crate::yield_now().await;
+                // Worker 0 picks the port, worker 1 joins it.
+                let listener = if worker == 0 {
+                    let listener = crate::net::TcpListener::bind_balanced("127.0.0.1:0").unwrap();
+                    *port.lock().unwrap() = listener.local_addr().unwrap().port();
+                    bound.wait();
+                    listener
+                } else {
+                    bound.wait();
+                    let port = *port.lock().unwrap();
+                    crate::net::TcpListener::bind_balanced(("127.0.0.1", port)).unwrap()
+                };
+                ready.wait();
+                let accept = async {
+                    loop {
+                        let stream = listener.accept().await.unwrap();
+                        let total = {
+                            let mut counts = counts.lock().unwrap();
+                            counts[worker] += 1;
+                            counts.iter().sum::<usize>()
+                        };
+                        drop(crate::spawn(async move {
+                            let _keep = stream;
+                            crate::shutdown_signal().await;
+                        }));
+                        if total == CONNECTIONS {
+                            handle.shutdown();
+                        }
+                    }
+                };
+                crate::until_shutdown(accept).await;
+            }
+        })
+        .unwrap();
+        drop(client.join().unwrap());
+        assert_eq!(
+            *counts.lock().unwrap(),
+            [CONNECTIONS, 0],
+            "worker 1 is saturated"
+        );
     }
 }

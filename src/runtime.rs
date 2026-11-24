@@ -104,6 +104,12 @@ pub(crate) struct WorkerShared {
     wake: OnceLock<crate::driver::WakeHandle>,
     /// How the worker's driver was chosen; set once the driver is up.
     driver_choice: OnceLock<DriverChoice>,
+    /// The clock of the worker thread's CPU time, and when the worker
+    /// started on [`observe::clock_ns`], for balanced listeners telling how
+    /// busy it has been (see `RuntimeShared::busy_ns_of`); set when the
+    /// worker starts.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    cpu_clock: OnceLock<(libc::clockid_t, u64)>,
 }
 
 impl WorkerShared {
@@ -118,6 +124,8 @@ impl WorkerShared {
             idle_seen: AtomicU64::new(0),
             wake: OnceLock::new(),
             driver_choice: OnceLock::new(),
+            #[cfg(all(target_os = "linux", not(miri)))]
+            cpu_clock: OnceLock::new(),
         }))
     }
 
@@ -269,6 +277,56 @@ impl RuntimeShared {
         w.load.tasks.load(Ordering::Relaxed)
             + w.load.queued.load(Ordering::Relaxed)
             + w.load.incoming.load(Ordering::Relaxed)
+    }
+
+    /// What worker `i` published for choosing where to send work: its live
+    /// tasks, its runnable tasks, and the work sent to it that it has not
+    /// taken in yet.
+    pub(crate) fn counts_of(&self, i: usize) -> (usize, usize, usize) {
+        let load = &self.workers[i].load;
+        (
+            load.tasks.load(Ordering::Relaxed),
+            load.queued.load(Ordering::Relaxed),
+            load.incoming.load(Ordering::Relaxed),
+        )
+    }
+
+    /// Task polls worker `i` has made so far.
+    pub(crate) fn polls_of(&self, i: usize) -> u64 {
+        self.workers[i].counters.polls()
+    }
+
+    /// Nanoseconds of CPU time worker `i` has spent working so far: the
+    /// CPU time of its thread, less the time it spent spinning for work;
+    /// and when it started, on [`observe::clock_ns`]. `None` before its
+    /// thread has started, after it has ended, under Miri and off Linux.
+    /// One system call: the kernel keeps a thread's CPU time.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    pub(crate) fn busy_ns_of(&self, i: usize) -> Option<(u64, u64)> {
+        let w = &self.workers[i];
+        let (clock, started) = *w.cpu_clock.get()?;
+        let mut ts = libc::timespec {
+            tv_sec: 0,
+            tv_nsec: 0,
+        };
+        // SAFETY: `ts` is a valid place for the result. A clock of a thread
+        // that has ended gives an error, which is checked.
+        if unsafe { libc::clock_gettime(clock, &mut ts) } != 0 {
+            return None;
+        }
+        let cpu = u64::try_from(ts.tv_sec)
+            .ok()?
+            .saturating_mul(1_000_000_000)
+            .saturating_add(u64::try_from(ts.tv_nsec).ok()?);
+        #[cfg(test)]
+        let cpu = fake_cpu::read(i, started).unwrap_or(cpu);
+        Some((cpu.saturating_sub(w.counters.spin_ns()), started))
+    }
+
+    /// See the Linux version: a thread's CPU time is not read here.
+    #[cfg(not(all(target_os = "linux", not(miri))))]
+    pub(crate) fn busy_ns_of(&self, _i: usize) -> Option<(u64, u64)> {
+        None
     }
 
     /// Counts work about to be sent to `worker` from any thread, before it
@@ -587,6 +645,18 @@ impl Worker {
         shared.counters.set_driver(driver.kind());
         // A worker instance is built once, so the slot is always empty here.
         let _ = shared.driver_choice.set(choice);
+        // Miri has no CPU-time clocks, and macOS no `pthread_getcpuclockid`;
+        // balanced listeners then go by counts.
+        #[cfg(all(target_os = "linux", not(miri)))]
+        {
+            let started = observe::clock_ns();
+            let mut clock: libc::clockid_t = 0;
+            // SAFETY: `pthread_self` names the calling thread, which is the
+            // worker's own; `clock` is a valid place for the result.
+            if unsafe { libc::pthread_getcpuclockid(libc::pthread_self(), &mut clock) } == 0 {
+                let _ = shared.cpu_clock.set((clock, started));
+            }
+        }
         Ok(Rc::new(Self {
             index,
             shared,
@@ -1046,6 +1116,11 @@ impl Worker {
             Some(timer) => timer.min(start + spin),
             None => start + spin,
         };
+        // Spinning uses the CPU but is not work: balanced listeners take it
+        // off the thread's CPU time when they tell how busy a worker is. It
+        // is counted at every clock read, so that a long spin shows while
+        // it lasts.
+        let mut counted = start;
         loop {
             // Reading the clock costs about as much as the checks, so look at
             // the ring many times per clock read.
@@ -1055,11 +1130,15 @@ impl Worker {
                     || self.driver.borrow_mut().has_completions()
                     || (self.has_probes.get() && self.fire_probes(false))
                 {
+                    self.shared.counters.spun(counted.elapsed());
                     return true;
                 }
                 std::hint::spin_loop();
             }
-            if Instant::now() >= deadline {
+            let now = Instant::now();
+            self.shared.counters.spun(now - counted);
+            counted = now;
+            if now >= deadline {
                 // A due timer is work; an expired spin budget is not.
                 return self
                     .timers
@@ -2537,6 +2616,47 @@ fn pin_to_cpu(cpu: usize) {
     sys::pin_to_cpu(cpu);
 }
 
+/// Tests only: CPU time of the workers' threads made up by a test instead
+/// of read from the kernel, so that tests of balanced listeners do not
+/// depend on how the machine schedules threads (a worker kept busy can get
+/// no CPU for tens of milliseconds on a crowded runner, and then really is
+/// idle).
+#[cfg(all(test, target_os = "linux", not(miri)))]
+pub(crate) mod fake_cpu {
+    use std::sync::{Mutex, MutexGuard};
+
+    /// CPU time of worker `i` started at `started`, in nanoseconds.
+    type Cpu = fn(usize, u64) -> u64;
+
+    static FAKE: Mutex<Option<Cpu>> = Mutex::new(None);
+    /// Held by every test that reads workers' CPU time, faked or not.
+    static ONE_AT_A_TIME: Mutex<()> = Mutex::new(());
+
+    /// Until the guard is dropped, worker `i`'s thread has used
+    /// `cpu(i, started)` nanoseconds of CPU time, `started` being when it
+    /// started on `observe::clock_ns`; `None`: the real CPU time.
+    pub(crate) fn set(cpu: Option<Cpu>) -> Guard {
+        let one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
+        *FAKE.lock().unwrap_or_else(|e| e.into_inner()) = cpu;
+        Guard { _one: one }
+    }
+
+    pub(crate) struct Guard {
+        _one: MutexGuard<'static, ()>,
+    }
+
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            *FAKE.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        }
+    }
+
+    pub(super) fn read(i: usize, started: u64) -> Option<u64> {
+        let fake = *FAKE.lock().unwrap_or_else(|e| e.into_inner());
+        fake.map(|cpu| cpu(i, started))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{default_workers, pin_by_default, thread_limit_error, Deferred};
@@ -2645,5 +2765,62 @@ mod tests {
         // Under a quota the CPUs are shared: leave the workers to the
         // scheduler rather than stack every process on CPUs 0 and 1.
         assert!(!pin_by_default(64, Some(2)));
+    }
+
+    /// A worker's CPU time is read from its thread's clock and grows while
+    /// it works.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn a_working_worker_shows_cpu_time() {
+        let _real = super::fake_cpu::set(None);
+        let rt = crate::Builder::new().workers(1).build().unwrap();
+        let shared = rt.shared.clone();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let s = seen.clone();
+        rt.run(move |_| {
+            let (shared, seen) = (shared.clone(), s.clone());
+            async move {
+                let (before, _) = shared.busy_ns_of(0).unwrap();
+                let start = std::time::Instant::now();
+                while start.elapsed() < std::time::Duration::from_millis(5) {
+                    std::hint::spin_loop();
+                }
+                let (after, _) = shared.busy_ns_of(0).unwrap();
+                *seen.lock().unwrap() = Some((before, after));
+            }
+        })
+        .unwrap();
+        let (before, after) = seen.lock().unwrap().unwrap();
+        assert!(after > before, "{before} then {after}");
+    }
+
+    /// Time spent spinning for work is taken off a worker's CPU time.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    #[test]
+    fn time_spent_spinning_for_work_is_not_busy() {
+        const CPU: u64 = 1_000_000_000_000;
+        let _fake = super::fake_cpu::set(Some(|_, _| CPU));
+        let rt = crate::Builder::new()
+            .workers(1)
+            .spin_before_park(std::time::Duration::from_secs(10))
+            .build()
+            .unwrap();
+        let shared = rt.shared.clone();
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let s = seen.clone();
+        rt.run(move |_| {
+            let (shared, seen) = (shared.clone(), s.clone());
+            async move {
+                // Nothing to do until the timer: the worker spins.
+                crate::time::sleep(std::time::Duration::from_millis(20)).await;
+                let spun = shared.workers[0].counters.spin_ns();
+                let (busy, _) = shared.busy_ns_of(0).unwrap();
+                *seen.lock().unwrap() = Some((spun, busy));
+            }
+        })
+        .unwrap();
+        let (spun, busy) = seen.lock().unwrap().unwrap();
+        assert!(spun > 0, "the worker did not spin");
+        assert_eq!(busy, CPU - spun);
     }
 }

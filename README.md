@@ -676,12 +676,12 @@ The other systems have one driver each, chosen by default (`DriverKind` is
 
 Every table, with its method, machine and raw output, is in
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md): throughput from one connection to 5,000, memory
-per connection, system calls, bare metal from one worker to sixteen, HTTPS, the database and
-Redis clients, routing, files, core primitives, UDP, gRPC, large uploads, QUIC, the
-benchmark lab against Tokio, Monoio and Glommio, and what has not been measured. A change of
-a percent or two is below the noise of those runs, so CI holds the hot paths to their
-instruction counts instead ([bench/instr](bench/instr/README.md)): a change that makes any
-of them cost 1% more fails.
+per connection, system calls, bare metal from one worker to sixteen, uneven load across
+workers, HTTPS, the database and Redis clients, routing, files, core primitives, UDP, gRPC,
+large uploads, QUIC, the benchmark lab against Tokio, Monoio and Glommio, and what has not
+been measured. A change of a percent or two is below the noise of those runs, so CI holds
+the hot paths to their instruction counts instead ([bench/instr](bench/instr/README.md)): a
+change that makes any of them cost 1% more fails.
 
 ## Testing and safety
 
@@ -872,7 +872,8 @@ younger than both, and one service runs on it so far.
   another worker, the blocking lane, or `giong-http`'s per-worker request byte budget.
 - **Started tasks do not migrate.** Balancing happens where work starts: jobs queued with
   `Handle::spawn_balanced` go to the first idle worker, and listeners bound with
-  `TcpListener::bind_balanced` hand new connections to less busy workers. A connection
+  `TcpListener::bind_balanced` hand new connections to workers that have been less busy
+  lately (by time spent working, not by connection counts). A connection
   already being served stays on its worker, however busy that worker gets.
 - **Graceful draining is opt-in.** By default, when a worker's main future returns, the
   remaining connections are dropped. Set `.shutdown_grace(..)` and use `until_shutdown` in
@@ -914,7 +915,7 @@ src/
   net.rs        the core shared by stream sockets, TcpListener, TcpStream
   net/addr.rs   ToSocketAddrs, connecting to the first of several addresses (Happy Eyeballs)
   net/dns.rs    lookup_host and Resolver: /etc/hosts, DNS over UDP and TCP, cache
-  net/balance.rs  bind_balanced: handing new connections to idle workers
+  net/balance.rs  bind_balanced: handing new connections to less busy workers
   net/share.rs  which ports this process holds, so bind refuses another process's
   net/spread.rs, net/udp_spread.rs  handing connections and datagrams to the workers on Windows
   net/unix.rs   UnixListener, UnixStream

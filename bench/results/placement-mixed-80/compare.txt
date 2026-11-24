@@ -1,0 +1,14 @@
+mixed: 80 rounds of before, 80 of balanced; quartiles of the rounds (p25 / median / p75)
+metric                             before                  balanced  U test p
+hot_rps             16850 / 16966 / 17048     16844 / 16983 / 17072      0.48
+light_p50_us              271 / 290 / 360           264 / 292 / 359      0.67
+light_p99_us              735 / 822 / 922           712 / 786 / 866      0.14
+light_p999_us          1999 / 2761 / 4318        1808 / 2552 / 3796      0.31
+light_max_us           3317 / 5058 / 8408        3322 / 4552 / 7650      0.39
+
+range of the rounds (min to max)
+hot_rps                    14489 to 17263            15557 to 17260
+light_p50_us                   131 to 372                129 to 386
+light_p99_us                  604 to 2170               590 to 4706
+light_p999_us                860 to 40766              854 to 34583
+light_max_us                1487 to 41791             1438 to 46757

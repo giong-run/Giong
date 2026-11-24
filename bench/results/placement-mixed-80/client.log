@@ -1,0 +1,640 @@
+== mixed before round 1
+hot_rps=17052 light_p50_us=360 light_p99_us=672 light_p999_us=2303 light_max_us=4673
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 1
+hot_rps=17183 light_p50_us=358 light_p99_us=728 light_p999_us=3169 light_max_us=12189
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed before round 2
+hot_rps=16848 light_p50_us=274 light_p99_us=835 light_p999_us=1984 light_max_us=2548
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed balanced round 2
+hot_rps=17017 light_p50_us=363 light_p99_us=722 light_p999_us=2344 light_max_us=12444
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 3
+hot_rps=17127 light_p50_us=363 light_p99_us=648 light_p999_us=2150 light_max_us=3791
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 3
+hot_rps=17070 light_p50_us=257 light_p99_us=1104 light_p999_us=4228 light_max_us=6243
+  worker 0: 2 hot, 12 light
+  worker 1: 4 hot, 6 light
+== mixed before round 4
+hot_rps=17055 light_p50_us=264 light_p99_us=808 light_p999_us=2227 light_max_us=3124
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed balanced round 4
+hot_rps=15906 light_p50_us=145 light_p99_us=755 light_p999_us=1025 light_max_us=2346
+  worker 0: 5 hot, 5 light
+  worker 1: 1 hot, 13 light
+== mixed before round 5
+hot_rps=16689 light_p50_us=284 light_p99_us=834 light_p999_us=1848 light_max_us=2907
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed balanced round 5
+hot_rps=16939 light_p50_us=276 light_p99_us=836 light_p999_us=2267 light_max_us=4523
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed before round 6
+hot_rps=16749 light_p50_us=337 light_p99_us=1481 light_p999_us=5642 light_max_us=6342
+  worker 0: 2 hot, 10 light
+  worker 1: 4 hot, 8 light
+== mixed balanced round 6
+hot_rps=16886 light_p50_us=263 light_p99_us=733 light_p999_us=1941 light_max_us=3260
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed before round 7
+hot_rps=17052 light_p50_us=360 light_p99_us=810 light_p999_us=14676 light_max_us=29639
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 7
+hot_rps=17087 light_p50_us=357 light_p99_us=690 light_p999_us=2677 light_max_us=3109
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed before round 8
+hot_rps=16910 light_p50_us=365 light_p99_us=803 light_p999_us=1758 light_max_us=3334
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed balanced round 8
+hot_rps=17079 light_p50_us=360 light_p99_us=648 light_p999_us=3293 light_max_us=5185
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 9
+hot_rps=17103 light_p50_us=281 light_p99_us=825 light_p999_us=2348 light_max_us=2927
+  worker 0: 2 hot, 10 light
+  worker 1: 4 hot, 8 light
+== mixed balanced round 9
+hot_rps=17104 light_p50_us=279 light_p99_us=785 light_p999_us=2191 light_max_us=2958
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed before round 10
+hot_rps=16851 light_p50_us=365 light_p99_us=1415 light_p999_us=4306 light_max_us=8507
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed balanced round 10
+hot_rps=17081 light_p50_us=365 light_p99_us=805 light_p999_us=6276 light_max_us=10931
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed before round 11
+hot_rps=17005 light_p50_us=362 light_p99_us=651 light_p999_us=3692 light_max_us=4853
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed balanced round 11
+hot_rps=16815 light_p50_us=363 light_p99_us=824 light_p999_us=2112 light_max_us=5488
+  worker 0: 3 hot, 11 light
+  worker 1: 3 hot, 7 light
+== mixed before round 12
+hot_rps=17089 light_p50_us=358 light_p99_us=727 light_p999_us=6851 light_max_us=9439
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 12
+hot_rps=16818 light_p50_us=263 light_p99_us=858 light_p999_us=3265 light_max_us=6243
+  worker 0: 2 hot, 12 light
+  worker 1: 4 hot, 6 light
+== mixed before round 13
+hot_rps=17123 light_p50_us=323 light_p99_us=752 light_p999_us=860 light_max_us=3029
+  worker 0: 2 hot, 9 light
+  worker 1: 4 hot, 9 light
+== mixed balanced round 13
+hot_rps=16960 light_p50_us=368 light_p99_us=867 light_p999_us=2791 light_max_us=6637
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed before round 14
+hot_rps=17088 light_p50_us=370 light_p99_us=839 light_p999_us=7779 light_max_us=8319
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 14
+hot_rps=17060 light_p50_us=322 light_p99_us=832 light_p999_us=1752 light_max_us=2981
+  worker 0: 2 hot, 9 light
+  worker 1: 4 hot, 9 light
+== mixed before round 15
+hot_rps=16892 light_p50_us=368 light_p99_us=949 light_p999_us=3921 light_max_us=5823
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed balanced round 15
+hot_rps=17099 light_p50_us=286 light_p99_us=885 light_p999_us=3009 light_max_us=4933
+  worker 0: 2 hot, 10 light
+  worker 1: 4 hot, 8 light
+== mixed before round 16
+hot_rps=17157 light_p50_us=276 light_p99_us=750 light_p999_us=2004 light_max_us=2674
+  worker 0: 2 hot, 10 light
+  worker 1: 4 hot, 8 light
+== mixed balanced round 16
+hot_rps=16938 light_p50_us=376 light_p99_us=988 light_p999_us=9594 light_max_us=9811
+  worker 0: 4 hot, 10 light
+  worker 1: 2 hot, 8 light
+== mixed before round 17
+hot_rps=16862 light_p50_us=271 light_p99_us=833 light_p999_us=1435 light_max_us=1978
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 17
+hot_rps=17043 light_p50_us=357 light_p99_us=627 light_p999_us=1525 light_max_us=3545
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed before round 18
+hot_rps=17081 light_p50_us=353 light_p99_us=666 light_p999_us=1613 light_max_us=2861
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed balanced round 18
+hot_rps=17013 light_p50_us=281 light_p99_us=827 light_p999_us=2275 light_max_us=3518
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed before round 19
+hot_rps=17144 light_p50_us=281 light_p99_us=874 light_p999_us=1947 light_max_us=3204
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed balanced round 19
+hot_rps=17047 light_p50_us=275 light_p99_us=779 light_p999_us=2824 light_max_us=3947
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed before round 20
+hot_rps=17076 light_p50_us=302 light_p99_us=738 light_p999_us=3123 light_max_us=7841
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed balanced round 20
+hot_rps=16994 light_p50_us=301 light_p99_us=1569 light_p999_us=4005 light_max_us=8008
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed before round 21
+hot_rps=16925 light_p50_us=372 light_p99_us=650 light_p999_us=2808 light_max_us=4626
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed balanced round 21
+hot_rps=17056 light_p50_us=354 light_p99_us=744 light_p999_us=2322 light_max_us=3411
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 22
+hot_rps=16948 light_p50_us=286 light_p99_us=963 light_p999_us=3968 light_max_us=5405
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed balanced round 22
+hot_rps=17115 light_p50_us=359 light_p99_us=645 light_p999_us=2238 light_max_us=4209
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 23
+hot_rps=17129 light_p50_us=362 light_p99_us=611 light_p999_us=1138 light_max_us=1825
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 23
+hot_rps=17019 light_p50_us=360 light_p99_us=690 light_p999_us=2314 light_max_us=6301
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed before round 24
+hot_rps=17033 light_p50_us=307 light_p99_us=1103 light_p999_us=4438 light_max_us=41791
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 24
+hot_rps=17109 light_p50_us=248 light_p99_us=777 light_p999_us=2346 light_max_us=2961
+  worker 0: 2 hot, 12 light
+  worker 1: 4 hot, 6 light
+== mixed before round 25
+hot_rps=16965 light_p50_us=370 light_p99_us=717 light_p999_us=2004 light_max_us=3790
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 25
+hot_rps=17224 light_p50_us=263 light_p99_us=754 light_p999_us=1473 light_max_us=2242
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed before round 26
+hot_rps=16932 light_p50_us=359 light_p99_us=864 light_p999_us=2714 light_max_us=6796
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 26
+hot_rps=16892 light_p50_us=270 light_p99_us=919 light_p999_us=4006 light_max_us=17412
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed before round 27
+hot_rps=17073 light_p50_us=352 light_p99_us=627 light_p999_us=1943 light_max_us=3267
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 27
+hot_rps=17081 light_p50_us=354 light_p99_us=635 light_p999_us=2460 light_max_us=3314
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 28
+hot_rps=16999 light_p50_us=264 light_p99_us=817 light_p999_us=2842 light_max_us=4141
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed balanced round 28
+hot_rps=16845 light_p50_us=260 light_p99_us=1103 light_p999_us=2643 light_max_us=3628
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed before round 29
+hot_rps=16998 light_p50_us=258 light_p99_us=757 light_p999_us=2142 light_max_us=4994
+  worker 0: 2 hot, 12 light
+  worker 1: 4 hot, 6 light
+== mixed balanced round 29
+hot_rps=16815 light_p50_us=285 light_p99_us=860 light_p999_us=2980 light_max_us=3714
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed before round 30
+hot_rps=16892 light_p50_us=276 light_p99_us=958 light_p999_us=1761 light_max_us=2881
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 30
+hot_rps=16766 light_p50_us=326 light_p99_us=1361 light_p999_us=4265 light_max_us=7531
+  worker 0: 4 hot, 9 light
+  worker 1: 2 hot, 9 light
+== mixed before round 31
+hot_rps=17004 light_p50_us=291 light_p99_us=900 light_p999_us=2612 light_max_us=3357
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed balanced round 31
+hot_rps=16914 light_p50_us=359 light_p99_us=1197 light_p999_us=4378 light_max_us=8134
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed before round 32
+hot_rps=15583 light_p50_us=151 light_p99_us=852 light_p999_us=1218 light_max_us=3458
+  worker 0: 1 hot, 13 light
+  worker 1: 5 hot, 5 light
+== mixed balanced round 32
+hot_rps=16876 light_p50_us=270 light_p99_us=806 light_p999_us=2051 light_max_us=4570
+  worker 0: 2 hot, 12 light
+  worker 1: 4 hot, 6 light
+== mixed before round 33
+hot_rps=16729 light_p50_us=371 light_p99_us=2170 light_p999_us=40766 light_max_us=41214
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 33
+hot_rps=16715 light_p50_us=368 light_p99_us=824 light_p999_us=3299 light_max_us=5590
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed before round 34
+hot_rps=16709 light_p50_us=267 light_p99_us=917 light_p999_us=4354 light_max_us=9289
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 34
+hot_rps=16003 light_p50_us=378 light_p99_us=4706 light_p999_us=9797 light_max_us=11879
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 35
+hot_rps=14489 light_p50_us=170 light_p99_us=1913 light_p999_us=11446 light_max_us=15049
+  worker 0: 5 hot, 5 light
+  worker 1: 1 hot, 13 light
+== mixed balanced round 35
+hot_rps=16767 light_p50_us=326 light_p99_us=1074 light_p999_us=4563 light_max_us=6791
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed before round 36
+hot_rps=14832 light_p50_us=158 light_p99_us=1373 light_p999_us=3861 light_max_us=9162
+  worker 0: 1 hot, 14 light
+  worker 1: 5 hot, 4 light
+== mixed balanced round 36
+hot_rps=15557 light_p50_us=144 light_p99_us=883 light_p999_us=1814 light_max_us=12609
+  worker 0: 5 hot, 4 light
+  worker 1: 1 hot, 14 light
+== mixed before round 37
+hot_rps=16939 light_p50_us=354 light_p99_us=879 light_p999_us=6812 light_max_us=9095
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 37
+hot_rps=16630 light_p50_us=265 light_p99_us=1879 light_p999_us=23243 light_max_us=25987
+  worker 0: 4 hot, 5 light
+  worker 1: 2 hot, 13 light
+== mixed before round 38
+hot_rps=16548 light_p50_us=279 light_p99_us=862 light_p999_us=3106 light_max_us=7403
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 38
+hot_rps=17083 light_p50_us=261 light_p99_us=787 light_p999_us=6915 light_max_us=14418
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed before round 39
+hot_rps=16885 light_p50_us=359 light_p99_us=1222 light_p999_us=3286 light_max_us=4277
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 39
+hot_rps=16827 light_p50_us=271 light_p99_us=724 light_p999_us=1017 light_max_us=1811
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed before round 40
+hot_rps=17263 light_p50_us=340 light_p99_us=604 light_p999_us=1633 light_max_us=3634
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 40
+hot_rps=16965 light_p50_us=367 light_p99_us=710 light_p999_us=34583 light_max_us=46757
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed before round 1
+hot_rps=16742 light_p50_us=356 light_p99_us=1041 light_p999_us=3085 light_max_us=4491
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 1
+hot_rps=17122 light_p50_us=301 light_p99_us=723 light_p999_us=2098 light_max_us=6262
+  worker 0: 2 hot, 9 light
+  worker 1: 4 hot, 9 light
+== mixed before round 2
+hot_rps=16921 light_p50_us=278 light_p99_us=846 light_p999_us=10304 light_max_us=16861
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed balanced round 2
+hot_rps=16990 light_p50_us=249 light_p99_us=739 light_p999_us=1919 light_max_us=4201
+  worker 0: 4 hot, 4 light
+  worker 1: 2 hot, 14 light
+== mixed before round 3
+hot_rps=16731 light_p50_us=272 light_p99_us=859 light_p999_us=2234 light_max_us=3136
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 3
+hot_rps=16804 light_p50_us=373 light_p99_us=1130 light_p999_us=10374 light_max_us=14497
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 4
+hot_rps=17122 light_p50_us=279 light_p99_us=769 light_p999_us=1058 light_max_us=3714
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed balanced round 4
+hot_rps=17030 light_p50_us=271 light_p99_us=790 light_p999_us=1744 light_max_us=3346
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed before round 5
+hot_rps=16641 light_p50_us=361 light_p99_us=986 light_p999_us=19421 light_max_us=33431
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 5
+hot_rps=16926 light_p50_us=362 light_p99_us=916 light_p999_us=6409 light_max_us=11189
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed before round 6
+hot_rps=16901 light_p50_us=366 light_p99_us=1378 light_p999_us=6951 light_max_us=8346
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 6
+hot_rps=17040 light_p50_us=276 light_p99_us=758 light_p999_us=1292 light_max_us=1533
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed before round 7
+hot_rps=16992 light_p50_us=372 light_p99_us=829 light_p999_us=17952 light_max_us=26998
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 7
+hot_rps=15576 light_p50_us=140 light_p99_us=904 light_p999_us=2046 light_max_us=3430
+  worker 0: 1 hot, 14 light
+  worker 1: 5 hot, 4 light
+== mixed before round 8
+hot_rps=17026 light_p50_us=287 light_p99_us=804 light_p999_us=1416 light_max_us=2535
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed balanced round 8
+hot_rps=17067 light_p50_us=355 light_p99_us=604 light_p999_us=2039 light_max_us=3459
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 9
+hot_rps=16945 light_p50_us=287 light_p99_us=863 light_p999_us=6061 light_max_us=14280
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed balanced round 9
+hot_rps=15655 light_p50_us=146 light_p99_us=817 light_p999_us=2085 light_max_us=3160
+  worker 0: 1 hot, 14 light
+  worker 1: 5 hot, 4 light
+== mixed before round 10
+hot_rps=15640 light_p50_us=139 light_p99_us=801 light_p999_us=1075 light_max_us=1487
+  worker 0: 5 hot, 4 light
+  worker 1: 1 hot, 14 light
+== mixed balanced round 10
+hot_rps=15737 light_p50_us=129 light_p99_us=777 light_p999_us=1791 light_max_us=2777
+  worker 0: 5 hot, 3 light
+  worker 1: 1 hot, 15 light
+== mixed before round 11
+hot_rps=16960 light_p50_us=360 light_p99_us=654 light_p999_us=2902 light_max_us=3994
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 11
+hot_rps=17135 light_p50_us=356 light_p99_us=645 light_p999_us=1684 light_max_us=4769
+  worker 0: 3 hot, 11 light
+  worker 1: 3 hot, 7 light
+== mixed before round 12
+hot_rps=16968 light_p50_us=258 light_p99_us=753 light_p999_us=3295 light_max_us=5644
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed balanced round 12
+hot_rps=17209 light_p50_us=268 light_p99_us=698 light_p999_us=859 light_max_us=4238
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed before round 13
+hot_rps=17043 light_p50_us=362 light_p99_us=721 light_p999_us=3149 light_max_us=4542
+  worker 0: 3 hot, 11 light
+  worker 1: 3 hot, 7 light
+== mixed balanced round 13
+hot_rps=17127 light_p50_us=246 light_p99_us=786 light_p999_us=3085 light_max_us=6714
+  worker 0: 2 hot, 13 light
+  worker 1: 4 hot, 5 light
+== mixed before round 14
+hot_rps=15641 light_p50_us=158 light_p99_us=937 light_p999_us=12247 light_max_us=21032
+  worker 0: 5 hot, 6 light
+  worker 1: 1 hot, 12 light
+== mixed balanced round 14
+hot_rps=17260 light_p50_us=347 light_p99_us=590 light_p999_us=1281 light_max_us=4534
+  worker 0: 3 hot, 11 light
+  worker 1: 3 hot, 7 light
+== mixed before round 15
+hot_rps=17049 light_p50_us=349 light_p99_us=664 light_p999_us=2623 light_max_us=6715
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed balanced round 15
+hot_rps=16890 light_p50_us=285 light_p99_us=865 light_p999_us=4413 light_max_us=5029
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed before round 16
+hot_rps=17001 light_p50_us=360 light_p99_us=710 light_p999_us=3647 light_max_us=8375
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 16
+hot_rps=16987 light_p50_us=257 light_p99_us=919 light_p999_us=4524 light_max_us=8269
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed before round 17
+hot_rps=17016 light_p50_us=270 light_p99_us=769 light_p999_us=1043 light_max_us=17534
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed balanced round 17
+hot_rps=17078 light_p50_us=253 light_p99_us=756 light_p999_us=1463 light_max_us=3133
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed before round 18
+hot_rps=16976 light_p50_us=364 light_p99_us=719 light_p999_us=8561 light_max_us=10042
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed balanced round 18
+hot_rps=17017 light_p50_us=361 light_p99_us=685 light_p999_us=2689 light_max_us=3324
+  worker 0: 3 hot, 11 light
+  worker 1: 3 hot, 7 light
+== mixed before round 19
+hot_rps=15549 light_p50_us=145 light_p99_us=961 light_p999_us=3362 light_max_us=8254
+  worker 0: 5 hot, 4 light
+  worker 1: 1 hot, 14 light
+== mixed balanced round 19
+hot_rps=16936 light_p50_us=375 light_p99_us=762 light_p999_us=4947 light_max_us=12114
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 20
+hot_rps=17034 light_p50_us=265 light_p99_us=747 light_p999_us=2304 light_max_us=7399
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 20
+hot_rps=17041 light_p50_us=352 light_p99_us=602 light_p999_us=963 light_max_us=2581
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed before round 21
+hot_rps=16889 light_p50_us=285 light_p99_us=867 light_p999_us=2035 light_max_us=5828
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 21
+hot_rps=16980 light_p50_us=295 light_p99_us=827 light_p999_us=7601 light_max_us=9905
+  worker 0: 2 hot, 10 light
+  worker 1: 4 hot, 8 light
+== mixed before round 22
+hot_rps=16869 light_p50_us=287 light_p99_us=1152 light_p999_us=18266 light_max_us=21517
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed balanced round 22
+hot_rps=16938 light_p50_us=359 light_p99_us=622 light_p999_us=3128 light_max_us=3948
+  worker 0: 3 hot, 7 light
+  worker 1: 3 hot, 11 light
+== mixed before round 23
+hot_rps=17086 light_p50_us=256 light_p99_us=834 light_p999_us=3219 light_max_us=7240
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed balanced round 23
+hot_rps=16887 light_p50_us=277 light_p99_us=971 light_p999_us=3726 light_max_us=6610
+  worker 0: 2 hot, 12 light
+  worker 1: 4 hot, 6 light
+== mixed before round 24
+hot_rps=17034 light_p50_us=287 light_p99_us=738 light_p999_us=1493 light_max_us=2247
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed balanced round 24
+hot_rps=16814 light_p50_us=263 light_p99_us=955 light_p999_us=3181 light_max_us=5323
+  worker 0: 2 hot, 12 light
+  worker 1: 4 hot, 6 light
+== mixed before round 25
+hot_rps=16858 light_p50_us=273 light_p99_us=1017 light_p999_us=3324 light_max_us=9853
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed balanced round 25
+hot_rps=16973 light_p50_us=281 light_p99_us=830 light_p999_us=1550 light_max_us=2672
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed before round 26
+hot_rps=16948 light_p50_us=255 light_p99_us=820 light_p999_us=3581 light_max_us=4499
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed balanced round 26
+hot_rps=17003 light_p50_us=362 light_p99_us=605 light_p999_us=870 light_max_us=2946
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 27
+hot_rps=15275 light_p50_us=167 light_p99_us=912 light_p999_us=2177 light_max_us=7446
+  worker 0: 1 hot, 12 light
+  worker 1: 5 hot, 6 light
+== mixed balanced round 27
+hot_rps=16840 light_p50_us=357 light_p99_us=637 light_p999_us=3532 light_max_us=9345
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed before round 28
+hot_rps=16515 light_p50_us=298 light_p99_us=950 light_p999_us=2284 light_max_us=3088
+  worker 0: 4 hot, 8 light
+  worker 1: 2 hot, 10 light
+== mixed balanced round 28
+hot_rps=16674 light_p50_us=366 light_p99_us=648 light_p999_us=854 light_max_us=1438
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed before round 29
+hot_rps=16735 light_p50_us=262 light_p99_us=955 light_p999_us=22557 light_max_us=36413
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 29
+hot_rps=16946 light_p50_us=265 light_p99_us=834 light_p999_us=2764 light_max_us=3559
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed before round 30
+hot_rps=15758 light_p50_us=131 light_p99_us=848 light_p999_us=2351 light_max_us=6581
+  worker 0: 5 hot, 4 light
+  worker 1: 1 hot, 14 light
+== mixed balanced round 30
+hot_rps=16894 light_p50_us=289 light_p99_us=828 light_p999_us=3074 light_max_us=4737
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed before round 31
+hot_rps=16948 light_p50_us=254 light_p99_us=788 light_p999_us=2219 light_max_us=3566
+  worker 0: 4 hot, 6 light
+  worker 1: 2 hot, 12 light
+== mixed balanced round 31
+hot_rps=17124 light_p50_us=280 light_p99_us=794 light_p999_us=2072 light_max_us=2705
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed before round 32
+hot_rps=16776 light_p50_us=372 light_p99_us=1146 light_p999_us=9814 light_max_us=15697
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 32
+hot_rps=17035 light_p50_us=361 light_p99_us=726 light_p999_us=6088 light_max_us=13711
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== mixed before round 33
+hot_rps=17250 light_p50_us=354 light_p99_us=609 light_p999_us=2128 light_max_us=3376
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 33
+hot_rps=16392 light_p50_us=386 light_p99_us=783 light_p999_us=2802 light_max_us=4168
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 34
+hot_rps=17044 light_p50_us=290 light_p99_us=816 light_p999_us=1286 light_max_us=2802
+  worker 0: 2 hot, 10 light
+  worker 1: 4 hot, 8 light
+== mixed balanced round 34
+hot_rps=16867 light_p50_us=363 light_p99_us=948 light_p999_us=2058 light_max_us=5335
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed before round 35
+hot_rps=17089 light_p50_us=368 light_p99_us=614 light_p999_us=1171 light_max_us=3854
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 35
+hot_rps=17056 light_p50_us=278 light_p99_us=854 light_p999_us=3192 light_max_us=4897
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== mixed before round 36
+hot_rps=17004 light_p50_us=280 light_p99_us=816 light_p999_us=4455 light_max_us=5578
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 36
+hot_rps=17209 light_p50_us=256 light_p99_us=712 light_p999_us=1427 light_max_us=3706
+  worker 0: 2 hot, 12 light
+  worker 1: 4 hot, 6 light
+== mixed before round 37
+hot_rps=17048 light_p50_us=362 light_p99_us=649 light_p999_us=2281 light_max_us=2796
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== mixed balanced round 37
+hot_rps=17093 light_p50_us=356 light_p99_us=639 light_p999_us=1678 light_max_us=2653
+  worker 0: 3 hot, 5 light
+  worker 1: 3 hot, 13 light
+== mixed before round 38
+hot_rps=17039 light_p50_us=362 light_p99_us=695 light_p999_us=1660 light_max_us=2830
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed balanced round 38
+hot_rps=16986 light_p50_us=258 light_p99_us=769 light_p999_us=26086 light_max_us=33138
+  worker 0: 4 hot, 5 light
+  worker 1: 2 hot, 13 light
+== mixed before round 39
+hot_rps=17046 light_p50_us=266 light_p99_us=777 light_p999_us=4284 light_max_us=5121
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== mixed balanced round 39
+hot_rps=16765 light_p50_us=255 light_p99_us=701 light_p999_us=1145 light_max_us=2501
+  worker 0: 2 hot, 13 light
+  worker 1: 4 hot, 5 light
+== mixed before round 40
+hot_rps=16968 light_p50_us=360 light_p99_us=685 light_p999_us=2515 light_max_us=7935
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== mixed balanced round 40
+hot_rps=16898 light_p50_us=360 light_p99_us=628 light_p999_us=1765 light_max_us=4124
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light

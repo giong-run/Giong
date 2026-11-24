@@ -103,7 +103,7 @@ const OPENING_WAIT: Duration = Duration::from_millis(20);
 /// Nanoseconds on a clock that is the same for every thread of the process,
 /// below 2^63 (292 years): what a sleep in progress is measured on, by the
 /// worker that sleeps and by the threads that read its pulse.
-fn clock_ns() -> u64 {
+pub(crate) fn clock_ns() -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let since = EPOCH.get_or_init(Instant::now).elapsed();
     u64::try_from(since.as_nanos()).unwrap_or(u64::MAX) & !ASLEEP
@@ -125,6 +125,10 @@ pub(crate) struct Counters {
     /// [`clock_ns`], modulo 2^63): a reader adds its own clock and has the
     /// total with the sleep in progress, from one value.
     idle_ns: AtomicU64,
+    /// Nanoseconds spent busy-polling for work before a sleep (see
+    /// [`Builder::spin_before_park`](crate::Builder::spin_before_park)):
+    /// on the CPU, but idle. Kept apart from `idle_ns`, which is time asleep.
+    spin_ns: AtomicU64,
     spawned: AtomicU64,
     /// The location of the task being polled, or null between batches.
     polling: AtomicPtr<panic::Location<'static>>,
@@ -246,6 +250,7 @@ impl Counters {
             polls: AtomicU64::new(0),
             parks: AtomicU64::new(0),
             idle_ns: AtomicU64::new(0),
+            spin_ns: AtomicU64::new(0),
             spawned: AtomicU64::new(0),
             polling: AtomicPtr::new(ptr::null_mut()),
             driver: AtomicU8::new(0),
@@ -370,6 +375,26 @@ impl Counters {
         } else {
             value.wrapping_add(clock_ns()) & !ASLEEP
         }
+    }
+
+    /// The worker busy-polled for work for `spun`.
+    pub(crate) fn spun(&self, spun: Duration) {
+        Self::bump(
+            &self.spin_ns,
+            u64::try_from(spun.as_nanos()).unwrap_or(u64::MAX),
+        );
+    }
+
+    /// Nanoseconds spent busy-polling for work so far: CPU time the worker
+    /// used without doing any work.
+    #[cfg(all(target_os = "linux", not(miri)))]
+    pub(crate) fn spin_ns(&self) -> u64 {
+        self.spin_ns.load(Ordering::Relaxed)
+    }
+
+    /// Task polls so far.
+    pub(crate) fn polls(&self) -> u64 {
+        self.polls.load(Ordering::Relaxed)
     }
 
     /// `value`, or, while it says that a sleep is starting, what the

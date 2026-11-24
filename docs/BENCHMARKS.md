@@ -332,6 +332,56 @@ other two vCPUs could no longer keep up once the server had two workers, so that
 shows the one-worker numbers (giong 218.9k, Monoio 214.2k, giong-http 186.1k, Glommio
 175.8k, raw Tokio 151.1k). Recorded output: `bench/results/workers/`.
 
+## Uneven load across workers
+
+Where `TcpListener::bind_balanced` puts new connections when the workers are busy in
+uneven ways (`bench/placement.sh`, 10 rounds of 4 s, medians; 2 workers on 2 vCPUs, the
+client on the other 2). "Before" is the 1.0.0 rule, which compared counts of tasks only;
+"now" compares the CPU time each worker used lately first and counts only among workers
+within 5% of a core of the least busy one; when every worker is at least 80% busy, a
+worker with clearly less work waiting gets the connection, and otherwise counts decide,
+but never in favour of a worker whose task polls take over 25% longer.
+
+**Skewed:** one hot connection keeps its worker 75-85% busy, 300 idle connections arrive
+next, and 4 clients keep opening short connections (20 requests of 20 µs of work each).
+
+| Listeners | Requests | p50 | p99 | p99.9 | Hot connection |
+|---|---|---|---|---|---|
+| Plain (`bind`), paced | 16,000/s | 101 µs | 588 µs | 1,030 µs | 3,316 req/s |
+| Balanced before, paced | 16,000/s | 72 µs | 508 µs | 775 µs | 3,674 req/s |
+| **Balanced now, paced** | 16,000/s | **61 µs** | **198 µs** | **536 µs** | **4,006 req/s** |
+| Plain, back to back | 20,382/s | 103 µs | 612 µs | 982 µs | 3,020 req/s |
+| Balanced before, back to back | 31,482/s | 70 µs | 514 µs | 710 µs | 3,408 req/s |
+| Balanced now, back to back | 31,470/s | 72 µs | 502 µs | 700 µs | 3,502 req/s |
+
+"Paced" sends one request per 250 µs per client; "back to back" sends the next as soon as
+the last is answered. Paced, the short connections' p99 drops by three fifths and the hot
+connection gets 9% more done. Back to back both workers are saturated, and **p50 is 2 µs
+higher (3%)**: in 30 more rounds ([`bench/results/placement-closed-30/`](../bench/results/placement-closed-30/)), 73 against 71 µs
+(Mann-Whitney p < 0.01) and 30.8k against 31.5k requests per second (p 0.06), with p99 and
+p99.9 the same. Each worker serves its requests as fast as before (p50 66-72 µs on the
+quiet worker, 278-286 µs on the hot one, in both); the hot worker serves a slightly
+smaller share of them. Raw data: [`bench/results/placement/`](../bench/results/placement/).
+
+**Mixed:** 24 connections arrive 10 ms apart in random order, 6 hot (100 µs of work back to
+back) and 18 light (20 µs every 20 ms); 80 rounds compared as distributions
+(`bench/placement/compare.py`, [`bench/results/placement-mixed-80/`](../bench/results/placement-mixed-80/)):
+
+| Rounds' p25 / median / p75 | Before | Now | Mann-Whitney p |
+|---|---|---|---|
+| Hot work | 16.9 / 17.0 / 17.0k req/s | 16.8 / 17.0 / 17.1k req/s | 0.48 |
+| Light p50 | 271 / 290 / 360 µs | 264 / 292 / 359 µs | 0.67 |
+| Light p99 | 735 / 822 / 922 µs | 712 / 786 / 866 µs | 0.14 |
+| Light p99.9 | 2.0 / 2.8 / 4.3 ms | 1.8 / 2.6 / 3.8 ms | 0.31 |
+| Slowest light request | 3.3 / 5.1 / 8.4 ms | 3.3 / 4.6 / 7.7 ms | 0.39 |
+
+The light requests' p50 depends on where the hot connections land: when they split 4 and
+2 (or 5 and 1) and the worker with fewer hot ones holds most light ones, light requests
+wait behind less hot work. Going by waiting work alone, the new rule split them 3 and 3
+almost every time and lost on p50 (358 against 286 µs); with counts deciding once waiting
+work does not, it lands them like the old rule (the client log says where every
+connection ended up).
+
 ## HTTPS
 
 `bench/tls.sh`: `giong-http` + `giong-tls` against Axum + `axum-server`, both on rustls with
