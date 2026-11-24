@@ -44,6 +44,43 @@ fn msg_for(i: u32, max: usize) -> Vec<u8> {
         .collect()
 }
 
+/// The descriptors a listener receives in a handshake (the memfd and the
+/// eventfds) are close-on-exec, like every other descriptor here, so a
+/// program this process starts does not inherit them.
+#[test]
+fn an_accepted_channel_s_descriptors_are_close_on_exec() {
+    let path = SockPath::new();
+    giong::block_on(async {
+        let listener = IpcListener::bind(&path.0, 1 << 16).unwrap();
+        let server = giong::spawn(async move { listener.accept().await.unwrap() });
+        let client = ipc::connect(&path.0, 4096).await.unwrap();
+        let channel = server.await.unwrap();
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let fd: RawFd = entry
+                .unwrap()
+                .file_name()
+                .to_str()
+                .unwrap()
+                .parse()
+                .unwrap();
+            if fd <= 2 {
+                continue;
+            }
+            // SAFETY: only reads the flags of a descriptor number.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            // read_dir's own descriptor may be closed by now.
+            if flags >= 0 {
+                assert_ne!(
+                    flags & libc::FD_CLOEXEC,
+                    0,
+                    "descriptor {fd} is inherited by exec"
+                );
+            }
+        }
+        drop((client, channel));
+    });
+}
+
 #[test]
 fn messages_of_every_size_arrive_in_order_both_ways() {
     let path = SockPath::new();
