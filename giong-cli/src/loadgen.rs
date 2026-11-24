@@ -740,7 +740,13 @@ mod tests {
         let o = run(&plan(addr, Some(100.0)));
         assert_eq!(o.answered(), 0);
         assert!(o.failed > 0);
-        assert!(o.first_error.unwrap().contains("cannot connect"));
+        // Linux refuses at once; Windows retries a refused connection for
+        // about two seconds, so the request's time runs out first there.
+        let e = o.first_error.unwrap();
+        assert!(
+            e.contains("cannot connect") || e.contains("no answer within"),
+            "{e}"
+        );
     }
 
     #[test]
