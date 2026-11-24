@@ -146,10 +146,20 @@ fn loopback(addr: &str) -> Option<String> {
 /// dashboard at any other file the user can read.
 fn inside_giong(root: &Path, p: PathBuf) -> Option<PathBuf> {
     let p = if p.is_relative() { root.join(p) } else { p };
-    let up = p
-        .components()
-        .any(|c| matches!(c, std::path::Component::ParentDir));
-    (!up && p.starts_with(root.join(".giong"))).then_some(p)
+    if p.components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return None;
+    }
+    let giong = root.join(".giong");
+    if p.starts_with(&giong) {
+        return Some(p);
+    }
+    // The same folder by another name: giong dev and this command may see
+    // the project through different paths (on macOS /var is /private/var).
+    let giong = std::fs::canonicalize(&giong).ok()?;
+    let folder = std::fs::canonicalize(p.parent()?).ok()?;
+    folder.starts_with(giong).then_some(p)
 }
 
 /// The project root of the current directory, if in one.
@@ -679,6 +689,21 @@ mod tests {
         let s = DevState::read(&dir).unwrap();
         assert_eq!(s.listen, ["127.0.0.1:9000", "[::1]:9001", "127.0.0.2:9002"]);
         assert_eq!(s.log, None);
+        // The same .giong reached through a linked path is the same folder.
+        #[cfg(unix)]
+        {
+            let alias = dir.with_extension("alias");
+            let _ = std::fs::remove_file(&alias);
+            std::os::unix::fs::symlink(&dir, &alias).unwrap();
+            let log = alias.join(".giong/dev.log");
+            std::fs::write(
+                dir.join(".giong/dev.json"),
+                json!({ "log": log }).to_string(),
+            )
+            .unwrap();
+            assert_eq!(DevState::read(&dir).unwrap().log, Some(log));
+            std::fs::remove_file(&alias).unwrap();
+        }
         for log in [".giong/../secret", "src/main.rs", "../.giong/dev.log"] {
             std::fs::write(
                 dir.join(".giong/dev.json"),
