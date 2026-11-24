@@ -95,8 +95,9 @@ fn giongs_checks_find_what_blocks_a_worker_and_nothing_in_comments_or_sync_code(
     assert_eq!(lines_of(&v, "GIONG-E5006"), vec![7, 8], "{}", out.dump());
     assert_eq!(lines_of(&v, "GIONG-E5008"), vec![18], "{}", out.dump());
     assert_eq!(lines_of(&v, "GIONG-E5007"), vec![24], "{}", out.dump());
+    // Native separators, as rustc gives them (src\\main.rs on Windows).
     for f in findings(&v) {
-        assert_eq!(f["file"], "src/main.rs", "{f:#}");
+        assert_eq!(file_of(f), "src/main.rs", "{f:#}");
     }
 }
 
@@ -193,7 +194,7 @@ fn a_compile_error_is_an_error_at_its_place() {
         .find(|f| f["code"] == "GIONG-E5009")
         .unwrap_or_else(|| panic!("no E5009\n{}", out.dump()));
     assert_eq!(e["severity"], "error");
-    assert_eq!(e["file"], "src/main.rs");
+    assert_eq!(file_of(e), "src/main.rs");
     assert_eq!(e["line"], 2);
 }
 
@@ -245,4 +246,9 @@ fn a_half_typed_file_does_not_panic() {
     let (out, v) = check(dir.path(), &["--no-clippy"]);
     assert!(!out.stderr.contains("panicked"), "{}", out.dump());
     assert_eq!(v["ok"], false, "{}", out.dump());
+}
+
+/// A finding's file with `/` for the separator.
+fn file_of(f: &serde_json::Value) -> String {
+    f["file"].as_str().unwrap_or("").replace('\\', "/")
 }
