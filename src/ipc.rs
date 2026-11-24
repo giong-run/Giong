@@ -56,7 +56,7 @@
 
 mod ring;
 
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::future::{poll_fn, Future};
 use std::io;
 use std::ops::Deref;
@@ -67,9 +67,11 @@ use std::ptr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::task::Poll;
+use std::time::Duration;
 
 use crate::driver::Io;
 use crate::error::{raise, Code};
+use crate::executor::{JoinError, JoinHandle};
 use crate::kbox::KernelBox;
 use crate::net::{UnixListener, UnixStream};
 use crate::op::Op;
@@ -930,21 +932,42 @@ pub async fn connect<P: AsRef<Path>>(path: P, capacity: usize) -> io::Result<(Se
     halves(shared, true)
 }
 
+/// How long a connecting process has to send its handshake.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Handshakes a listener runs at once; further connections wait in the
+/// socket's backlog.
+const MAX_HANDSHAKES: usize = 64;
+
+/// A handshake running as a task of its own.
+type Handshake = JoinHandle<io::Result<(Sender, Receiver)>>;
+
 /// Listens for [`connect`] on a Unix socket path.
 pub struct IpcListener {
     inner: UnixListener,
     max_capacity: usize,
+    /// Handshakes running or done, oldest first: each runs as a task of its
+    /// own, so that a process that connects and sends nothing holds up no
+    /// other.
+    handshakes: RefCell<Vec<Handshake>>,
 }
 
 impl IpcListener {
     /// Listens at `path`, accepting channels of at most `max_capacity`
-    /// bytes per direction (a power of two from 4 KiB to 1 GiB). The
-    /// socket file's permissions decide who may connect.
+    /// bytes per direction (a power of two from 4 KiB to 1 GiB).
+    ///
+    /// The socket file's permissions decide who may connect, and it is
+    /// created with the process's umask, so that by default any local user
+    /// who can reach the path can open a channel and take handshake slots.
+    /// Bind in a directory only the intended users can enter (mode `0700`
+    /// for one user, or `0750` with a shared group), or narrow the file's
+    /// mode before the first `accept`.
     pub fn bind<P: AsRef<Path>>(path: P, max_capacity: usize) -> io::Result<Self> {
         check_capacity(max_capacity, "IPC capacity limit")?;
         Ok(Self {
             inner: UnixListener::bind(path)?,
             max_capacity,
+            handshakes: RefCell::new(Vec::new()),
         })
     }
 
@@ -954,93 +977,177 @@ impl IpcListener {
     /// asks for too much or is not a giong IPC client; the listener keeps
     /// working.
     ///
-    /// Cancel safe while it waits for a connection: none is taken. Dropped
-    /// during a handshake, it closes that connection, and the connecting
-    /// process fails with `GIONG-E0093`.
+    /// Handshakes run apart from the caller, up to 64 at once, and the
+    /// first to finish is returned: a process that connects and sends
+    /// nothing holds up no other, and fails with `GIONG-E0093` after 5
+    /// seconds, its connection closed. So serve with a loop that goes on
+    /// past such errors:
+    ///
+    /// ```no_run
+    /// # giong::block_on(async {
+    /// let listener = giong::ipc::IpcListener::bind("/run/app/ipc.sock", 1 << 20)?;
+    /// loop {
+    ///     let (tx, rx) = match listener.accept().await {
+    ///         Ok(channel) => channel,
+    ///         Err(e) if giong::error::code(&e).is_some() => continue, // one bad client
+    ///         Err(e) => return Err(e),
+    ///     };
+    ///     giong::spawn(async move { /* serve tx, rx */ drop((tx, rx)) });
+    /// }
+    /// # Ok::<_, std::io::Error>(())
+    /// # }).unwrap();
+    /// ```
+    ///
+    /// Cancel safe: a handshake under way when the future is dropped goes
+    /// on, and the next call returns it. Dropping the listener ends the
+    /// handshakes under way, and those processes fail with `GIONG-E0093`.
     pub async fn accept(&self) -> io::Result<(Sender, Receiver)> {
-        let control = self.inner.accept().await?;
-        let msg = handshake_msg();
-        let io = Io::RecvMsg {
-            fd: control.as_raw_fd(),
-            msg: msg.as_ptr().cast(),
-            // The memfd and eventfds arrive close-on-exec, so that they
-            // never leak into a program this process starts.
-            flags: libc::MSG_CMSG_CLOEXEC,
-        };
-        // SAFETY: as in `connect`.
-        let (res, _, msg) = unsafe { Op::new(io, msg) }.await;
-        if res < 0 {
-            return Err(io::Error::from_raw_os_error(-res));
-        }
-        let fds = received_fds(&msg);
-        let m = msg.get();
-        if res as usize != HANDSHAKE_LEN
-            || fds.len() != FDS
-            || m.hdr.msg_flags & libc::MSG_CTRUNC != 0
-        {
-            let _ = answer(&control, REFUSED_INVALID).await;
-            return Err(handshake_failed("the handshake message is malformed"));
-        }
-        let magic = u64::from_le_bytes(m.data[..8].try_into().unwrap());
-        let version = u32::from_le_bytes(m.data[8..12].try_into().unwrap());
-        let capacity = u32::from_le_bytes(m.data[12..16].try_into().unwrap()) as usize;
-        if magic != ring::MAGIC || version != ring::VERSION {
-            let _ = answer(&control, REFUSED_INVALID).await;
-            return Err(handshake_failed(
-                "the client speaks another protocol or version",
-            ));
-        }
-        if check_capacity(capacity, "IPC capacity").is_err() || capacity > self.max_capacity {
-            let _ = answer(&control, REFUSED_CAPACITY).await;
-            return Err(raise(
-                Code::IpcCapacity,
-                format!(
-                    "a client asked for an IPC capacity of {capacity} bytes, above this \
-                     listener's limit of {}",
-                    self.max_capacity
-                ),
-                "have the client connect with a smaller capacity, or raise the limit in \
-                 IpcListener::bind.",
-            ));
-        }
-        let len = ring::mapping_len(capacity);
-        let mut fds = fds.into_iter();
-        let mem = fds.next().unwrap();
-        let efds: [Fd; 4] = [
-            fds.next().unwrap(),
-            fds.next().unwrap(),
-            fds.next().unwrap(),
-            fds.next().unwrap(),
-        ];
-        if let Err(why) = check_memfd(mem.0, len)
-            .and_then(|()| efds.iter().try_for_each(|fd| check_eventfd(fd.0)))
-        {
-            let _ = answer(&control, REFUSED_INVALID).await;
-            return Err(handshake_failed(why));
-        }
-        let base = map(mem.0, len)?;
-        drop(mem);
-        let shared = Shared {
-            base,
-            len,
-            capacity,
-            efds,
-            control,
-        };
-        // SAFETY: the mapping is at least a page long and page-aligned.
-        let header = unsafe { &(*base.cast::<ring::Control>()).header };
-        if header.magic.load(Ordering::Acquire) != ring::MAGIC
-            || header.version.load(Ordering::Acquire) != ring::VERSION
-            || header.capacity.load(Ordering::Acquire) as usize != capacity
-        {
-            let _ = answer(&shared.control, REFUSED_INVALID).await;
-            return Err(handshake_failed(
-                "the shared memory does not match the handshake",
-            ));
-        }
-        answer(&shared.control, ACCEPTED).await?;
-        halves(shared, false)
+        let mut incoming = Box::pin(self.inner.accept());
+        poll_fn(|cx| loop {
+            {
+                let mut handshakes = self.handshakes.borrow_mut();
+                for i in 0..handshakes.len() {
+                    if let Poll::Ready(out) = Pin::new(&mut handshakes[i]).poll(cx) {
+                        handshakes.remove(i);
+                        return Poll::Ready(out.unwrap_or_else(|e| Err(lost_handshake(e))));
+                    }
+                }
+                if handshakes.len() >= MAX_HANDSHAKES {
+                    return Poll::Pending;
+                }
+            }
+            match incoming.as_mut().poll(cx) {
+                Poll::Ready(Ok(control)) => {
+                    let max_capacity = self.max_capacity;
+                    let task = crate::spawn(async move {
+                        crate::time::timeout(HANDSHAKE_TIMEOUT, handshake(control, max_capacity))
+                            .await
+                            .unwrap_or_else(|_| Err(silent_client()))
+                    });
+                    self.handshakes.borrow_mut().push(task);
+                    incoming.set(self.inner.accept());
+                }
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
+            }
+        })
+        .await
     }
+}
+
+impl Drop for IpcListener {
+    fn drop(&mut self) {
+        for h in self.handshakes.get_mut().drain(..) {
+            h.abort();
+        }
+    }
+}
+
+/// A process connected and sent no handshake in time.
+fn silent_client() -> io::Error {
+    raise(
+        Code::IpcHandshake,
+        format!(
+            "IPC handshake failed: the connecting process sent no handshake within {} \
+             seconds, so its connection was closed",
+            HANDSHAKE_TIMEOUT.as_secs()
+        ),
+        "connect with giong::ipc::connect, which sends the handshake at once; check \
+         which process opened the socket if none of yours did.",
+    )
+}
+
+/// A handshake task that panicked or was cancelled.
+fn lost_handshake(e: JoinError) -> io::Error {
+    raise(
+        Code::IpcHandshake,
+        format!("IPC handshake failed: its task ended without an answer ({e})"),
+        "report this as a giong bug, with the panic message from the log.",
+    )
+}
+
+/// The listener's side of the handshake on a new connection.
+async fn handshake(control: UnixStream, max_capacity: usize) -> io::Result<(Sender, Receiver)> {
+    let msg = Received(handshake_msg());
+    let io = Io::RecvMsg {
+        fd: control.as_raw_fd(),
+        msg: msg.0.as_ptr().cast(),
+        // The memfd and the eventfds come in close-on-exec, as every
+        // descriptor giong opens: none may leak into a program the
+        // service runs.
+        flags: libc::MSG_CMSG_CLOEXEC,
+    };
+    // SAFETY: as in `connect`.
+    let (res, _, mut msg) = unsafe { Op::new(io, msg) }.await;
+    if res < 0 {
+        return Err(io::Error::from_raw_os_error(-res));
+    }
+    let fds = msg.take_fds();
+    let m = msg.get();
+    if res as usize != HANDSHAKE_LEN || fds.len() != FDS || m.hdr.msg_flags & libc::MSG_CTRUNC != 0
+    {
+        let _ = answer(&control, REFUSED_INVALID).await;
+        return Err(handshake_failed("the handshake message is malformed"));
+    }
+    let magic = u64::from_le_bytes(m.data[..8].try_into().unwrap());
+    let version = u32::from_le_bytes(m.data[8..12].try_into().unwrap());
+    let capacity = u32::from_le_bytes(m.data[12..16].try_into().unwrap()) as usize;
+    if magic != ring::MAGIC || version != ring::VERSION {
+        let _ = answer(&control, REFUSED_INVALID).await;
+        return Err(handshake_failed(
+            "the client speaks another protocol or version",
+        ));
+    }
+    if check_capacity(capacity, "IPC capacity").is_err() || capacity > max_capacity {
+        let _ = answer(&control, REFUSED_CAPACITY).await;
+        return Err(raise(
+            Code::IpcCapacity,
+            format!(
+                "a client asked for an IPC capacity of {capacity} bytes, above this \
+                 listener's limit of {}",
+                max_capacity
+            ),
+            "have the client connect with a smaller capacity, or raise the limit in \
+             IpcListener::bind.",
+        ));
+    }
+    let len = ring::mapping_len(capacity);
+    let mut fds = fds.into_iter();
+    let mem = fds.next().unwrap();
+    let efds: [Fd; 4] = [
+        fds.next().unwrap(),
+        fds.next().unwrap(),
+        fds.next().unwrap(),
+        fds.next().unwrap(),
+    ];
+    if let Err(why) =
+        check_memfd(mem.0, len).and_then(|()| efds.iter().try_for_each(|fd| check_eventfd(fd.0)))
+    {
+        let _ = answer(&control, REFUSED_INVALID).await;
+        return Err(handshake_failed(why));
+    }
+    let base = map(mem.0, len)?;
+    drop(mem);
+    let shared = Shared {
+        base,
+        len,
+        capacity,
+        efds,
+        control,
+    };
+    // SAFETY: the mapping is at least a page long and page-aligned.
+    let header = unsafe { &(*base.cast::<ring::Control>()).header };
+    if header.magic.load(Ordering::Acquire) != ring::MAGIC
+        || header.version.load(Ordering::Acquire) != ring::VERSION
+        || header.capacity.load(Ordering::Acquire) as usize != capacity
+    {
+        let _ = answer(&shared.control, REFUSED_INVALID).await;
+        return Err(handshake_failed(
+            "the shared memory does not match the handshake",
+        ));
+    }
+    answer(&shared.control, ACCEPTED).await?;
+    halves(shared, false)
 }
 
 impl std::fmt::Debug for IpcListener {
@@ -1054,26 +1161,51 @@ impl std::fmt::Debug for IpcListener {
 
 /// The descriptors an `SCM_RIGHTS` message carried, owned (so closed if
 /// the handshake fails).
-fn received_fds(msg: &KernelBox<HandshakeMsg>) -> Vec<Fd> {
-    let mut out = Vec::new();
-    let hdr = &msg.get().hdr;
-    // SAFETY: the kernel filled `hdr`'s control buffer, which lives in the
-    // box; the CMSG macros stay inside `msg_controllen`.
-    unsafe {
-        let mut cmsg = libc::CMSG_FIRSTHDR(hdr);
-        while !cmsg.is_null() {
-            if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
-                let n = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
-                    / std::mem::size_of::<RawFd>();
-                let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
-                for i in 0..n {
-                    out.push(Fd(ptr::read_unaligned(data.add(i))));
-                }
-            }
-            cmsg = libc::CMSG_NXTHDR(hdr, cmsg);
-        }
+/// A handshake message being received. The descriptors the kernel put in
+/// its control buffer are ours from the moment it did: dropping the message
+/// closes the ones [`Self::take_fds`] has not handed out. That covers a
+/// receive that completes after its handshake was dropped (the listener went
+/// away, or the client took too long), which the driver finishes on its own.
+struct Received(KernelBox<HandshakeMsg>);
+
+impl Received {
+    fn get(&self) -> &HandshakeMsg {
+        self.0.get()
     }
-    out
+
+    /// Takes the descriptors out of the control buffer, once.
+    fn take_fds(&mut self) -> Vec<Fd> {
+        let mut out = Vec::new();
+        let p = self.0.as_ptr();
+        // SAFETY: the kernel is done with the box (its operation completed);
+        // the control buffer is in it, and the CMSG macros stay inside
+        // `msg_controllen`, which is then set to 0 so that nothing is taken
+        // twice. A receive that never ran left the buffer zeroed, which holds
+        // no SCM_RIGHTS entry.
+        unsafe {
+            let hdr = ptr::addr_of!((*p).hdr);
+            let mut cmsg = libc::CMSG_FIRSTHDR(hdr);
+            while !cmsg.is_null() && (*cmsg).cmsg_len as usize >= libc::CMSG_LEN(0) as usize {
+                if (*cmsg).cmsg_level == libc::SOL_SOCKET && (*cmsg).cmsg_type == libc::SCM_RIGHTS {
+                    let n = ((*cmsg).cmsg_len as usize - libc::CMSG_LEN(0) as usize)
+                        / std::mem::size_of::<RawFd>();
+                    let data = libc::CMSG_DATA(cmsg).cast::<RawFd>();
+                    for i in 0..n {
+                        out.push(Fd(ptr::read_unaligned(data.add(i))));
+                    }
+                }
+                cmsg = libc::CMSG_NXTHDR(hdr, cmsg);
+            }
+            (*p).hdr.msg_controllen = 0;
+        }
+        out
+    }
+}
+
+impl Drop for Received {
+    fn drop(&mut self) {
+        drop(self.take_fds());
+    }
 }
 
 fn check_memfd(fd: RawFd, len: usize) -> Result<(), &'static str> {
@@ -1104,5 +1236,77 @@ fn check_eventfd(fd: RawFd) -> Result<(), &'static str> {
             Err("a wake-up descriptor is not an eventfd")
         }
         _ => Ok(()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A pipe whose write end goes over a socket pair into a [`Received`],
+    /// as a client's descriptors do; returns the read end. The read end sees
+    /// the end of the stream only once every copy of the write end is closed.
+    fn receive_a_write_end() -> (Fd, Received) {
+        let mut ends = [0; 2];
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        // SAFETY: plain system calls on descriptors this test owns; the
+        // message and its buffers outlive the calls.
+        unsafe {
+            assert_eq!(
+                libc::pipe2(ends.as_mut_ptr(), libc::O_CLOEXEC | libc::O_NONBLOCK),
+                0
+            );
+            let (read, write) = (Fd(ends[0]), Fd(ends[1]));
+            let out = handshake_msg();
+            let p = out.as_ptr();
+            let fd_len = std::mem::size_of::<RawFd>() as u32;
+            (*p).hdr.msg_controllen = libc::CMSG_SPACE(fd_len) as _;
+            let cmsg = libc::CMSG_FIRSTHDR(ptr::addr_of!((*p).hdr));
+            (*cmsg).cmsg_level = libc::SOL_SOCKET;
+            (*cmsg).cmsg_type = libc::SCM_RIGHTS;
+            (*cmsg).cmsg_len = libc::CMSG_LEN(fd_len) as _;
+            libc::CMSG_DATA(cmsg)
+                .cast::<RawFd>()
+                .write_unaligned(write.0);
+            let sent = libc::sendmsg(a.as_raw_fd(), ptr::addr_of!((*p).hdr), 0);
+            assert_eq!(sent, HANDSHAKE_LEN as isize);
+            drop(write);
+            let msg = Received(handshake_msg());
+            let got = libc::recvmsg(b.as_raw_fd(), msg.0.as_ptr().cast(), libc::MSG_CMSG_CLOEXEC);
+            assert_eq!(got, HANDSHAKE_LEN as isize);
+            (read, msg)
+        }
+    }
+
+    fn at_end(read: &Fd) -> bool {
+        let mut b = [0u8; 1];
+        // SAFETY: a read into a live one-byte buffer.
+        let n = unsafe { libc::read(read.0, b.as_mut_ptr().cast(), 1) };
+        assert!(n == 0 || io::Error::last_os_error().kind() == io::ErrorKind::WouldBlock);
+        n == 0
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no sendmsg or recvmsg")]
+    fn a_received_message_nobody_took_closes_its_descriptors() {
+        let (read, msg) = receive_a_write_end();
+        assert!(!at_end(&read));
+        drop(msg);
+        assert!(at_end(&read));
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no sendmsg or recvmsg")]
+    fn descriptors_taken_from_a_message_outlive_it_and_close_once() {
+        let (read, mut msg) = receive_a_write_end();
+        let fds = msg.take_fds();
+        assert_eq!(fds.len(), 1);
+        // SAFETY: F_GETFD only reads the flags.
+        let flags = unsafe { libc::fcntl(fds[0].0, libc::F_GETFD) };
+        assert_eq!(flags & libc::FD_CLOEXEC, libc::FD_CLOEXEC);
+        drop(msg);
+        assert!(!at_end(&read));
+        drop(fds);
+        assert!(at_end(&read));
     }
 }
