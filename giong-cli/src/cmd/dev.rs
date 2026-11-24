@@ -1313,19 +1313,29 @@ pub(crate) fn started(pid: u64) -> Option<String> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // Fields after the command name, which may hold spaces and ')'.
         let rest = &stat[stat.rfind(')')? + 1..];
-        // starttime is field 22; `rest` starts at field 3.
-        rest.split_whitespace().nth(19).map(String::from)
+        let mut fields = rest.split_whitespace();
+        // state is field 3: a zombie (a runner that ended where nobody
+        // reaps, as under docker without --init) does not run.
+        if fields.next()? == "Z" {
+            return None;
+        }
+        // starttime is field 22.
+        fields.nth(18).map(String::from)
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
         let out = Process::new("ps")
-            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            // Separate -o options: after `=` the rest of an argument is the
+            // column header, so `stat=,lstart=` would print stat alone.
+            .args(["-o", "stat=", "-o", "lstart=", "-p", &pid.to_string()])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (out.status.success() && !text.is_empty()).then_some(text)
+        // A zombie does not run.
+        let (stat, start) = text.split_once(char::is_whitespace)?;
+        (out.status.success() && !stat.starts_with('Z')).then(|| start.trim().to_string())
     }
     #[cfg(not(unix))]
     {

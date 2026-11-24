@@ -1040,6 +1040,24 @@ mod tests {
         let _ = fs::remove_dir_all(&root);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_does_not_run() {
+        // A running process has a start time (and `ps` is asked right).
+        assert!(super::super::dev::started(u64::from(std::process::id())).is_some());
+        // `true` ends at once; unreaped, it stays a zombie until `wait`.
+        let Ok(mut child) = Process::new("true").spawn() else {
+            return;
+        };
+        let pid = u64::from(child.id());
+        let until = Instant::now() + Duration::from_secs(5);
+        while super::super::dev::started(pid).is_some() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(super::super::dev::started(pid), None);
+        let _ = child.wait();
+    }
+
     #[test]
     fn a_hostile_processes_file_runs_nothing() {
         let root = std::env::temp_dir().join(format!("giong-devctl-procs-{}", std::process::id()));
