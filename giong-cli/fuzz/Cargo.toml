@@ -43,3 +43,17 @@ name = "lint"
 path = "fuzz_targets/lint.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "record"
+path = "fuzz_targets/record.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "dashboard_http"
+path = "fuzz_targets/dashboard_http.rs"
+test = false
+doc = false
+bench = false
