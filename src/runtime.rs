@@ -22,6 +22,7 @@ use crate::driver::Io;
 use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
+use crate::lane::{BlockingHandle, LaneConfig, LaneStats, Lanes};
 use crate::notify::{Doorbell, JobCount};
 use crate::observe::{self, Counters, Location, Pulse, WorkerState};
 #[cfg(unix)]
@@ -163,6 +164,8 @@ pub(crate) struct RuntimeShared {
     /// and [`TRACING`] (see [`Handle::set_request_tracing`]), one load per
     /// batch of tasks for both.
     measuring: AtomicU8,
+    /// The blocking and compute lanes ([`crate::lane`]).
+    pub(crate) lanes: Lanes,
 }
 
 /// In [`RuntimeShared::measuring`]: workers time every task poll for
@@ -173,7 +176,7 @@ pub(crate) const PROFILING: u8 = 1;
 pub(crate) const TRACING: u8 = 2;
 
 impl RuntimeShared {
-    fn new(workers: usize) -> io::Result<Arc<Self>> {
+    fn new(workers: usize, lanes: LaneConfig) -> io::Result<Arc<Self>> {
         let workers = (0..workers)
             .map(|_| WorkerShared::new())
             .collect::<io::Result<Vec<_>>>()?;
@@ -187,6 +190,7 @@ impl RuntimeShared {
             }),
             jobs_len: JobCount::new(),
             measuring: AtomicU8::new(0),
+            lanes: Lanes::new(lanes),
         }))
     }
 
@@ -358,6 +362,7 @@ impl RuntimeShared {
         // Outside the lock: dropping a job cancels its handle, which wakes
         // whoever awaits it.
         drop(stranded);
+        self.lanes.stop();
     }
 
     fn shutdown(&self) {
@@ -486,6 +491,10 @@ pub(crate) struct Worker {
     main_location: Cell<Location>,
     /// Registered sources and the profile being gathered.
     pub(crate) observe: observe::Local,
+    /// The budget of the task being polled, or null (see [`crate::budget`]).
+    pub(crate) budget: Cell<*const crate::budget::Inner>,
+    /// The budget I/O slots of operations in flight, by driver key.
+    pub(crate) io_charges: RefCell<Vec<Option<crate::budget::IoCharge>>>,
     /// Request tracing is on for this thread (see `observe::requests`).
     pub(crate) tracing: Cell<bool>,
 }
@@ -606,6 +615,8 @@ impl Worker {
             draining: Cell::new(false),
             main_location: Cell::new(panic::Location::caller()),
             observe: observe::Local::default(),
+            budget: Cell::new(std::ptr::null()),
+            io_charges: RefCell::new(Vec::new()),
             tracing: Cell::new(false),
         }))
     }
@@ -1009,6 +1020,12 @@ impl Worker {
         for sock in deferred.sock_closes {
             driver.close_sock(sock);
         }
+        // What the cancellations freed (a budget's I/O slot may be among
+        // it, and wake a task): dropped outside the driver, before the
+        // worker sleeps.
+        let graveyard = driver.take_graveyard();
+        drop(driver);
+        drop(graveyard);
     }
 
     /// Publishes how busy this worker is (see [`Load`]): two relaxed stores
@@ -1173,6 +1190,11 @@ pub struct Builder {
     signals: bool,
     spin: Option<Duration>,
     shutdown_grace: Duration,
+    max_blocking_threads: usize,
+    /// `None`: the CPU budget (see [`Builder::compute_threads`]).
+    compute_threads: Option<usize>,
+    /// `None`: four per compute thread.
+    compute_backlog: Option<usize>,
     open_files: bool,
     precise_timers: bool,
     /// Makes this worker panic before it reports that it started. A field
@@ -1204,6 +1226,9 @@ impl Builder {
             signals: false,
             spin: None,
             shutdown_grace: Duration::ZERO,
+            max_blocking_threads: crate::lane::DEFAULT_MAX_BLOCKING,
+            compute_threads: None,
+            compute_backlog: None,
             open_files: true,
             precise_timers: false,
             #[cfg(test)]
@@ -1409,6 +1434,58 @@ impl Builder {
         self
     }
 
+    /// The most threads of the blocking lane ([`spawn_blocking`](crate::spawn_blocking))
+    /// at once (default: 128, at least 1).
+    ///
+    /// Threads start only when every thread is busy and end after 10 seconds
+    /// idle, so a quiet process has none. A closure that finds every thread
+    /// busy waits for one. Raise the limit for many slow blocking calls at
+    /// once (each thread reserves a 2 MiB stack, touched only as used); lower
+    /// it to bound what a hung dependency, such as an NFS mount, can tie up.
+    pub fn max_blocking_threads(mut self, n: usize) -> Self {
+        self.max_blocking_threads = n.max(1);
+        self
+    }
+
+    /// The most threads of the compute lane ([`spawn_compute`](crate::spawn_compute))
+    /// at once (at least 1).
+    ///
+    /// Defaults to the CPU budget of the process, the same number
+    /// [`workers`](Self::workers) defaults to: its CPUs, or its cgroup CPU
+    /// quota when that is lower. More threads than CPUs only add switching.
+    /// Compute threads run at a lower priority than the workers (nice +10),
+    /// so they use the CPU time the workers leave; see the
+    /// [lane docs](crate::lane) for what that means under a CPU quota.
+    pub fn compute_threads(mut self, n: usize) -> Self {
+        self.compute_threads = Some(n.max(1));
+        self
+    }
+
+    /// How many closures may wait for a compute thread before
+    /// [`try_spawn_compute`](crate::try_spawn_compute) refuses new ones with
+    /// `GIONG-E0014` (default: four per compute thread). Does not limit
+    /// [`spawn_compute`](crate::spawn_compute), which always queues.
+    ///
+    /// Zero refuses whenever every compute thread is busy.
+    pub fn compute_backlog(mut self, n: usize) -> Self {
+        self.compute_backlog = Some(n);
+        self
+    }
+
+    /// The lane settings, with the defaults filled in.
+    fn lane_config(&self) -> LaneConfig {
+        let compute_threads = self
+            .compute_threads
+            .unwrap_or_else(|| default_workers(allowed_cpus().len(), parallelism()));
+        LaneConfig {
+            max_blocking: self.max_blocking_threads,
+            compute_threads,
+            compute_backlog: self
+                .compute_backlog
+                .unwrap_or(compute_threads * crate::lane::BACKLOG_PER_THREAD),
+        }
+    }
+
     /// The settings each worker starts from. Reads `GIONG_DRIVER` when no
     /// driver was named.
     fn config(&self) -> io::Result<Config> {
@@ -1443,7 +1520,7 @@ impl Builder {
         let workers = self
             .workers
             .unwrap_or_else(|| default_workers(allowed_cpus().len(), parallelism()));
-        let shared = RuntimeShared::new(workers)?;
+        let shared = RuntimeShared::new(workers, self.lane_config())?;
         Ok(Runtime {
             builder: self,
             cfg,
@@ -1460,7 +1537,7 @@ impl Builder {
         if self.open_files {
             raise_open_files_limit();
         }
-        let rt = RuntimeShared::new(1)?;
+        let rt = RuntimeShared::new(1, self.lane_config())?;
         // Work sent through a `Handle` after the runtime is gone is cancelled
         // rather than left waiting, on every exit path.
         let _stop = Stop(rt.clone());
@@ -1842,6 +1919,46 @@ impl Handle {
     /// `true` once a shutdown has been requested.
     pub fn is_shutdown(&self) -> bool {
         self.rt.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// [`spawn_blocking`](crate::spawn_blocking) on this runtime's blocking
+    /// lane, from any thread, including threads outside the runtime.
+    pub fn spawn_blocking<F, T>(&self, f: F) -> BlockingHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.rt.lanes.spawn_blocking(f)
+    }
+
+    /// [`spawn_compute`](crate::spawn_compute) on this runtime's compute
+    /// lane, from any thread, including threads outside the runtime.
+    pub fn spawn_compute<F, T>(&self, f: F) -> BlockingHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.rt.lanes.spawn_compute(f)
+    }
+
+    /// [`try_spawn_compute`](crate::try_spawn_compute) on this runtime's
+    /// compute lane, from any thread.
+    ///
+    /// # Errors
+    ///
+    /// `GIONG-E0014` when the compute lane's backlog is full.
+    pub fn try_spawn_compute<F, T>(&self, f: F) -> io::Result<BlockingHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.rt.lanes.try_spawn_compute(f)
+    }
+
+    /// Threads, busy threads and queued closures of the blocking and compute
+    /// lanes, right now.
+    pub fn lane_stats(&self) -> LaneStats {
+        self.rt.lanes.stats()
     }
 
     /// Starts a task on the given worker and returns a handle to its result.

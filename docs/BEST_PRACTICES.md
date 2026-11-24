@@ -72,13 +72,15 @@ stops all of them, and their latency becomes yours.
 
 - Use `giong::fs` for files, `giong::time::sleep` for waiting and `giong::net` for
   sockets, never `std::fs`, `std::thread::sleep` or `std::net` on a worker.
-- There is no `spawn_blocking`. Run blocking or CPU-heavy work on a thread of its own and
-  await the answer, as below.
+- Run blocking calls (`std::fs`, C libraries) with `giong::spawn_blocking` and CPU-heavy
+  work (hashing, images, compression) with `giong::spawn_compute`, whose threads run below
+  the workers' priority, and await the answer. `try_spawn_compute` sheds with
+  `GIONG-E0014` when the compute lane is behind, for a service that would rather answer
+  `503` than queue.
 
 ```rust,ignore
-let (tx, rx) = giong::sync::oneshot::channel();
-std::thread::spawn(move || { let _ = tx.send(expensive(input)); });
-let result = rx.await;
+// Err(JoinError) only if the closure panicked or the runtime stopped first.
+let hash = giong::spawn_compute(move || expensive(input)).await;
 ```
 
 - A loop that does a lot of work without waiting on I/O should call

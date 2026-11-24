@@ -12,6 +12,8 @@
 //! writer, a hung network filesystem) holds up only its own thread. A
 //! finished job pushes its result onto its worker's [`Completions`] and pokes
 //! the worker's eventfd.
+//! It is separate from the public blocking lane ([`crate::spawn_blocking`]),
+//! so application jobs cannot starve file operations.
 //!
 //! When every thread is busy, jobs wait their turn. If no job finishes for
 //! [`STALL`] while jobs wait, the busy threads are taken to be stuck, and a

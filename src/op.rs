@@ -7,6 +7,7 @@ use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
+use crate::budget;
 use crate::driver::{Io, Start, ZeroCopyHold};
 use crate::runtime;
 
@@ -20,7 +21,8 @@ use crate::runtime;
 pub(crate) struct Op<T: 'static> {
     io: Option<Io>,
     /// Driver key while in flight (32 bits, so that an operation, which
-    /// every I/O future holds, stays small).
+    /// every I/O future holds, stays small), with [`CHARGED`] set when it
+    /// holds an I/O slot of a budget.
     key: Option<u32>,
     data: Option<T>,
     /// What a zero-copy send leaves with the driver when it returns at its
@@ -31,6 +33,11 @@ pub(crate) struct Op<T: 'static> {
     /// Operations are tied to one worker thread.
     _not_send: PhantomData<*const ()>,
 }
+
+/// Set in `Op::key` when the operation holds an I/O slot of the budget its
+/// task runs in ([`crate::budget`]): the worker keeps the slot by key until
+/// the kernel completes the operation.
+const CHARGED: u32 = 1 << 31;
 
 // `Op` never hands out a pinned reference to `T`; it only moves it in and out.
 impl<T: 'static> Unpin for Op<T> {}
@@ -83,14 +90,27 @@ impl<T: 'static> Future for Op<T> {
                 let (res, flags) = match this.key {
                     None => {
                         let io = this.io.expect("giong: operation polled after completion");
-                        match driver.start(&io, cx.waker()) {
-                            Start::Done(res, flags) => (res, flags),
-                            Start::Submitted(key) => {
-                                this.key = Some(
-                                    u32::try_from(key).expect("giong: 2^32 operations in flight"),
-                                );
-                                this.worker_uid = w.shared.uid;
-                                return Poll::Pending;
+                        let budget = w.budget.get();
+                        if !budget.is_null() {
+                            // Inside a budget: out of line, so that code
+                            // without budgets pays one test here.
+                            match start_charged(w, &mut driver, &io, cx.waker(), budget) {
+                                Charged::Done(res, flags) => (res, flags),
+                                Charged::Submitted(key) => {
+                                    this.key = Some(key);
+                                    this.worker_uid = w.shared.uid;
+                                    return Poll::Pending;
+                                }
+                                Charged::Waiting => return Poll::Pending,
+                            }
+                        } else {
+                            match driver.start(&io, cx.waker()) {
+                                Start::Done(res, flags) => (res, flags),
+                                Start::Submitted(key) => {
+                                    this.key = Some(op_key(key));
+                                    this.worker_uid = w.shared.uid;
+                                    return Poll::Pending;
+                                }
                             }
                         }
                     }
@@ -99,9 +119,14 @@ impl<T: 'static> Future for Op<T> {
                             drop(driver);
                             wrong_worker();
                         }
-                        match driver.poll_op(key as usize, cx.waker(), &mut this.hold) {
+                        let slot = key & !CHARGED;
+                        match driver.poll_op(slot as usize, cx.waker(), &mut this.hold) {
                             Poll::Ready(done) => {
                                 this.key = None;
+                                if key & CHARGED != 0 {
+                                    // The kernel is done: the slot goes back.
+                                    drop(budget::release_io(w, slot));
+                                }
                                 done
                             }
                             Poll::Pending => return Poll::Pending,
@@ -141,7 +166,10 @@ impl<T: 'static> Future for Op<T> {
 impl<T: 'static> Drop for Op<T> {
     fn drop(&mut self) {
         // Never submitted, or already completed: nothing is in flight.
-        let Some(key) = self.key.take() else { return };
+        let Some(charged_key) = self.key.take() else {
+            return;
+        };
+        let key = charged_key & !CHARGED;
         let mut data = self.data.take().map(|data| (data, self.hold.take()));
         let result_is_fd = self.io.is_some_and(|io| io.result_is_fd());
         let finish = self.io.is_some_and(|io| io.finishes_when_dropped());
@@ -149,11 +177,33 @@ impl<T: 'static> Drop for Op<T> {
             if w.shared.uid != self.worker_uid {
                 return false;
             }
-            let data = data.take().map(|d| Box::new(d) as Box<dyn Any>);
+            // A budget's I/O slot travels with the resources, so that it is
+            // given back when the kernel completes the operation, not now.
+            let charge = if charged_key & CHARGED != 0 {
+                budget::release_io(w, key)
+            } else {
+                None
+            };
+            let charged = charge.is_some();
+            let data = data
+                .take()
+                .map(|(d, hold)| Box::new((d, hold, charge)) as Box<dyn Any>);
             match w.driver.try_borrow_mut() {
-                Ok(mut driver) => driver.cancel_op(key as usize, data, result_is_fd, finish),
+                Ok(mut driver) => {
+                    driver.cancel_op(key as usize, data, result_is_fd, finish);
+                    if charged {
+                        // Resources the kernel is done with already: drop
+                        // them now, outside the driver, so that the slot
+                        // goes back (and wakes a task waiting for one)
+                        // before the worker next sleeps.
+                        let graveyard = driver.take_graveyard();
+                        drop(driver);
+                        drop(graveyard);
+                    }
+                }
                 // Dropped by code the driver runs (a waker's `wake` or
-                // `drop`): cancelled at the next turn, still on this worker.
+                // `drop`): cancelled at the next turn, still on this worker
+                // (which drops what that frees before it sleeps).
                 Err(_) => w.defer_cancel(key as usize, data, result_is_fd, finish),
             }
             true
@@ -165,6 +215,58 @@ impl<T: 'static> Drop for Op<T> {
             mem::forget(data);
         }
     }
+}
+
+/// How [`start_charged`] went.
+enum Charged {
+    /// Waiting for one of the budget's I/O slots.
+    Waiting,
+    /// In flight, holding a slot: the key, with [`CHARGED`] set.
+    Submitted(u32),
+    /// Done at once; the slot went back.
+    Done(i32, u32),
+}
+
+/// Starts `io` holding one of the I/O slots of `budget`, the budget of the
+/// task being polled.
+#[cold]
+#[inline(never)]
+fn start_charged(
+    w: &runtime::Worker,
+    driver: &mut crate::driver::Driver,
+    io: &Io,
+    waker: &std::task::Waker,
+    budget: *const budget::Inner,
+) -> Charged {
+    if !budget::take_io(budget, waker) {
+        return Charged::Waiting;
+    }
+    match driver.start(io, waker) {
+        Start::Done(res, flags) => {
+            budget::give_io(budget);
+            Charged::Done(res, flags)
+        }
+        Start::Submitted(key) => {
+            let key = op_key(key);
+            budget::hold_io(w, key, budget);
+            Charged::Submitted(key | CHARGED)
+        }
+    }
+}
+
+/// A driver key as `Op` keeps it: below [`CHARGED`].
+#[inline(always)]
+fn op_key(key: usize) -> u32 {
+    if key >= CHARGED as usize {
+        too_many_ops();
+    }
+    key as u32
+}
+
+#[cold]
+#[inline(never)]
+fn too_many_ops() -> ! {
+    panic!("giong: 2^31 operations in flight")
 }
 
 #[cold]
