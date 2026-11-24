@@ -10,7 +10,7 @@ use std::mem;
 use std::panic;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
@@ -159,9 +159,18 @@ pub(crate) struct RuntimeShared {
     jobs: Mutex<Jobs>,
     /// How many jobs wait in `jobs`, readable without the lock.
     jobs_len: JobCount,
-    /// Workers time every task poll (see [`Handle::set_profiling`]).
-    profiling: AtomicBool,
+    /// What workers measure: [`PROFILING`] (see [`Handle::set_profiling`])
+    /// and [`TRACING`] (see [`Handle::set_request_tracing`]), one load per
+    /// batch of tasks for both.
+    measuring: AtomicU8,
 }
+
+/// In [`RuntimeShared::measuring`]: workers time every task poll for
+/// [`observe::take_profile`].
+pub(crate) const PROFILING: u8 = 1;
+/// In [`RuntimeShared::measuring`]: workers trace requests for
+/// [`observe::take_requests`], and time every task poll to find long ones.
+pub(crate) const TRACING: u8 = 2;
 
 impl RuntimeShared {
     fn new(workers: usize) -> io::Result<Arc<Self>> {
@@ -177,7 +186,7 @@ impl RuntimeShared {
                 stopped: false,
             }),
             jobs_len: JobCount::new(),
-            profiling: AtomicBool::new(false),
+            measuring: AtomicU8::new(0),
         }))
     }
 
@@ -221,9 +230,22 @@ impl RuntimeShared {
         self.workers.len()
     }
 
-    /// `true` while workers should time task polls.
+    /// `true` while workers should time task polls for the profile.
     pub(crate) fn profiling(&self) -> bool {
-        self.profiling.load(Ordering::Relaxed)
+        self.measuring() & PROFILING != 0
+    }
+
+    /// What workers measure: [`PROFILING`] and [`TRACING`] bits.
+    pub(crate) fn measuring(&self) -> u8 {
+        self.measuring.load(Ordering::Relaxed)
+    }
+
+    fn set_measuring(&self, what: u8, on: bool) {
+        if on {
+            self.measuring.fetch_or(what, Ordering::Relaxed);
+        } else {
+            self.measuring.fetch_and(!what, Ordering::Relaxed);
+        }
     }
 
     /// How busy worker `i` looks; see [`least_loaded`](Self::least_loaded).
@@ -464,6 +486,8 @@ pub(crate) struct Worker {
     main_location: Cell<Location>,
     /// Registered sources and the profile being gathered.
     pub(crate) observe: observe::Local,
+    /// Request tracing is on for this thread (see `observe::requests`).
+    pub(crate) tracing: Cell<bool>,
 }
 
 /// Something a spinning worker can watch for work that arrives without a
@@ -582,6 +606,7 @@ impl Worker {
             draining: Cell::new(false),
             main_location: Cell::new(panic::Location::caller()),
             observe: observe::Local::default(),
+            tracing: Cell::new(false),
         }))
     }
 
@@ -2043,13 +2068,39 @@ impl Handle {
     /// spawned; [`observe::take_profile`] collects the result on a worker.
     /// Workers notice the change at their next batch of tasks.
     pub fn set_profiling(&self, on: bool) {
-        self.rt.profiling.store(on, Ordering::Relaxed);
+        self.rt.set_measuring(PROFILING, on);
     }
 
     /// `true` while task polls are being timed (see
     /// [`set_profiling`](Self::set_profiling)).
     pub fn is_profiling(&self) -> bool {
         self.rt.profiling()
+    }
+
+    /// Turns request tracing on or off on every worker: see
+    /// [`observe`](crate::observe#why-a-request-is-slow). While it is on,
+    /// the protocol crates (`giong-http`) follow each request through its
+    /// phases, the database clients time their waits, and every worker times
+    /// each task poll to find the long ones; [`observe::take_requests`]
+    /// collects the result on a worker. Turned off, it costs one read of a
+    /// thread-local per request. Workers notice the change at their next
+    /// batch of tasks; requests already in flight then are not traced.
+    ///
+    /// ```
+    /// let rt = giong::Builder::new().workers(1).build()?;
+    /// let handle = rt.handle();
+    /// handle.set_request_tracing(true);
+    /// assert!(handle.is_request_tracing());
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn set_request_tracing(&self, on: bool) {
+        self.rt.set_measuring(TRACING, on);
+    }
+
+    /// `true` while requests are traced (see
+    /// [`set_request_tracing`](Self::set_request_tracing)).
+    pub fn is_request_tracing(&self) -> bool {
+        self.rt.measuring() & TRACING != 0
     }
 
     /// The caller's worker index, if it runs on a worker of this runtime.

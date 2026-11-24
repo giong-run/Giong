@@ -728,6 +728,7 @@ impl Client {
     /// Not cancel safe: if the future is dropped, the statements may still run
     /// on the server, and what they change stays.
     pub async fn batch_execute(&self, sql: &str) -> Result<(), Error> {
+        let _wait = giong::observe::wait(giong::observe::Wait::Query, "mysql");
         self.conn.check_tx().await?;
         let may_change = sql.split(';').any(session::may_change);
         if may_change && !self.conn.shared.get() {
@@ -949,6 +950,7 @@ impl Client {
         params: &[&dyn ToSql],
         keep_rows: bool,
     ) -> Result<(ResultSet, protocol::Ok, u64), Error> {
+        let _wait = giong::observe::wait(giong::observe::Wait::Query, "mysql");
         self.conn.check_tx().await?;
         if params.len() > MAX_PARAMS {
             return Err(Error::conversion(format!(

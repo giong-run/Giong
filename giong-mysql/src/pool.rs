@@ -799,6 +799,7 @@ impl Pool {
         &self,
         mut decide: impl FnMut(&mut State, usize, Instant) -> Decision<T>,
     ) -> Result<Result<T, Client>, Error> {
+        let _wait = giong::observe::wait(giong::observe::Wait::Pool, "mysql");
         let deadline = Instant::now() + self.inner.wait_timeout;
         // Failed attempts to open a connection so far: when one fails while
         // this task waits, and the pool has no connection open to wait for,

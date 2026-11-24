@@ -488,6 +488,7 @@ impl Conn {
         timed: bool,
         encode: impl FnOnce(&mut Vec<u8>),
     ) -> Result<Value, Error> {
+        let _wait = giong::observe::wait(giong::observe::Wait::Query, "redis");
         if self.state.borrow().out.len() >= MAX_UNWRITTEN {
             self.wait_for_room(what).await?;
         }

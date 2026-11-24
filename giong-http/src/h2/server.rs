@@ -51,6 +51,7 @@
 //!   the client's flow control keeps from sending, `idle_timeout` with no
 //!   stream open.
 
+use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::future::{poll_fn, Future};
 use std::mem;
@@ -61,6 +62,7 @@ use std::task::{Context, Poll};
 use std::time::{Duration, Instant};
 
 use giong::error::Code;
+use giong::observe::RequestTrace;
 use giong::time::sleep_until;
 
 use super::frame::{self, Head, Reason, PREFACE};
@@ -2332,12 +2334,172 @@ fn itoa(mut n: usize, buf: &mut [u8; 20]) -> &[u8] {
     }
 }
 
+/// The traces of a connection's streams' requests while request tracing is
+/// on (see `giong::observe::RequestTrace`), kept by slot in the worker's
+/// `TRACES`: the entry's index plus one, 0 for none. Kept there and not in
+/// the connection's future, so that tracing does not make idle connections
+/// larger. Dropped with the connection's future, it frees its entry, and the
+/// requests still followed count as abandoned.
+///
+/// A request is followed from its handler's start to its answer handed to
+/// the connection: its arrival and the writing of its answer are not timed
+/// on HTTP/2 yet.
+struct Traces(u32);
+
+thread_local! {
+    /// The worker's HTTP/2 traces, by connection (see `Traces`); `None`
+    /// marks a free entry, listed in `free`.
+    static TRACES: RefCell<TraceSlab> = const {
+        RefCell::new(TraceSlab {
+            entries: Vec::new(),
+            free: Vec::new(),
+        })
+    };
+}
+
+struct TraceSlab {
+    entries: Vec<Option<Vec<Option<RequestTrace>>>>,
+    free: Vec<u32>,
+}
+
+impl Traces {
+    fn is_some(&self) -> bool {
+        self.0 != 0
+    }
+
+    /// Runs `f` on this connection's traces, if it has any.
+    fn with<R>(&self, f: impl FnOnce(&mut Vec<Option<RequestTrace>>) -> R) -> Option<R> {
+        if self.0 == 0 {
+            return None;
+        }
+        TRACES
+            .try_with(|slab| {
+                let mut slab = slab.borrow_mut();
+                slab.entries
+                    .get_mut(self.0 as usize - 1)
+                    .and_then(Option::as_mut)
+                    .map(f)
+            })
+            .ok()
+            .flatten()
+    }
+
+    /// Takes the trace of the request in `slot`, if there is one. Dropped
+    /// or finished only after the slab is released.
+    fn take(&self, slot: usize) -> Option<RequestTrace> {
+        self.with(|t| t.get_mut(slot).and_then(Option::take))
+            .flatten()
+    }
+
+    /// Frees this connection's entry; the requests it still follows count
+    /// as abandoned.
+    fn clear(&mut self) {
+        if self.0 == 0 {
+            return;
+        }
+        let slot = mem::replace(&mut self.0, 0);
+        let traces = TRACES
+            .try_with(|slab| {
+                let mut slab = slab.borrow_mut();
+                let traces = slab
+                    .entries
+                    .get_mut(slot as usize - 1)
+                    .and_then(Option::take);
+                if traces.is_some() {
+                    slab.free.push(slot - 1);
+                }
+                traces
+            })
+            .ok()
+            .flatten();
+        drop(traces);
+    }
+}
+
+impl Drop for Traces {
+    fn drop(&mut self) {
+        if self.0 != 0 {
+            self.clear();
+        }
+    }
+}
+
+/// Polls a handler through the trace of the request in `slot`, if it has
+/// one. The trace is out of `TRACES` while the handler runs, which may
+/// itself serve HTTP/2.
+#[cold]
+#[inline(never)]
+fn poll_traced<R>(traces: &mut Traces, slot: usize, poll: impl FnOnce() -> R) -> R {
+    match traces.take(slot) {
+        Some(mut trace) => {
+            let out = trace.poll(poll);
+            traces.with(|t| t[slot] = Some(trace));
+            out
+        }
+        None => poll(),
+    }
+}
+
+/// Starts following the request in `slot`, if requests are traced.
+#[cold]
+#[inline(never)]
+fn start_trace(traces: &mut Traces, slot: usize) {
+    let Some(mut trace) = RequestTrace::start("h2") else {
+        return;
+    };
+    trace.started();
+    if traces.0 == 0 {
+        traces.0 = TRACES
+            .try_with(|slab| {
+                let mut slab = slab.borrow_mut();
+                if let Some(i) = slab.free.pop() {
+                    slab.entries[i as usize] = Some(Vec::new());
+                    return i + 1;
+                }
+                match u32::try_from(slab.entries.len()) {
+                    Ok(i) if i < u32::MAX => {
+                        slab.entries.push(Some(Vec::new()));
+                        i + 1
+                    }
+                    _ => 0,
+                }
+            })
+            .unwrap_or(0);
+    }
+    traces.with(|t| {
+        if t.len() <= slot {
+            t.resize_with(slot + 1, || None);
+        }
+        t[slot] = Some(trace);
+    });
+}
+
+/// Drops the trace of the request in `slot`: counted as abandoned.
+#[cold]
+#[inline(never)]
+fn drop_trace(traces: &mut Traces, slot: usize) {
+    drop(traces.take(slot));
+}
+
+/// Ends the trace of the request in `slot`, answered with `status`.
+#[cold]
+#[inline(never)]
+fn trace_answered(traces: &mut Traces, slot: usize, status: u16) {
+    if let Some(mut trace) = traces.take(slot) {
+        trace.responded(status);
+        trace.finish();
+    }
+}
+
 /// Drops the handlers of the streams that are gone.
-fn stop_handlers<F>(s: &mut Session, tasks: &mut [Option<HeapFuture<F>>]) {
+fn stop_handlers<F>(s: &mut Session, tasks: &mut [Option<HeapFuture<F>>], traces: &mut Traces) {
     while let Some(event) = s.pop_event() {
         let Event::Stop(slot) = event;
         if let Some(task) = tasks.get_mut(slot) {
             drop_quietly(task.take());
+        }
+        if traces.is_some() {
+            drop_trace(traces, slot);
         }
     }
 }
@@ -2347,6 +2509,7 @@ fn stop_handlers<F>(s: &mut Session, tasks: &mut [Option<HeapFuture<F>>]) {
 fn poll_handler<F: Future<Output = Response>>(
     s: &mut Session,
     tasks: &mut [Option<HeapFuture<F>>],
+    traces: &mut Traces,
     slot: usize,
 ) {
     let Some(Some(task)) = tasks.get_mut(slot) else {
@@ -2354,14 +2517,25 @@ fn poll_handler<F: Future<Output = Response>>(
     };
     let waker = s.wakers.get(slot).clone();
     let mut cx = Context::from_waker(&waker);
-    match catching(|| Pin::new(task).poll(&mut cx)) {
+    let polled = if !traces.is_some() {
+        catching(|| Pin::new(task).poll(&mut cx))
+    } else {
+        poll_traced(traces, slot, || catching(|| Pin::new(task).poll(&mut cx)))
+    };
+    match polled {
         Ok(Poll::Pending) => {}
         Ok(Poll::Ready(resp)) => {
             tasks[slot] = None;
+            if traces.is_some() {
+                trace_answered(traces, slot, resp.status());
+            }
             s.respond(slot, resp);
         }
         Err(()) => {
             drop_quietly(tasks[slot].take());
+            if traces.is_some() {
+                trace_answered(traces, slot, 500);
+            }
             s.handler_panicked(slot);
         }
     }
@@ -2417,6 +2591,7 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
     input.drain(..PREFACE.len());
 
     let mut tasks: Vec<Option<HeapFuture<_>>> = Vec::new();
+    let mut traces = Traces(0);
     let mut polls: Vec<usize> = Vec::new();
     // Handlers woken while handlers wait for the client to take responses.
     let mut parked: Vec<usize> = Vec::new();
@@ -2443,22 +2618,30 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
                 give_buffer(mem::take(&mut input));
             }
         }
-        stop_handlers(&mut s, &mut tasks);
+        stop_handlers(&mut s, &mut tasks, &mut traces);
         // Handlers to start, each polled at once, so that its answer counts
         // against the budget for responses before the next one starts.
         while let Some((slot, req)) = s.next_start() {
             if tasks.len() <= slot {
                 tasks.resize_with(slot + 1, || None);
             }
+            if RequestTrace::is_on() {
+                start_trace(&mut traces, slot);
+            }
             match catching(|| HeapFuture::new(handler.call(req))) {
                 Ok(task) => {
                     tasks[slot] = Some(task);
-                    poll_handler(&mut s, &mut tasks, slot);
+                    poll_handler(&mut s, &mut tasks, &mut traces, slot);
                 }
-                Err(()) => s.handler_panicked(slot),
+                Err(()) => {
+                    if traces.is_some() {
+                        trace_answered(&mut traces, slot, 500);
+                    }
+                    s.handler_panicked(slot);
+                }
             }
             s.service(slot);
-            stop_handlers(&mut s, &mut tasks);
+            stop_handlers(&mut s, &mut tasks, &mut traces);
         }
         // Then the woken ones, unless handlers wait. A handler that sends a
         // streamed body piece by piece is woken as soon as its piece is
@@ -2476,10 +2659,10 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
                 if s.handlers_wait() {
                     parked.push(slot);
                 } else {
-                    poll_handler(&mut s, &mut tasks, slot);
+                    poll_handler(&mut s, &mut tasks, &mut traces, slot);
                 }
                 s.service(slot);
-                stop_handlers(&mut s, &mut tasks);
+                stop_handlers(&mut s, &mut tasks, &mut traces);
             }
             rounds += 1;
             if rounds >= ROUNDS_PER_TURN
@@ -2491,7 +2674,7 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             }
         }
         s.fill();
-        stop_handlers(&mut s, &mut tasks);
+        stop_handlers(&mut s, &mut tasks, &mut traces);
 
         if write.is_none() && !s.out.is_empty() {
             let (out, counted) = s.take_out();
@@ -2509,6 +2692,7 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             s.release();
             if !s.keeps_streams() && tasks.capacity() > 0 {
                 tasks = Vec::new();
+                traces.clear();
             }
         }
         if let Some(slot) = slot {
