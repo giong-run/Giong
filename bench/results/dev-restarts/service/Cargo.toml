@@ -1,0 +1,10 @@
+[package]
+name = "devsvc"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The giong checkout under test (the measured run used PR #223's branch).
+giong = { path = "../../../.." }
+
+[workspace]
