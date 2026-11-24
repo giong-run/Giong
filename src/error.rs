@@ -319,6 +319,12 @@ codes! {
     /// `transfer-encoding`, `host` and the like), or a value with a line
     /// break or another control character. Raised by `Trailers::field`.
     HttpInvalidTrailer = 1122, InvalidInput, "invalid HTTP trailer field";
+    /// The server could not accept a new connection: the process holds as
+    /// many open files as its limit allows (`EMFILE`, the soft
+    /// `RLIMIT_NOFILE`), or the system does (`ENFILE`). The connection
+    /// waits in the listen queue; each worker says so on stderr, at most
+    /// once a minute.
+    HttpServerOutOfFiles = 1123, Other, "connection not accepted: the server is out of file descriptors";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with

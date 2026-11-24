@@ -1,0 +1,61 @@
+# The rest-api example with PostgreSQL and Redis, from the repository's root:
+#
+#     docker compose -f examples/rest-api/compose.yaml up --build
+#     curl localhost:8080/users -H 'Content-Type: application/json' \
+#       -d '{"name":"Ada Lovelace","email":"ada@example.com"}'
+#
+# It serves plain HTTP on port 8080; set TLS_CERT and TLS_KEY (mounted files)
+# for HTTPS, as examples/rest-api/README.md shows.
+services:
+  api:
+    build:
+      context: ../..
+      dockerfile: examples/rest-api/Dockerfile
+    environment:
+      # The PostgreSQL image serves without TLS; giong-postgres asks for it
+      # unless told not to.
+      DATABASE_URL: postgres://app:secret@postgres/app?sslmode=disable
+      # Service names resolve through Docker's DNS server, which giong's own
+      # resolver reads from /etc/resolv.conf like any other.
+      REDIS_URL: redis://redis:6379
+      LISTEN: 0.0.0.0:8080
+    ports:
+      - "8080:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_started
+    # The CPU limit sets the number of workers: one per whole CPU, here 2.
+    # A fraction is rounded down (1.5 CPUs, 1 worker), which keeps p99 low;
+    # docs/DEPLOYMENT.md has the measurements.
+    cpus: 2
+    # giong-http refuses new connections before this runs out, instead of
+    # being killed for memory (GIONG-E1121).
+    mem_limit: 256m
+    # For io_uring, which Docker's default seccomp profile blocks: make
+    # giong-seccomp.json as docs/DEPLOYMENT.md shows (Docker's default profile
+    # plus the three io_uring calls), put it next to this file, and uncomment.
+    # memlock matters on Linux 6.14 to 7.2, which count io_uring's rings
+    # against it (GIONG-E0010).
+    # security_opt:
+    #   - seccomp=giong-seccomp.json
+    # ulimits:
+    #   memlock:
+    #     soft: -1
+    #     hard: -1
+
+  postgres:
+    image: postgres:17
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: secret
+      POSTGRES_DB: app
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U app -d app"]
+      interval: 1s
+      timeout: 2s
+      retries: 30
+
+  redis:
+    image: redis:7
