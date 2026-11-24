@@ -645,9 +645,29 @@ fn inheritable_descriptors() -> Vec<RawFd> {
     open
 }
 
+/// `true` if io_uring works here (it is blocked in a container, for
+/// instance). Where CI says it must work (`GIONG_TEST_EXPECT_DRIVER=io_uring`),
+/// not working is a failure instead of a reason to test epoll only.
+fn io_uring_available() -> bool {
+    let res = giong::Builder::new()
+        .driver(giong::DriverKind::IoUring)
+        .block_on(async {});
+    if let Err(e) = &res {
+        assert_ne!(
+            std::env::var("GIONG_TEST_EXPECT_DRIVER").as_deref(),
+            Ok("io_uring"),
+            "io_uring must work here, but: {e}"
+        );
+    }
+    res.is_ok()
+}
+
 #[test]
 fn a_new_channel_leaks_no_descriptor_into_exec() {
     for driver in ["io_uring", "epoll"] {
+        if driver == "io_uring" && !io_uring_available() {
+            continue;
+        }
         let path = SockPath::new();
         let out = Command::new(std::env::current_exe().unwrap())
             .args([
