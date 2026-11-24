@@ -40,6 +40,11 @@
 # by the epoll growth (+32.5 bytes).
 # web instructions: #309 merged with main b87bb04, measured locally: +71
 # per request against main (+0.61% io_uring, +0.58% epoll).
+# tcp-echo and udp-echo instructions: the CI run of #182 merged with main
+# 86d1fab. Main itself had grown since those rows were taken (measured
+# locally on 86d1fab: tcp-echo 3663.0 io_uring, 4554.4 epoll; udp-echo
+# 4160.4, 4862.6). #182's own cost against that main: 0 and +13 (+0.29%)
+# for tcp-echo, +5 (+0.12%, +0.10%) for udp-echo.
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1376.4,1
 io_uring,spawn,allocations,1.000,1
@@ -51,9 +56,9 @@ io_uring,channel,instructions,1721.4,1
 io_uring,channel,allocations,0.000,1
 io_uring,timeout,instructions,98.1,1
 io_uring,timeout,allocations,0.000,1
-io_uring,tcp-echo,instructions,3629.0,1
+io_uring,tcp-echo,instructions,3663.0,1
 io_uring,tcp-echo,allocations,1.000,1
-io_uring,udp-echo,instructions,4130.4,1
+io_uring,udp-echo,instructions,4165.4,1
 io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,191.7,1
 io_uring,file-read,allocations,0.000,1
@@ -94,9 +99,9 @@ epoll,channel,instructions,1446.4,1
 epoll,channel,allocations,0.000,1
 epoll,timeout,instructions,98.1,1
 epoll,timeout,allocations,0.000,1
-epoll,tcp-echo,instructions,4521.4,1
+epoll,tcp-echo,instructions,4567.4,1
 epoll,tcp-echo,allocations,1.000,1
-epoll,udp-echo,instructions,4842.7,1
+epoll,udp-echo,instructions,4867.6,1
 epoll,udp-echo,allocations,1.000,1
 epoll,file-read,instructions,243.6,3
 epoll,file-read,allocations,0.016,1
