@@ -1,0 +1,101 @@
+name: net - apt install from the cache
+description: >
+  Install Ubuntu packages from a cache of their .deb files (scripts/ci-apt.sh),
+  going to the Ubuntu mirrors only when the runner image changes, and load
+  kernel modules, installing linux-modules-extra for the running kernel when
+  one is missing.
+inputs:
+  packages:
+    description: Packages to install, separated by spaces.
+    required: false
+    default: ""
+  modules:
+    description: >
+      Kernel modules to load. When modprobe cannot find one, the
+      linux-modules-extra package of the running kernel is installed with the
+      packages, then the modules are loaded again (and must load).
+    required: false
+    default: ""
+  stop-services:
+    description: Services the packages start that the tests start themselves, to stop.
+    required: false
+    default: ""
+  setup:
+    description: >
+      A command run before `apt-get update` when the cache misses, to add a
+      repository; not run on a hit.
+    required: false
+    default: ""
+runs:
+  using: composite
+  steps:
+    - name: "net: what to install"
+      id: plan
+      shell: bash
+      env:
+        PACKAGES: ${{ inputs.packages }}
+        MODULES: ${{ inputs.modules }}
+        SETUP: ${{ inputs.setup }}
+      run: |
+        pkgs="$PACKAGES"
+        kernel=""
+        for m in $MODULES; do
+            if ! sudo modprobe "$m" 2> /dev/null; then
+                kernel="$(uname -r)"
+            fi
+        done
+        if [ -n "$kernel" ]; then pkgs="$pkgs linux-modules-extra-$kernel"; fi
+        pkgs="$(printf '%s\n' $pkgs | sort -u | xargs)"
+        echo "packages=$pkgs" >> "$GITHUB_OUTPUT"
+        # The image (ImageOS, ImageVersion) fixes what is installed already,
+        # and so which dependencies the files must bring; the kernel only
+        # matters for its modules package. Several image versions serve jobs
+        # at once (20261116.133.1 and .376.1 on 2026-11-23), so a job falls
+        # back to the files another version saved: scripts/ci-apt.sh installs
+        # them only if they fit this image, and downloads otherwise.
+        sum="$(printf '%s\n%s\n' "$pkgs" "$SETUP" | sha256sum | cut -c1-16)"
+        echo "prefix=apt-${ImageOS:-unknown}-$sum-" >> "$GITHUB_OUTPUT"
+        echo "key=apt-${ImageOS:-unknown}-$sum-${ImageVersion:-unknown}" >> "$GITHUB_OUTPUT"
+        echo "dir=$RUNNER_TEMP/apt-cache-$sum" >> "$GITHUB_OUTPUT"
+    - name: "net: restore the .deb files"
+      id: restore
+      if: steps.plan.outputs.packages != ''
+      uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      with:
+        path: ${{ steps.plan.outputs.dir }}
+        key: ${{ steps.plan.outputs.key }}
+        restore-keys: ${{ steps.plan.outputs.prefix }}
+    - name: "net: apt install ${{ steps.plan.outputs.packages }}"
+      id: install
+      if: steps.plan.outputs.packages != ''
+      shell: bash
+      env:
+        CI_APT_SETUP: ${{ inputs.setup }}
+        DIR: ${{ steps.plan.outputs.dir }}
+        PACKAGES: ${{ steps.plan.outputs.packages }}
+      run: |
+        # shellcheck disable=SC2086
+        "$GITHUB_WORKSPACE/scripts/ci-apt.sh" install "$DIR" $PACKAGES
+        if [ -f "$DIR/.packages" ]; then echo "complete=true" >> "$GITHUB_OUTPUT"; fi
+    - name: "net: keep the .deb files for the next run"
+      if: steps.plan.outputs.packages != '' && steps.restore.outputs.cache-hit != 'true' && steps.install.outputs.complete == 'true'
+      uses: actions/cache/save@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+      # Two jobs that missed at once both try to save; actions/cache only
+      # warns for the one that finds the key taken.
+      with:
+        path: ${{ steps.plan.outputs.dir }}
+        key: ${{ steps.plan.outputs.key }}
+    - name: Load the kernel modules
+      if: inputs.modules != ''
+      shell: bash
+      env:
+        MODULES: ${{ inputs.modules }}
+      run: for m in $MODULES; do sudo modprobe "$m"; done
+    - name: Stop the services the packages started
+      if: inputs.stop-services != ''
+      shell: bash
+      env:
+        SERVICES: ${{ inputs.stop-services }}
+      run: |
+        # shellcheck disable=SC2086
+        sudo systemctl stop $SERVICES
