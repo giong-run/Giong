@@ -147,10 +147,27 @@ fn a_fixed_delay_is_measured_as_that_delay() {
     let r = round(&v);
     let p50 = us(r, "p50_us");
     assert!(
-        (19_000.0..60_000.0).contains(&p50),
+        p50 >= 19_000.0,
         "p50 {p50} µs for a 20 ms handler\n{}",
         out.dump()
     );
+    // GIONG-E5062: the generator itself ran late, so this machine is too busy
+    // for its numbers to be judged (a loaded CI runner overruns the
+    // handler's sleep too). giong bench said so; that is the right answer.
+    let lagged = v["findings"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .any(|f| f["code"] == "GIONG-E5062");
+    if lagged {
+        eprintln!("a_fixed_delay_is_measured_as_that_delay: generator lag reported, upper bound not checked (p50 {p50} µs)");
+    } else {
+        assert!(
+            p50 < 60_000.0,
+            "p50 {p50} µs for a 20 ms handler\n{}",
+            out.dump()
+        );
+    }
     assert_eq!(r["failed"], 0, "{}", out.dump());
 }
 
