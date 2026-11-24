@@ -372,6 +372,7 @@ struct Config {
     buf_count: u16,
     buf_size: usize,
     shutdown_grace: Duration,
+    precise_timers: bool,
 }
 
 /// Everything a worker thread owns. Reached through a thread-local.
@@ -544,8 +545,9 @@ impl Worker {
     fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
         let pool = BufPool::new(cfg.buf_count, cfg.buf_size)?;
-        let (driver, choice) =
+        let (mut driver, choice) =
             Driver::new(cfg.driver, cfg.chosen_by, cfg.ring_entries, pool.clone())?;
+        driver.set_precise_timers(cfg.precise_timers);
         // A worker instance is built once, so the slots are always empty
         // here.
         let _ = shared.wake.set(driver.waker());
@@ -1146,6 +1148,7 @@ pub struct Builder {
     signals: bool,
     spin: Option<Duration>,
     shutdown_grace: Duration,
+    precise_timers: bool,
     /// Makes this worker panic before it reports that it started. A field
     /// of the builder, not a static, so that the runtimes of other tests
     /// running at the same time are not touched.
@@ -1175,6 +1178,7 @@ impl Builder {
             signals: false,
             spin: None,
             shutdown_grace: Duration::ZERO,
+            precise_timers: false,
             #[cfg(test)]
             panic_on_start: None,
         }
@@ -1290,6 +1294,24 @@ impl Builder {
         self
     }
 
+    /// Wake short timed waits on time on macOS (default: `false`).
+    ///
+    /// macOS adds timer slack to a wait's time limit, to batch wake-ups and
+    /// save power: a 2 ms sleep takes 2 to 4 ms. With this on, a wait of up
+    /// to 100 ms is timed with a kernel timer marked critical, which fires
+    /// on time; longer waits keep the limit, whose slack is under 1% of
+    /// them. The cost, measured on the CI runners with a task that sleeps
+    /// 2 ms in a loop: about a third more CPU time (7.05 against 5.28 ms
+    /// per second), more interrupt wake-ups (411 against 348 per second)
+    /// and a higher Energy Impact (2.77 against 2.08). Turn it on where
+    /// the latency of short sleeps and timeouts matters more than battery.
+    /// Linux and Windows time their waits without this slack, and ignore
+    /// the option.
+    pub fn precise_timers(mut self, enable: bool) -> Self {
+        self.precise_timers = enable;
+        self
+    }
+
     /// Request a runtime shutdown when the process receives SIGINT or SIGTERM
     /// (default: `false`). Only applies to [`Runtime::run`].
     ///
@@ -1362,6 +1384,7 @@ impl Builder {
             buf_count: self.buf_count,
             buf_size: self.buf_size,
             shutdown_grace: self.shutdown_grace,
+            precise_timers: self.precise_timers,
         })
     }
 

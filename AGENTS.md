@@ -270,6 +270,10 @@ is loaded.
   requests can also each pass alone and fail together: `bench/instr/baseline.csv` limits
   are the usual case (both add a little heap to the same path). Merge `main` in and run
   `scripts/instr.py check` again when the other one lands first.
+- **A CI step named `net: ` is rerun by the CI gate when it fails** (docs/DEVELOPMENT.md,
+  "When CI fails outside the code"). Only downloads and installs go there, through
+  `scripts/ci-net.sh` or `.github/actions/apt-install`; a bare `apt-get` or `curl` in a
+  workflow goes to a mirror every run and fails the whole run when the mirror does.
 - **A push cancels the CI run in progress.** Push a finished step, not each edit: in
   November 2026 more than half of all pull request runs were cancelled by the next push
   after running a median of 7 minutes. Iterate locally (`scripts/preflight.sh --quick`, run

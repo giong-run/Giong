@@ -923,6 +923,22 @@ impl Driver {
         Ok((driver, choice))
     }
 
+    /// Times short waits in [`park`](Self::park) exactly, without the
+    /// kernel's timer slack: see [`Builder::precise_timers`]. Only kqueue
+    /// has that slack; the other drivers ignore it.
+    ///
+    /// [`Builder::precise_timers`]: crate::Builder::precise_timers
+    pub(crate) fn set_precise_timers(&mut self, enable: bool) {
+        match self {
+            #[cfg(any(target_os = "macos", giong_libkqueue))]
+            Driver::Kqueue(d) => d.set_precise_timers(enable),
+            #[allow(unreachable_patterns)]
+            _ => {
+                let _ = enable;
+            }
+        }
+    }
+
     /// The handle that wakes this driver's worker when it sleeps in
     /// [`park`](Self::park); see [`WakeHandle`] for what it promises.
     pub(crate) fn waker(&self) -> WakeHandle {
