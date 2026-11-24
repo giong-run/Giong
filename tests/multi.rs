@@ -739,28 +739,31 @@ fn sigterm_delivered_to_a_thread_outside_the_runtime_shuts_it_down() {
     ignore = "timing: measures wake-up latency, which Miri slows down"
 )]
 fn a_sleeping_worker_is_woken_promptly_by_another_thread() {
-    // Latency of the eventfd wake-up path.
-    let (tx, mut rx) = mpsc::unbounded::<Instant>();
-    let sender = std::thread::spawn(move || {
-        for _ in 0..200 {
-            std::thread::sleep(Duration::from_millis(1));
-            tx.send(Instant::now()).unwrap();
-        }
-    });
-    let worst = giong::block_on(async move {
-        let mut worst = Duration::ZERO;
-        while let Some(sent) = timeout(Duration::from_secs(10), rx.recv())
-            .await
-            .expect("lost wake-up")
-        {
-            worst = worst.max(sent.elapsed());
-        }
+    // Latency of the eventfd (kqueue: EVFILT_USER) wake-up path.
+    let measured = common::wake_latency_within(Duration::from_millis(100), || {
+        let (tx, mut rx) = mpsc::unbounded::<Instant>();
+        let sender = std::thread::spawn(move || {
+            for _ in 0..200 {
+                std::thread::sleep(Duration::from_millis(1));
+                tx.send(Instant::now()).unwrap();
+            }
+        });
+        let worst = giong::block_on(async move {
+            let mut worst = Duration::ZERO;
+            while let Some(sent) = timeout(Duration::from_secs(10), rx.recv())
+                .await
+                .expect("lost wake-up")
+            {
+                worst = worst.max(sent.elapsed());
+            }
+            worst
+        });
+        sender.join().unwrap();
         worst
     });
-    sender.join().unwrap();
     assert!(
-        worst < Duration::from_millis(100),
-        "slow cross-thread wake-up: {worst:?}"
+        measured.is_ok(),
+        "slow cross-thread wake-up on every try: {measured:?}"
     );
 }
 

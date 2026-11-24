@@ -21,6 +21,8 @@
 # changelog.d/http-request-cost.md; the other rows matched main there. The
 # allocation rows of idle-h2 and idle-https are from this change's CI run
 # (two fewer allocations per idle HTTP/2 and HTTPS connection).
+# web instructions: scripts/instr.py on the same kind of VM after the
+# request path changes of changelog.d/perf-web-request-path.md.
 # The spawn rows of both drivers: re-measured for budgets and lanes (#182), 3
 # rounds on a dev VM whose counts match the other rows to the decimal; spawning
 # got cheaper.
@@ -51,7 +53,7 @@ io_uring,h2-streams,instructions,253592.7,0.5
 io_uring,h2-streams,allocations,286.005,0.5
 io_uring,https,instructions,34649.5,1
 io_uring,https,allocations,19.035,1
-io_uring,web,instructions,12711.4,1
+io_uring,web,instructions,11595.5,1
 io_uring,web,allocations,3.000,1
 io_uring,redis-get,instructions,8350.1,1
 io_uring,redis-get,allocations,2.000,1
@@ -94,7 +96,7 @@ epoll,h2-streams,instructions,254714.6,0.5
 epoll,h2-streams,allocations,286.005,0.5
 epoll,https,instructions,35667.0,1
 epoll,https,allocations,19.000,1
-epoll,web,instructions,13570.6,1
+epoll,web,instructions,12458.6,1
 epoll,web,allocations,3.000,1
 epoll,redis-get,instructions,8920.7,1
 epoll,redis-get,allocations,2.000,1
