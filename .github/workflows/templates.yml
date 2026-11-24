@@ -1,0 +1,63 @@
+name: Templates
+
+# Every project `giong new` can write, built and tested against this checkout's
+# crates the way a user would (scripts/templates.sh): fmt, clippy with warnings
+# as errors, the tests on io_uring and on epoll, against real PostgreSQL, MySQL
+# and Redis servers. A change to a template, or to an API a template uses,
+# fails here instead of in a user's first minute.
+
+on:
+  pull_request:
+  merge_group:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: templates-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The same pinned toolchain as ci.yml and release.yml.
+  RUST_STABLE: "1.100.0"
+
+jobs:
+  templates:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    # The same servers as the GitHub Actions workflow the templates write.
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: app
+        ports: ["5432:5432"]
+        options: --health-cmd pg_isready --health-interval 2s --health-timeout 5s --health-retries 30
+      mysql:
+        image: mysql:8.4
+        env:
+          MYSQL_ROOT_PASSWORD: mysql
+          MYSQL_DATABASE: app
+        ports: ["3306:3306"]
+        options: --health-cmd "mysqladmin ping -h 127.0.0.1 -pmysql" --health-interval 2s --health-timeout 5s --health-retries 60
+      redis:
+        image: redis:7
+        ports: ["6379:6379"]
+        options: --health-cmd "redis-cli ping" --health-interval 2s --health-timeout 5s --health-retries 30
+    env:
+      DATABASE_URL: postgres://postgres:postgres@127.0.0.1:5432/app
+      MYSQL_URL: mysql://root:mysql@127.0.0.1:3306/app
+      REDIS_URL: redis://127.0.0.1:6379
+      # A database test that skips fails the job.
+      GIONG_TEMPLATES_REQUIRE_DB: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: clippy, rustfmt
+      - run: uname -r
+      - run: scripts/templates.sh

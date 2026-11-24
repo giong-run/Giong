@@ -963,6 +963,9 @@ impl IpcListener {
         let io = Io::RecvMsg {
             fd: control.as_raw_fd(),
             msg: msg.as_ptr().cast(),
+            // The memfd and eventfds arrive close-on-exec, so that they
+            // never leak into a program this process starts.
+            flags: libc::MSG_CMSG_CLOEXEC,
         };
         // SAFETY: as in `connect`.
         let (res, _, msg) = unsafe { Op::new(io, msg) }.await;

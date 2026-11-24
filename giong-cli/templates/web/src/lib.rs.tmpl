@@ -1,0 +1,166 @@
+{{#if postgres & redis}}
+//! A REST API on giong: users kept in PostgreSQL, read through a Redis
+//! cache, with nothing from the Tokio ecosystem.
+{{/if}}
+{{#if postgres & !redis}}
+//! A REST API on giong: users kept in PostgreSQL, with nothing from the
+//! Tokio ecosystem.
+{{/if}}
+{{#if mysql & redis}}
+//! A REST API on giong: users kept in MySQL, read through a Redis cache,
+//! with nothing from the Tokio ecosystem.
+{{/if}}
+{{#if mysql & !redis}}
+//! A REST API on giong: users kept in MySQL, with nothing from the Tokio
+//! ecosystem.
+{{/if}}
+{{#if redis & !sql}}
+//! An HTTP service on giong: counters kept in Redis, with nothing from the
+//! Tokio ecosystem.
+{{/if}}
+{{#if !db}}
+//! An HTTP service on giong, with nothing from the Tokio ecosystem.
+{{/if}}
+//!
+//! | Route | What it does |
+//! |---|---|
+//! | `GET /health` | `ok` while the process runs |
+{{#if db}}
+{{#if sql & redis}}
+//! | `GET /ready` | `ready` when the database and Redis answer, `503` otherwise |
+{{/if}}
+{{#if sql & !redis}}
+//! | `GET /ready` | `ready` when the database answers, `503` otherwise |
+{{/if}}
+{{#if redis & !sql}}
+//! | `GET /ready` | `ready` when Redis answers, `503` otherwise |
+{{/if}}
+{{/if}}
+{{#if sql}}
+//! | `GET /users?limit=50&after=0` | a page of users, by id |
+//! | `POST /users` | creates a user: `{"name": .., "email": ..}` |
+{{#if redis}}
+//! | `GET /users/{id}` | one user, from the cache when it is there |
+{{#else}}
+//! | `GET /users/{id}` | one user |
+{{/if}}
+//! | `PUT /users/{id}` | replaces a user's name and email |
+//! | `DELETE /users/{id}` | deletes a user |
+//! | `GET /users/export` | every user, one JSON object per line, streamed |
+{{/if}}
+{{#if redis & !sql}}
+//! | `GET /counters/{name}` | a counter's value, `0` when it was never counted |
+//! | `POST /counters/{name}` | adds `{"by": n}` (or 1) and answers the new value |
+{{/if}}
+{{#if !db}}
+//! | `GET /hello/{name}` | a greeting |
+//! | `POST /echo` | answers the JSON message it is sent: `{"message": ..}` |
+{{/if}}
+//!
+//! `main.rs` reads the configuration and starts the server; this file is
+//! the API, which the tests build too.
+
+use std::time::Duration;
+
+use giong_web::middleware::{Compression, Logger, RequestId, Timeout};
+use giong_web::{App, Error, Req, Response, Router, Sink};
+
+{{#if sql}}
+mod users;
+{{/if}}
+{{#if redis & !sql}}
+mod counters;
+{{/if}}
+{{#if !db}}
+mod hello;
+{{/if}}
+
+/// What every handler of a worker shares: its own pools, nothing locked.
+pub struct State {
+{{#if postgres}}
+    pub db: giong_postgres::Pool,
+{{/if}}
+{{#if mysql}}
+    pub db: giong_mysql::Pool,
+{{/if}}
+{{#if redis & sql}}
+    pub cache: giong_redis::Pool,
+    /// How long a user stays in the cache.
+    pub cache_ttl: Duration,
+{{/if}}
+{{#if redis & !sql}}
+    pub redis: giong_redis::Pool,
+{{/if}}
+{{#if !db}}
+    /// The first word of `GET /hello/{name}`.
+    pub greeting: &'static str,
+{{/if}}
+}
+
+{{#if sql}}
+/// The tables, created at startup when they are missing.
+pub const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
+
+{{/if}}
+async fn health(_req: Req<State>) -> Result<Response, Error> {
+    Ok(Response::text("ok"))
+}
+
+{{#if sql & redis}}
+/// `503` (with the cause in the log) when either store does not answer.
+async fn ready(req: Req<State>) -> Result<Response, Error> {
+    let state = req.state();
+    state.db.query_one("SELECT 1", &[]).await?;
+    state.cache.ping().await?;
+    Ok(Response::text("ready"))
+}
+
+{{/if}}
+{{#if sql & !redis}}
+/// `503` (with the cause in the log) when the database does not answer.
+async fn ready(req: Req<State>) -> Result<Response, Error> {
+    req.state().db.query_one("SELECT 1", &[]).await?;
+    Ok(Response::text("ready"))
+}
+
+{{/if}}
+{{#if redis & !sql}}
+/// `503` (with the cause in the log) when Redis does not answer.
+async fn ready(req: Req<State>) -> Result<Response, Error> {
+    req.state().redis.ping().await?;
+    Ok(Response::text("ready"))
+}
+
+{{/if}}
+/// The access log: one JSON line per request, or none.
+pub enum AccessLog {
+    Stdout,
+    Off,
+}
+
+/// The API, with its middleware, for one worker.
+pub fn app(state: State, log: AccessLog) -> App<State> {
+    let mut router = Router::new()
+        .get("/health", health)
+{{#if db}}
+        .get("/ready", ready)
+{{/if}}
+{{#if sql}}
+        .nest("/users", users::routes())
+{{/if}}
+{{#if redis & !sql}}
+        .nest("/counters", counters::routes())
+{{/if}}
+{{#if !db}}
+        .get("/hello/{name}", hello::hello)
+        .post("/echo", hello::echo)
+{{/if}}
+        .layer(RequestId::new());
+    if let AccessLog::Stdout = log {
+        router = router.layer(Logger::new(Sink::Stdout));
+    }
+    router
+        .layer(Compression::new())
+        .layer(Timeout::new(Duration::from_secs(10)))
+        .build(state)
+}

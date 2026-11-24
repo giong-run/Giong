@@ -64,6 +64,7 @@
 #![warn(missing_docs)]
 
 mod http;
+mod limits;
 mod proc;
 mod rpc;
 mod schema;
