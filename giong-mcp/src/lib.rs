@@ -37,6 +37,7 @@
 //! | `tasks` | live tasks grouped by the line that spawned them, per worker |
 //! | `sources` | what registered sources report: giong-postgres, giong-mysql and giong-redis pools |
 //! | `profile` | times every task poll for a while and says which spawn sites the workers spent their time in |
+//! | `slow_requests` | traces requests for a while and says, per route, where the time of the slowest went and why, with evidence and a confidence |
 //!
 //! Each answer is JSON, as `structuredContent` and as text.
 //!
@@ -64,9 +65,11 @@
 #![warn(missing_docs)]
 
 mod http;
+mod limits;
 mod proc;
 mod rpc;
 mod schema;
+mod slow;
 mod tools;
 mod watch;
 

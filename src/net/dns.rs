@@ -8,17 +8,19 @@ use std::fmt;
 use std::future::{poll_fn, Future};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
-use std::pin::pin;
+use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::task::Poll;
 use std::time::{Duration, SystemTime};
 
 use crate::error::{raise, Code};
 use crate::net::{TcpStream, UdpSocket};
-use crate::time::{timeout, Instant};
+use crate::sync::oneshot;
+use crate::time::{sleep, timeout, Instant};
 
 const TYPE_A: u16 = 1;
 const TYPE_CNAME: u16 = 5;
+const TYPE_SOA: u16 = 6;
 const TYPE_AAAA: u16 = 28;
 const CLASS_IN: u16 = 1;
 
@@ -27,7 +29,22 @@ const RCODE_NXDOMAIN: u8 = 3;
 
 /// Longest a positive answer is kept in the cache, whatever its TTL says.
 const MAX_CACHE_TTL: Duration = Duration::from_secs(300);
-/// Entries kept in one resolver's cache.
+/// Longest a name that does not exist is remembered as missing, whatever
+/// its zone's SOA record says (RFC 2308 allows hours; a name that was just
+/// created should not stay missing for long).
+const MAX_MISSING_TTL: Duration = Duration::from_secs(30);
+/// Longest addresses of one family are cached when the query for the other
+/// family went unanswered: long enough that a server which never answers
+/// `AAAA` costs one short wait per half minute, short enough that a lost
+/// answer does not hide the other family for the full TTL.
+const MAX_PARTIAL_TTL: Duration = Duration::from_secs(30);
+/// Once one of the `A` and `AAAA` queries has answered with addresses, how
+/// long the other one is waited for at least: the resolution delay of Happy
+/// Eyeballs (RFC 8305, section 3). The wait is as long as the first answer
+/// took when that was longer, as a slow path to the server slows both.
+const OTHER_FAMILY_GRACE: Duration = Duration::from_millis(50);
+/// Entries kept in one resolver's cache (and again in its cache of
+/// missing names).
 const MAX_CACHE_ENTRIES: usize = 1024;
 /// How often the system resolver checks whether its files changed.
 const RELOAD_CHECK: Duration = Duration::from_secs(5);
@@ -337,7 +354,13 @@ fn parse_hosts(text: &str) -> Vec<(String, IpAddr)> {
 /// Looks in the hosts file first, then asks the DNS servers: `A` and `AAAA`
 /// queries go out together over UDP, an answer marked as truncated is asked
 /// again over TCP, and the search list is applied as `ndots` says. Answers
-/// are cached for their TTL (at most five minutes).
+/// are cached for their TTL (at most five minutes), and a name that does not
+/// exist is remembered as missing for its zone's negative TTL (RFC 2308, at
+/// most 30 seconds). Lookups of one name that run at the same time share
+/// one set of queries. Once one of the `A` and `AAAA` queries has answered
+/// with addresses, the other is waited for only briefly (50 ms, or as long
+/// as the first answer took), so a server that never answers `AAAA` does not
+/// hold the `A` records for the whole timeout.
 ///
 /// A resolver belongs to the worker that created it and is cheap to clone.
 /// [`lookup_host`](crate::net::lookup_host) and
@@ -351,9 +374,18 @@ pub struct Resolver {
     inner: Rc<Inner>,
 }
 
+/// What a lookup that is under way owes the lookups of the same name that
+/// started after it.
+type Waiting = Vec<oneshot::Sender<io::Result<Vec<IpAddr>>>>;
+
 struct Inner {
     cfg: ResolverConfig,
     cache: RefCell<HashMap<String, (Vec<IpAddr>, Instant)>>,
+    /// Query names the servers said do not exist (or have no addresses),
+    /// and until when that holds.
+    missing: RefCell<HashMap<String, Instant>>,
+    /// Lookups under way, by cache key, with the lookups waiting on them.
+    flights: RefCell<HashMap<String, Waiting>>,
     /// Round-robin start for `rotate`.
     next_server: std::cell::Cell<usize>,
 }
@@ -374,6 +406,8 @@ impl Resolver {
             inner: Rc::new(Inner {
                 cfg,
                 cache: RefCell::new(HashMap::new()),
+                missing: RefCell::new(HashMap::new()),
+                flights: RefCell::new(HashMap::new()),
                 next_server: std::cell::Cell::new(0),
             }),
         }
@@ -414,14 +448,52 @@ impl Resolver {
         if let Some(addrs) = self.cached(&key) {
             return Ok(addrs);
         }
+        // One lookup per name at a time: a lookup that finds another one
+        // under way waits for its result. If that one is dropped first, its
+        // waiters see their channel close, and one of them takes over.
+        loop {
+            let waiting = match self.inner.flights.borrow_mut().entry(key.clone()) {
+                std::collections::hash_map::Entry::Occupied(mut flight) => {
+                    let (tx, rx) = oneshot::channel();
+                    flight.get_mut().push(tx);
+                    rx
+                }
+                std::collections::hash_map::Entry::Vacant(slot) => {
+                    slot.insert(Vec::new());
+                    break;
+                }
+            };
+            if let Ok(result) = waiting.await {
+                return result;
+            }
+        }
+        let flight = Flight {
+            inner: &self.inner,
+            key: &key,
+        };
+        let result = self.resolve(host, &key).await;
+        for waiter in flight.land() {
+            let _ = waiter.send(copy_result(&result));
+        }
+        result
+    }
+
+    /// Asks the servers for `host`'s candidate names in turn, and caches
+    /// what they say.
+    async fn resolve(&self, host: &str, key: &str) -> io::Result<Vec<IpAddr>> {
+        let cfg = &self.inner.cfg;
         let mut last_err = None;
         for name in cfg.candidates(host) {
+            let name_key = name.trim_end_matches('.').to_ascii_lowercase();
+            if self.known_missing(&name_key) {
+                continue;
+            }
             match self.query(&name).await {
                 Ok(Outcome::Found(addrs, ttl)) => {
-                    self.store(key, addrs.clone(), ttl);
+                    self.store(key.to_string(), addrs.clone(), ttl);
                     return Ok(addrs);
                 }
-                Ok(Outcome::Missing) => {}
+                Ok(Outcome::Missing(ttl)) => self.store_missing(name_key, ttl),
                 // A server problem with one candidate: try the next one, but
                 // report the problem if no candidate resolves.
                 Err(e) => last_err = Some(e),
@@ -452,6 +524,38 @@ impl Resolver {
             }
             None => None,
         }
+    }
+
+    fn known_missing(&self, name: &str) -> bool {
+        let mut missing = self.inner.missing.borrow_mut();
+        match missing.get(name) {
+            Some(expires) if *expires > Instant::now() => true,
+            Some(_) => {
+                missing.remove(name);
+                false
+            }
+            None => false,
+        }
+    }
+
+    fn store_missing(&self, name: String, ttl: Option<Duration>) {
+        // Without the zone's SOA record there is no negative TTL, and
+        // RFC 2308 (section 5) says not to cache.
+        let Some(ttl) = ttl.map(|ttl| ttl.min(MAX_MISSING_TTL)) else {
+            return;
+        };
+        if ttl.is_zero() {
+            return;
+        }
+        let mut missing = self.inner.missing.borrow_mut();
+        let now = Instant::now();
+        if missing.len() >= MAX_CACHE_ENTRIES {
+            missing.retain(|_, expires| *expires > now);
+            if missing.len() >= MAX_CACHE_ENTRIES {
+                missing.clear();
+            }
+        }
+        missing.insert(name, now + ttl);
     }
 
     fn store(&self, key: String, addrs: Vec<IpAddr>, ttl: Duration) {
@@ -512,18 +616,87 @@ impl Resolver {
     }
 }
 
+/// A lookup under way, registered in [`Inner::flights`]. Dropped before it
+/// [lands](Self::land) (the lookup was cancelled), it leaves the map, and
+/// the lookups waiting on it see their channels close.
+struct Flight<'a> {
+    inner: &'a Inner,
+    key: &'a str,
+}
+
+impl Flight<'_> {
+    /// Ends the lookup, returning the lookups that wait for its result.
+    fn land(self) -> Waiting {
+        let waiting = self.inner.flights.borrow_mut().remove(self.key);
+        std::mem::forget(self);
+        waiting.unwrap_or_default()
+    }
+}
+
+impl Drop for Flight<'_> {
+    fn drop(&mut self) {
+        let waiting = self.inner.flights.borrow_mut().remove(self.key);
+        // The senders close outside the borrow: a waiter woken by that runs
+        // later, but nothing here may assume so.
+        drop(waiting);
+    }
+}
+
+/// The result of a lookup again, for a lookup that waited on it.
+fn copy_result(result: &io::Result<Vec<IpAddr>>) -> io::Result<Vec<IpAddr>> {
+    match result {
+        Ok(addrs) => Ok(addrs.clone()),
+        Err(e) => Err(copy_error(e)),
+    }
+}
+
+/// An error like `e`: the same kind, the same giong error (code, message,
+/// fix) and the same operating system error underneath, which is what
+/// callers look at. Other errors become their kind and text.
+fn copy_error(e: &io::Error) -> io::Error {
+    fn copy_source(e: &(dyn std::error::Error + 'static)) -> io::Error {
+        match e.downcast_ref::<io::Error>() {
+            Some(e) => copy_error(e),
+            None => io::Error::other(e.to_string()),
+        }
+    }
+    if let Some(raw) = e.raw_os_error() {
+        return io::Error::from_raw_os_error(raw);
+    }
+    let Some(inner) = e.get_ref() else {
+        return e.kind().into();
+    };
+    if let Some(giong) = inner.downcast_ref::<crate::error::Error>() {
+        if giong.get_ref().is_none() {
+            let mut copy = crate::error::Error::new(
+                giong.code(),
+                giong.message().into_owned(),
+                giong.fix().to_owned(),
+            );
+            if let Some(source) = std::error::Error::source(giong) {
+                copy = copy.with_source(copy_source(source));
+            }
+            return io::Error::new(e.kind(), copy);
+        }
+    }
+    io::Error::new(e.kind(), inner.to_string())
+}
+
 /// What the servers said about one name.
 enum Outcome {
     /// Addresses, and how long they may be cached.
     Found(Vec<IpAddr>, Duration),
-    /// The name does not exist, or has no address records.
-    Missing,
+    /// The name does not exist, or has no address records; for how long
+    /// that may be cached, when the server said.
+    Missing(Option<Duration>),
 }
 
 /// Sends the `A` and the `AAAA` query to `server` at the same time and
 /// waits up to `wait` for each answer. Addresses in one answer are enough:
 /// some servers never answer `AAAA` queries, and that must not lose the
-/// `A` records.
+/// `A` records, nor hold them for the whole `wait`. Once one answer has
+/// addresses, the other is waited for [`OTHER_FAMILY_GRACE`], or as long as
+/// the first one took if that is longer.
 async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<Outcome> {
     let ask = |qtype| async move {
         match timeout(wait, exchange(server, name, qtype)).await {
@@ -541,20 +714,25 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
             )),
         }
     };
-    let (a, aaaa) = join(ask(TYPE_A), ask(TYPE_AAAA)).await;
+    let (a, aaaa) = first_with_grace(ask(TYPE_A), ask(TYPE_AAAA)).await;
     let mut addrs = Vec::new();
     let mut ttl = u32::MAX;
+    // How long the name may be remembered as missing, while every answer
+    // says it is.
+    let mut missing_ttl = Some(u32::MAX);
     let mut err = None;
+    let partial = a.is_none() || aaaa.is_none();
     // IPv6 first, as getaddrinfo orders them on a host with IPv6.
-    for answer in [aaaa, a] {
+    for answer in [aaaa, a].into_iter().flatten() {
         match answer {
-            Ok(answer) if answer.rcode == RCODE_NOERROR => {
-                if !answer.addrs.is_empty() {
+            Ok(answer) if answer.rcode == RCODE_NOERROR || answer.rcode == RCODE_NXDOMAIN => {
+                if answer.addrs.is_empty() {
+                    missing_ttl = missing_ttl.zip(answer.negative_ttl).map(|(a, b)| a.min(b));
+                } else {
                     ttl = ttl.min(answer.min_ttl);
                     addrs.extend(answer.addrs);
                 }
             }
-            Ok(answer) if answer.rcode == RCODE_NXDOMAIN => {}
             // The kernel's own error, such as "connection refused" when
             // nothing listens on the server's port: say that it came from
             // the DNS server, or a failed `connect("db.internal:5432")`
@@ -590,12 +768,19 @@ async fn ask_both(server: SocketAddr, name: &str, wait: Duration) -> io::Result<
         }
     }
     if !addrs.is_empty() {
-        return Ok(Outcome::Found(addrs, Duration::from_secs(ttl.into())));
+        let mut ttl = Duration::from_secs(ttl.into());
+        if partial {
+            ttl = ttl.min(MAX_PARTIAL_TTL);
+        }
+        return Ok(Outcome::Found(addrs, ttl));
     }
     match err {
         Some(e) => Err(e),
-        // NXDOMAIN, or no address records of either type.
-        None => Ok(Outcome::Missing),
+        // NXDOMAIN, or no address records of either type. (`partial` cannot
+        // hold here: the grace starts only after an answer with addresses.)
+        None => Ok(Outcome::Missing(
+            missing_ttl.map(|ttl| Duration::from_secs(ttl.into())),
+        )),
     }
 }
 
@@ -618,9 +803,7 @@ async fn exchange(server: SocketAddr, name: &str, qtype: u16) -> io::Result<Answ
         SocketAddr::V4(_) => (Ipv4Addr::UNSPECIFIED, 0).into(),
         SocketAddr::V6(_) => (Ipv6Addr::UNSPECIFIED, 0).into(),
     };
-    // Not `UdpSocket::bind`: its SO_REUSEPORT would let the kernel give two
-    // concurrent queries the same port, and their answers could cross.
-    let socket = UdpSocket::from_std(std::net::UdpSocket::bind(local)?);
+    let socket = UdpSocket::from_std(query_socket(local)?);
     // Connected: the kernel drops datagrams from anyone but the server.
     socket.connect(server)?;
     let (res, query) = socket.send(query).await;
@@ -638,6 +821,31 @@ async fn exchange(server: SocketAddr, name: &str, qtype: u16) -> io::Result<Answ
         }
         return Ok(answer);
     }
+}
+
+/// A UDP socket on a fresh port of its own, for one query.
+///
+/// Not `UdpSocket::bind`: its `SO_REUSEPORT` would let the kernel give two
+/// concurrent queries the same port, and their answers could cross.
+#[cfg(unix)]
+fn query_socket(local: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    std::net::UdpSocket::bind(local)
+}
+
+/// A UDP socket on a fresh port of its own, for one query.
+///
+/// Its bind is exclusive (`SO_EXCLUSIVEADDRUSE`). Without that, Windows lets
+/// any other socket, of any process, bind the same port on a more specific
+/// address (`127.0.0.1`, the adapter's own) and take the datagrams sent to
+/// it: the answer goes to that socket and the lookup waits out its timeout.
+/// Runs of many test processes at once caught local DNS servers doing it.
+#[cfg(windows)]
+fn query_socket(local: SocketAddr) -> io::Result<std::net::UdpSocket> {
+    use socket2::{Domain, Protocol, Socket, Type};
+    let sock = Socket::new(Domain::for_address(local), Type::DGRAM, Some(Protocol::UDP))?;
+    crate::sys::set_exclusive_address(&sock)?;
+    sock.bind(&local.into())?;
+    Ok(sock.into())
 }
 
 async fn exchange_tcp(
@@ -675,10 +883,24 @@ async fn exchange_tcp(
     }
 }
 
-/// Runs two futures to completion side by side.
-async fn join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
+/// Runs the `A` and the `AAAA` query side by side. Once one of them has
+/// answered with addresses, the other gets [`OTHER_FAMILY_GRACE`] (or as long
+/// as the first took, if longer) and is then given up: `None`.
+async fn first_with_grace<A, B>(
+    a: A,
+    b: B,
+) -> (Option<io::Result<Answer>>, Option<io::Result<Answer>>)
+where
+    A: Future<Output = io::Result<Answer>>,
+    B: Future<Output = io::Result<Answer>>,
+{
+    fn has_addrs(r: &Option<io::Result<Answer>>) -> bool {
+        matches!(r, Some(Ok(answer)) if answer.rcode == RCODE_NOERROR && !answer.addrs.is_empty())
+    }
+    let started = Instant::now();
     let (mut a, mut b) = (pin!(a), pin!(b));
     let (mut ra, mut rb) = (None, None);
+    let mut grace: Option<crate::time::Sleep> = None;
     poll_fn(|cx| {
         if ra.is_none() {
             if let Poll::Ready(v) = a.as_mut().poll(cx) {
@@ -691,10 +913,17 @@ async fn join<A: Future, B: Future>(a: A, b: B) -> (A::Output, B::Output) {
             }
         }
         if ra.is_some() && rb.is_some() {
-            Poll::Ready((ra.take().unwrap(), rb.take().unwrap()))
-        } else {
-            Poll::Pending
+            return Poll::Ready((ra.take(), rb.take()));
         }
+        if grace.is_none() && (has_addrs(&ra) || has_addrs(&rb)) {
+            grace = Some(sleep(started.elapsed().max(OTHER_FAMILY_GRACE)));
+        }
+        if let Some(grace) = grace.as_mut() {
+            if Pin::new(grace).poll(cx).is_ready() {
+                return Poll::Ready((ra.take(), rb.take()));
+            }
+        }
+        Poll::Pending
     })
     .await
 }
@@ -739,6 +968,9 @@ struct Answer {
     truncated: bool,
     addrs: Vec<IpAddr>,
     min_ttl: u32,
+    /// For an answer without addresses: how long that may be cached, from
+    /// the SOA record of the authority section (RFC 2308, section 5).
+    negative_ttl: Option<u32>,
 }
 
 /// A recursive query for `name` (no trailing dot) of type `qtype`.
@@ -850,6 +1082,7 @@ fn parse_response(buf: &[u8], id: u16, name: &str, qtype: u16) -> io::Result<Ans
     let rcode = (flags & 0xF) as u8;
     let qdcount = read_u16(buf, 4)?;
     let ancount = read_u16(buf, 6)?;
+    let nscount = read_u16(buf, 8)?;
     if qdcount != 1 {
         return Err(malformed());
     }
@@ -935,12 +1168,49 @@ fn parse_response(buf: &[u8], id: u16, name: &str, qtype: u16) -> io::Result<Ans
             addrs.push(ip);
         }
     }
+    // A negative answer carries its zone's SOA record in the authority
+    // section, which says how long the answer may be cached. A broken
+    // authority section only costs the caching.
+    let negative_ttl = if addrs.is_empty() && !truncated {
+        negative_ttl(buf, pos, nscount)
+    } else {
+        None
+    };
     Ok(Answer {
         rcode,
         truncated,
         addrs,
         min_ttl,
+        negative_ttl,
     })
+}
+
+/// The negative TTL of the SOA record among the `count` authority records at
+/// `pos`: the smaller of its TTL and its MINIMUM field (RFC 2308, section 5).
+fn negative_ttl(buf: &[u8], mut pos: usize, count: u16) -> Option<u32> {
+    for _ in 0..count {
+        let (_, next) = read_name(buf, pos).ok()?;
+        let rtype = read_u16(buf, next).ok()?;
+        let class = read_u16(buf, next + 2).ok()?;
+        let ttl = read_u32(buf, next + 4).ok()?;
+        let rdlen = read_u16(buf, next + 8).ok()? as usize;
+        let rdata = next + 10;
+        if buf.len() < rdata + rdlen {
+            return None;
+        }
+        if rtype == TYPE_SOA && class == CLASS_IN {
+            // MNAME and RNAME, then SERIAL, REFRESH, RETRY, EXPIRE, MINIMUM.
+            let (_, after_mname) = read_name(buf, rdata).ok()?;
+            let (_, after_rname) = read_name(buf, after_mname).ok()?;
+            let minimum_at = after_rname + 16;
+            if minimum_at + 4 > rdata + rdlen {
+                return None;
+            }
+            return Some(ttl.min(read_u32(buf, minimum_at).ok()?));
+        }
+        pos = rdata + rdlen;
+    }
+    None
 }
 
 // --------------------------------------------------------- system resolver
@@ -1157,6 +1427,17 @@ pub(crate) mod fuzzing {
 mod tests {
     use super::*;
 
+    #[cfg(windows)]
+    #[test]
+    fn no_other_socket_can_take_a_query_sockets_port() {
+        let socket = query_socket((Ipv4Addr::UNSPECIFIED, 0).into()).unwrap();
+        let port = socket.local_addr().unwrap().port();
+        // A more specific address on the same port: Windows lets such a
+        // bind take the port's datagrams unless the first bind is exclusive.
+        let taken = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port));
+        assert!(taken.is_err(), "bound {:?} over the query's port", taken);
+    }
+
     /// The threads that read the system stamps, for the test below.
     #[cfg(windows)]
     static STAMP_THREADS: std::sync::Mutex<Vec<std::thread::ThreadId>> =
@@ -1360,6 +1641,98 @@ mod tests {
         assert_eq!((nx.rcode, nx.addrs.len()), (RCODE_NXDOMAIN, 0));
         let tc = parse_response(&response(&q, 0, true, &[]), 3, "gone.example", TYPE_A).unwrap();
         assert!(tc.truncated);
+    }
+
+    /// The authority section of a negative answer: its SOA record, a
+    /// compressed pointer to the question's name for the owner.
+    fn with_soa(mut r: Vec<u8>, ttl: u32, minimum: u32, before: &[(u16, &[u8])]) -> Vec<u8> {
+        let count = before.len() as u16 + 1;
+        r[8..10].copy_from_slice(&count.to_be_bytes());
+        for (rtype, rdata) in before {
+            r.extend_from_slice(&[0xC0, 12]);
+            r.extend_from_slice(&rtype.to_be_bytes());
+            r.extend_from_slice(&CLASS_IN.to_be_bytes());
+            r.extend_from_slice(&600u32.to_be_bytes());
+            r.extend_from_slice(&(rdata.len() as u16).to_be_bytes());
+            r.extend_from_slice(rdata);
+        }
+        let mut soa = b"\x02ns\xC0\x0C\x05admin\xC0\x0C".to_vec();
+        for field in [2026112201u32, 7200, 900, 1209600, minimum] {
+            soa.extend_from_slice(&field.to_be_bytes());
+        }
+        r.extend_from_slice(&[0xC0, 12]);
+        r.extend_from_slice(&TYPE_SOA.to_be_bytes());
+        r.extend_from_slice(&CLASS_IN.to_be_bytes());
+        r.extend_from_slice(&ttl.to_be_bytes());
+        r.extend_from_slice(&(soa.len() as u16).to_be_bytes());
+        r.extend_from_slice(&soa);
+        r
+    }
+
+    #[test]
+    fn a_negative_answer_carries_the_ttl_of_its_soa_record() {
+        let q = build_query(4, "gone.example", TYPE_A).unwrap();
+        let parse = |r: &[u8]| parse_response(r, 4, "gone.example", TYPE_A).unwrap();
+        // The smaller of the record's TTL and its MINIMUM field.
+        let nx = parse(&with_soa(response(&q, 3, false, &[]), 3600, 60, &[]));
+        assert_eq!((nx.rcode, nx.negative_ttl), (RCODE_NXDOMAIN, Some(60)));
+        let nx = parse(&with_soa(response(&q, 3, false, &[]), 20, 900, &[]));
+        assert_eq!(nx.negative_ttl, Some(20));
+        // NODATA too, and past other authority records.
+        let nodata = parse(&with_soa(
+            response(&q, 0, false, &[]),
+            300,
+            300,
+            &[(2, b"\x02ns\xC0\x0C")],
+        ));
+        assert_eq!((nodata.rcode, nodata.negative_ttl), (0, Some(300)));
+        // No SOA record: nothing to cache by.
+        assert_eq!(parse(&response(&q, 3, false, &[])).negative_ttl, None);
+        // A cut authority section costs the caching, not the answer.
+        let mut cut = with_soa(response(&q, 3, false, &[]), 300, 300, &[]);
+        cut.truncate(cut.len() - 3);
+        let nx = parse(&cut);
+        assert_eq!((nx.rcode, nx.negative_ttl), (RCODE_NXDOMAIN, None));
+        // An SOA whose fields run past its record length is ignored.
+        let mut short = with_soa(response(&q, 3, false, &[]), 300, 300, &[]);
+        let rdlen_at = short.len() - 2 - 18 - 20;
+        let rdlen = u16::from_be_bytes([short[rdlen_at], short[rdlen_at + 1]]);
+        short[rdlen_at..rdlen_at + 2].copy_from_slice(&(rdlen - 4).to_be_bytes());
+        short.truncate(short.len() - 4);
+        assert_eq!(parse(&short).negative_ttl, None);
+        // An answer with addresses is not negative.
+        let ok = parse(&with_soa(
+            response(&q, 0, false, &[(&q[12..26], TYPE_A, 30, &[192, 0, 2, 1])]),
+            300,
+            300,
+            &[],
+        ));
+        assert_eq!((ok.addrs.len(), ok.negative_ttl), (1, None));
+    }
+
+    #[test]
+    fn a_shared_error_keeps_its_code_message_and_os_error() {
+        let os = io::Error::from_raw_os_error(111);
+        let coded: io::Error =
+            crate::error::Error::new(Code::DnsServerUnreachable, "cannot reach", "check it.")
+                .with_source(io::Error::from_raw_os_error(111))
+                .into();
+        let copy = copy_error(&coded);
+        assert_eq!(copy.kind(), coded.kind());
+        assert_eq!(copy.to_string(), coded.to_string());
+        assert_eq!(crate::error::code(&copy), Some(Code::DnsServerUnreachable));
+        let source = std::error::Error::source(copy.get_ref().unwrap()).unwrap();
+        let source = source.downcast_ref::<io::Error>().unwrap();
+        assert_eq!(source.raw_os_error(), Some(111));
+        assert_eq!(copy_error(&os).raw_os_error(), Some(111));
+        let plain = io::Error::new(io::ErrorKind::TimedOut, "slow");
+        let copy = copy_error(&plain);
+        assert_eq!(
+            (copy.kind(), copy.to_string()),
+            (plain.kind(), plain.to_string())
+        );
+        let bare: io::Error = io::ErrorKind::UnexpectedEof.into();
+        assert_eq!(copy_error(&bare).kind(), io::ErrorKind::UnexpectedEof);
     }
 
     /// macOS writes a router's link-local address with its interface

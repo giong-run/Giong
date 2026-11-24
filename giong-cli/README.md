@@ -11,6 +11,7 @@ cargo install giong-cli --locked                            # anywhere Rust runs
 The install scripts download the prebuilt binary of the latest release from GitHub, check its SHA-256 and put it in `~/.giong/bin` (`%USERPROFILE%\.giong\bin` on Windows) without asking for root; where no binary is published they build it with cargo. `GIONG_VERSION=1.5.0` picks a version, `GIONG_INSTALL=/path` another folder, `GIONG_DOWNLOAD_URL` a mirror of the release downloads. Then:
 
 ```sh
+giong new api --db postgres   # a service that builds and passes its tests now
 giong doctor     # is this machine (and project) ready?
 giong dev --background  # build, run on localhost and rebuild on every save; returns once it serves
 giong dev status        # what runs, where, and how the last build went (logs, stop: the same way)
@@ -51,6 +52,38 @@ One project has one `giong dev`, and it is the way to run the service while deve
 
 The service gets the variables of `.env` (those not already set), `WORKERS=2` so a laptop stays usable (`--workers N` sets another number, `--prod-like` leaves it to the service: every core), `RUST_BACKTRACE=1`, and `GIONG_MCP` set to a Unix socket so [giong-mcp](https://github.com/giong-run/Giong/tree/main/giong-mcp) can answer. Its output goes to the terminal and to `.giong/dev.log`; `.giong/dev.json` holds the state of the session (process ids, addresses, the last build and its errors) for other tools, and `--json` prints one event per line. `--once` builds, runs the service until it exits, and stops.
 
+## giong new
+
+```sh
+giong new <dir> [--template web|grpc|worker] [--db postgres,mysql,redis] [--tls] [--name NAME] [--no-git] [--no-ai] [--dry-run]
+```
+
+Writes a project that builds, passes `clippy -D warnings` and passes its tests from the first minute, then runs `git init` and `giong ai init` in it. Every project has one worker per core with graceful shutdown on `SIGTERM`, giong-mcp (off until `GIONG_MCP` is set), an end to end test, `.env.example`, a Dockerfile, a GitHub Actions workflow with the database services it needs, and a dev profile that builds faster: on a PostgreSQL, Redis and TLS service a clean debug build takes 12.6 s instead of 15.3 s and the target directory 296 MB instead of 640 MB (Rust 1.100, [method](https://github.com/giong-run/Giong/tree/main/bench/results/devkit/template-profile)).
+
+| Template | What it is |
+|---|---|
+| `web` (default) | A JSON API on giong-web with `/health` (and `/ready` when it has a database): a users API on PostgreSQL or MySQL (with Redis as a cache when both are chosen), counters on Redis, or a hello service without a database. Migrations in `migrations/`. |
+| `grpc` | A gRPC service from `proto/service.proto` with health and reflection, built by giong-grpc-build (no `protoc` to install). |
+| `worker` | A job runner: jobs claimed from a table with `FOR UPDATE SKIP LOCKED` (PostgreSQL) or in a transaction (MySQL), from a Redis list, or on a timer, with retries and backoff. |
+
+`--tls` serves HTTPS or gRPC over TLS when `TLS_CERT` and `TLS_KEY` are set. `postgres` and `mysql` exclude each other, `grpc` takes no database and `worker` one, without `--tls`: anything else is refused with `GIONG-E5032` and the choices that work. The directory must be new or empty (`GIONG-E5031`); a write that fails takes back everything it made. Every combination is built, linted, tested on io_uring and on epoll against real databases, started and stopped with `SIGTERM` on every pull request.
+
+## giong ai init
+
+```sh
+giong ai init [--dry-run]
+```
+
+Teaches the project to coding agents: `AGENTS.md` (the Gióng rules and this project's commands, read by Codex, Copilot, Cursor, Gemini and others), `CLAUDE.md` (imports `AGENTS.md`), `.cursor/rules/giong.mdc`, the Gióng skill of this release in `.claude/skills/giong/`, and the `giong` server in `.mcp.json`. Run it again at any time: in a file you wrote it replaces only its own marked block, a whole file only while it carries its `giong:owned` line, and in `.mcp.json` it adds its server when missing and keeps everything else. A file it cannot read is left alone, and a `CLAUDE.md` that links to `AGENTS.md` stays a link; it writes through no other link (a repository can commit `.mcp.json` as a link to a file elsewhere) and says so (`GIONG-E5036`). It warns when the project uses another giong version than the command (`GIONG-E5038`).
+
+## giong test
+
+```sh
+giong test [--quick] [--nextest] [--timeout SECS] [-- cargo test arguments]
+```
+
+Runs `cargo test` with the variables of `.env` (those not already set; cargo and rustc settings stay out, `GIONG-E5088`), then on Linux again with `GIONG_DRIVER=epoll`, the driver a container without io_uring gets. Each failing test is a `GIONG-E5083` finding naming the driver it failed on and what it printed. A run longer than `--timeout` (1800 s; 0 for none) is stopped with every process it started, naming the tests still running (`GIONG-E5086`). `--quick` runs once, `--nextest` uses cargo-nextest.
+
 ## giong check
 
 ```sh
@@ -66,6 +99,14 @@ Runs `cargo clippy` (or `cargo check`, when clippy is not installed or with `--n
 | `GIONG-E5008` | a `RefCell` borrow held across an `.await`, which panics when another task borrows it meanwhile |
 
 Code in `spawn_blocking`, threads and tests is left out. Fixes that can be applied as they are come as `edits` in the JSON document. While `giong dev` runs, its last build is in the report too.
+
+## giong fix
+
+```sh
+giong fix [--dry-run] [--allow-dirty] [-- cargo arguments]
+```
+
+Applies the fixes that need no judgement: the compiler's and clippy's machine-applicable suggestions and the `edits` of `giong check`'s findings, then looks again, up to three rounds. Each fix is applied whole or not at all, two fixes that touch the same code are never both applied, an edit outside the project is refused, and a file that changed while it ran is not written (`GIONG-E5082`). It refuses a git repository with changes that are not committed (`GIONG-E5080`) unless `--allow-dirty`; `--dry-run` shows the diff. What it leaves needs a decision: `giong check` lists it.
 
 ## giong doctor
 

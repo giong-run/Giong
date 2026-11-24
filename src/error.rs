@@ -151,6 +151,30 @@ codes! {
     /// A future that had started an I/O operation on one giong worker was
     /// polled on another worker or runtime. It panics with this code.
     WrongWorker = 13, Other, "an operation was polled on another worker";
+    /// [`try_spawn_compute`](crate::try_spawn_compute) refused a closure:
+    /// as many closures as
+    /// [`Builder::compute_backlog`](crate::Builder::compute_backlog) allows
+    /// already wait for a compute thread. The closure was dropped without
+    /// running.
+    ComputeBusy = 14, WouldBlock, "the compute lane is full";
+    /// [`signal::listen`](crate::signal::listen) was asked for a signal that
+    /// cannot be listened for: `SIGKILL` and `SIGSTOP`, which nobody can
+    /// catch, the signals that report a fault in the program itself
+    /// (`SIGSEGV`, `SIGBUS`, `SIGILL`, `SIGFPE`), or a number that is not a
+    /// signal.
+    SignalNotAllowed = 16, InvalidInput, "this signal cannot be listened for";
+    /// Descriptors could not be passed over a Unix socket: too many for one
+    /// message, none of the bytes they must travel with, or a received
+    /// message whose control data the kernel had to cut off.
+    FdPassing = 17, InvalidInput, "descriptors could not be passed";
+    /// A socket handed over by systemd (socket activation) cannot be used
+    /// as asked: the sockets were already taken, or the socket is not the
+    /// kind asked for (a TCP listener asked of a UDP socket, say).
+    ActivatedSocket = 18, InvalidInput, "the inherited socket cannot be used that way";
+    /// giong cannot watch a child process: the kernel refused a pidfd for
+    /// it (Linux older than 5.3, or a seccomp profile that blocks
+    /// `pidfd_open`), or something else in the process reaped it first.
+    ChildProcess = 19, Other, "cannot watch the child process";
     /// A worker thread could not be started, most often because the
     /// process may not have more threads: a container's PID limit (`pids.max`)
     /// or `RLIMIT_NPROC` counts each thread. The kernel's error kind
@@ -167,6 +191,18 @@ codes! {
     /// kernel's error is the [`source`](std::error::Error::source), so
     /// `raw_os_error` stays reachable.
     NetworkBuffersExhausted = 28, OutOfMemory, "the system ran out of network buffers";
+
+    // ------------------------------------------------------------ budgets
+    /// A `try_` call of a [`Budget`](crate::budget::Budget) refused work:
+    /// the budget is at one of its [`Limits`](crate::budget::Limits) (tasks,
+    /// memory or compute closures), or other calls already wait for room.
+    /// The work was dropped without running.
+    BudgetFull = 80, WouldBlock, "the budget is at its limit";
+    /// [`Budget::reserve`](crate::budget::Budget::reserve) or
+    /// [`try_reserve`](crate::budget::Budget::try_reserve) asked for more
+    /// bytes than the budget's whole memory limit, so it could never be
+    /// granted.
+    BudgetTooSmall = 81, InvalidInput, "a reservation larger than the budget";
 
     // ------------------------------------------------------------ ipc
     /// An IPC message is longer than the channel takes: a quarter of its
@@ -319,6 +355,12 @@ codes! {
     /// `transfer-encoding`, `host` and the like), or a value with a line
     /// break or another control character. Raised by `Trailers::field`.
     HttpInvalidTrailer = 1122, InvalidInput, "invalid HTTP trailer field";
+    /// The server could not accept a new connection: the process holds as
+    /// many open files as its limit allows (`EMFILE`, the soft
+    /// `RLIMIT_NOFILE`), or the system does (`ENFILE`). The connection
+    /// waits in the listen queue; each worker says so on stderr, at most
+    /// once a minute.
+    HttpServerOutOfFiles = 1123, Other, "connection not accepted: the server is out of file descriptors";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with

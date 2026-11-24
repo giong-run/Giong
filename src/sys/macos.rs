@@ -580,6 +580,37 @@ pub(crate) unsafe fn sendmmsg(
     count as isize
 }
 
+/// Lowers the calling thread's CPU priority (compute lane threads). The nice
+/// value belongs to the whole process on macOS, so `setpriority` would slow
+/// the workers too: the thread takes the utility quality-of-service class
+/// instead, which the scheduler serves after the workers' default class.
+/// A failure leaves the thread at its old priority, which is safe.
+pub(crate) fn lower_thread_priority(_nice: i32) {
+    // SAFETY: plain call about the calling thread.
+    unsafe { libc::pthread_set_qos_class_self_np(libc::qos_class_t::QOS_CLASS_UTILITY, 0) };
+}
+
+/// A close-on-exec pipe: `[read, write]`. macOS has no `pipe2`: the flag is
+/// set after the `pipe`, as for [`Bell::new`].
+pub(crate) fn cloexec_pipe() -> io::Result<[RawFd; 2]> {
+    let mut fds = [0; 2];
+    // SAFETY: a valid pointer to two descriptors.
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    for fd in fds {
+        // SAFETY: fcntl on a descriptor we own.
+        unsafe { libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) };
+    }
+    Ok(fds)
+}
+
+/// The highest signal number, and the first real-time one: macOS has no
+/// real-time signals, so 31 and 32.
+pub(crate) fn signal_range() -> (i32, i32) {
+    (31, 32)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
