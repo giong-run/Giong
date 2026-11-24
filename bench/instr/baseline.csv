@@ -26,6 +26,8 @@
 # The allocation rows of http1-client and https: #312 merged with main
 # f8686eb, measured locally (the request is no longer copied once per send:
 # one allocation fewer per request; instructions -0.2 to -0.4%).
+# http1-client and https rows: #311 merged with main 851880e (after #312's
+# saving), measured locally: one allocation fewer again per request.
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1397.4,1
 io_uring,spawn,allocations,1.000,1
@@ -45,14 +47,14 @@ io_uring,file-read,instructions,191.7,1
 io_uring,file-read,allocations,0.000,1
 io_uring,http1,instructions,8551.8,1
 io_uring,http1,allocations,1.000,1
-io_uring,http1-client,instructions,22570.3,1
-io_uring,http1-client,allocations,12.008,1
-io_uring,h2,instructions,31631.3,1
-io_uring,h2,allocations,29.001,1
-io_uring,h2-streams,instructions,253592.7,0.5
-io_uring,h2-streams,allocations,286.005,0.5
-io_uring,https,instructions,34649.5,1
-io_uring,https,allocations,18.035,1
+io_uring,http1-client,instructions,22138.8,1
+io_uring,http1-client,allocations,11.008,1
+io_uring,h2,instructions,30231.2,1
+io_uring,h2,allocations,22.000,1
+io_uring,h2-streams,instructions,241316.8,0.5
+io_uring,h2-streams,allocations,230.005,0.5
+io_uring,https,instructions,34250.5,1
+io_uring,https,allocations,17.035,1
 io_uring,web,instructions,11595.5,1
 io_uring,web,allocations,3.000,1
 io_uring,redis-get,instructions,8350.1,1
@@ -88,14 +90,14 @@ epoll,file-read,instructions,243.6,3
 epoll,file-read,allocations,0.016,1
 epoll,http1,instructions,9410.4,1
 epoll,http1,allocations,1.000,1
-epoll,http1-client,instructions,23613.7,1
-epoll,http1-client,allocations,12.000,1
-epoll,h2,instructions,32532.4,1
-epoll,h2,allocations,29.001,1
-epoll,h2-streams,instructions,254714.6,0.5
-epoll,h2-streams,allocations,286.005,0.5
-epoll,https,instructions,35667.0,1
-epoll,https,allocations,18.000,1
+epoll,http1-client,instructions,23184.0,1
+epoll,http1-client,allocations,11.000,1
+epoll,h2,instructions,31128.8,1
+epoll,h2,allocations,22.001,1
+epoll,h2-streams,instructions,242171.3,0.5
+epoll,h2-streams,allocations,230.004,0.5
+epoll,https,instructions,35268.3,1
+epoll,https,allocations,17.000,1
 epoll,web,instructions,12458.6,1
 epoll,web,allocations,3.000,1
 epoll,redis-get,instructions,8920.7,1

@@ -1339,7 +1339,8 @@ impl Client {
             };
             match stream.response().await {
                 Ok(()) => {
-                    let head = h2_head(stream.head());
+                    let fields = stream.take_fields();
+                    let head = h2_head(stream.head(), fields);
                     #[cfg(feature = "unstable-http3")]
                     if route.proxy.is_none() {
                         self.note_alt_svc(url, &head, &stream.head().bytes);
@@ -1455,8 +1456,9 @@ impl Client {
                     drop(stream);
                     conn.handshake().await;
                 }
-                Ok(stream) => {
-                    let head = h2_head(stream.head());
+                Ok(mut stream) => {
+                    let fields = stream.take_fields();
+                    let head = h2_head(stream.head(), fields);
                     self.note_alt_svc(url, &head, &stream.head().bytes);
                     return Ok(Pending::new(
                         None,
@@ -1866,9 +1868,9 @@ struct Pending {
     body: Body,
     /// Set when the body is compressed and the client asked for that.
     inflate: Option<Box<Inflate>>,
-    url: String,
-    /// `METHOD url`, for messages.
+    /// `METHOD url`, for messages; the URL is its tail, from `url_at`.
     what: String,
+    url_at: usize,
 }
 
 /// The body of a response, over either protocol.
@@ -1985,14 +1987,21 @@ impl Pending {
                 });
             }
         }
+        // The method is a token: the first space ends it.
+        let url_at = what.find(' ').map_or(0, |i| i + 1);
+        debug_assert_eq!(what[url_at..], url.text());
         Self {
             lease,
             head,
             body,
             inflate,
-            url: url.text(),
             what,
+            url_at,
         }
+    }
+
+    fn url(&self) -> &str {
+        &self.what[self.url_at..]
     }
 
     fn version(&self) -> Version {
@@ -2110,7 +2119,8 @@ impl Pending {
             fields: self.head.fields,
             body_start: start,
             data,
-            url: self.url,
+            url: self.what,
+            url_at: self.url_at,
         })
     }
 }
@@ -2190,11 +2200,11 @@ fn h2_fields(
 }
 
 /// The head of an HTTP/2 response, as the rest of the client reads heads.
-fn h2_head(head: &h2::ResponseHead) -> Head {
+fn h2_head(head: &h2::ResponseHead, fields: Vec<(Range<usize>, Range<usize>)>) -> Head {
     Head {
         status: head.status,
         minor: 1,
-        fields: head.fields.clone(),
+        fields,
         len: head.bytes.len(),
         content_length: head.content_length,
         chunked: false,
@@ -2650,7 +2660,9 @@ pub struct Response {
     data: Vec<u8>,
     fields: Vec<(Range<usize>, Range<usize>)>,
     body_start: usize,
+    /// `METHOD url`: the URL is its tail, from `url_at`.
     url: String,
+    url_at: usize,
 }
 
 impl Response {
@@ -2685,7 +2697,7 @@ impl Response {
             self.status,
             format!(
                 "{} answered {} {}: {shown:?}{more}",
-                self.url,
+                self.url(),
                 self.status,
                 crate::response::reason(self.status)
             ),
@@ -2722,7 +2734,7 @@ impl Response {
                 ErrorKind::Decode,
                 format!(
                     "the body of {} is not UTF-8 text ({e}); read it with Response::body",
-                    self.url
+                    self.url()
                 ),
             )
         })
@@ -2735,7 +2747,7 @@ impl Response {
 
     /// The URL that answered, after any redirects.
     pub fn url(&self) -> &str {
-        &self.url
+        &self.url[self.url_at..]
     }
 }
 
@@ -2744,7 +2756,7 @@ impl fmt::Debug for Response {
         f.debug_struct("Response")
             .field("status", &self.status)
             .field("version", &self.version)
-            .field("url", &self.url)
+            .field("url", &self.url())
             .field("headers", &self.fields.len())
             .field("body", &self.body().len())
             .finish()
@@ -2821,7 +2833,7 @@ impl StreamingResponse {
             status,
             format!(
                 "{} answered {status} {}",
-                self.pending().url,
+                self.pending().url(),
                 crate::response::reason(status)
             ),
         ))
@@ -2847,7 +2859,7 @@ impl StreamingResponse {
 
     /// The URL that answered, after any redirects.
     pub fn url(&self) -> &str {
-        &self.pending().url
+        self.pending().url()
     }
 
     /// The trailer fields the server sent after the body: in a last
@@ -2965,7 +2977,7 @@ impl fmt::Debug for StreamingResponse {
         let p = self.pending();
         f.debug_struct("StreamingResponse")
             .field("status", &p.head.status)
-            .field("url", &p.url)
+            .field("url", &p.url())
             .field("decompressing", &p.inflate.is_some())
             .finish()
     }
