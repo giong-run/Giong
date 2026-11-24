@@ -14,7 +14,7 @@ fn cargo() -> std::process::Command {
     c.env_remove("CARGO_TARGET_DIR")
         .env_remove("RUSTFLAGS")
         // CI turns incremental builds off; these tests need its data.
-        .env_remove("CARGO_INCREMENTAL")
+        .env("CARGO_INCREMENTAL", "1")
         // CI sets CARGO_TERM_COLOR=always; these tests read cargo's words.
         .env("CARGO_TERM_COLOR", "never");
     c
@@ -260,14 +260,19 @@ fn stale_incremental_data_goes_and_fresh_stays() {
     }
     let dir = TempDir::new("clean-incr");
     new_package(&dir, "incr", "");
-    build(dir.path());
+    let log = build(dir.path());
     let inc = dir.join("target/debug/incremental");
     let fresh: Vec<PathBuf> = std::fs::read_dir(&inc)
-        .unwrap()
-        .flatten()
-        .map(|e| e.path())
-        .collect();
-    assert!(!fresh.is_empty());
+        .map(|d| d.flatten().map(|e| e.path()).collect())
+        .unwrap_or_default();
+    assert!(
+        !fresh.is_empty(),
+        "no incremental data in {}; target/debug holds {:?}; cargo said:\n{log}",
+        inc.display(),
+        std::fs::read_dir(dir.join("target/debug"))
+            .map(|d| d.flatten().map(|e| e.file_name()).collect::<Vec<_>>())
+            .unwrap_or_default()
+    );
     let old = inc.join("incr-oldsession");
     std::fs::create_dir_all(old.join("s-x")).unwrap();
     std::fs::write(old.join("s-x/dep-graph.bin"), vec![1u8; 1000]).unwrap();
