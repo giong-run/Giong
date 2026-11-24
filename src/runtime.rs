@@ -1173,6 +1173,7 @@ pub struct Builder {
     signals: bool,
     spin: Option<Duration>,
     shutdown_grace: Duration,
+    open_files: bool,
     precise_timers: bool,
     /// Makes this worker panic before it reports that it started. A field
     /// of the builder, not a static, so that the runtimes of other tests
@@ -1203,6 +1204,7 @@ impl Builder {
             signals: false,
             spin: None,
             shutdown_grace: Duration::ZERO,
+            open_files: true,
             precise_timers: false,
             #[cfg(test)]
             panic_on_start: None,
@@ -1350,6 +1352,25 @@ impl Builder {
         self
     }
 
+    /// On Linux, raise the process's soft limit on open files
+    /// (`RLIMIT_NOFILE`, `ulimit -n`) to its hard limit when the runtime is
+    /// built (default: `true`). Every connection is a file descriptor, and the soft limit is
+    /// often far below what the system allows: containerd, and so most
+    /// Kubernetes nodes, starts containers at 1,024 soft and 524,288 hard,
+    /// which would stop a server near a thousand connections. Go programs
+    /// raise it the same way.
+    ///
+    /// It is raised once per process, by the first runtime built with this
+    /// on, and never lowered; a limit the program set itself before that is
+    /// raised too. Pass `false` to keep the soft limit as it is, for example
+    /// for a program that starts children which use `select(2)`, whose
+    /// descriptors must stay below 1,024 (children inherit the limit). A hard
+    /// limit of `unlimited` is read as `fs.nr_open`, the most Linux allows.
+    pub fn raise_open_files_limit(mut self, enable: bool) -> Self {
+        self.open_files = enable;
+        self
+    }
+
     /// Graceful shutdown: once a worker's main future has completed, keep
     /// running that worker's remaining tasks for up to `grace`, so they can
     /// finish what they are doing. Tasks still alive after that are dropped.
@@ -1416,6 +1437,9 @@ impl Builder {
     /// Creates the runtime. Nothing runs until [`Runtime::run`] is called.
     pub fn build(self) -> io::Result<Runtime> {
         let cfg = self.config()?;
+        if self.open_files {
+            raise_open_files_limit();
+        }
         let workers = self
             .workers
             .unwrap_or_else(|| default_workers(allowed_cpus().len(), parallelism()));
@@ -1433,6 +1457,9 @@ impl Builder {
     pub fn block_on<F: Future>(self, fut: F) -> io::Result<F::Output> {
         let location = panic::Location::caller();
         let cfg = self.config()?;
+        if self.open_files {
+            raise_open_files_limit();
+        }
         let rt = RuntimeShared::new(1)?;
         // Work sent through a `Handle` after the runtime is gone is cancelled
         // rather than left waiting, on every exit path.
@@ -1665,6 +1692,46 @@ impl Runtime {
         Ok(())
     }
 }
+
+/// Raises the soft `RLIMIT_NOFILE` to the hard one, once per process (see
+/// [`Builder::raise_open_files_limit`]). Failure changes nothing: the
+/// process keeps the limit it had.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn raise_open_files_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` fills the struct it is given, which is of its type.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            return;
+        }
+        let mut max = lim.rlim_max;
+        if max == libc::RLIM_INFINITY {
+            // Linux refuses more than `fs.nr_open` descriptors per process.
+            match std::fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|n| n.trim().parse().ok())
+            {
+                Some(nr_open) => max = nr_open,
+                None => return,
+            }
+        }
+        if lim.rlim_cur >= max {
+            return;
+        }
+        lim.rlim_cur = max;
+        // SAFETY: `setrlimit` reads the struct it is given, which is of its type.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+    });
+}
+
+/// Other systems keep their limit: their hard limits and caps differ from
+/// Linux's, and each port decides for itself. Miri has no `getrlimit`.
+#[cfg(any(not(target_os = "linux"), miri))]
+fn raise_open_files_limit() {}
 
 /// Whether a worker thread could not be started because the process may not
 /// have more threads: the kernel says only `EAGAIN` ("Resource temporarily

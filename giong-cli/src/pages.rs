@@ -1020,6 +1020,30 @@ The message names the field and where the bad byte is, without repeating the val
 
 [All error codes](README.md)
 "#),
+    (1123, r#"# GIONG-E1123: connection not accepted: the server is out of file descriptors
+
+Said on stderr by giong-http's server, at most once a minute on each worker, when it could not accept a new connection because the process holds as many open files as it may. In code: `giong::error::Code::HttpServerOutOfFiles`.
+
+```text
+giong-http: GIONG-E1123 could not accept 37 connection(s) on this worker: Too many open files (os error 24) (open files: 1024, hard limit 1024); new clients wait in the listen queue until a connection closes. Raise the hard limit on open files (docker run --ulimit nofile=, LimitNOFILE= in systemd) or lower max_connections; see docs/errors/E1123.md
+```
+
+## What happened
+
+Every connection is a file descriptor, and so is every open file, socket and pipe of the process. `accept` failed with `EMFILE`: the process holds as many as its soft `RLIMIT_NOFILE` (`ulimit -n`) allows. Or, rarer, with `ENFILE`: the whole system holds as many as `fs.file-max` allows. The server keeps serving the connections it has and tries again 50 ms later; new clients wait in the listen queue, and those that wait longer than their own timeout give up. Nothing else reports it: the clients see a connection that never answers.
+
+On Linux, giong raises the soft limit to the hard one when a runtime is built (`Builder::raise_open_files_limit`), so the limit that was reached is the hard one, or a soft one the program set after that. containerd starts containers at 1,024 soft and 524,288 hard, which giong raises past; a hard limit of 1,024 (`docker run --ulimit nofile=1024:1024`, `LimitNOFILE=1024`) stays.
+
+## How to fix it
+
+- If the server should hold more connections: raise the hard limit where the process starts: `docker run --ulimit nofile=65536:65536`, `ulimits` in Docker Compose, `LimitNOFILE=65536` in a systemd unit, `/etc/security/limits.conf` for a login shell. In Kubernetes the container runtime sets it for every container on the node.
+- If the program lowered its own soft limit, or turned off `raise_open_files_limit`, raise the soft limit or leave it to giong.
+- To stop accepting before the limit, lower `Server::max_connections` (per worker) so that the workers' connections and the program's other files fit under it: new clients then wait in the listen queue by design, and the program's own files (database connections, log files) still open.
+- If the descriptors are not connections (a leak: files or sockets the program opens and never closes), find them: `ls -l /proc/<pid>/fd`, or giong-mcp's `overview`, which warns when four fifths of the limit are open.
+- `ENFILE`: the machine as a whole is out of file descriptors; raise `fs.file-max`, or find the process that holds them.
+
+[All error codes](README.md)
+"#),
     (1201, r#"# GIONG-E1201: invalid route pattern
 
 Raised by giong-web as a panic, when a route is added to a `Router` (`get`, `post`, `route`, `nest`...). The panic points at the line that added it. In code: `giong::error::Code::WebInvalidRoute`.

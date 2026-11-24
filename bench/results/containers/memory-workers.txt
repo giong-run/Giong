@@ -1,0 +1,14 @@
+# bench/results/containers/memory-workers.sh <workers> <unconfined|default>
+# 2026-11-21, same machine and build as cpu-quota.txt, no CPU limit.
+# RSS of the server (VmRSS of process 1) and the container's cgroup usage, idle
+# and after wrk -t4 -c256 -d8s; fallback_msgs = stderr lines saying a worker
+# runs on epoll (with unconfined, 64 workers pass the 8 MiB RLIMIT_MEMLOCK of
+# this Linux 6.18.44: GIONG-E0010, those workers run on epoll).
+workers=1 seccomp=unconfined  | idle_rss_kib=3008 idle_cg_kib=1216 | rps=116373.27 | after_rss_kib=4160 after_cg_kib=2300 | fallback_msgs=0
+workers=4 seccomp=unconfined  | idle_rss_kib=3648 idle_cg_kib=1964 | rps=316089.10 | after_rss_kib=5980 after_cg_kib=4584 | fallback_msgs=0
+workers=16 seccomp=unconfined  | idle_rss_kib=5932 idle_cg_kib=5316 | rps=157430.31 | after_rss_kib=11972 after_cg_kib=11772 | fallback_msgs=0
+workers=64 seccomp=unconfined  | idle_rss_kib=13752 idle_cg_kib=17620 | rps=128302.45 | after_rss_kib=29852 after_cg_kib=34244 | fallback_msgs=1
+workers=1 seccomp=default  | idle_rss_kib=2788 idle_cg_kib=1016 | rps=105059.52 | after_rss_kib=3364 after_cg_kib=1888 | fallback_msgs=1
+workers=4 seccomp=default  | idle_rss_kib=2972 idle_cg_kib=1276 | rps=279824.16 | after_rss_kib=3676 after_cg_kib=2176 | fallback_msgs=1
+workers=16 seccomp=default  | idle_rss_kib=3620 idle_cg_kib=2316 | rps=156736.56 | after_rss_kib=5132 after_cg_kib=3964 | fallback_msgs=1
+workers=64 seccomp=default  | idle_rss_kib=6640 idle_cg_kib=7172 | rps=119571.02 | after_rss_kib=11268 after_cg_kib=12120 | fallback_msgs=1

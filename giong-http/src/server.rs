@@ -11,6 +11,7 @@ use std::ops::Deref;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::{pin, Pin};
 use std::rc::Rc;
+use std::sync::OnceLock;
 use std::task::{Context, Poll, Waker};
 use std::time::{Duration, Instant};
 
@@ -1087,6 +1088,7 @@ impl Server {
             }
         };
         let slots = Rc::new(Slots::new(self.cfg.max_connections));
+        open_files_limits();
         // Below the limit, a slot first and then the connection. At the
         // limit, the connection first, so that an idle connection is asked
         // to make room only for a client that is there (one connection past
@@ -1108,7 +1110,12 @@ impl Server {
             match accepted {
                 Ok((stream, slot)) => spawn(stream, slot),
                 // For example EMFILE: back off instead of spinning.
-                Err(_) => sleep(Duration::from_millis(50)).await,
+                Err(e) => {
+                    if matches!(e.raw_os_error(), Some(EMFILE | ENFILE)) {
+                        note_out_of_files(&e);
+                    }
+                    sleep(Duration::from_millis(50)).await
+                }
             }
         }
         // Connections established just before the shutdown still get served.
@@ -1507,7 +1514,15 @@ thread_local! {
     static REFUSING: Cell<usize> = const { Cell::new(0) };
     /// Connections refused since the worker last said so, and when it did.
     static REFUSED: Cell<(u64, Option<Instant>)> = const { Cell::new((0, None)) };
+    /// Accepts that failed for want of file descriptors since the worker
+    /// last said so, and when it did.
+    static OUT_OF_FILES: Cell<(u64, Option<Instant>)> = const { Cell::new((0, None)) };
 }
+
+/// `accept` errors for want of file descriptors: the process's limit, and
+/// the system's (the same numbers on Linux and macOS).
+const EMFILE: i32 = 24;
+const ENFILE: i32 = 23;
 
 /// The answer to a connection refused because memory is low.
 const LOW_MEMORY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
@@ -1578,6 +1593,47 @@ fn note_refused_connection(reserve: u64) {
             reserve >> 20
         );
     });
+}
+
+/// Says on stderr, at most once a minute per worker, that connections wait
+/// because the process is out of file descriptors (GIONG-E1123): without it
+/// a server at its limit serves the connections it has and says nothing,
+/// while new clients wait in the listen queue.
+fn note_out_of_files(e: &io::Error) {
+    let _ = OUT_OF_FILES.try_with(|failed| {
+        let (count, last) = failed.get();
+        let now = Instant::now();
+        if last.is_some_and(|last| now.duration_since(last) < Duration::from_secs(60)) {
+            failed.set((count + 1, last));
+            return;
+        }
+        failed.set((0, Some(now)));
+        let limits = open_files_limits()
+            .map(|(soft, hard)| format!(" (open files: {soft}, hard limit {hard})"))
+            .unwrap_or_default();
+        eprintln!(
+            "giong-http: GIONG-E1123 could not accept {} connection(s) on this worker: {e}{limits}; \
+             new clients wait in the listen queue until a connection closes. Raise the hard \
+             limit on open files (docker run --ulimit nofile=, LimitNOFILE= in systemd) or \
+             lower max_connections; see docs/errors/E1123.md",
+            count + 1,
+        );
+    });
+}
+
+/// The soft and hard limits on open files, from `/proc/self/limits`, read
+/// once when the first accept loop starts: reading them needs a descriptor,
+/// which is what is missing when they are wanted.
+fn open_files_limits() -> Option<&'static (String, String)> {
+    static LIMITS: OnceLock<Option<(String, String)>> = OnceLock::new();
+    LIMITS
+        .get_or_init(|| {
+            let limits = std::fs::read_to_string("/proc/self/limits").ok()?;
+            let line = limits.lines().find(|l| l.starts_with("Max open files"))?;
+            let mut fields = line.split_whitespace().skip(3);
+            Some((fields.next()?.to_owned(), fields.next()?.to_owned()))
+        })
+        .as_ref()
 }
 
 /// An HTTP/2 connection chosen through ALPN: its own task body.

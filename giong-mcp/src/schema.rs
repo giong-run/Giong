@@ -85,10 +85,25 @@ pub(crate) fn overview() -> Value {
                 }),
                 &["pid", "uptime_s", "rss_bytes", "threads", "open_fds", "fd_limit"],
             ),
+            "limits": object(
+                json!({
+                    "cpus": or_null(int()),
+                    "cpu_quota": or_null(num()),
+                    "memory_bytes": or_null(int()),
+                    "pids_max": or_null(int()),
+                    "pids_current": or_null(int()),
+                    "open_files": or_null(int()),
+                    "open_files_hard": or_null(int()),
+                }),
+                &["cpus", "cpu_quota", "memory_bytes", "pids_max", "pids_current", "open_files",
+                  "open_files_hard"],
+            ),
             "runtime": object(
-                json!({ "workers": int(), "shutting_down": { "type": "boolean" },
+                json!({ "workers": int(),
+                        "workers_from": { "type": "string", "enum": ["cpus", "cpu_quota", "set"] },
+                        "shutting_down": { "type": "boolean" },
                         "profiling": { "type": "boolean" } }),
-                &["workers", "shutting_down", "profiling"],
+                &["workers", "workers_from", "shutting_down", "profiling"],
             ),
             "workers": array(object(
                 json!({
@@ -107,7 +122,14 @@ pub(crate) fn overview() -> Value {
             )),
             "warnings": array(text()),
         }),
-        &["giong_mcp", "process", "runtime", "workers", "warnings"],
+        &[
+            "giong_mcp",
+            "process",
+            "limits",
+            "runtime",
+            "workers",
+            "warnings",
+        ],
     )
 }
 

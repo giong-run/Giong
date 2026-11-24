@@ -29,7 +29,7 @@ workspace, thirteen crates and three examples:
 | `giong-web/` | `giong-web` | a router, middleware (request ids, JSON-line logs, CORS, gzip, timeouts; `tracing` spans behind `tracing`) and JSON on giong-http |
 | `giong-mcp/` | `giong-mcp` | an MCP server that lets agents read a running service's workers, tasks, pools and profiles |
 | `giong-compat/` | `giong-compat` | `Compat`: Tokio and futures-io `AsyncRead`/`AsyncWrite`/`AsyncBufRead` for giong's streams, for transport-generic crates (h2, tokio-rustls, tokio-tungstenite, hyper's `conn`) |
-| `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server |
+| `examples/rest-api/` | `rest-api` (not published) | a complete REST API: PostgreSQL, a Redis cache, HTTPS; its test needs PostgreSQL and redis-server; `Dockerfile` and `compose.yaml` run it in containers |
 | `giong-proto/` | `giong-proto` (new in 1.1) | Protocol Buffers decoded as views over the receive buffer (no copy, no allocation); message structs for encoding; codes `GIONG-E4001`-`E4008`. `conformance/` holds Google's conformance testee and the differential tests against prost |
 | `giong-grpc-build/` | `giong-grpc-build` (new in 1.1) | generates giong-proto messages and giong-grpc service traits, servers and clients from `.proto` files at build time, parsed in Rust by protox (no `protoc`) |
 | `giong-grpc/` | `giong-grpc` (new in 1.1) | gRPC servers and clients on giong-http's HTTP/2: the four kinds of call, deadlines, cancellation, metadata, gzip, health and reflection; codes `GIONG-E4101`-`E4110`. `interop/run.sh` runs gRPC's interoperability cases against grpc-go (needs Go); `tests/generated/` and `src/generated/` hold generated code that `tests/generated.rs` keeps current (`GIONG_GRPC_REGENERATE=1` rewrites it) |
@@ -59,6 +59,12 @@ Where the code is:
 | `src/observe/requests.rs` | request tracing: `RequestTrace`, `wait`, `set_route`, `take_requests` |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
 
+A service built on giong for a container (Docker, Kubernetes, a sandbox): start from
+`examples/rest-api/Dockerfile`; set `Builder::shutdown_on_signals(true)`, and leave the
+worker count to giong unless the pod has a CPU request and no limit. giong raises the soft
+`RLIMIT_NOFILE` to the hard one itself (`Builder::raise_open_files_limit`). [docs/DEPLOYMENT.md](docs/DEPLOYMENT.md) has the why and
+the numbers.
+
 Which crate to use, in this repository and in a service built on giong: the giong crate
 for the job first (HTTP server and client, routing, TLS, PostgreSQL, MySQL, Redis, files,
 names, timers); then a crate that needs no runtime; then a Tokio-ecosystem crate that takes
@@ -74,12 +80,12 @@ To find out why a giong service is slow, stuck or leaking, ask it rather than gu
 `let _mcp = giong_mcp::start_from_env(&handle);` alive; run it with
 `GIONG_MCP=127.0.0.1:7777` and `GIONG_MCP_TOKEN` (16 characters or more), and connect with
 `claude mcp add --transport http giong http://127.0.0.1:7777/mcp --header "Authorization: Bearer $GIONG_MCP_TOKEN"`.
-Tools: `overview` (memory, threads, open descriptors, workers, warnings such as a blocked
-worker), `workers`, `tasks` (live tasks by the line that spawned them), `sources` (database
-pools), `profile` (where the workers spent a time window) and `slow_requests` (per route,
-where the time of the slowest requests went: pool waits, queries, other services, the
-handler's code, a worker blocked by another task, with a verdict and its confidence). It
-listens on loopback or a Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
+Tools: `overview` (memory, threads, open descriptors, container limits and why this many
+workers, warnings such as a blocked worker), `workers`, `tasks` (live tasks by the line that
+spawned them), `sources` (database pools), `profile` (where the workers spent a time window)
+and `slow_requests` (per route, where the time of the slowest requests went: pool waits,
+queries, other services, the handler's code, a worker blocked by another task, with a verdict
+and its confidence). It listens on loopback or a Unix socket only and only reads. Details: [giong-mcp/README.md](giong-mcp/README.md).
 
 ## The machine you need
 
