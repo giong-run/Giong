@@ -274,6 +274,15 @@ struct Analysis {
 }
 
 /// What the slow requests of one route spent their time on, and why.
+/// Whether other tasks' long polls, explaining `blocked` of the slow
+/// requests' extra time, explain it better than the dominant phase does
+/// with `phase`. Both are shares of the same quantity: blocked time is
+/// part of a phase (the request is suspended while the worker runs other
+/// tasks), so it cannot exceed the phase it sits in.
+fn blocked_wins(blocked: f64, phase: f64) -> bool {
+    blocked >= 0.3 && blocked >= phase * 0.8
+}
+
 fn analyse(
     name: &str,
     r: &RouteStats,
@@ -292,6 +301,7 @@ fn analyse(
     let tail_means: Vec<Duration> = tp.iter().map(|d| mean(*d, n)).collect();
     let fast_means: Vec<Duration> = fp.iter().map(|d| mean(*d, fast.requests)).collect();
     let blocked = mean(tail.blocked, n);
+    let fast_blocked = mean(fast.blocked, fast.requests);
 
     // Which phase makes the slow requests slow: the one that grows most
     // from the faster half to the tail, when the tail stands out; else the
@@ -349,9 +359,15 @@ fn analyse(
         _ => "unattributed_wait",
     };
     let mut strength = share_of_excess.unwrap_or(share_of_tail);
-    if blocked_share >= 0.3 && blocked_share >= strength * 0.8 {
+    // Measured like the dominant phase: the share of the excess when the
+    // tail stands out, else the share of the tail's time.
+    let blocked_strength = match share_of_excess {
+        Some(_) => blocked.saturating_sub(fast_blocked).as_secs_f64() / excess.as_secs_f64(),
+        None => blocked_share,
+    };
+    if blocked_wins(blocked_strength, strength) {
         cause = "worker_blocked";
-        strength = blocked_share;
+        strength = blocked_strength;
     } else if cause == "unattributed_wait" && max_busy >= 0.85 {
         cause = "worker_saturated";
     }
@@ -702,6 +718,18 @@ fn suggestion(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// macOS CI, #181: blocked time explained 91% of the excess (6.2 of
+    /// 6.8 ms) and the suspended phase 99.9%. Compared with blocked time's
+    /// share of the whole tail (77%) instead, it lost to the phase it is
+    /// part of, and the verdict blamed unnamed waits.
+    #[test]
+    fn blocked_time_is_weighed_like_the_phase_it_sits_in() {
+        assert!(blocked_wins(0.91, 0.999));
+        assert!(!blocked_wins(0.768 * 0.9, 0.999));
+        assert!(!blocked_wins(0.25, 0.3));
+        assert!(blocked_wins(0.5, 0.6));
+    }
 
     #[test]
     fn quantile_labels() {
