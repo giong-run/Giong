@@ -16,6 +16,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
+use std::hash::{BuildHasherDefault, Hasher};
 use std::mem;
 use std::ops::Range;
 use std::pin::pin;
@@ -341,6 +342,15 @@ impl Stream {
             .expect("the head is read before anything asks for it")
     }
 
+    /// The head's field positions, taken once for the response the caller
+    /// builds: nothing here reads them after.
+    pub(crate) fn take_fields(&mut self) -> Vec<(Range<usize>, Range<usize>)> {
+        self.head
+            .as_mut()
+            .map(|head| std::mem::take(&mut head.fields))
+            .unwrap_or_default()
+    }
+
     /// The length of the body, when known: none for a `HEAD` request or
     /// a `204` or `304` answer, otherwise what `content-length` says.
     pub(crate) fn body_length(&self) -> Option<u64> {
@@ -541,6 +551,25 @@ pub(super) struct Decoded {
     pub(super) malformed: Option<&'static str>,
 }
 
+impl Decoded {
+    fn clear(&mut self) {
+        self.status = None;
+        self.bytes.clear();
+        self.fields.clear();
+        self.size = 0;
+        self.content_length = None;
+        self.malformed = None;
+    }
+}
+
+/// The decode buffer a connection keeps between header blocks; one that
+/// grew past this (a huge head) is let go.
+const KEEP_DECODED: usize = 4096;
+
+/// The write buffer a connection keeps for the next write; one that grew
+/// past this (request bodies) is let go.
+const KEEP_OUT: usize = 4096;
+
 /// A connection error: what the GOAWAY says, and the message requests get.
 struct ConnError {
     reason: Reason,
@@ -561,14 +590,41 @@ fn reason_name(code: u32) -> String {
     }
 }
 
+/// Hashes the stream ids that key [`State::streams`]. The client picks
+/// them itself (odd, counting up), so no server can choose ids that
+/// collide; SipHash, the default, costs about a hundred instructions a
+/// lookup, and a request makes seven. Multiplying by an odd constant keeps
+/// distinct ids distinct in the low bits, and mixes them into the high
+/// bits the table also uses.
+#[derive(Default)]
+struct IdHash(u64);
+
+impl Hasher for IdHash {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 = (self.0.rotate_left(8) ^ u64::from(b)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+        }
+    }
+
+    fn write_u32(&mut self, n: u32) {
+        self.0 = (self.0 ^ u64::from(n)).wrapping_mul(0x9e37_79b9_7f4a_7c15);
+    }
+}
+
 /// The protocol state of a connection, without I/O: frames in, frames out.
 struct State {
     encoder: Encoder,
     decoder: Decoder,
     /// Frames to write.
     out: Vec<u8>,
+    /// The last buffer written, kept empty for the next `out`.
+    spare: Vec<u8>,
     next_id: u32,
-    streams: HashMap<u32, StreamState>,
+    streams: HashMap<u32, StreamState, BuildHasherDefault<IdHash>>,
     /// Streams with request body to send, served in turn.
     sending: VecDeque<u32>,
     /// Streams whose streamed request body has sent its last piece and
@@ -590,6 +646,9 @@ struct State {
     /// Why the connection can carry nothing more; set when it ends.
     dead: Option<String>,
     block: Option<Block>,
+    /// Where header blocks are decoded, kept between blocks so a response
+    /// head costs one exact allocation and trailers none.
+    decoded: Decoded,
     max_head_size: usize,
     /// No stream open since then.
     idle_since: Instant,
@@ -607,8 +666,9 @@ impl State {
             encoder: Encoder::new(),
             decoder: Decoder::new(TABLE_SIZE),
             out: Vec::new(),
+            spare: Vec::new(),
             next_id: 1,
-            streams: HashMap::new(),
+            streams: HashMap::default(),
             sending: VecDeque::new(),
             pulling: Vec::new(),
             peer_max_streams: INITIAL_MAX_STREAMS,
@@ -621,6 +681,7 @@ impl State {
             goaway: None,
             dead: None,
             block: None,
+            decoded: Decoded::default(),
             max_head_size,
             idle_since: Instant::now(),
             pings: HashMap::new(),
@@ -1311,18 +1372,31 @@ impl State {
     /// the block is for, so every block is decoded.
     fn decode(&mut self, block: &[u8]) -> Result<Decoded, ConnError> {
         let max = self.max_head_size;
-        let mut d = Decoded::default();
-        self.decoder
-            .decode(block, |name, value| check_field(&mut d, max, name, value))
-            .map_err(|e| ConnError {
+        let mut d = std::mem::take(&mut self.decoded);
+        d.clear();
+        let result = self
+            .decoder
+            .decode(block, |name, value| check_field(&mut d, max, name, value));
+        if let Err(e) = result {
+            self.decoded = d;
+            return Err(ConnError {
                 reason: Reason::Compression,
                 detail: format!("a header block could not be decoded: {}", e.0),
-            })?;
+            });
+        }
         Ok(d)
     }
 
     fn header_block(&mut self, id: u32, end_stream: bool, block: &[u8]) -> Result<(), ConnError> {
         let d = self.decode(block)?;
+        let result = self.decoded_block(id, end_stream, &d);
+        if d.bytes.capacity() <= KEEP_DECODED && d.fields.capacity() <= KEEP_DECODED / 64 {
+            self.decoded = d;
+        }
+        result
+    }
+
+    fn decoded_block(&mut self, id: u32, end_stream: bool, d: &Decoded) -> Result<(), ConnError> {
         let max = self.max_head_size;
         let Some(s) = self.streams.get_mut(&id) else {
             // A stream given up: the block only mattered to the table.
@@ -1415,8 +1489,8 @@ impl State {
         s.content_length = d.content_length;
         s.head = Some(ResponseHead {
             status,
-            bytes: d.bytes,
-            fields: d.fields,
+            bytes: d.bytes.clone(),
+            fields: d.fields.clone(),
             content_length: d.content_length,
         });
         if end_stream {
@@ -1761,7 +1835,7 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
     let mut timer = pin!(sleep_until(Instant::now() + settings.idle_timeout));
     if false {
         // Names the type of the write future for `write`.
-        write.set(Some(socket.write_all(Vec::new())));
+        write.set(Some(socket.write_all_back(Vec::new())));
     }
     loop {
         let (out, over, reading, idle_since) = {
@@ -1780,14 +1854,17 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
                     st.end("the server closed the connection (GOAWAY)".into(), false);
                 }
             }
-            let out = (write.is_none() && !st.out.is_empty()).then(|| mem::take(&mut st.out));
+            let out = (write.is_none() && !st.out.is_empty()).then(|| {
+                let spare = mem::take(&mut st.spare);
+                mem::replace(&mut st.out, spare)
+            });
             st.poked = false;
             // Once the connection is over, only the last write is waited for.
             let idle_since = st.is_idle().then_some(st.idle_since);
             (out, st.dead.is_some(), st.reading(), idle_since)
         };
         if let Some(out) = out {
-            write.set(Some(socket.write_all(out)));
+            write.set(Some(socket.write_all_back(out)));
             write_deadline = Some(Instant::now() + settings.write_timeout);
         }
         if over && write.is_none() {
@@ -1831,11 +1908,15 @@ async fn drive(socket: Socket, inner: Rc<Inner>, settings: Settings) {
         })
         .await;
         match woke {
-            Wake::Wrote(Ok(())) => {
+            Wake::Wrote((Ok(()), mut buf)) => {
                 write.set(None);
                 write_deadline = None;
+                if buf.capacity() <= KEEP_OUT {
+                    buf.clear();
+                    inner.state.borrow_mut().spare = buf;
+                }
             }
-            Wake::Wrote(Err(e)) => {
+            Wake::Wrote((Err(e), _)) => {
                 write.set(None);
                 inner
                     .state
@@ -2483,6 +2564,31 @@ mod tests {
             check_field(&mut d, max, n, v);
         }
         d
+    }
+
+    #[test]
+    fn the_kept_decode_buffer_starts_clean_for_each_block() {
+        let mut st = State::new(16 * 1024);
+        let mut encoder = Encoder::new();
+        let mut bad = Vec::new();
+        encoder.begin(&mut bad);
+        encoder.status(200, &mut bad);
+        encoder.field(b"x-one", b"1", Index::No, &mut bad);
+        encoder.field(b"connection", b"close", Index::No, &mut bad);
+        let d = st.decode(&bad).ok().expect("decodable");
+        assert!(d.malformed.is_some());
+        st.decoded = d;
+        let mut good = Vec::new();
+        encoder.begin(&mut good);
+        encoder.status(204, &mut good);
+        encoder.field(b"x-two", b"2", Index::No, &mut good);
+        let d = st.decode(&good).ok().expect("decodable");
+        assert_eq!(d.malformed, None);
+        assert_eq!(d.status, Some(204));
+        assert_eq!(d.content_length, None);
+        assert_eq!(d.fields.len(), 1);
+        assert_eq!(&d.bytes[d.fields[0].0.clone()], b"x-two");
+        assert_eq!(&d.bytes[d.fields[0].1.clone()], b"2");
     }
 
     #[test]

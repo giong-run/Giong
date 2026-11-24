@@ -8,6 +8,209 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.4.2] - 2026-11-24
+
+Faster requests and the rest of the fixes from the review of 1.4.0, with nothing new to
+learn. A client request over HTTP/1.1 or HTTP/2 costs about a quarter fewer CPU instructions,
+a giong-web request 13% fewer, a gRPC unary call 22% fewer and an HTTP/3 request 6.6% fewer,
+and giong-quic no longer slows a busy connection for every idle one beside it. On Windows, a
+TCP write to a peer that stopped reading now waits for it instead of handing the kernel the
+whole buffer, timers fire within a millisecond or two instead of 15.6 ms late, and a waiting
+UDP receive holds no buffer. At `max_connections`, giong-http closes the connection idle
+longest for a new client instead of leaving it in the listen queue. Database pools no longer
+open a connection attempt for every call while their server is down, and giong-mysql takes
+turns at `max_prepared_stmt_count` instead of failing. A second Ctrl+C or SIGTERM now ends a
+process whose shutdown hangs. No API is removed or changed.
+
+### Changed
+
+- **giong-http**: the client no longer copies a request, body included, every time it sends
+  it over HTTP/1.1 (kept in case a closed keep-alive connection makes it send the request
+  again): the request is lent to the connection and handed back whole. 200 uploads of 1 MiB
+  to a giong-http server in one process ran 86.0 million instructions before and 55.0
+  million after (callgrind), and each upload allocates 1 MiB less.
+- **giong-mysql**, **giong-postgres**: fewer allocations per statement. A request
+  waited for by one task keeps its waker without a vector; giong-mysql no longer copies
+  the column definitions that every run of a prepared statement sends again when they
+  match the last run's, and giong-postgres reads what it needs of the command tag
+  instead of keeping a copy. Measured with `bench/instr` (a query with one parameter
+  and one row against a fake server): giong-mysql 27 to 23 allocations and 14,129 to
+  13,711 instructions per query (2.96% fewer) on io_uring, 14,744 to 14,326 on epoll;
+  giong-postgres 16 to 14 allocations, instructions unchanged (10,249 to 10,241).
+  Both counts include the fake server's own allocations.
+- **giong-http**: at `Server::max_connections`, the server closes the connection that has been
+  idle longest (HTTP/1.1 between requests, HTTP/2 with no request open) when a new client
+  arrives, as nginx does with keep-alive connections, instead of leaving the new client in the
+  listen queue until a connection closes on its own, up to `idle_timeout` later. A client, or
+  many browsers, holding the limit in idle keep-alive connections no longer locks every new
+  client out. A connection receiving or answering a request is never closed for this, nor an
+  HTTP/1.1 connection that has not sent its first request yet, nor one whose next request has
+  already arrived. On Linux and macOS; on Windows the server still waits. It costs an idle
+  connection 16 to 32 bytes and a request under 1% more CPU instructions (`bench/instr`).
+  Fixes [#266](https://github.com/giong-run/Giong/issues/266).
+- **giong-grpc**: a unary call costs 22% fewer CPU instructions, client and server counted
+  together (88,317 to 68,941 on one worker over loopback). The client no longer copies the
+  request and response futures each time it awaits them nor boxes the wait for each message,
+  formats the `grpc-timeout` value and the URL without `format!`, and lowercases metadata
+  names only when they are not lowercase already; the server reads the call's header fields
+  in one pass instead of one per field it looks for, and writes the status into the trailers
+  without formatting the code or copying the field names.
+- **giong-http**: the HTTP/2 client decodes header blocks into a buffer it keeps between
+  blocks (one exact allocation for a response head, none for trailers), reuses its write
+  buffer, and hands the response its header positions instead of a copy; a buffered response
+  keeps its URL inside the request description instead of a second string. `bench/instr`,
+  io_uring: `h2` 31,631 to 30,231 instructions and 29 to 22 allocations per request,
+  `h2-streams` 253,593 to 241,317, `http1-client` 22,570 to 22,260, `https` 34,649 to 34,337.
+  `Request::header` compares names as bytes, without a UTF-8 check of each one.
+- **giong-http**: an HTTP/3 request costs 6.6% fewer CPU instructions, client and server
+  counted together (114,971 to 107,418 for a small GET on one worker over loopback). QPACK
+  finds the static entries of a field name with one `match` instead of a binary search that
+  compared about a dozen names per field, and the Huffman code of HPACK and QPACK encodes
+  32 bits at a time into the bytes it reserved, computing the coded length once instead of
+  twice (39% fewer instructions), and decodes without a branch per four bits (14% fewer).
+- **giong-http**: a request from the client to the server costs a quarter fewer CPU
+  instructions, both ends counted, over HTTP/1.1 and HTTP/2 (`bench/instr`, io_uring:
+  `http1-client` 30,851 to 22,570, `h2` 43,481 to 31,631, `h2-streams` 372,328 to 253,593,
+  `https` 42,927 to 34,649; heap allocations per request 33 to 13 over HTTP/1.1 and 48 to 29
+  over HTTP/2). The client no longer formats the URL and the `Host` header with `format!` for
+  every request (four times each), and looks the route's pool up once instead of twice; the
+  HPACK encoder finds a name in the static table with one `match` instead of comparing it with
+  all 61 entries; the HTTP/2 and HTTP/3 servers read a response's header fields without a
+  UTF-8 check and substring searches; the HTTP/2 client keys its streams with a cheap hash of
+  the ids it picks itself instead of SipHash; header names are checked against a table; and a
+  response's first header field is written into a buffer allocated once instead of grown three
+  times. The HTTP/1.1 server alone costs 8% less (`http1` 9,421 to 8,642, heap allocations per
+  request 3 to 1), and a giong-web route 5% less (`web` 13,414 to 12,711, allocations 5 to 3).
+- **giong-web**: a request costs about 8% fewer instructions (the `web` case of `bench/instr`:
+  12,711 to 11,596 on io_uring, 13,571 to 12,459 on epoll; 7.7% fewer with two middleware,
+  measured before the HTTP/1.1 header change above). `Req` is 328 bytes instead of 416 (the
+  first four path parameters are kept inline, more on the heap), `Next::run` starts the next
+  middleware or the handler without an async layer of its own, which each moved the request,
+  and a path parameter is cut from the request target without finding the path again. Routes
+  find `/` with a byte search. ([#331](https://github.com/giong-run/Giong/issues/331)).
+- **giong-http**: `Request::path` and `Request::query` find the path and the query with a
+  byte search, and look for a scheme and host only in a target that does not start with
+  `/` ([#331](https://github.com/giong-run/Giong/issues/331)).
+- **giong-quic**: an endpoint finds the connections whose timers are due in a heap, instead
+  of asking every connection it holds for its next deadline twice at each wake of its
+  driver. A busy connection no longer pays for the idle ones next to it: with one worker
+  holding a server and a client endpoint, a stream round trip took 16 µs of CPU with no
+  other connection, 104 µs with 1,000 idle ones, 513 µs with 3,000 and 3.5 ms with 10,000;
+  it now takes 11–13 µs in all four cases. HTTP/3 in giong-http runs on it
+  ([#264](https://github.com/giong-run/Giong/issues/264)).
+
+### Fixed
+
+- **giong-http**: the HTTP/1.1 client returns the answer a server sent before it read the
+  whole request body, such as a 413 or a 401 followed by a close, instead of
+  `GIONG-E1106` "sending the request failed", where the system kept that answer readable
+  after the server's reset (Linux does; Windows and some BSD timings discard it). It
+  already did so for streamed bodies; a buffered body now gets the same. A 408 on a
+  kept-alive connection is still taken as the server closing it while idle, and a safe
+  request is sent again on a new connection
+  ([#232](https://github.com/giong-run/Giong/issues/232)).
+- **giong-http**: a client error for a request not sent again on a reused connection
+  ("the connection had been used before...") names its code and link once, and keeps its
+  `io::Error` source, so `io::Error::from(e).kind()` is `ConnectionReset` again when the
+  server reset the connection ([#235](https://github.com/giong-run/Giong/issues/235)).
+- **giong**: 64 file operations that never return on blocking threads (opens
+  of FIFOs with no writer, calls on a hung network filesystem; every file operation on the
+  epoll and kqueue drivers runs there) no longer hold up every other
+  file operation of the process. When every blocking thread is busy and none finishes for
+  100 ms, the pool grows (at most doubling per 100 ms), up to 512 threads
+  ([#260](https://github.com/giong-run/Giong/issues/260)).
+- **giong-mysql**: a burst of distinct statements at the server's `max_prepared_stmt_count`
+  no longer fails. Once a connection hits the limit (error 1461), its prepares take turns:
+  each closes the statements nobody is using and tries again, with a short pause, until
+  no prepare on the connection has succeeded for a second. Before, each prepare tried
+  only once more, and 2,482 of 3,000 concurrent tasks over 41 statements failed against
+  a limit of 8 ([#242](https://github.com/giong-run/Giong/issues/242)).
+- **giong-postgres**, **giong-mysql**, **giong-redis**: a pool no longer opens a connection
+  attempt for every call while its server is down. After a failed attempt, the pool
+  opens one connection at a time until one succeeds, and tasks that waited through a
+  failed attempt, with no connection open to wait for, get its error at once. With no
+  connection open, calls after a failure also get its error at once for a pause of 10 ms
+  that doubles with each failure in a row up to 1 s, less a random part of up to half.
+  Measured against a closed port with a pool of 4: 64 tasks calling for 300 ms make 6
+  attempts for about 9,600 calls in each crate, where every call made its own attempt
+  before (9,004 of 9,004 with MySQL); one task calling every millisecond for 400 ms makes
+  6 attempts for 200 calls, where it made 200. The error is the server's own, as before,
+  and the first success clears the state ([#247](https://github.com/giong-run/Giong/issues/247)).
+- **giong**: `Handle::pulse` no longer reports more idle time between two readings than passed
+  between them. A reading taken while a worker had read the clock for its sleep, but not yet
+  published it, missed the sleep, and the next reading then counted the sleep from before the
+  first one ([#320](https://github.com/giong-run/Giong/issues/320)).
+- **giong**: sources registered with `observe::register` that were dropped no longer stay
+  in the worker's list (holding their allocation) until a `snapshot()`: registering drops
+  them whenever the list has doubled. Every database pool registers one
+  ([#249](https://github.com/giong-run/Giong/issues/249)).
+- **giong**: a worker thread that panics while it starts now fails `Runtime::run` at once,
+  with that panic, before any worker runs; the runtime used to run on the other workers and
+  raise the panic only when it ended ([#250](https://github.com/giong-run/Giong/issues/250)).
+- **giong**: CPU pinning reads and sets the affinity with a mask sized to the machine, so
+  it keeps a container's CPU set and no longer panics a worker on machines with more than
+  1024 possible CPUs ([#251](https://github.com/giong-run/Giong/issues/251)).
+- **giong**: a task whose future panics while it is dropped after finishing now reports
+  `JoinError::Panic`, not `JoinError::Cancelled`
+  ([#252](https://github.com/giong-run/Giong/issues/252)).
+- **giong**: with `Builder::shutdown_on_signals(true)`, a second SIGINT or SIGTERM now ends
+  the process at once, as it would with no handler; every signal after the first used to be
+  ignored, so a shutdown that hung could be stopped only with `kill -9`. A signal within
+  250 ms of the first counts as the same request, since wrappers such as cargo-watch
+  forward the Ctrl-C their process group also got
+  ([#271](https://github.com/giong-run/Giong/issues/271)).
+- **giong-web**: `RequestId` no longer gives the same id on two threads. The middle part of
+  an id was the worker index, which two runtimes in one process share (each has a worker
+  0) and which every thread off a worker shared as `ffff`, with counters that all started
+  at 1: 8 plain threads and 4 one-worker runtimes made 2 distinct ids out of 12. The
+  second half of an id now counts the process's ids, each thread reserving 65,536 numbers
+  at a time, so no two ids of one process repeat; the format is unchanged
+  ([#295](https://github.com/giong-run/Giong/issues/295)).
+- **giong** (Windows): a socket dropped while the driver was busy is closed at the next
+  turn of the event loop, as on the other platforms. It could stay open, keeping a
+  listener's port and leaving the peer without an end of stream, until some other close or
+  cancel was deferred, and was never closed if a runtime ended first
+  ([#289](https://github.com/giong-run/Giong/issues/289)).
+- **giong**: on Windows, with `Builder::shutdown_on_signals(true)`, a second Ctrl+C or
+  Ctrl+Break now ends the process at once, as it would with no handler; every event after
+  the first used to be swallowed, so a shutdown that hung could not be stopped from the
+  console. An event within 250 ms of the first, such as the same press passed on by a
+  wrapper, still counts as the first ([#274](https://github.com/giong-run/Giong/issues/274)).
+- **giong**: on Windows a TCP write to a peer that has stopped reading now waits for it, as
+  on Linux and macOS. One overlapped send was handed the whole buffer, and Windows takes
+  such a send whole while the socket's buffer has room: a 512 MiB `write_all` to a stalled
+  peer ended at once, the kernel held every byte, and a write timeout counting from the last
+  progress could never fire. Stream sends now go a megabyte at a time (#360).
+- **giong-http**: once an HTTP/2 client has closed its side of the connection, an answer
+  its flow control holds back is reset at once, instead of after `write_timeout` (30 s by
+  default): the client can no longer open the window. The handler and the bytes it held
+  are freed, and a graceful shutdown no longer waits for such a connection
+  ([#263](https://github.com/giong-run/Giong/issues/263)).
+- **giong-http**: an HTTP/2 client that opens many streams before it has the server's
+  SETTINGS is no longer cut off. Until then it cannot know `max_concurrent_streams`
+  (RFC 9113, section 6.5.2): the streams past the limit are still refused, but the
+  refusals count as frames that do no work instead of resets, so 1,000 streams in a first
+  flight get 900 refusals and 100 answers instead of `GOAWAY` `GIONG-E1116` after 201.
+  Opening past the limit after the SETTINGS acknowledgement still counts as before. A
+  client that has not acknowledged the server's SETTINGS within 10 seconds now gets
+  `GOAWAY` `SETTINGS_TIMEOUT` (section 6.5.3), so none can keep the more lenient
+  accounting ([#234](https://github.com/giong-run/Giong/issues/234)).
+- **giong-http**: the HTTP/3 client accepts at most 32 informational (1xx) responses before
+  the final one, as its HTTP/1.1 and HTTP/2 clients do; a server that sends only 1xx
+  answers now fails the request as a protocol error at once, instead of holding it until
+  the request timeout.
+- **giong**: on Windows, timers no longer fire up to 15.6 ms late. The completion port's own
+  timeout ends on the system's clock tick, so a 1 ms sleep took 15.6 ms; the driver now
+  ends its wait with a high-resolution waitable timer reported to the port
+  (`NtAssociateWaitCompletionPacket`), and a 1 ms sleep takes about 1 to 2 ms. Where Windows
+  lacks those calls (before Windows 10 1803, or under Wine), the driver keeps the
+  millisecond timeout.
+- **giong**: On Windows a UDP receive that waits for a datagram no longer holds a receive
+  buffer: it waits with a zero-byte peek and reads into a pool buffer only once the
+  datagram has arrived, as on Linux and macOS. 1000 idle sockets with 64 KiB buffers no
+  longer commit about 62 MiB
+  ([#238](https://github.com/giong-run/Giong/issues/238)).
+
 ## [1.4.1] - 2026-11-23
 
 Security fixes and serious bugs from a review of 1.4.0, and nothing new to learn. giong-http
@@ -2945,7 +3148,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.4.1...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.4.2...HEAD
+[1.4.2]: https://github.com/giong-run/Giong/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/giong-run/Giong/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/giong-run/Giong/compare/v1.3.0...v1.4.0
 [1.3.0]: https://github.com/giong-run/Giong/compare/v1.2.0...v1.3.0

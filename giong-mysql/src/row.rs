@@ -4,7 +4,7 @@ use std::fmt;
 use std::rc::Rc;
 
 use crate::error::{Error, ErrorKind};
-use crate::protocol::{ColumnDef, Reader, BINARY_COLLATION};
+use crate::protocol::{ColumnDefRef, Reader, BINARY_COLLATION};
 use crate::types::{ColumnType, FromSql};
 
 const UNSIGNED_FLAG: u16 = 32;
@@ -19,13 +19,21 @@ pub struct Column {
 }
 
 impl Column {
-    pub(crate) fn from_def(def: ColumnDef) -> Self {
+    pub(crate) fn from_def(def: ColumnDefRef<'_>) -> Self {
         Self {
-            name: def.name,
+            name: def.name.into(),
             ty: def.ty,
             flags: def.flags,
             collation: def.collation,
         }
+    }
+
+    /// Whether `def` describes this column.
+    pub(crate) fn is(&self, def: &ColumnDefRef<'_>) -> bool {
+        *self.name == *def.name
+            && self.ty == def.ty
+            && self.flags == def.flags
+            && self.collation == def.collation
     }
 
     #[cfg(any(test, fuzzing))]

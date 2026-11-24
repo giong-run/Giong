@@ -11,7 +11,7 @@ use giong_http::{Request, Response};
 use crate::error::Rendered;
 use crate::next::{BoxHandler, Chain, DynMiddleware, Endpoint};
 use crate::req::RouteInfo;
-use crate::route::{Captures, Lookup, Method, Pattern, Table};
+use crate::route::{Captures, Lookup, Method, Params, Pattern, Table};
 use crate::{log, Error, Middleware, Next, Req};
 
 struct RouteDef<S> {
@@ -505,7 +505,8 @@ impl<S: 'static> App<S> {
         // Answers the router gives by itself run through the middleware of
         // the routes or the nested router the path belongs to (see
         // `Router::layer`), so that a `Cors` nested at `/api` sees them.
-        let (route, chain, endpoint) = match self.table.lookup(&method, http.path(), &mut caps) {
+        let path = http.path();
+        let (route, chain, endpoint) = match self.table.lookup(&method, path, &mut caps) {
             Lookup::Found(i) => {
                 let route = &self.routes[i];
                 (
@@ -527,12 +528,19 @@ impl<S: 'static> App<S> {
             }
             Lookup::NotFound => (
                 None,
-                self.scope_chain(http.path()),
-                Endpoint::NotFound(self.hint(http.path())),
+                self.scope_chain(path),
+                Endpoint::NotFound(self.hint(path)),
             ),
         };
+        // Where the path starts in the target: it is a slice of it, but
+        // for the `/` of an absolute target with no path (`http://host`).
+        let target = http.target();
+        let base = (path.as_ptr() as usize)
+            .checked_sub(target.as_ptr() as usize)
+            .filter(|&at| at + path.len() <= target.len());
+        let params = Params::new(&caps, base);
         let info = route.map(|r| r.info.clone());
-        let req = Req::new(http, self.state.clone(), info.clone(), caps);
+        let req = Req::new(http, self.state.clone(), info.clone(), params);
         let resp = Next { chain, endpoint }.run(req).await;
         if let Some(rendered) = resp.extension::<Rendered>() {
             if rendered.error.status() >= 500 && !rendered.logged.get() {
