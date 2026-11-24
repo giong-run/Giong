@@ -13,7 +13,7 @@
 //! writes its file when it starts and removes it when it stops; a file whose
 //! process is gone is removed by the next reader.
 
-use std::fs::{self, File};
+use std::fs;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::process::{Command as Process, Stdio};
@@ -27,6 +27,7 @@ use crate::code::Code;
 use crate::procs;
 use crate::project::Project;
 use crate::report::{Failure, Finding, Report, Severity};
+use crate::state;
 
 /// Set in the environment of a runner that `--background` started.
 pub const BACKGROUND_VAR: &str = "GIONG_DEV_BACKGROUND";
@@ -108,7 +109,7 @@ pub fn registered() -> Vec<PathBuf> {
 
 /// `.giong/dev.json` of `root`.
 pub fn read_state(root: &Path) -> Option<Value> {
-    let text = fs::read_to_string(root.join(".giong").join("dev.json")).ok()?;
+    let text = state::read_to_string(&state::dir(root).join("dev.json")).ok()?;
     serde_json::from_str(&text).ok()
 }
 
@@ -352,10 +353,17 @@ pub fn status(args: &Args) -> Result<Report, Failure> {
 pub fn logs(args: &Args) -> Result<Report, Failure> {
     let n = args.number::<usize>("lines")?.unwrap_or(50).min(100_000);
     let root = root_here()?;
-    let path = root.join(".giong").join("dev.log");
+    let path = state::dir(&root).join("dev.log");
     let mut report = Report::new("dev");
-    let text = match fs::read(&path) {
+    let text = match state::read(&path) {
         Ok(bytes) => String::from_utf8_lossy(&bytes).into_owned(),
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => {
+            return Err(Failure::new(
+                Code::USAGE,
+                format!("{} cannot be read: {e}", path.display()),
+                "remove it and run giong dev again: giong writes its own .giong files",
+            ));
+        }
         Err(_) => {
             report.line(format!(
                 "No output yet: giong dev has not run in {}",
@@ -410,7 +418,7 @@ fn stop_project(root: &Path, report: &mut Report, stopped: &mut Vec<Value>) {
     let runs = |pid: u64| is_runner(Some(pid), started);
     if let Some(pid) = pid.filter(|p| runs(*p)) {
         let request = state_dir.join("stop");
-        let _ = fs::write(&request, b"");
+        let _ = state::create(&request);
         // A runner in a build looks for the request only once cargo ends.
         let wait = if state["build"]["state"] == "building" {
             Duration::from_secs(5)
@@ -608,17 +616,17 @@ pub fn background(args: &Args, argv: &[String]) -> Result<Report, Failure> {
         report.line("giong dev already runs for this project:".to_string());
         return Ok(fill(report, &root));
     }
-    let state_dir = root.join(".giong");
-    let _ = fs::create_dir_all(&state_dir);
-    let log_path = state_dir.join("runner.log");
+    let log_path = state::dir(&root).join("runner.log");
     let cannot = |e: std::io::Error| {
         Failure::new(
             Code::USAGE,
             format!("{} cannot be written: {e}", log_path.display()),
-            "check that the project directory is writable",
+            "check that the project directory is writable and that .giong is a folder of its \
+             own, not a link",
         )
     };
-    let log = File::create(&log_path).map_err(cannot)?;
+    state::ensure(&root).map_err(cannot)?;
+    let log = state::create(&log_path).map_err(cannot)?;
     let err = log.try_clone().map_err(cannot)?;
     let exe = std::env::current_exe().map_err(|e| {
         Failure::new(
@@ -634,6 +642,9 @@ pub fn background(args: &Args, argv: &[String]) -> Result<Report, Failure> {
         .stderr(err)
         .env(BACKGROUND_VAR, "1");
     detach(&mut cmd);
+    // The runner must not hold the caller's pipe open (#378).
+    #[cfg(windows)]
+    crate::noinherit::keep_std_handles();
     let mut child = cmd.spawn().map_err(|e| {
         Failure::new(
             Code::USAGE,
@@ -642,7 +653,7 @@ pub fn background(args: &Args, argv: &[String]) -> Result<Report, Failure> {
         )
     })?;
     let deadline = Instant::now() + START_WAIT;
-    let mut reader = File::open(&log_path).map_err(cannot)?;
+    let mut reader = state::open_read(&log_path).map_err(cannot)?;
     let mut offset = 0u64;
     let mut partial = String::new();
     let mut outcome = None;
@@ -1038,6 +1049,24 @@ mod tests {
         let _ = other.kill();
         let _ = other.wait();
         let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_zombie_does_not_run() {
+        // A running process has a start time (and `ps` is asked right).
+        assert!(super::super::dev::started(u64::from(std::process::id())).is_some());
+        // `true` ends at once; unreaped, it stays a zombie until `wait`.
+        let Ok(mut child) = Process::new("true").spawn() else {
+            return;
+        };
+        let pid = u64::from(child.id());
+        let until = Instant::now() + Duration::from_secs(5);
+        while super::super::dev::started(pid).is_some() && Instant::now() < until {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(super::super::dev::started(pid), None);
+        let _ = child.wait();
     }
 
     #[test]

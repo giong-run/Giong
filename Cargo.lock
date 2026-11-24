@@ -410,6 +410,7 @@ dependencies = [
 name = "giong-cli"
 version = "1.4.2"
 dependencies = [
+ "libc",
  "serde_json",
  "socket2",
 ]

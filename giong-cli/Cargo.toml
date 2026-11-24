@@ -30,6 +30,10 @@ serde_json = { version = "1", features = ["preserve_order"] }
 # inheritable for the spawn only, without `unsafe` here.
 [target.'cfg(unix)'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }
+# O_NOFOLLOW for giong's own files in .giong (src/state.rs); socket2 uses it too.
+libc = "0.2"
 
 [lints.rust]
-unsafe_code = "forbid"
+# One Windows-only module (src/noinherit.rs) needs a system call std does
+# not offer; everything else stays free of `unsafe`.
+unsafe_code = "deny"

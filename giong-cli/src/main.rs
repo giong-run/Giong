@@ -11,12 +11,15 @@ mod code;
 mod dotenv;
 mod host;
 mod lint;
+#[cfg(windows)]
+mod noinherit;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
 mod procs;
 mod project;
 mod report;
 mod scaffold;
+mod state;
 mod template;
 mod watch;
 
