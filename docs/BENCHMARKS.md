@@ -681,6 +681,27 @@ for every scenario and the raw data are in
 - On a shared cloud VM the tails (p99.9) move several times between rounds; the full
   summary lists them, but decide on a bare-metal run.
 
+## Build time and size
+
+[`bench/build.sh`](../bench/build.sh): the same three-route JSON service with the same
+layers (request ids, a log line per request, compression, a timeout), on giong-web 1.3.0
+from crates.io and on axum 0.8 + tokio + tower-http, built on a 4-vCPU cloud VM with
+Rust 1.97. Mean of two rounds; times ±10% on a VM, sizes exact. Raw data and the full
+table: [`bench/results/build/cloud-4vcpu/`](../bench/results/build/cloud-4vcpu/summary.md).
+
+| | giong-web | axum + tokio + tower-http |
+|---|---|---|
+| Crates in the build | **22** | 83 |
+| Clean debug build | **7.4 s** | 18.8 s |
+| Rebuild after a one-line edit | **0.56 s** | 0.87 s |
+| `target/` after a debug build | **181 MB** | 403 MB |
+| Clean release build | **11.4 s** | 33.9 s |
+| Release binary, stripped | **1.45 MB** | 3.60 MB |
+
+For a service this small an edit rebuilds in under a second on both; the gap is in
+clean builds (CI, Docker without a cache, a new checkout) and disk. A larger service has
+not been measured.
+
 ## What has not been measured
 
 - **macOS and Windows.** Both are correct and tested in CI, but not tuned, and no speed

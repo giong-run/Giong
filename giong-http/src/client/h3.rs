@@ -31,6 +31,10 @@ const MAX_SETTINGS_FRAME: u64 = 4 * 1024;
 /// second.
 const MAX_UNKNOWN_FRAMES: u32 = 1024;
 
+/// Informational (1xx) responses accepted before the final one, as over
+/// HTTP/1.1 and HTTP/2.
+const MAX_INFORMATIONAL: u32 = 32;
+
 /// What the connection's streams and its task share.
 struct State {
     /// Why the connection carries no more requests, once it does not.
@@ -507,6 +511,7 @@ impl Stream {
     /// Waits for the head of the final response (1xx responses are
     /// skipped).
     pub(crate) async fn response(&mut self) -> Result<(), StreamError> {
+        let mut informational = 0;
         loop {
             let header = match self.r.header(On::Response).await {
                 Ok(Some(header)) => header,
@@ -532,6 +537,13 @@ impl Stream {
                         );
                     }
                     if status < 200 {
+                        // As over HTTP/1.1 and HTTP/2: a server that only
+                        // ever sends 1xx answers is told apart from a slow
+                        // one, instead of holding the request to its timeout.
+                        informational += 1;
+                        if informational > MAX_INFORMATIONAL {
+                            return Err(self.malformed("more than 32 1xx responses"));
+                        }
                         continue;
                     }
                     self.head = Some(ResponseHead {
@@ -563,6 +575,15 @@ impl Stream {
         self.head
             .as_ref()
             .expect("the head is read before anything asks for it")
+    }
+
+    /// The head's field positions, taken once for the response the caller
+    /// builds: nothing here reads them after.
+    pub(crate) fn take_fields(&mut self) -> Vec<(std::ops::Range<usize>, std::ops::Range<usize>)> {
+        self.head
+            .as_mut()
+            .map(|head| std::mem::take(&mut head.fields))
+            .unwrap_or_default()
     }
 
     /// The response has no body whatever its fields say.

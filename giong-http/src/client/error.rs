@@ -21,6 +21,8 @@ struct Inner {
     message: String,
     status: Option<u16>,
     source: Option<io::Error>,
+    /// What to do about it, shown after the source.
+    advice: Option<String>,
 }
 
 /// What kind of error an [`Error`] is.
@@ -83,6 +85,7 @@ impl Error {
             message: message.into(),
             status: None,
             source: None,
+            advice: None,
         }))
     }
 
@@ -92,6 +95,7 @@ impl Error {
             message: message.into(),
             status: None,
             source: Some(source),
+            advice: None,
         }))
     }
 
@@ -101,6 +105,7 @@ impl Error {
             message: message.into(),
             status: Some(status),
             source: None,
+            advice: None,
         }))
     }
 
@@ -110,11 +115,32 @@ impl Error {
             message: message.into(),
             status,
             source: None,
+            advice: None,
         }))
     }
 
     pub(crate) fn request(message: impl Into<String>) -> Self {
         Self::new(ErrorKind::Request, message)
+    }
+
+    /// The same error with `advice` after its message and source.
+    pub(crate) fn advise(self, advice: impl Into<String>) -> Self {
+        // A shared (cloned) error keeps its source's kind and text only:
+        // the original's `source()` chain and `raw_os_error()` are lost.
+        let inner = Arc::try_unwrap(self.0).unwrap_or_else(|shared| Inner {
+            kind: shared.kind,
+            message: shared.message.clone(),
+            status: shared.status,
+            source: shared
+                .source
+                .as_ref()
+                .map(|s| io::Error::new(s.kind(), s.to_string())),
+            advice: None,
+        });
+        Self(Arc::new(Inner {
+            advice: Some(advice.into()),
+            ..inner
+        }))
     }
 
     /// What kind of error this is.
@@ -153,6 +179,9 @@ impl fmt::Display for Error {
         let mut what = self.0.message.clone();
         if let Some(source) = &self.0.source {
             what = format!("{what}: {source}");
+        }
+        if let Some(advice) = &self.0.advice {
+            what = format!("{what}; {advice}");
         }
         let stop = if what.ends_with('.') { "" } else { "." };
         write!(f, "{code}: {what}{stop} See {}", code.url())
@@ -207,6 +236,29 @@ mod tests {
         let io: io::Error = e.into();
         assert_eq!(io.kind(), io::ErrorKind::TimedOut);
         assert_eq!(giong::error::code(&io), Some(Code::HttpClientTimeout));
+    }
+
+    #[test]
+    fn advice_comes_after_the_source_and_keeps_it() {
+        let reset = || io::Error::new(io::ErrorKind::ConnectionReset, "reset by peer");
+        let e = Error::io(ErrorKind::Closed, "POST http://x/: reading failed", reset());
+        let kept = e.clone();
+        for e in [
+            e.advise("retry if that is safe"),
+            kept.advise("retry if that is safe"),
+        ] {
+            let text = e.to_string();
+            assert!(
+                text.starts_with(
+                    "GIONG-E1106: POST http://x/: reading failed: reset by peer; retry if that \
+                     is safe. See https://"
+                ),
+                "{text}"
+            );
+            assert_eq!(text.matches("GIONG-E1106").count(), 1, "{text}");
+            assert_eq!(e.kind(), ErrorKind::Closed);
+            assert_eq!(io::Error::from(e).kind(), io::ErrorKind::ConnectionReset);
+        }
     }
 
     #[test]

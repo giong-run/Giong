@@ -346,3 +346,40 @@ fn reused_task_states_wake_the_right_task() {
         }
     });
 }
+
+/// Finishes at once, and panics when dropped.
+struct PanicsWhenDropped;
+
+impl std::future::Future for PanicsWhenDropped {
+    type Output = u32;
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        _: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<u32> {
+        std::task::Poll::Ready(7)
+    }
+}
+
+impl Drop for PanicsWhenDropped {
+    fn drop(&mut self) {
+        panic!("drop panic (expected by this test)");
+    }
+}
+
+#[test]
+fn a_future_that_panics_while_dropped_after_finishing_is_a_panic_not_a_cancel() {
+    giong::block_on(async {
+        let local = giong::spawn(PanicsWhenDropped).await;
+        assert!(
+            matches!(&local, Err(e) if e.is_panic()),
+            "spawn: {:?}",
+            local.as_ref().map_err(|e| e.is_panic())
+        );
+        let remote = giong::handle().spawn_on(0, || PanicsWhenDropped).await;
+        assert!(
+            matches!(&remote, Err(e) if e.is_panic()),
+            "spawn_on: {:?}",
+            remote.as_ref().map_err(|e| e.is_panic())
+        );
+    });
+}

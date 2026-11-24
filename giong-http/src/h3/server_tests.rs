@@ -5,9 +5,10 @@
 use std::io;
 use std::net::SocketAddr;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-use giong_quic::{ClientConfig, Connection, Endpoint, SendStream, ServerConfig};
+use giong_quic::{ClientConfig, Connection, Endpoint, SendStream, ServerConfig, TransportConfig};
 
 use super::frame::{kind, read_varint, write_varint, Header, Settings};
 use super::qpack::{self, Encoder};
@@ -43,6 +44,9 @@ fn tls() -> (rustls::ServerConfig, rustls::ClientConfig) {
 /// The application under test.
 struct App;
 
+/// Handlers of `/counted` started so far: only one test asks for it.
+static COUNTED: AtomicUsize = AtomicUsize::new(0);
+
 impl Handler for App {
     async fn call(&self, req: Request) -> Response {
         match req.path() {
@@ -59,6 +63,10 @@ impl Handler for App {
             "/early" => Response::text(req.is_early_data().to_string()),
             "/echo" => Response::new(200).body(req.body().to_vec()),
             "/big" => Response::new(200).body(pattern(1 << 20)),
+            "/counted" => {
+                COUNTED.fetch_add(1, Ordering::Relaxed);
+                Response::new(200).body(pattern(1 << 20))
+            }
             "/empty" => Response::new(204),
             "/upload" => {
                 let body = req.body_stream().expect("a streamed body");
@@ -126,7 +134,7 @@ impl Handler for App {
                 }));
                 Response::new(200).body(out)
             }
-            "/panic" => panic!("the handler panics on purpose"),
+            "/panic" => panic!("the handler panics on purpose (expected by this test)"),
             _ => Response::new(404),
         }
     }
@@ -150,6 +158,14 @@ struct Client {
 /// Starts a server with `server` and connects a client to it, without the
 /// client's control stream.
 async fn connect_bare(server: Server) -> (Rc<Connection>, Endpoint) {
+    connect_bare_with(server, TransportConfig::default()).await
+}
+
+/// [`connect_bare`] with the client's transport settings.
+async fn connect_bare_with(
+    server: Server,
+    transport: TransportConfig,
+) -> (Rc<Connection>, Endpoint) {
     let (server_tls, client_tls) = tls();
     let endpoint = Endpoint::server(
         "127.0.0.1:0".parse().unwrap(),
@@ -161,13 +177,18 @@ async fn connect_bare(server: Server) -> (Rc<Connection>, Endpoint) {
         async move { server.serve_h3(endpoint, App).await },
     ));
     let client = Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
-    let cfg = ClientConfig::new(client_tls).unwrap();
+    let cfg = ClientConfig::new(client_tls).unwrap().transport(transport);
     let conn = client.connect(addr, "localhost", &cfg).await.unwrap();
     (Rc::new(conn), client)
 }
 
 async fn connect_to(server: Server) -> Client {
-    let (conn, endpoint) = connect_bare(server).await;
+    connect_with(server, TransportConfig::default()).await
+}
+
+/// [`connect_to`] with the client's transport settings.
+async fn connect_with(server: Server, transport: TransportConfig) -> Client {
+    let (conn, endpoint) = connect_bare_with(server, transport).await;
     let mut control = conn.open_uni().await.unwrap();
     let mut out = vec![0x00];
     Settings::write_frame(&mut out, 1 << 20);
@@ -284,6 +305,7 @@ async fn roundtrip(client: &Client, request: Vec<u8>) -> io::Result<Reply> {
 }
 
 fn run<F: std::future::Future<Output = ()>>(test: impl FnOnce() -> F) {
+    crate::quiet_panics::quiet_expected_panics();
     giong::Builder::new()
         .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
         .block_on(test())
@@ -488,6 +510,54 @@ fn the_limits_of_the_server_apply() {
         request.extend(data(&pattern(10_000)));
         let reply = roundtrip(&client, request).await.unwrap();
         assert_eq!(reply.body, pattern(10_000));
+    });
+}
+
+#[test]
+fn responses_the_client_does_not_take_are_held_within_the_budget() {
+    run(|| async {
+        // A client that takes 64 KiB at most before it reads, and asks for
+        // 40 answers of 1 MiB on one connection. Each handler holds its
+        // answer until QUIC takes it; QUIC itself takes up to its send
+        // window (8 MiB). The connection's budget for answers not taken
+        // is 1 MiB here: about ten handlers may run before the client
+        // reads, not forty, as each would without the budget.
+        let client = connect_with(
+            Server::new(),
+            TransportConfig::default().windows(64 * 1024, 64 * 1024),
+        )
+        .await;
+        let mut streams = Vec::new();
+        for _ in 0..40 {
+            let (mut send, recv) = client.conn.open_bi().await.unwrap();
+            send.write_all(&get("/counted")).await.unwrap();
+            send.finish().unwrap();
+            streams.push((send, recv));
+        }
+        giong::time::sleep(std::time::Duration::from_millis(500)).await;
+        let started = COUNTED.load(Ordering::Relaxed);
+        assert!(
+            (1..=12).contains(&started),
+            "{started} handlers ran while the client took nothing"
+        );
+        // Once the client reads (every stream at once: data for the streams
+        // not read would fill the 64 KiB window), every waiting handler
+        // runs in turn.
+        let reads: Vec<_> = streams
+            .into_iter()
+            .map(|(send, mut recv)| {
+                giong::spawn(async move {
+                    let _send = send;
+                    parse(&recv.read_to_end(2 << 20).await.unwrap())
+                })
+            })
+            .collect();
+        for read in reads {
+            let reply = read.await.unwrap();
+            assert_eq!(reply.status(), 200);
+            assert_eq!(reply.body.len(), 1 << 20);
+        }
+        assert_eq!(COUNTED.load(Ordering::Relaxed), 40);
     });
 }
 

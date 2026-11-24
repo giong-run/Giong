@@ -29,7 +29,7 @@ pub fn check_payload(input: &[u8]) {
     let _ = protocol::ok(input);
     let _ = protocol::err(input);
     let _ = DbError::parse(input);
-    let _ = protocol::column_def(input);
+    let _ = protocol::column_def_ref(input);
     let _ = protocol::prepare_ok(input);
     let _ = protocol::is_end_of_rows(input);
 }
