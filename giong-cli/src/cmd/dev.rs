@@ -144,6 +144,7 @@ const POLL: Duration = Duration::from_millis(250);
 const SETTLE: Duration = Duration::from_millis(120);
 /// How long a new build must stay up after it binds before it replaces the
 /// running one.
+#[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
 const SETTLE_AFTER_READY: Duration = Duration::from_millis(200);
 /// The last lines of a service's output kept for a report.
 const TAIL: usize = 40;
@@ -225,6 +226,7 @@ struct Dev {
     prod_like: bool,
     once: bool,
     grace: Duration,
+    #[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
     ready_timeout: Duration,
     listen: Vec<SocketAddr>,
     /// The addresses the service is told to listen on (`LISTEN`), after
@@ -1606,6 +1608,7 @@ fn giong_takes_sockets(project: &Project) -> bool {
 
 /// giong's version in a Cargo.lock, and whether it comes from a path (no
 /// `source`).
+#[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
 fn lock_giong_version(lock: &str) -> Option<(crate::host::Version, bool)> {
     for block in lock.split("[[package]]") {
         let mut name = None;

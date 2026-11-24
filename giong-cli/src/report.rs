@@ -249,6 +249,7 @@ impl Report {
         &self.findings
     }
 
+    #[allow(dead_code)] // read by giong fix and the e2e tests
     pub fn data_value(&self, key: &str) -> Option<&Value> {
         self.data.get(key)
     }
