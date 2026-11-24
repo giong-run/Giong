@@ -274,12 +274,20 @@ struct Analysis {
 }
 
 /// Whether other tasks' long polls, explaining `blocked` of the slow
-/// requests' extra time, explain it better than the dominant phase does
-/// with `phase`. Both are shares of the same quantity: blocked time is
-/// part of a phase (the request is suspended while the worker runs other
-/// tasks), so it cannot exceed the phase it sits in.
-fn blocked_wins(blocked: f64, phase: f64) -> bool {
-    blocked >= 0.3 && blocked >= phase * 0.8
+/// requests' extra time, name its cause better than the dominant phase,
+/// which explains `share` of it. Both are shares of the same quantity.
+///
+/// Blocked time is time a request was suspended, so it is part of the
+/// `other` phase. When `other` dominates, it is split in two: blocked time
+/// and waits no code named; blocked wins when it is the larger part. When
+/// a named phase (a pool, queries) dominates, blocked time competes with
+/// it and must come close to it.
+fn blocked_wins(blocked: f64, share: f64, dominant_is_other: bool) -> bool {
+    if dominant_is_other {
+        blocked >= 0.3 && blocked >= share - blocked
+    } else {
+        blocked >= 0.3 && blocked >= share * 0.8
+    }
 }
 
 /// What the slow requests of one route spent their time on, and why.
@@ -369,7 +377,7 @@ fn analyse(
         }
         None => blocked_share,
     };
-    if blocked_wins(blocked_strength, strength) {
+    if blocked_wins(blocked_strength, strength, phase == "other") {
         cause = "worker_blocked";
         strength = blocked_strength;
     } else if cause == "unattributed_wait" && max_busy >= 0.85 {
@@ -723,16 +731,20 @@ fn suggestion(
 mod tests {
     use super::*;
 
-    /// macOS CI, #181: blocked time explained 91% of the excess (6.2 of
-    /// 6.8 ms) and the suspended phase 99.9%. Compared with blocked time's
-    /// share of the whole tail (77%) instead, it lost to the phase it is
-    /// part of, and the verdict blamed unnamed waits.
+    /// macOS CI on #181. Blocked time explained 91% of the excess (6.2 of
+    /// 6.8 ms) once, 72% (18.0 of 25.1 ms) another time, with the
+    /// suspended phase it is part of at 99.9% and 100%. Both times it is
+    /// the larger part of that phase, so the worker was blocked.
     #[test]
-    fn blocked_time_is_weighed_like_the_phase_it_sits_in() {
-        assert!(blocked_wins(0.91, 0.999));
-        assert!(!blocked_wins(0.768 * 0.9, 0.999));
-        assert!(!blocked_wins(0.25, 0.3));
-        assert!(blocked_wins(0.5, 0.6));
+    fn blocked_time_is_weighed_against_the_rest_of_its_phase() {
+        assert!(blocked_wins(0.91, 0.999, true));
+        assert!(blocked_wins(0.717, 1.0, true));
+        // Under half of the suspended time: waits no code named.
+        assert!(!blocked_wins(0.45, 1.0, true));
+        assert!(!blocked_wins(0.25, 0.3, true));
+        // Against a named phase it must come close to it.
+        assert!(blocked_wins(0.5, 0.6, false));
+        assert!(!blocked_wins(0.4, 0.9, false));
     }
 
     #[test]
