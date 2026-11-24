@@ -1,0 +1,327 @@
+//! The service end to end: the app served on a free port of 127.0.0.1 and
+//! called with giong-http's client, the way a real client calls it.
+{{#if db}}
+//!
+//! It talks to the database and Redis named by `DATABASE_URL` and `REDIS_URL`,
+//! from the environment or from `.env` (`giong db up` writes them). Without
+//! them the tests that need a store print `SKIPPED` and pass. They only touch
+//! the rows and keys they create, so a development database is fine.
+{{/if}}
+
+use std::time::Duration;
+
+use giong::net::TcpListener;
+use giong_http::client::Client;
+use giong_web::Server;
+use {{crate}}::{app, AccessLog, State};
+
+{{#if db}}
+/// A variable from the environment, else from `.env` in the project.
+fn setting(name: &str) -> Option<String> {
+    if let Some(v) = std::env::var(name).ok().filter(|v| !v.is_empty()) {
+        return Some(v);
+    }
+    let env = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/.env")).ok()?;
+    env.lines().find_map(|line| {
+        let (key, value) = line.trim().split_once('=')?;
+        let value = value.trim().trim_matches('"');
+        (key.trim() == name && !value.is_empty()).then(|| value.to_string())
+    })
+}
+
+/// The state for the tests, or `None` (and a line saying so) without a store.
+fn state() -> Option<State> {
+{{#if sql}}
+    let Some(db_url) = setting("DATABASE_URL") else {
+        eprintln!("SKIPPED: DATABASE_URL is not set (run giong db up, or set it)");
+        return None;
+    };
+{{/if}}
+{{#if redis}}
+    let Some(redis_url) = setting("REDIS_URL") else {
+        eprintln!("SKIPPED: REDIS_URL is not set (run giong db up, or set it)");
+        return None;
+    };
+{{/if}}
+    Some(State {
+{{#if postgres}}
+        db: giong_postgres::Pool::new(giong_postgres::Config::from_url(&db_url).unwrap(), 2),
+{{/if}}
+{{#if mysql}}
+        db: giong_mysql::Pool::new(giong_mysql::Config::from_url(&db_url).unwrap(), 2),
+{{/if}}
+{{#if redis & sql}}
+        cache: giong_redis::Pool::new(giong_redis::Config::from_url(&redis_url).unwrap(), 1),
+        cache_ttl: Duration::from_secs(60),
+{{/if}}
+{{#if redis & !sql}}
+        redis: giong_redis::Pool::new(giong_redis::Config::from_url(&redis_url).unwrap(), 1),
+{{/if}}
+    })
+}
+
+/// A tag that makes this run's rows and keys its own.
+fn run_tag() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    format!("{}x{nanos}", std::process::id())
+}
+{{#else}}
+fn state() -> State {
+    State { greeting: "Hello" }
+}
+{{/if}}
+
+/// Serves the app on a free port; the server lives as long as the test's
+/// `block_on`.
+fn serve(state: State) -> String {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let app = app(state, AccessLog::Off);
+    giong::spawn(async move { Server::new().serve(listener, app).await });
+    format!("http://127.0.0.1:{port}")
+}
+
+fn client() -> Client {
+    Client::builder().timeout(Duration::from_secs(10)).build()
+}
+
+{{#if db}}
+#[test]
+fn health_and_ready() {
+    let Some(state) = state() else { return };
+    giong::block_on(async {
+        let (base, client) = (serve(state), client());
+        let resp = client.get(&format!("{base}/health")).send().await.unwrap();
+        assert_eq!((resp.status(), resp.text().unwrap()), (200, "ok"));
+        let resp = client.get(&format!("{base}/ready")).send().await.unwrap();
+        assert_eq!((resp.status(), resp.text().unwrap()), (200, "ready"));
+        let resp = client.get(&format!("{base}/nothing")).send().await.unwrap();
+        assert_eq!(resp.status(), 404);
+        assert!(resp.text().unwrap().contains("GIONG-E"));
+    });
+}
+{{#else}}
+#[test]
+fn health_hello_and_echo() {
+    giong::block_on(async {
+        let (base, client) = (serve(state()), client());
+        let resp = client.get(&format!("{base}/health")).send().await.unwrap();
+        assert_eq!((resp.status(), resp.text().unwrap()), (200, "ok"));
+
+        let resp = client.get(&format!("{base}/hello/Ada")).send().await.unwrap();
+        assert_eq!((resp.status(), resp.text().unwrap()), (200, "Hello, Ada!"));
+
+        let resp = client
+            .post(&format!("{base}/echo"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"message":"xin chào \"giong\""}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200);
+        let body: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        assert_eq!(body["message"], "xin chào \"giong\"");
+
+        // Mistakes are answered with a status and a problem+json body.
+        let resp = client
+            .post(&format!("{base}/echo"))
+            .header("Content-Type", "application/json")
+            .body("{not json")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        let resp = client
+            .post(&format!("{base}/echo"))
+            .header("Content-Type", "application/json")
+            .body(format!(r#"{{"message":"{}"}}"#, "x".repeat(1001)))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422);
+        assert!(resp.text().unwrap().contains("\"code\":\"message_too_long\""));
+        let resp = client.get(&format!("{base}/nothing")).send().await.unwrap();
+        assert_eq!(resp.status(), 404);
+        assert!(resp.text().unwrap().contains("GIONG-E"));
+    });
+}
+{{/if}}
+{{#if sql}}
+
+#[test]
+fn users_from_create_to_delete() {
+    let Some(state) = state() else { return };
+    let tag = run_tag();
+    giong::block_on(async {
+        let setup = &state.db;
+        setup.batch_execute({{crate}}::SCHEMA).await.unwrap();
+        let (base, client) = (serve(state), client());
+        let url = |path: &str| format!("{base}{path}");
+        let email = format!("ada-{tag}@example.com");
+
+        let resp = client
+            .post(&url("/users"))
+            .header("Content-Type", "application/json")
+            .body(format!(r#"{{"name":"  Ada Lovelace ","email":"{email}"}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 201, "{}", resp.text().unwrap());
+        let created: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let id = created["id"].as_i64().unwrap();
+        assert_eq!(resp.header("location"), Some(format!("/users/{id}").as_str()));
+        assert_eq!(created["name"], "Ada Lovelace");
+        assert!(created["created_at"].as_str().unwrap().ends_with('Z'));
+
+        // The same email again is a conflict; a bad body is a 422.
+        let resp = client
+            .post(&url("/users"))
+            .header("Content-Type", "application/json")
+            .body(format!(r#"{{"name":"Ada again","email":"{email}"}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 409);
+        assert!(resp.text().unwrap().contains("\"code\":\"email_taken\""));
+        let resp = client
+            .post(&url("/users"))
+            .header("Content-Type", "application/json")
+            .body(r#"{"name":"","email":"nobody"}"#)
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 422);
+        assert!(resp.text().unwrap().contains("\"code\":\"invalid_name\""));
+
+{{#if redis}}
+        let first = client.get(&url(&format!("/users/{id}"))).send().await.unwrap();
+        assert_eq!(first.status(), 200);
+        assert_eq!(first.header("x-cache"), Some("miss"));
+        let second = client.get(&url(&format!("/users/{id}"))).send().await.unwrap();
+        assert_eq!(second.header("x-cache"), Some("hit"));
+        assert_eq!(first.body(), second.body());
+{{#else}}
+        let resp = client.get(&url(&format!("/users/{id}"))).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().unwrap().contains("\"name\":\"Ada Lovelace\""));
+{{/if}}
+        let resp = client.get(&url("/users/abc")).send().await.unwrap();
+        assert_eq!(resp.status(), 400);
+
+        let resp = client
+            .put(&url(&format!("/users/{id}")))
+            .header("Content-Type", "application/json")
+            .body(format!(r#"{{"name":"Ada King","email":"{email}"}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().unwrap());
+        assert!(resp.text().unwrap().contains("\"name\":\"Ada King\""));
+        // The same values again: still 200, not a 404.
+        let resp = client
+            .put(&url(&format!("/users/{id}")))
+            .header("Content-Type", "application/json")
+            .body(format!(r#"{{"name":"Ada King","email":"{email}"}}"#))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().unwrap());
+        let resp = client.get(&url(&format!("/users/{id}"))).send().await.unwrap();
+{{#if redis}}
+        assert_eq!(resp.header("x-cache"), Some("miss"));
+{{/if}}
+        assert!(resp.text().unwrap().contains("\"name\":\"Ada King\""));
+
+        // Pages: the rows after `id`, in order, with a link to the next page.
+        let mut ids = vec![id];
+        for n in 0..3 {
+            let body = format!(r#"{{"name":"User {n}","email":"user{n}-{tag}@example.com"}}"#);
+            let resp = client
+                .post(&url("/users"))
+                .header("Content-Type", "application/json")
+                .body(body)
+                .send()
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), 201);
+            let user: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+            ids.push(user["id"].as_i64().unwrap());
+        }
+        let resp = client
+            .get(&url(&format!("/users?limit=2&after={}", id - 1)))
+            .send()
+            .await
+            .unwrap();
+        let page: serde_json::Value = serde_json::from_slice(resp.body()).unwrap();
+        let users = page["users"].as_array().unwrap();
+        assert_eq!(users.len(), 2);
+        assert_eq!(users[0]["id"], id);
+        assert_eq!(page["next_after"], users[1]["id"]);
+        let resp = client.get(&url("/users?limit=0")).send().await.unwrap();
+        assert_eq!(resp.status(), 400);
+
+        let resp = client.get(&url("/users/export")).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert_eq!(resp.header("content-type"), Some("application/x-ndjson"));
+        let text = resp.text().unwrap();
+        let exported: Vec<i64> = text
+            .lines()
+            .map(|l| serde_json::from_str::<serde_json::Value>(l).unwrap()["id"].as_i64().unwrap())
+            .collect();
+        assert!(ids.iter().all(|id| exported.contains(id)));
+
+        for id in ids {
+            let resp = client.delete(&url(&format!("/users/{id}"))).send().await.unwrap();
+            assert_eq!(resp.status(), 204);
+            let resp = client.get(&url(&format!("/users/{id}"))).send().await.unwrap();
+            assert_eq!(resp.status(), 404);
+            let resp = client.delete(&url(&format!("/users/{id}"))).send().await.unwrap();
+            assert_eq!(resp.status(), 404);
+        }
+    });
+}
+{{/if}}
+{{#if redis & !sql}}
+
+#[test]
+fn counters() {
+    let Some(state) = state() else { return };
+    let name = format!("test-{}", run_tag());
+    giong::block_on(async {
+        let (base, client) = (serve(state), client());
+        let url = format!("{base}/counters/{name}");
+
+        let resp = client.get(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200);
+        assert!(resp.text().unwrap().contains("\"value\":0"));
+        let resp = client.post(&url).send().await.unwrap();
+        assert_eq!(resp.status(), 200, "{}", resp.text().unwrap());
+        assert!(resp.text().unwrap().contains("\"value\":1"));
+        let resp = client
+            .post(&url)
+            .header("Content-Type", "application/json")
+            .body(r#"{"by":41}"#)
+            .send()
+            .await
+            .unwrap();
+        assert!(resp.text().unwrap().contains("\"value\":42"));
+        let resp = client.get(&url).send().await.unwrap();
+        assert!(resp.text().unwrap().contains("\"value\":42"));
+
+        let resp = client
+            .get(&format!("{base}/counters/no%20spaces"))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), 400);
+        assert!(resp.text().unwrap().contains("\"code\":\"invalid_name\""));
+
+        let redis_url = setting("REDIS_URL").unwrap();
+        let cleanup = giong_redis::Pool::new(giong_redis::Config::from_url(&redis_url).unwrap(), 1);
+        assert!(cleanup.del(format!("counter:{name}")).await.unwrap());
+    });
+}
+{{/if}}

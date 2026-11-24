@@ -18,12 +18,14 @@ mod loadgen;
 mod procs;
 mod project;
 mod report;
+mod scaffold;
 mod service;
 mod sha256;
 // Shared with giong dev, which moves its .giong files onto it separately;
 // until then a few helpers have no caller here.
 #[allow(dead_code)]
 mod state;
+mod template;
 mod watch;
 
 use std::process::ExitCode;

@@ -68,6 +68,16 @@ codes! {
     DEV_RUNNING = 5022, "DevRunning", "giong dev already serves this project";
     COMPILER_WARNING = 5023, "CompilerWarning", "the compiler has a warning";
     LISTENS_ON_NETWORK = 5024, "ListensOnNetwork", "the service would listen on every network interface";
+    BAD_NAME = 5030, "BadProjectName", "the project name is not valid";
+    TARGET_NOT_EMPTY = 5031, "TargetNotEmpty", "the directory for the new project is not empty";
+    BAD_TEMPLATE_CHOICE = 5032, "BadTemplateChoice", "the template does not offer that choice";
+    WRITE_FAILED = 5033, "WriteFailed", "a file of the project could not be written";
+    WINDOWS_LIMITED = 5034, "WindowsLimited", "the project's crates do not build on Windows";
+    BAD_GIONG_PATH = 5035, "BadGiongPath", "--giong-path is not a giong checkout";
+    AGENT_FILE_FOREIGN = 5036, "AgentFileForeign", "an agent file exists that giong did not write";
+    MCP_JSON_INVALID = 5037, "McpJsonInvalid", ".mcp.json is not valid JSON";
+    VERSION_MISMATCH = 5038, "VersionMismatch", "the project uses another giong version than this command";
+    NOT_GIONG_PROJECT = 5039, "NotGiongProject", "the project does not depend on giong";
     NO_CONTAINER_RUNTIME = 5040, "NoContainerRuntime", "neither Docker nor Podman answers";
     DB_NOT_READY = 5041, "DbNotReady", "the database does not answer queries";
     DB_URL = 5042, "DbUrl", "no usable database URL";
@@ -95,6 +105,15 @@ codes! {
     IMAGE_LOAD = 5074, "ImageLoad", "the image could not be loaded into Docker or Podman";
     IMAGE_PUSH = 5075, "ImagePush", "the image could not be pushed to the registry";
     IMAGE_TAG = 5076, "ImageTag", "the image name or tag is not valid";
+    FIX_DIRTY = 5080, "FixDirty", "the project has changes that are not committed";
+    FIX_FAILED = 5081, "FixFailed", "cargo could not apply its fixes";
+    FIX_CONFLICT = 5082, "FixConflict", "a fix no longer matches the code";
+    TEST_FAILED = 5083, "TestFailed", "a test failed";
+    DRIVER_NOT_HERE = 5084, "DriverNotHere", "the tests could not run on every driver";
+    NEXTEST_MISSING = 5085, "NextestMissing", "cargo-nextest is not installed";
+    TEST_TIMEOUT = 5086, "TestTimeout", "the tests took longer than the time limit";
+    GIT_INIT_FAILED = 5087, "GitInitFailed", "git init failed in the new project";
+    DOTENV_BUILD_SETTING = 5088, "DotenvBuildSetting", ".env sets a cargo or rustc setting";
 }
 
 impl Code {

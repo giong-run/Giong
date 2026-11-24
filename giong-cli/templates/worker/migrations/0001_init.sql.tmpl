@@ -1,0 +1,31 @@
+{{#file-if sql}}
+-- The job queue. `giong db migrate` applies the files of this directory in
+-- order and remembers which it applied; the service also runs this one at
+-- startup, so it only creates what is missing. Add changes as new files
+-- (0002_add_column.sql...), never by editing an applied one.
+{{#if postgres}}
+CREATE TABLE IF NOT EXISTS jobs (
+    id bigserial PRIMARY KEY,
+    queue text NOT NULL DEFAULT 'default',
+    payload text NOT NULL,
+    state text NOT NULL DEFAULT 'queued',
+    attempts integer NOT NULL DEFAULT 0,
+    run_after timestamptz NOT NULL DEFAULT now(),
+    last_error text,
+    created_at timestamptz NOT NULL DEFAULT now()
+);
+CREATE INDEX IF NOT EXISTS jobs_due ON jobs (queue, run_after, id) WHERE state = 'queued';
+{{/if}}
+{{#if mysql}}
+CREATE TABLE IF NOT EXISTS jobs (
+    id BIGINT AUTO_INCREMENT PRIMARY KEY,
+    queue VARCHAR(64) NOT NULL DEFAULT 'default',
+    payload TEXT NOT NULL,
+    state VARCHAR(16) NOT NULL DEFAULT 'queued',
+    attempts INT NOT NULL DEFAULT 0,
+    run_after DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
+    last_error TEXT,
+    created_at DATETIME(6) NOT NULL DEFAULT (UTC_TIMESTAMP(6)),
+    INDEX jobs_due (queue, state, run_after, id)
+) DEFAULT CHARSET = utf8mb4;
+{{/if}}

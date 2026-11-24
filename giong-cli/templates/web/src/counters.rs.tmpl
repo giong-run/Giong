@@ -1,0 +1,73 @@
+{{#file-if redis & !sql}}
+//! `/counters/{name}`: counters kept in Redis, shared by every worker and
+//! every copy of the service.
+
+use giong_web::{json, Error, Req, Response, Router};
+use serde::{Deserialize, Serialize};
+
+use crate::State;
+
+#[derive(Serialize)]
+struct Counter<'a> {
+    name: &'a str,
+    value: i64,
+}
+
+#[derive(Deserialize, Default)]
+struct Add {
+    by: Option<i64>,
+}
+
+/// The routes, mounted at `/counters`.
+pub fn routes() -> Router<State> {
+    Router::new()
+        .get("/{name}", get_counter)
+        .post("/{name}", add_to_counter)
+}
+
+/// A name of letters, digits, `-` and `_`, at most 64 bytes, so a key never
+/// collides with another kind of key.
+fn counter_name(req: &Req<State>) -> Result<String, Error> {
+    let name: String = req.param("name")?;
+    let valid = !name.is_empty()
+        && name.len() <= 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_');
+    if !valid {
+        return Err(Error::bad_request(
+            "invalid_name",
+            "name: 1 to 64 letters, digits, - or _",
+        ));
+    }
+    Ok(name)
+}
+
+fn key(name: &str) -> String {
+    format!("counter:{name}")
+}
+
+async fn get_counter(req: Req<State>) -> Result<Response, Error> {
+    let name = counter_name(&req)?;
+    let value: Option<i64> = req.state().redis.get(key(&name)).await?;
+    json(
+        200,
+        &Counter {
+            name: &name,
+            value: value.unwrap_or(0),
+        },
+    )
+}
+
+async fn add_to_counter(req: Req<State>) -> Result<Response, Error> {
+    let name = counter_name(&req)?;
+    // An empty body adds 1.
+    let add: Add = if req.body().is_empty() {
+        Add::default()
+    } else {
+        req.json()?
+    };
+    let by = add.by.unwrap_or(1);
+    let value = req.state().redis.incr(key(&name), by).await?;
+    json(200, &Counter { name: &name, value })
+}
