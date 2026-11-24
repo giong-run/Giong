@@ -184,9 +184,8 @@ fn connection(plan: &Plan, conns: usize, i: usize, start: Instant) -> Outcome {
                 if due >= end {
                     break;
                 }
-                let now = Instant::now();
-                if now < due {
-                    std::thread::sleep(due - now);
+                if Instant::now() < due {
+                    sleep_until(due);
                     if due >= window {
                         out.lag
                             .add(nanos(Instant::now().saturating_duration_since(due)));
@@ -237,6 +236,26 @@ fn connection(plan: &Plan, conns: usize, i: usize, start: Instant) -> Outcome {
         next = (next + 1) % plan.requests.len();
     }
     out
+}
+
+/// Sleeps until `due`. macOS may wake a sleeping thread late by up to the
+/// length of its sleep (timer coalescing), which made an 80 ms wait between
+/// requests end up to 80 ms late and every latency include it: there the
+/// wait is cut in halves, each of which can end late only by its own length,
+/// so the thread wakes by `due` after a few short sleeps. Linux's timer
+/// slack is 50 µs, so one sleep is enough.
+fn sleep_until(due: Instant) {
+    loop {
+        let left = due.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return;
+        }
+        if cfg!(target_os = "linux") || left <= Duration::from_micros(200) {
+            std::thread::sleep(left);
+            return;
+        }
+        std::thread::sleep(left / 2);
+    }
 }
 
 fn nanos(d: Duration) -> u64 {
@@ -729,6 +748,15 @@ mod tests {
         // 400/s for 0.5 s: 200 requests due in the window.
         assert!((195..=205).contains(&o.answered()), "{}", o.answered());
         assert!(o.lag.count() > 0 && o.lag.count() <= o.answered());
+    }
+
+    #[test]
+    fn sleep_until_wakes_at_the_due_time() {
+        for ms in [0u64, 1, 15, 80] {
+            let due = Instant::now() + Duration::from_millis(ms);
+            sleep_until(due);
+            assert!(Instant::now() >= due, "woke early for {ms} ms");
+        }
     }
 
     #[test]
