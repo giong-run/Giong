@@ -1,0 +1,91 @@
+# The giong command, end to end, on every OS it ships for: the real binary in
+# directories of its own (giong-cli/tests/e2e/). Linux and macOS also run the
+# slow scenarios (generated projects built and served, `giong dev` reloads
+# with no request dropped) once the commands they use exist.
+#
+# A second step runs the tests marked `#[ignore = "known bug: ..."]`, which
+# reproduce bugs found in review and not fixed yet. It may fail; the job
+# summary lists which still fail, so a fix shows up as soon as it lands.
+
+name: CLI end to end
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+    paths:
+      - "giong-cli/**"
+      - "docs/errors/**"
+      - "templates/**"
+      - "giong-web/**"
+      - "giong-mcp/**"
+      - ".github/workflows/cli-e2e.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: cli-e2e-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: "1"
+  # The stable compiler every workflow pins (scripts/release.py check).
+  RUST_STABLE: "1.100.0"
+
+jobs:
+  e2e:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-24.04
+            toolchain: pinned
+            slow: "1"
+          # Cargo before its new build-dir layout (units in .fingerprint/
+          # and deps/): giong clean must handle both.
+          - os: ubuntu-24.04
+            toolchain: "1.97.0"
+            slow: "0"
+          - os: macos-15
+            toolchain: pinned
+            slow: "1"
+          - os: windows-2025
+            toolchain: pinned
+            slow: "0"
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    env:
+      # The slow scenarios build generated projects: not on draft pull
+      # requests (docs/DEVELOPMENT.md, CI tiers), always once ready.
+      GIONG_E2E_SLOW: ${{ (matrix.slow == '1' && !github.event.pull_request.draft) && '1' || '0' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ matrix.toolchain == 'pinned' && env.RUST_STABLE || matrix.toolchain }}
+      - name: Unit and end-to-end tests
+        run: cargo test -p giong-cli --all-targets --no-fail-fast
+      - name: Known bugs (allowed to fail)
+        id: known
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -o pipefail
+          cargo test -p giong-cli --test e2e -- --ignored 2>&1 | tee known.log
+      - name: Summary of known bugs
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "### Known-bug tests on ${{ matrix.os }} (${{ matrix.toolchain }})"
+            if [ -f known.log ]; then
+              echo
+              echo "Still failing (the bug is not fixed):"
+              grep -E '^test .* FAILED$' known.log | sed 's/^test /- /; s/ \.\.\. FAILED$//' || echo "- none"
+              echo
+              echo "Passing now (remove the ignore):"
+              grep -E '^test .* ok$' known.log | sed 's/^test /- /; s/ \.\.\. ok$//' || echo "- none"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
