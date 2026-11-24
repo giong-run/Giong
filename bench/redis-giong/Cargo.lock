@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "io-uring",
  "libc",
@@ -61,7 +61,7 @@ dependencies = [
 
 [[package]]
 name = "giong-redis"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "giong",
  "giong-tls",
@@ -70,7 +70,7 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "1.4.1"
+version = "1.4.2"
 dependencies = [
  "giong",
  "libc",

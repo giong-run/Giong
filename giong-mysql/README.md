@@ -4,8 +4,8 @@ A MySQL and MariaDB client and connection pool for the [giong](../README.md) run
 
 ```toml
 [dependencies]
-giong = "1.4.1"
-giong-mysql = "1.4.1"
+giong = "1.4.2"
+giong-mysql = "1.4.2"
 ```
 
 ```rust,no_run
