@@ -5,7 +5,7 @@
 use std::io;
 use std::mem;
 use std::os::fd::RawFd;
-use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI32, AtomicU64, Ordering};
 
 use crate::error::Code;
 
@@ -166,9 +166,74 @@ static SIGNAL_FD: AtomicI32 = AtomicI32::new(-1);
 static SIGNAL_READ_FD: AtomicI32 = AtomicI32::new(-1);
 /// Set while a runtime has the handlers installed.
 static SIGNALS_IN_USE: AtomicBool = AtomicBool::new(false);
+/// When the first signal since the handlers were installed arrived, in
+/// nanoseconds of `CLOCK_MONOTONIC`; 0 before it.
+static FIRST_SIGNAL: AtomicU64 = AtomicU64::new(0);
+/// SIGINT, and SIGTERM, were ignored before the handlers were installed
+/// (as in a background job of a non-interactive shell).
+static INT_IGNORED: AtomicBool = AtomicBool::new(false);
+static TERM_IGNORED: AtomicBool = AtomicBool::new(false);
 
-/// Async-signal-safe: only `write(2)`, with `errno` preserved.
-extern "C" fn on_signal(_signal: libc::c_int) {
+/// A signal this soon after the first is part of the same request: one
+/// Ctrl-C reaches every process of the terminal's foreground group, and
+/// wrappers (cargo-watch, watchexec, process managers) forward it to their
+/// child too, so one key press can deliver two signals. Someone pressing
+/// Ctrl-C again because a shutdown hangs is always slower than this.
+const SAME_REQUEST_NS: u64 = 250_000_000;
+
+/// `CLOCK_MONOTONIC` in nanoseconds; never 0. Async-signal-safe.
+fn monotonic_ns() -> u64 {
+    // SAFETY: all-zero is a valid timespec, which the call fills in.
+    let mut ts: libc::timespec = unsafe { mem::zeroed() };
+    // SAFETY: a valid clock and pointer; `clock_gettime` is
+    // async-signal-safe.
+    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    (ts.tv_sec as u64)
+        .wrapping_mul(1_000_000_000)
+        .wrapping_add(ts.tv_nsec as u64)
+        .max(1)
+}
+
+/// Async-signal-safe: only `clock_gettime(2)` and `write(2)`, with `errno`
+/// preserved, and for a second signal `getpid(2)`, `sigaction(2)` and
+/// `raise(3)` or `_exit(2)`.
+extern "C" fn on_signal(signal: libc::c_int) {
+    let now = monotonic_ns();
+    if let Err(first) = FIRST_SIGNAL.compare_exchange(0, now, Ordering::Relaxed, Ordering::Relaxed)
+    {
+        if now.saturating_sub(first) < SAME_REQUEST_NS {
+            // The same request as the first: its shutdown is under way.
+            return;
+        }
+        let ignored = if signal == libc::SIGINT {
+            &INT_IGNORED
+        } else {
+            &TERM_IGNORED
+        };
+        if ignored.load(Ordering::Relaxed) {
+            // With no handler the signal would have done nothing.
+            return;
+        }
+        // The shutdown the first signal asked for has not finished: do what
+        // the signal does with no handler, and end the process. The signal
+        // stays blocked while this handler runs, so it is delivered, with
+        // its default action, as the handler returns. Process 1 (the
+        // program a container runs) is not ended by a signal's default
+        // action, so it exits with the status a shell gives a process the
+        // signal ended.
+        // SAFETY: all four calls are async-signal-safe; the action is valid.
+        unsafe {
+            if libc::getpid() == 1 {
+                libc::_exit(128 + signal);
+            }
+            let mut action: libc::sigaction = mem::zeroed();
+            action.sa_sigaction = libc::SIG_DFL;
+            libc::sigemptyset(&mut action.sa_mask);
+            libc::sigaction(signal, &action, std::ptr::null_mut());
+            libc::raise(signal);
+        }
+        return;
+    }
     let fd = SIGNAL_FD.load(Ordering::Relaxed);
     if fd >= 0 {
         let errno = super::errno_location();
@@ -222,6 +287,15 @@ impl SignalGuard {
             }
             // Forget signals that arrived while nobody was listening.
             super::drain(fd);
+            FIRST_SIGNAL.store(0, Ordering::SeqCst);
+            // What each signal did before, read before the handlers go in.
+            for (signal, ignored) in [(libc::SIGINT, &INT_IGNORED), (libc::SIGTERM, &TERM_IGNORED)]
+            {
+                let mut current: libc::sigaction = mem::zeroed();
+                let was_ignored = libc::sigaction(signal, std::ptr::null(), &mut current) == 0
+                    && current.sa_sigaction == libc::SIG_IGN;
+                ignored.store(was_ignored, Ordering::SeqCst);
+            }
 
             let mut action: libc::sigaction = mem::zeroed();
             action.sa_sigaction = on_signal as extern "C" fn(libc::c_int) as usize;
@@ -265,4 +339,129 @@ impl Drop for SignalGuard {
         }
         SIGNALS_IN_USE.store(false, Ordering::SeqCst);
     }
+}
+
+/// `MSG_DONTWAIT`: this one call does not wait, whatever the socket's mode.
+pub(crate) const MSG_DONTWAIT: i32 = libc::MSG_DONTWAIT;
+
+/// One piece of a vectored send or receive.
+pub(crate) type IoVec = libc::iovec;
+
+/// An IPv6 socket address, the largest giong reads from a datagram.
+pub(crate) type SockAddrIn6 = libc::sockaddr_in6;
+
+/// The address family of IPv4, as a socket address carries it.
+pub(crate) const AF_INET: i32 = libc::AF_INET;
+/// The address family of IPv6.
+pub(crate) const AF_INET6: i32 = libc::AF_INET6;
+/// The flag a received message carries when its end was cut off.
+pub(crate) const MSG_TRUNC: i32 = libc::MSG_TRUNC;
+
+/// The piece of `len` bytes at `base`.
+#[inline(always)]
+pub(crate) fn io_vec(base: *const u8, len: usize) -> IoVec {
+    libc::iovec {
+        iov_base: base.cast_mut().cast(),
+        iov_len: len,
+    }
+}
+
+/// Where a piece starts and how long it is.
+#[inline(always)]
+pub(crate) fn io_vec_parts(v: &IoVec) -> (*const u8, usize) {
+    (v.iov_base as *const u8, v.iov_len)
+}
+
+/// Points a piece at `base`, keeping its length.
+#[inline(always)]
+pub(crate) fn io_vec_set_base(v: &mut IoVec, base: *const u8) {
+    v.iov_base = base.cast_mut().cast();
+}
+
+/// The header of a receive that only says how much room the sender's
+/// address gets: `name_len` bytes, and nothing else.
+pub(crate) const fn recv_header(name_len: usize) -> MsgHdr {
+    // SAFETY: all-zero is a valid `msghdr` (null pointers, zero lengths).
+    let mut hdr: MsgHdr = unsafe { mem::zeroed() };
+    hdr.msg_namelen = name_len as SockLen;
+    hdr
+}
+
+/// Points a message header at `count` pieces.
+///
+/// # Safety
+///
+/// `msg` must point at a live header.
+#[inline(always)]
+pub(crate) unsafe fn msg_set_iov(msg: *mut MsgHdr, iov: *mut IoVec, count: usize) {
+    (*msg).msg_iov = iov;
+    (*msg).msg_iovlen = count as _;
+}
+
+/// Points a message header at `len` bytes of ancillary data.
+///
+/// # Safety
+///
+/// `msg` must point at a live header.
+#[inline(always)]
+pub(crate) unsafe fn msg_set_control(msg: *mut MsgHdr, control: *mut u8, len: usize) {
+    (*msg).msg_control = control.cast();
+    (*msg).msg_controllen = len as _;
+}
+
+/// Points a message header at an address of `len` bytes, or at room for one.
+///
+/// # Safety
+///
+/// `msg` must point at a live header.
+#[inline(always)]
+pub(crate) unsafe fn msg_set_name(msg: *mut MsgHdr, name: *mut u8, len: SockLen) {
+    (*msg).msg_name = name.cast();
+    (*msg).msg_namelen = len;
+}
+
+/// The length of the address in a message header.
+#[inline(always)]
+pub(crate) fn msg_name_len(msg: &MsgHdr) -> usize {
+    msg.msg_namelen as usize
+}
+
+/// `send(2)` that does not wait: the bytes sent, or -1 with `errno` set.
+///
+/// # Safety
+///
+/// `buf` must be valid for `len` bytes.
+#[inline(always)]
+pub(crate) unsafe fn send_nowait(fd: RawSock, buf: *const u8, len: usize) -> isize {
+    libc::send(fd, buf.cast(), len, super::MSG_NOSIGNAL | MSG_DONTWAIT)
+}
+
+/// `sendto(2)` that does not wait: the bytes sent, or -1 with `errno` set.
+///
+/// # Safety
+///
+/// `buf` must be valid for `len` bytes and `addr` for `addr_len`.
+#[inline(always)]
+pub(crate) unsafe fn send_to_nowait(
+    fd: RawSock,
+    buf: *const u8,
+    len: usize,
+    addr: *const SockAddr,
+    addr_len: SockLen,
+) -> isize {
+    libc::sendto(
+        fd,
+        buf.cast(),
+        len,
+        super::MSG_NOSIGNAL | MSG_DONTWAIT,
+        addr,
+        addr_len,
+    )
+}
+
+/// `true` if a send with `flags` waits for room in the socket's buffer;
+/// `false` if it asked not to (`MSG_DONTWAIT`).
+#[inline(always)]
+pub(crate) fn send_waits(flags: i32) -> bool {
+    flags & MSG_DONTWAIT == 0
 }

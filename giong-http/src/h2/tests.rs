@@ -217,6 +217,7 @@ struct TestServer {
 
 impl TestServer {
     fn start(server: Server) -> Self {
+        crate::quiet_panics::quiet_expected_panics();
         let app = App::default();
         let state = app.0.clone();
         let rt = giong::Builder::new()
@@ -814,6 +815,94 @@ fn responses_follow_the_clients_flow_control() {
 }
 
 #[test]
+fn initial_window_size_moves_the_stream_windows_once_per_frame() {
+    let server = TestServer::start(Server::new());
+    let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    c.auto_window = false;
+    let id = c.get("/bytes?n=5000");
+    let sent = |frames: Vec<Frame>| -> usize {
+        frames
+            .iter()
+            .filter(|f| f.head.kind == frame::DATA && f.head.stream == id)
+            .map(|f| f.payload.len())
+            .sum()
+    };
+    assert_eq!(sent(c.frames_within(Duration::from_millis(100))), 0);
+    // Several values in one frame: the last one counts.
+    let mut out = Vec::new();
+    frame::write_settings(
+        &mut out,
+        &[
+            (frame::INITIAL_WINDOW_SIZE, 100_000),
+            (frame::INITIAL_WINDOW_SIZE, 0),
+            (frame::INITIAL_WINDOW_SIZE, 1000),
+        ],
+    );
+    c.write(&out);
+    assert_eq!(sent(c.frames_within(Duration::from_millis(300))), 1000);
+    // The rest, so that the stream ends.
+    let mut out = Vec::new();
+    frame::write_settings(&mut out, &[(frame::INITIAL_WINDOW_SIZE, 65_535)]);
+    c.write(&out);
+    assert_eq!(sent(c.frames_within(Duration::from_millis(300))), 4000);
+
+    // A value that takes a window past 2^31-1 is an error even when a later
+    // one in the same frame would bring it back.
+    let mut d = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    let id = d.get("/sleep?ms=3000");
+    let mut out = Vec::new();
+    frame::write_window_update(&mut out, id, frame::MAX_WINDOW as u32);
+    frame::write_settings(
+        &mut out,
+        &[
+            (frame::INITIAL_WINDOW_SIZE, 10),
+            (frame::INITIAL_WINDOW_SIZE, 0),
+        ],
+    );
+    d.write(&out);
+    match d.goaway() {
+        Ended::GoAway(code, _) => assert_eq!(reason(code), "FLOW_CONTROL_ERROR"),
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
+fn settings_frames_full_of_window_sizes_cost_one_pass_over_the_streams() {
+    let server = TestServer::start(Server::new());
+    let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    c.auto_window = false;
+    // 100 streams wait on their windows, then come SETTINGS frames of the
+    // largest size, each holding 2,730 window sizes. Applying each one to
+    // every stream was 273,000 stream updates per frame.
+    for _ in 0..100 {
+        c.get("/bytes?n=5000");
+    }
+    c.frames_within(Duration::from_millis(100));
+    let entries = vec![(frame::INITIAL_WINDOW_SIZE, 0); frame::DEFAULT_FRAME_SIZE / 6];
+    let mut out = Vec::new();
+    for _ in 0..600 {
+        frame::write_settings(&mut out, &entries);
+    }
+    frame::write_ping(&mut out, false, b"measured");
+    let before = super::server::WINDOW_MOVES.load(Ordering::SeqCst);
+    c.write(&out);
+    loop {
+        let f = c.frame().expect("the connection stays open");
+        if f.head.kind == frame::PING && f.head.has(frame::ACK) {
+            break;
+        }
+    }
+    // One move of each stream per frame: 60,000 (other tests running at the
+    // same time add a few). It was 163,800,000, 8 s in a debug build.
+    let moves = super::server::WINDOW_MOVES.load(Ordering::SeqCst) - before;
+    assert!((60_000..1_000_000).contains(&moves), "{moves}");
+    // Every stream gets the window to end.
+    let mut out = Vec::new();
+    frame::write_settings(&mut out, &[(frame::INITIAL_WINDOW_SIZE, 65_535)]);
+    c.write(&out);
+}
+
+#[test]
 fn bodies_held_by_a_connection_stay_within_a_budget() {
     // Bodies of up to 64 KiB: the budget is then 1 MiB, half of it shared
     // by 100 streams at first.
@@ -1067,6 +1156,62 @@ fn streams_beyond_the_limit_are_refused() {
 }
 
 #[test]
+fn a_first_flight_past_the_stream_limit_is_refused_not_cut_off() {
+    // Until the client has our SETTINGS, it cannot know the limit: 1,000
+    // streams in its first flight get 900 refusals and 100 answers.
+    let server = TestServer::start(Server::new());
+    let first_flight = |c: &mut Client, out: &mut Vec<u8>| -> Vec<u32> {
+        (0..1000)
+            .map(|_| {
+                let id = c.next_id;
+                c.next_id += 2;
+                let block = c.encode(&[
+                    (":method", "GET"),
+                    (":scheme", "http"),
+                    (":path", "/wait"),
+                    (":authority", "x"),
+                ]);
+                frame::write_headers(out, id, &block, true, frame::DEFAULT_FRAME_SIZE);
+                id
+            })
+            .collect()
+    };
+    let mut c = Client::connect(server.addr);
+    let mut out = PREFACE.to_vec();
+    frame::write_settings(&mut out, &[]);
+    let ids = first_flight(&mut c, &mut out);
+    c.write(&out);
+    while c.resets.len() < 900 && c.goaway.is_none() {
+        c.frame().expect("the connection stays open");
+    }
+    assert!(c.goaway.is_none(), "{:?}", c.goaway);
+    let refused = Reason::RefusedStream as u32;
+    assert!(c.resets.values().all(|&code| code == refused));
+    server.state.released.store(true, Ordering::SeqCst);
+    let answers = ids
+        .iter()
+        .filter(|&&id| c.reply(id).is_ok_and(|r| r.text() == "released"))
+        .count();
+    assert_eq!(answers, 100);
+    assert!(c.goaway.is_none(), "{:?}", c.goaway);
+
+    // Once our SETTINGS are acknowledged, opening past the limit breaks the
+    // protocol, and many such streams end the connection.
+    let server = TestServer::start(Server::new());
+    let mut c = server.client();
+    let mut out = Vec::new();
+    first_flight(&mut c, &mut out);
+    c.try_write(&out);
+    match c.goaway() {
+        Ended::GoAway(code, debug) => {
+            assert_eq!(reason(code), "ENHANCE_YOUR_CALM");
+            assert!(debug.starts_with("GIONG-E1116"), "{debug}");
+        }
+        other => panic!("{other:?}"),
+    }
+}
+
+#[test]
 fn a_reset_drops_the_handler_at_once() {
     let server = TestServer::start(Server::new());
     let mut c = server.client();
@@ -1287,6 +1432,32 @@ fn malformed_requests_are_reset_and_the_connection_goes_on() {
         Ended::Reset(Reason::Protocol as u32)
     );
     assert_eq!(c.request("GET", "/", &[], b"").status, 200);
+}
+
+#[test]
+fn after_the_client_closes_answers_its_window_holds_back_are_reset() {
+    // A write timeout longer than the client's read timeout: only a reset
+    // that does not wait for it gets through.
+    let server = TestServer::start(Server::new().write_timeout(Duration::from_secs(600)));
+    // Its window holds the answer back; then the client closes its side,
+    // after which it can send no more window: the stream is reset at once
+    // instead of after the write timeout, and the connection ends.
+    let mut c = server.client_with(&[(frame::INITIAL_WINDOW_SIZE, 0)]);
+    c.auto_window = false;
+    let id = c.get("/bytes?n=5000");
+    c.frames_within(Duration::from_millis(100));
+    c.stream.shutdown(std::net::Shutdown::Write).unwrap();
+    assert_eq!(
+        c.reply(id).unwrap_err(),
+        Ended::Reset(Reason::Cancel as u32)
+    );
+    while c.frame().is_some() {}
+
+    // An answer the window lets through still arrives after a half-close.
+    let mut c = server.client();
+    let id = c.get("/bytes?n=5000");
+    c.stream.shutdown(std::net::Shutdown::Write).unwrap();
+    assert_eq!(c.reply(id).unwrap().body, pattern(5000));
 }
 
 #[test]

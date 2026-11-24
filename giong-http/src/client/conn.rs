@@ -3,6 +3,7 @@
 
 use std::future::Future;
 use std::io;
+use std::mem;
 use std::ops::Deref;
 use std::os::fd::AsRawFd;
 use std::pin::pin;
@@ -55,9 +56,14 @@ impl Stream {
     }
 
     pub(crate) async fn write_all(&self, buf: Vec<u8>) -> io::Result<()> {
+        self.write_all_back(buf).await.0
+    }
+
+    /// Writes all of `buf` and hands it back, whole, whatever happened.
+    pub(crate) async fn write_all_back(&self, buf: Vec<u8>) -> (io::Result<()>, Vec<u8>) {
         match self {
-            Stream::Tcp(s) => s.write_all(buf).await.0,
-            Stream::Tls(s) => s.write_all(buf).await.0,
+            Stream::Tcp(s) => s.write_all(buf).await,
+            Stream::Tls(s) => s.write_all(buf).await,
         }
     }
 
@@ -300,20 +306,41 @@ impl Conn {
     }
 
     /// Sends `request` and reads the head of the response to it, after
-    /// any 1xx (informational) responses.
+    /// any 1xx (informational) responses. `reused` says the connection
+    /// carried a request before.
+    ///
+    /// `request` is lent, not copied: it holds the whole body, and is still
+    /// there, whole, to be sent again on another connection if this one
+    /// turns out to be closed. (Taken away only if the future is dropped
+    /// half way, which ends the request anyway.)
     pub(crate) async fn send(
         &mut self,
-        request: Vec<u8>,
+        request: &mut Vec<u8>,
+        reused: bool,
         head_request: bool,
         max_head_size: usize,
         what: &str,
     ) -> Result<Answer, Failure> {
-        if let Err(e) = self.stream.write_all(request).await {
-            return Err(Failure::NothingReceived(Error::io(
+        let (sent, buf) = self.stream.write_all_back(mem::take(request)).await;
+        *request = buf;
+        if let Err(e) = sent {
+            let error = Error::io(
                 ErrorKind::Closed,
                 format!("{what}: sending the request failed"),
                 e,
-            )));
+            );
+            // The server may have answered (413, 401...) and closed without
+            // reading the rest of the body: its answer says more than the
+            // broken pipe. A 408 on a kept-alive connection is the server
+            // closing it while idle (RFC 9110 15.5.9), before it read this
+            // request: that one is sent again as before.
+            return match read_answer(self, head_request, max_head_size, what).await {
+                Ok(mut answer) if !(reused && answer.head.status == 408) => {
+                    answer.body.reusable = false;
+                    Ok(answer)
+                }
+                _ => Err(Failure::NothingReceived(error)),
+            };
         }
         read_answer(self, head_request, max_head_size, what).await
     }

@@ -54,8 +54,12 @@ changes to the project reach the site without anyone touching `site/`:
   `content.py` `CRATES` for its layer in the stack, bullets and a headline fact.
 - **Lines of code** are counted from each crate's `src/`. The **test counts** are in
   `content.py` (one number per crate, summed by the build).
-- **The roadmap** is `ROADMAP.md`: a `## X.Y — Name` heading is a milestone, its
-  `- [x]` boxes give its progress, `(done)` or all boxes ticked marks it done.
+- **The roadmap** is `ROADMAP.md`: a `## X.Y — Name` (or `## X.Y.x — Name`) heading is a
+  milestone, its `- [x]` boxes give its progress, `(done)` or all boxes ticked marks it
+  done. A milestone done in `ROADMAP.md` whose version is newer than the release shows as
+  "releasing", never as shipped; one whose text starts with "Proposed" gets that badge.
+  The roadmap page draws every numbered milestone on one track and gives each one that
+  has not shipped a card; the home page shows the first four of those cards.
 - **The release notes** are `CHANGELOG.md`; the newest release is announced on the
   home page, with its milestone's name from the roadmap.
 - **The error codes** are the tables in `docs/errors/README.md`.
@@ -75,7 +79,9 @@ changes, change the drawing in the same pull request.
 
 ## Changing the words or a number
 
-Edit `content.py`. Every number on the site comes from the README and `bench/results/`;
+Edit `content.py`. The home page's head-to-head table (`SCOREBOARD`, the README's table of
+the Tokio crates each giong crate replaces, with its losses) and its build numbers
+(`BUILD`, from `bench/results/build/`) are there too. Every number on the site comes from the README and `bench/results/`;
 when a benchmark is run again, update the README first and then `content.py`, so the
 two never disagree. Keep the caveats next to the numbers they qualify.
 
