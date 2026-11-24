@@ -444,7 +444,8 @@ pub fn render(o: &Options) -> Result<Vec<File>, Failure> {
     Ok(out)
 }
 
-/// Every template file, for tests and the template check.
+/// Every template file, for the tests.
+#[cfg(test)]
 pub fn template_files() -> &'static [(&'static str, &'static str)] {
     files::FILES
 }

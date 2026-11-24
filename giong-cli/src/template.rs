@@ -43,11 +43,6 @@ impl Context {
         self
     }
 
-    /// The value of a flag, if it is known.
-    pub fn get_flag(&self, name: &str) -> Option<bool> {
-        self.flags.get(name).copied()
-    }
-
     fn eval(&self, cond: &str) -> Result<bool, String> {
         let cond = cond.trim();
         if cond.is_empty() {
