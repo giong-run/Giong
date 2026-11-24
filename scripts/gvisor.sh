@@ -22,10 +22,14 @@ cd "$(dirname "$0")/.."
 release=20261116
 sha512=c87d792d5842efb70c38ee822124cfe0821a547715e7abcf3f2b14997cd02784edaa0b91e238ec5c27a25a1b9e00bf98113398eb62a0778d8d20d4e222f8b0e0
 image="${IMAGE:-ubuntu:24.04}"
+# Pulled first, with retries: `docker run` would pull it once, without any.
+docker image inspect "$image" > /dev/null 2>&1 ||
+    scripts/ci-net.sh retry -n 5 -t 300 -- docker pull -q "$image" > /dev/null
 
 if ! docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'; then
     tmp="$(mktemp -d)"
-    curl -fsSL -o "$tmp/gvisor.tar.bz2" \
+    scripts/ci-net.sh retry -n 4 -t 300 -- curl -fsSL --retry 3 --retry-all-errors \
+        --connect-timeout 20 -o "$tmp/gvisor.tar.bz2" \
         "https://storage.googleapis.com/gvisor/releases/release/$release/x86_64/gvisor.tar.bz2"
     echo "$sha512  $tmp/gvisor.tar.bz2" | sha512sum -c -
     tar -xjf "$tmp/gvisor.tar.bz2" -C "$tmp"
