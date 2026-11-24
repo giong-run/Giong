@@ -1,0 +1,3 @@
+Limit                     Soft Limit           Hard Limit           Units
+Max open files            1024                 524288               files
+Seccomp:	2

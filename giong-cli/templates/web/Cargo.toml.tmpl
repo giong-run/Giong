@@ -1,0 +1,31 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+giong = { {{src_giong}} }
+giong-mcp = { {{src_giong_mcp}} }
+{{#if tls}}
+giong-tls = { {{src_giong_tls}} }
+giong-web = { {{src_giong_web}}, features = ["serde", "tls"] }
+{{#else}}
+giong-web = { {{src_giong_web}}, features = ["serde"] }
+{{/if}}
+{{#if postgres}}
+giong-postgres = { {{src_giong_postgres}} }
+{{/if}}
+{{#if mysql}}
+giong-mysql = { {{src_giong_mysql}} }
+{{/if}}
+{{#if redis}}
+giong-redis = { {{src_giong_redis}} }
+{{/if}}
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+giong-http = { {{src_giong_http}}, features = ["client"] }
+
+{{profiles}}

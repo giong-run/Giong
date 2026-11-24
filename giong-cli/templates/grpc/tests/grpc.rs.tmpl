@@ -1,0 +1,69 @@
+//! The service end to end: served on a free port of 127.0.0.1 and called
+//! with the generated client, the way a real client calls it.
+
+use std::time::Duration;
+
+use giong::net::TcpListener;
+use giong_grpc::{CallOptions, Channel, Code, Server};
+use {{crate}}::pb::{{crate}}::v1::greeter::{GreeterClient, GreeterServer};
+use {{crate}}::pb::{{crate}}::v1::HelloRequest;
+use {{crate}}::{Hello, MAX_COUNT};
+
+fn serve() -> GreeterClient {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let endpoint = format!("http://{}", listener.local_addr().unwrap());
+    let grpc = Server::new().add(GreeterServer::new(Hello));
+    giong::spawn(async move { giong_http::Server::new().serve(listener, grpc).await });
+    GreeterClient::new(Channel::new(&endpoint).unwrap())
+}
+
+fn options() -> CallOptions {
+    CallOptions::new().timeout(Duration::from_secs(10))
+}
+
+#[test]
+fn one_greeting() {
+    giong::block_on(async {
+        let greeter = serve();
+        let request = HelloRequest {
+            name: "Ada",
+            ..Default::default()
+        };
+        let reply = greeter.say_hello(&request, options()).await.unwrap();
+        assert_eq!(reply.message().unwrap().message(), "Hello, Ada!");
+
+        let empty = HelloRequest::default();
+        let refused = greeter.say_hello(&empty, options()).await.unwrap_err();
+        assert_eq!(refused.code(), Code::InvalidArgument);
+        assert_eq!(refused.message(), "name must not be empty");
+    });
+}
+
+#[test]
+fn a_stream_of_greetings() {
+    giong::block_on(async {
+        let greeter = serve();
+        let request = HelloRequest {
+            name: "Ada",
+            count: 3,
+            ..Default::default()
+        };
+        let mut replies = greeter.say_hello_many(&request, options()).await.unwrap();
+        let mut lines = Vec::new();
+        while let Some(reply) = replies.message().await.unwrap() {
+            lines.push(reply.message().unwrap().message().to_owned());
+        }
+        assert_eq!(lines, ["Hello, Ada (1)!", "Hello, Ada (2)!", "Hello, Ada (3)!"]);
+
+        let too_many = HelloRequest {
+            name: "Ada",
+            count: MAX_COUNT + 1,
+            ..Default::default()
+        };
+        let refused = match greeter.say_hello_many(&too_many, options()).await {
+            Err(status) => status,
+            Ok(mut replies) => replies.message().await.unwrap_err(),
+        };
+        assert_eq!(refused.code(), Code::InvalidArgument);
+    });
+}

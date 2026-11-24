@@ -16,9 +16,20 @@
 //! behave the same way, with a non-blocking system call made when the socket
 //! is ready (see [`DriverKind`](crate::DriverKind)).
 
+#[cfg(target_os = "linux")]
+mod activation;
 mod addr;
 mod balance;
 pub(crate) mod dns;
+#[cfg(target_os = "linux")]
+mod fds;
+// giong dev's socket hand-off: in debug builds, or with the `dev` feature.
+// Elsewhere a stub that refuses to run under giong dev.
+#[cfg(all(unix, any(debug_assertions, feature = "dev")))]
+mod inherit;
+#[cfg(all(unix, not(any(debug_assertions, feature = "dev"))))]
+#[path = "net/inherit_off.rs"]
+mod inherit;
 mod sendq;
 mod share;
 #[cfg(windows)]
@@ -27,12 +38,18 @@ pub(crate) mod udp;
 #[cfg(unix)]
 mod unix;
 
+#[cfg(target_os = "linux")]
+pub use activation::{activated_sockets, ActivatedSocket};
 pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
+#[cfg(target_os = "linux")]
+pub use fds::{PeerCred, MAX_FDS};
 pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
 #[cfg(feature = "unstable-udp-offload")]
 pub use udp::{SendOptions, GRO_RECV_BUFFER};
+#[cfg(target_os = "linux")]
+pub use unix::UnixDatagram;
 #[cfg(unix)]
 pub use unix::{UnixListener, UnixStream};
 
@@ -327,6 +344,10 @@ pub(crate) fn close_socket(sock: &mut ManuallyDrop<Socket>, slot: &MultiSlot) {
 pub(crate) struct ListenSocket {
     sock: ManuallyDrop<Socket>,
     accept: MultiSlot,
+    /// A socket handed down by `giong dev`: it stops accepting when told to
+    /// (see `inherit`).
+    #[cfg(unix)]
+    inherited: bool,
     _not_send: PhantomData<*const ()>,
 }
 
@@ -341,8 +362,18 @@ impl ListenSocket {
         Self {
             sock: ManuallyDrop::new(sock),
             accept: MultiSlot::new(MultiKind::Accept),
+            #[cfg(unix)]
+            inherited: false,
             _not_send: PhantomData,
         }
+    }
+
+    /// A socket `giong dev` handed down (see `inherit`).
+    #[cfg(unix)]
+    pub(crate) fn inherited(sock: Socket) -> Self {
+        let mut listener = Self::new(sock);
+        listener.inherited = true;
+        listener
     }
 
     pub(crate) fn socket(&self) -> &Socket {
@@ -358,6 +389,10 @@ impl ListenSocket {
         runtime::with_worker(|w| {
             let key = self.accept.key(w);
             let mut driver = w.driver.borrow_mut();
+            #[cfg(unix)]
+            if self.inherited {
+                return inherit::poll_accept(&self.sock, key, &mut driver, cx);
+            }
             loop {
                 match driver.poll_multi(key, cx.waker()) {
                     MultiPoll::Item(res) if res >= 0 => {
@@ -1348,6 +1383,11 @@ pub struct TcpListener {
     /// The listener's hold on its port, for one that [`bind`](Self::bind)
     /// made (see `share`).
     held: Option<share::Held>,
+    /// Set once the descriptor has been lent out ([`AsFd`](std::os::fd::AsFd),
+    /// [`AsRawFd`]): it may have been duplicated or passed to another
+    /// process, so dropping the listener must only close this descriptor,
+    /// never shut the socket down for every copy.
+    lent: Cell<bool>,
     /// The listener's share of an address that several workers listen on
     /// (see `spread`). After `inner`: the socket is closed first.
     #[cfg(windows)]
@@ -1388,6 +1428,13 @@ impl TcpListener {
     /// share it: from the second listener on, one thread accepts the
     /// connections and hands them to the listeners in turn.
     ///
+    /// Under `giong dev` (the giong command's development loop), an address
+    /// `giong dev` listens on for the service is not bound again: every
+    /// listener for it is a duplicate of `giong dev`'s socket
+    /// (`GIONG_DEV_LISTEN`), which stays open while the service is rebuilt
+    /// and restarted, so no connection is refused in between. Elsewhere the
+    /// variable is unset and nothing changes.
+    ///
     /// `addr` is an IP address with a port (see
     /// [`ToSocketAddrs`]): a host name such as
     /// `"localhost:8080"` is refused with `GIONG-E0100`, which says what to
@@ -1414,6 +1461,19 @@ impl TcpListener {
     }
 
     fn bind_addr(addr: SocketAddr) -> io::Result<Self> {
+        // Under `giong dev`, the address may be one of the listening sockets
+        // it keeps open across restarts: share that socket (see `inherit`).
+        #[cfg(unix)]
+        if let Some(sock) = inherit::take(addr)? {
+            return Ok(Self {
+                inner: ListenSocket::inherited(sock),
+                balance: None,
+                // Not counted as this process's hold on the port: dropping a
+                // duplicate must not stop the shared socket listening.
+                held: None,
+                lent: Cell::new(false),
+            });
+        }
         let bind = || -> io::Result<Self> {
             // Linux 6.0.16 to 6.0.19 report success for a bind to an
             // address in use and leave the socket unbound: `share::bind`
@@ -1425,6 +1485,7 @@ impl TcpListener {
                 inner: ListenSocket::new(sock),
                 balance: None,
                 held,
+                lent: Cell::new(false),
                 #[cfg(windows)]
                 spread: None,
             };
@@ -1450,6 +1511,7 @@ impl TcpListener {
                 inner: ListenSocket::new(sock),
                 balance: None,
                 held: None,
+                lent: Cell::new(false),
                 spread: None,
             });
             listener.spread = member;
@@ -1515,6 +1577,7 @@ impl TcpListener {
             inner: ListenSocket::new(sock),
             balance: None,
             held: None,
+            lent: Cell::new(false),
             #[cfg(windows)]
             spread: None,
         }
@@ -1558,7 +1621,11 @@ impl Drop for TcpListener {
     fn drop(&mut self) {
         // Before the socket is closed, which happens when `inner` is dropped.
         if let Some(held) = self.held.take() {
-            held.release(self.inner.socket());
+            if self.lent.get() {
+                held.release_lent();
+            } else {
+                held.release(self.inner.socket());
+            }
         }
         // A connection this listener's own accept took goes to the others
         // that share the address, with those still waiting for it.
@@ -1575,22 +1642,38 @@ impl Drop for TcpListener {
 
 #[cfg(unix)]
 impl AsRawFd for TcpListener {
+    /// The descriptor. Once it has been taken, dropping the listener only
+    /// closes it, so that copies made of it (with `dup`, or passed to another
+    /// process with [`UnixStream::send_with_fds`]) keep listening.
     fn as_raw_fd(&self) -> RawFd {
+        self.lent.set(true);
         self.inner.socket().as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for TcpListener {
+    /// The descriptor, with the same effect on drop as
+    /// [`as_raw_fd`](AsRawFd::as_raw_fd).
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.lent.set(true);
+        std::os::fd::AsFd::as_fd(self.inner.socket())
     }
 }
 
 #[cfg(windows)]
 impl std::os::windows::io::AsRawSocket for TcpListener {
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        self.lent.set(true);
         std::os::windows::io::AsRawSocket::as_raw_socket(self.inner.socket())
     }
 }
 
 impl std::fmt::Debug for TcpListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Not `self.as_raw_fd()`, which would mark the descriptor lent.
         f.debug_struct("TcpListener")
-            .field("fd", &self.as_raw_fd())
+            .field("fd", &self.inner.socket().as_raw_fd())
             .finish()
     }
 }
@@ -1887,6 +1970,13 @@ impl TcpStream {
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for TcpStream {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(self.inner.socket())
     }
 }
 

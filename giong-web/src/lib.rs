@@ -117,6 +117,7 @@ mod percent;
 mod req;
 mod route;
 mod router;
+mod routes;
 
 pub use error::Error;
 pub use giong_http::{Body, BodySender, BodyStream, Request, Response, Server};
@@ -126,3 +127,4 @@ pub use log::{flush as flush_logs, Sink};
 pub use next::{Middleware, Next};
 pub use req::Req;
 pub use router::{App, Router};
+pub use routes::{RouteEntry, RouteList};

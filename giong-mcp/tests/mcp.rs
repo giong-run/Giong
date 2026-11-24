@@ -232,13 +232,23 @@ fn initialize_and_list_the_tools() {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(
-            names,
-            ["overview", "workers", "tasks", "sources", "profile"]
-        );
+        let mut expected = vec![
+            "overview",
+            "workers",
+            "tasks",
+            "sources",
+            "profile",
+            "slow_requests",
+        ];
+        if cfg!(feature = "web") {
+            expected.push("routes");
+        }
+        assert_eq!(names, expected);
         for t in tools["result"]["tools"].as_array().unwrap() {
-            // `profile` changes what the workers do while it measures.
-            assert_eq!(t["annotations"]["readOnlyHint"], t["name"] != "profile");
+            // `profile` and `slow_requests` change what the workers do
+            // while they measure.
+            let measures = t["name"] == "profile" || t["name"] == "slow_requests";
+            assert_eq!(t["annotations"]["readOnlyHint"], !measures);
             assert_eq!(t["inputSchema"]["type"], "object");
             assert_eq!(t["outputSchema"]["type"], "object");
         }
@@ -862,5 +872,337 @@ fn a_panicking_source_is_not_a_stopped_worker() {
         assert!(error.contains("stats() went wrong"), "{error}");
         assert!(w["workers"][0]["snapshot_error"].is_null(), "{w}");
         task.abort();
+    });
+}
+
+/// The `routes` tool lists the giong-web apps the workers serve, grouping
+/// workers with the same routes.
+#[cfg(feature = "web")]
+#[test]
+fn routes_lists_the_apps_on_every_worker() {
+    use giong_web::{Error, Req, Response, Router};
+
+    async fn ok(_req: Req) -> Result<Response, Error> {
+        Ok(Response::text("ok"))
+    }
+
+    let rt = giong::Builder::new().workers(2).build().unwrap();
+    let handle = rt.handle();
+    let server = open().start(&handle).unwrap();
+    let addr = server.local_addr().unwrap();
+    let (ready_tx, ready_rx) = mpsc::channel::<()>();
+    let (done_tx, done_rx) = mpsc::channel::<()>();
+    let h = handle.clone();
+    let test = thread::spawn(move || {
+        let outcome = std::panic::catch_unwind(|| {
+            // Both workers have built their apps.
+            ready_rx.recv().unwrap();
+            ready_rx.recv().unwrap();
+            let r = tool(addr, "routes", json!({}));
+            let apps = r["apps"].as_array().unwrap();
+            // Worker 0 serves an extra admin app; both serve the main one.
+            assert_eq!(apps.len(), 2, "{r}");
+            let main = apps
+                .iter()
+                .find(|a| a["workers"] == json!([0, 1]))
+                .expect("the shared app");
+            let routes = main["routes"].as_array().unwrap();
+            assert_eq!(routes.len(), 2);
+            assert_eq!(routes[0]["method"], "GET");
+            assert_eq!(routes[0]["pattern"], "/users/{id}");
+            assert_eq!(routes[0]["params"], json!(["id"]));
+            assert_eq!(routes[1]["method"], "PUT");
+            assert_eq!(routes[1]["pattern"], "/files/{*path}");
+            assert_eq!(routes[1]["catch_all"], true);
+            assert_eq!(routes[1]["stream_limit"], 4096);
+            assert!(routes[0]["added_at"]
+                .as_str()
+                .unwrap()
+                .contains("tests/mcp.rs:"));
+            let admin = apps
+                .iter()
+                .find(|a| a["workers"] == json!([0]))
+                .expect("worker 0's admin app");
+            assert_eq!(admin["routes"][0]["pattern"], "/admin");
+            assert!(r["unanswered"].as_array().unwrap().is_empty());
+            assert!(r.get("note").is_none());
+            // Arguments are refused.
+            let reply = rpc(
+                addr,
+                "tools/call",
+                json!({ "name": "routes", "arguments": { "x": 1 } }),
+            );
+            assert_eq!(reply["result"]["isError"], true, "{reply}");
+        });
+        h.shutdown();
+        let _ = done_tx.send(());
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    });
+    rt.run(move |w| {
+        let ready = ready_tx.clone();
+        async move {
+            let app = Router::new()
+                .get("/users/{id}", ok)
+                .put("/files/{*path}", ok)
+                .stream_bodies(4096)
+                .build(());
+            let admin = (w == 0).then(|| Router::new().get("/admin", ok).build(()));
+            ready.send(()).unwrap();
+            giong::shutdown_signal().await;
+            drop((app, admin));
+        }
+    })
+    .unwrap();
+    done_rx.recv().unwrap();
+    test.join().unwrap();
+    server.stop();
+}
+
+/// Without any giong-web app the answer says why the list is empty.
+#[cfg(feature = "web")]
+#[test]
+fn routes_without_an_app_says_so() {
+    with_service(open(), |addr, _| {
+        let r = tool(addr, "routes", json!({}));
+        assert!(r["apps"].as_array().unwrap().is_empty());
+        assert!(r["note"].as_str().unwrap().contains("no giong-web app"));
+    });
+}
+
+/// Keeps one HTTP/1.1 connection to `addr` busy with requests for `path`
+/// until `stop` is set, `pause` apart. Returns how many were answered.
+fn load(
+    addr: SocketAddr,
+    path: &'static str,
+    pause: Duration,
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> thread::JoinHandle<usize> {
+    thread::spawn(move || {
+        let mut s = TcpStream::connect(addr).unwrap();
+        s.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let req = format!("GET {path} HTTP/1.1\r\nHost: test\r\n\r\n");
+        let mut answered = 0;
+        let mut buf = Vec::new();
+        while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+            s.write_all(req.as_bytes()).unwrap();
+            // Every answer is "HTTP/1.1 200 OK ... Content-Length: 2 ... ok".
+            loop {
+                let mut chunk = [0u8; 1024];
+                let n = s.read(&mut chunk).unwrap();
+                assert!(n > 0, "the server closed the connection");
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    if buf.len() >= end + 4 + 2 {
+                        buf.drain(..end + 6);
+                        break;
+                    }
+                }
+            }
+            answered += 1;
+            if !pause.is_zero() {
+                thread::sleep(pause);
+            }
+        }
+        answered
+    })
+}
+
+/// A one-worker service answering HTTP/1.1 with `handler` on a loopback
+/// port, and an MCP server, until the closure returns.
+fn with_http_service<H, Fut>(handler: H, f: impl FnOnce(SocketAddr, SocketAddr) + Send + 'static)
+where
+    H: Fn(giong_http::Request) -> Fut + Clone + Send + Sync + 'static,
+    Fut: std::future::Future<Output = giong_http::Response> + 'static,
+{
+    let rt = giong::Builder::new().workers(1).build().unwrap();
+    let handle = rt.handle();
+    let server = open().start(&handle).unwrap();
+    let mcp = server.local_addr().unwrap();
+    let (addr_tx, addr_rx) = mpsc::channel::<SocketAddr>();
+    let h = handle.clone();
+    let test = thread::spawn(move || {
+        let addr = addr_rx.recv().unwrap();
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(mcp, addr)));
+        h.shutdown();
+        if let Err(panic) = outcome {
+            std::panic::resume_unwind(panic);
+        }
+    });
+    rt.run(move |_| {
+        let handler = handler.clone();
+        let addr_tx = addr_tx.clone();
+        async move {
+            let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            addr_tx.send(listener.local_addr().unwrap()).unwrap();
+            let server = giong_http::Server::new();
+            giong::until_shutdown(server.serve(listener, handler)).await;
+        }
+    })
+    .unwrap();
+    test.join().unwrap();
+    server.stop();
+}
+
+/// The route an answer of `slow_requests` lists under `name`.
+fn route<'a>(answer: &'a Value, name: &str) -> &'a Value {
+    answer["routes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["route"] == name)
+        .unwrap_or_else(|| panic!("no route {name} in {answer}"))
+}
+
+#[test]
+fn slow_requests_blame_a_pool_that_makes_requests_wait() {
+    use giong::observe::{Route, Wait};
+    static CHECKOUT: Route = Route::from_static("POST /checkout");
+    let handler = move |req: giong_http::Request| {
+        let path = req.path().to_owned();
+        async move {
+            if path == "/checkout" {
+                observe::set_route(&CHECKOUT);
+                // One request in ten waits 30 ms for a connection; every
+                // query takes 1 ms.
+                let n = COUNT.with(|c| {
+                    c.set(c.get() + 1);
+                    c.get()
+                });
+                if n % 10 == 0 {
+                    let _wait = observe::wait(Wait::Pool, "postgres");
+                    giong::time::sleep(Duration::from_millis(30)).await;
+                }
+                let _query = observe::wait(Wait::Query, "postgres");
+                giong::time::sleep(Duration::from_millis(1)).await;
+            }
+            giong_http::Response::text("ok")
+        }
+    };
+    thread_local! { static COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) }; }
+    with_http_service(handler, |mcp, addr| {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let clients: Vec<_> = (0..4)
+            .map(|_| load(addr, "/checkout", Duration::ZERO, stop.clone()))
+            .collect();
+        let health = load(addr, "/health", Duration::from_millis(5), stop.clone());
+        thread::sleep(Duration::from_millis(100));
+        let answer = tool(mcp, "slow_requests", json!({ "duration_ms": 1500 }));
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let served: usize = clients.into_iter().map(|c| c.join().unwrap()).sum();
+        health.join().unwrap();
+        assert!(served > 100, "{served}");
+
+        if std::env::var_os("SHOW_ANSWER").is_some() {
+            println!("{}", serde_json::to_string_pretty(&answer).unwrap());
+        }
+        let checkout = route(&answer, "POST /checkout");
+        assert!(checkout["requests"].as_u64().unwrap() > 50, "{answer}");
+        assert!(checkout["p99_ms"].as_f64().unwrap() >= 30.0, "{answer}");
+        assert!(checkout["p50_ms"].as_f64().unwrap() < 20.0, "{answer}");
+        let verdict = &checkout["verdict"];
+        assert_eq!(verdict["cause"], "pool_wait", "{answer}");
+        assert_ne!(verdict["confidence"], "low", "{answer}");
+        assert!(
+            verdict["share_of_excess"].as_f64().unwrap() > 0.8,
+            "{answer}"
+        );
+        assert!(verdict["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains("postgres pool"));
+        assert!(
+            checkout["tail"]["pool_ms"].as_f64().unwrap() >= 29.0,
+            "{answer}"
+        );
+        assert_eq!(checkout["slowest"][0]["pool"]["what"], "postgres");
+        assert_eq!(checkout["slowest"][0]["protocol"], "http/1.1");
+        assert!(answer["summary"]
+            .as_str()
+            .unwrap()
+            .starts_with("POST /checkout: p99"));
+        // Requests no code named.
+        let health = route(&answer, "(no route)");
+        assert!(health["requests"].as_u64().unwrap() > 10, "{answer}");
+        // Tracing is off again.
+        let overview = tool(mcp, "overview", json!({}));
+        assert!(overview.is_object());
+    });
+}
+
+#[test]
+fn slow_requests_name_the_route_that_blocks_the_worker() {
+    use giong::observe::Route;
+    static REPORT: Route = Route::from_static("GET /report");
+    static FAST: Route = Route::from_static("GET /fast");
+    // `/fast` requests in their handler right now. `/report` blocks only
+    // while one is: on one worker, a hold that starts between `/fast`
+    // requests delays none of them (on macOS the four clients fell into
+    // step with the 1 ms timer, and every hold missed them).
+    static FAST_IN_FLIGHT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+    let handler = |req: giong_http::Request| {
+        let path = req.path().to_owned();
+        async move {
+            use std::sync::atomic::Ordering::Relaxed;
+            if path == "/report" {
+                observe::set_route(&REPORT);
+                for _ in 0..1000 {
+                    if FAST_IN_FLIGHT.load(Relaxed) > 0 {
+                        break;
+                    }
+                    giong::yield_now().await;
+                }
+                // A blocking call on the I/O worker.
+                std::thread::sleep(Duration::from_millis(40));
+            } else {
+                observe::set_route(&FAST);
+                FAST_IN_FLIGHT.fetch_add(1, Relaxed);
+                giong::time::sleep(Duration::from_millis(1)).await;
+                FAST_IN_FLIGHT.fetch_sub(1, Relaxed);
+            }
+            giong_http::Response::text("ok")
+        }
+    };
+    with_http_service(handler, |mcp, addr| {
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let fast: Vec<_> = (0..4)
+            .map(|_| load(addr, "/fast", Duration::ZERO, stop.clone()))
+            .collect();
+        let report = load(addr, "/report", Duration::from_millis(100), stop.clone());
+        thread::sleep(Duration::from_millis(100));
+        let answer = tool(
+            mcp,
+            "slow_requests",
+            json!({ "duration_ms": 1500, "route": "/fast" }),
+        );
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        for c in fast {
+            c.join().unwrap();
+        }
+        report.join().unwrap();
+
+        assert_eq!(answer["routes"].as_array().unwrap().len(), 1, "{answer}");
+        if std::env::var_os("SHOW_ANSWER").is_some() {
+            println!("{}", serde_json::to_string_pretty(&answer).unwrap());
+        }
+        let fast = route(&answer, "GET /fast");
+        let verdict = &fast["verdict"];
+        assert_eq!(verdict["cause"], "worker_blocked", "{answer}");
+        assert!(
+            verdict["suggestion"]
+                .as_str()
+                .unwrap()
+                .contains("GET /report"),
+            "{answer}"
+        );
+        assert_eq!(fast["slowest"][0]["blocked_by"]["route"], "GET /report");
+        assert!(
+            fast["tail"]["blocked_ms"].as_f64().unwrap() >= 10.0,
+            "{answer}"
+        );
+        let lp = &answer["long_polls"][0];
+        assert_eq!(lp["giong_http_connection"], true, "{answer}");
+        assert!(lp["max_ms"].as_f64().unwrap() >= 40.0, "{answer}");
     });
 }

@@ -7,7 +7,7 @@
   of the capacity), sending waits while the channel is full, and `Receiver::recv` copies
   each message out of the shared memory into a buffer it keeps, so a peer cannot change
   the bytes while they are read; `Receiver::recv_in_place` (`unsafe`) reads them where they
-  lie, for a peer the caller trusts ([#319](https://github.com/giong-run/Giong/issues/319)). A process that dies is reported (`GIONG-E0094`), and so is one that corrupts the
+  lie, for a peer the caller trusts ([#319](https://github.com/giong-run/Giong/issues/319)). The listener runs handshakes as tasks of their own, up to 64 at once with 5 seconds each, so a process that connects and sends nothing holds up no other ([#246](https://github.com/giong-run/Giong/issues/246)). Descriptors received in a handshake are close-on-exec, so none leaks into a program the service runs, and a handshake given up while its message arrives closes them ([#286](https://github.com/giong-run/Giong/issues/286)). A process that dies is reported (`GIONG-E0094`), and so is one that corrupts the
   ring (`GIONG-E0091`); the receiving process checks every position and length it reads.
   On a spinning worker (`spin_before_park`), a waiting receiver is watched from the spin
   loop and neither side makes a system call. A sender publishes a burst of messages with

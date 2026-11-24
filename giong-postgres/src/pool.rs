@@ -842,6 +842,7 @@ impl Pool {
         kind: Waiter,
         mut decide: impl FnMut(&mut State, Instant) -> Decision<T>,
     ) -> Result<Result<T, Client>, Error> {
+        let _wait = giong::observe::wait(giong::observe::Wait::Pool, "postgres");
         let deadline = Instant::now() + self.inner.wait_timeout;
         let mut waiting: Option<Waiting<'_>> = None;
         // Failed attempts to open a connection so far: when one fails while

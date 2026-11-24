@@ -545,17 +545,55 @@ fn a_body_cut_short_fails_the_stream() {
 
 #[test]
 fn each_piece_has_the_request_timeout_but_the_whole_body_has_none() {
-    let server = TestServer::start(Server::new().request_timeout(Duration::from_millis(300)));
+    const TIMEOUT: Duration = Duration::from_millis(300);
+    let server = TestServer::start(Server::new().request_timeout(TIMEOUT));
 
-    // Ten pieces 100 ms apart: a second in all, well past the timeout.
-    let mut c = server.client();
-    c.send(upload("steady", 100));
-    for piece in pattern(100).chunks(10) {
-        std::thread::sleep(Duration::from_millis(100));
-        c.send(piece);
-    }
-    let r = c.reply();
-    assert_eq!(r.status, 200, "{}", r.text());
+    // Twenty pieces 50 ms apart: a second in all, well past the timeout.
+    //
+    // How far apart the server sees two pieces depends on this thread, not
+    // on the server: macOS lets a sleeping thread wake late by up to the
+    // length of its sleep, and a loaded runner can stop a thread for longer
+    // (#375 saw a gap reach the timeout). So each gap is timed from before
+    // one send to after the next, which bounds the gap the server saw from
+    // above: the server starts the timeout for a piece only after the one
+    // before it (or the head) has arrived. A try with a gap near the timeout
+    // proves nothing either way, so its answer is not read (the server may
+    // rightly have cut it) and it runs again on a new connection; a try with
+    // every gap well within the timeout must be answered 200.
+    let mut slow = Vec::new();
+    let answered = (0..5).any(|attempt| {
+        let mut c = server.client();
+        let body = pattern(100);
+        let mut last = Instant::now();
+        c.send(upload(&format!("steady-{attempt}"), body.len()));
+        let mut widest = Duration::ZERO;
+        for piece in body.chunks(5) {
+            std::thread::sleep(Duration::from_millis(50));
+            let before = Instant::now();
+            let sent = c.stream.write_all(piece);
+            widest = widest.max(last.elapsed());
+            last = before;
+            if sent.is_err() {
+                break;
+            }
+        }
+        if widest >= TIMEOUT * 5 / 6 {
+            slow.push(widest);
+            return false;
+        }
+        let r = c.reply();
+        assert_eq!(
+            r.status,
+            200,
+            "every piece came within {widest:?} of the one before, yet: {}",
+            r.text()
+        );
+        true
+    });
+    assert!(
+        answered,
+        "this thread never sent the pieces close enough together; widest gaps: {slow:?}"
+    );
 
     // Half the body, then nothing.
     let mut c = server.client();

@@ -76,6 +76,10 @@ for line in sys.stdin:
         # which the guests do not have, and does not depend on the kernel.
         if msg["target"]["name"] == "generated" and "giong-grpc" in msg["package_id"]:
             continue
+        # giong-cli runs the giong binary, cargo, git and containers, none of
+        # which the guests have, and does not depend on the kernel.
+        if msg["manifest_path"].endswith("/giong-cli/Cargo.toml"):
+            continue
         print(msg["executable"])
 '
 )
@@ -87,7 +91,7 @@ root="$WORK/initramfs"
 rm -rf "$root"
 mkdir -p "$root"/{bin,tests,proc,sys,dev,tmp,etc}
 cp "$busybox" "$root/bin/busybox"
-for applet in sh mount ip poweroff cat echo uname date mkdir ulimit modprobe depmod; do
+for applet in sh mount ip poweroff cat echo true false sleep uname date mkdir ulimit modprobe depmod; do
     ln -s busybox "$root/bin/$applet"
 done
 # The kernel loads modules it needs (the crypto behind kernel TLS) through

@@ -1,0 +1,22 @@
+[package]
+name = "{{name}}"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+giong = { {{src_giong}} }
+giong-grpc = { {{src_giong_grpc}} }
+{{#if tls}}
+giong-http = { {{src_giong_http}}, features = ["tls"] }
+giong-tls = { {{src_giong_tls}} }
+{{#else}}
+giong-http = { {{src_giong_http}} }
+{{/if}}
+giong-mcp = { {{src_giong_mcp}} }
+giong-proto = { {{src_giong_proto}} }
+
+[build-dependencies]
+giong-grpc-build = { {{src_giong_grpc_build}} }
+
+{{profiles}}

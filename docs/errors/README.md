@@ -42,6 +42,10 @@ when it is no longer raised.
 | [GIONG-E0011](E0011.md) | `NotInRuntime` | not inside a giong runtime |
 | [GIONG-E0012](E0012.md) | `RuntimeAlreadyRunning` | a runtime already runs on this thread |
 | [GIONG-E0013](E0013.md) | `WrongWorker` | an operation was polled on another worker |
+| [GIONG-E0016](E0016.md) | `SignalNotAllowed` | this signal cannot be listened for |
+| [GIONG-E0017](E0017.md) | `FdPassing` | descriptors could not be passed |
+| [GIONG-E0018](E0018.md) | `ActivatedSocket` | the inherited socket cannot be used that way |
+| [GIONG-E0019](E0019.md) | `ChildProcess` | cannot watch the child process |
 | [GIONG-E0020](E0020.md) | `ThreadLimit` | a worker thread could not be started |
 
 ## macOS
@@ -113,6 +117,7 @@ when it is no longer raised.
 | [GIONG-E1120](E1120.md) | `HttpServerBusy` | request refused: the server's memory budget for requests is full |
 | [GIONG-E1121](E1121.md) | `HttpServerLowMemory` | connection refused: the server is low on memory |
 | [GIONG-E1122](E1122.md) | `HttpInvalidTrailer` | invalid HTTP trailer field |
+| [GIONG-E1123](E1123.md) | `HttpServerOutOfFiles` | connection not accepted: the server is out of file descriptors |
 
 ## giong-web
 
@@ -252,3 +257,54 @@ New in giong 1.1. A call that fails ends with a gRPC status; the statuses giong-
 | [GIONG-E4108](E4108.md) | `GrpcDeadline` | gRPC deadline exceeded |
 | [GIONG-E4109](E4109.md) | `GrpcCancelled` | gRPC call cancelled |
 | [GIONG-E4110](E4110.md) | `GrpcUnimplemented` | gRPC method not found |
+
+## giong-cli
+
+The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can also carry the runtime's own codes (`GIONG-E0001` when io_uring is blocked, for example).
+
+| Code | Name | Meaning |
+|---|---|---|
+| [GIONG-E5000](E5000.md) | `Usage` | the command line is not valid |
+| [GIONG-E5001](E5001.md) | `NotAProject` | no Cargo project here |
+| [GIONG-E5002](E5002.md) | `CargoFailed` | cargo could not be run |
+| [GIONG-E5003](E5003.md) | `RustTooOld` | the Rust compiler is too old |
+| [GIONG-E5004](E5004.md) | `TokioCrate` | a dependency needs the Tokio runtime |
+| [GIONG-E5005](E5005.md) | `UnknownCode` | no such error code |
+| [GIONG-E5006](E5006.md) | `BlockingCall` | a blocking call inside a worker |
+| [GIONG-E5007](E5007.md) | `HostNameBind` | binding a host name |
+| [GIONG-E5008](E5008.md) | `BorrowAcrossAwait` | a RefCell borrow held across an await |
+| [GIONG-E5009](E5009.md) | `BuildFailed` | the code does not compile |
+| [GIONG-E5010](E5010.md) | `Lint` | clippy has a finding |
+| [GIONG-E5011](E5011.md) | `DiskUsed` | build directories use a lot of disk |
+| [GIONG-E5012](E5012.md) | `SlowDebugInfo` | the dev profile writes full debug information |
+| [GIONG-E5013](E5013.md) | `OpenFilesLimit` | the open-files limit is low |
+| [GIONG-E5014](E5014.md) | `PortInUse` | the port is in use |
+| [GIONG-E5015](E5015.md) | `DockerSeccomp` | Docker blocks io_uring |
+| [GIONG-E5016](E5016.md) | `EnvMissing` | a variable from .env.example is not set |
+| [GIONG-E5017](E5017.md) | `ServiceExited` | the service stopped |
+| [GIONG-E5018](E5018.md) | `ServiceNotReady` | the service did not start listening |
+| [GIONG-E5019](E5019.md) | `McpUnreachable` | the service's giong-mcp does not answer |
+| [GIONG-E5020](E5020.md) | `WatchLimit` | too many files to watch |
+| [GIONG-E5021](E5021.md) | `NoLinker` | no linker found |
+| [GIONG-E5022](E5022.md) | `DevRunning` | giong dev already serves this project |
+| [GIONG-E5023](E5023.md) | `CompilerWarning` | the compiler has a warning |
+| [GIONG-E5024](E5024.md) | `ListensOnNetwork` | the service would listen on every network interface |
+| [GIONG-E5030](E5030.md) | `BadProjectName` | the project name is not valid |
+| [GIONG-E5031](E5031.md) | `TargetNotEmpty` | the directory for the new project is not empty |
+| [GIONG-E5032](E5032.md) | `BadTemplateChoice` | the template does not offer that choice |
+| [GIONG-E5033](E5033.md) | `WriteFailed` | a file of the project could not be written |
+| [GIONG-E5034](E5034.md) | `WindowsLimited` | the project's crates do not build on Windows |
+| [GIONG-E5035](E5035.md) | `BadGiongPath` | --giong-path is not a giong checkout |
+| [GIONG-E5036](E5036.md) | `AgentFileForeign` | an agent file exists that giong did not write |
+| [GIONG-E5037](E5037.md) | `McpJsonInvalid` | .mcp.json is not valid JSON |
+| [GIONG-E5038](E5038.md) | `VersionMismatch` | the project uses another giong version than this command |
+| [GIONG-E5039](E5039.md) | `NotGiongProject` | the project does not depend on giong |
+| [GIONG-E5080](E5080.md) | `FixDirty` | the project has changes that are not committed |
+| [GIONG-E5081](E5081.md) | `FixFailed` | cargo could not apply its fixes |
+| [GIONG-E5082](E5082.md) | `FixConflict` | a fix no longer matches the code |
+| [GIONG-E5083](E5083.md) | `TestFailed` | a test failed |
+| [GIONG-E5084](E5084.md) | `DriverNotHere` | the tests could not run on every driver |
+| [GIONG-E5085](E5085.md) | `NextestMissing` | cargo-nextest is not installed |
+| [GIONG-E5086](E5086.md) | `TestTimeout` | the tests took longer than the time limit |
+| [GIONG-E5087](E5087.md) | `GitInitFailed` | git init failed in the new project |
+| [GIONG-E5088](E5088.md) | `DotenvBuildSetting` | .env sets a cargo or rustc setting |

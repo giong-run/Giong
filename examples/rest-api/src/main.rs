@@ -1,16 +1,17 @@
-//! Starts the API: reads the configuration from the environment, creates
-//! the table, then serves on every core.
+//! Starts the service: reads the configuration from the environment,
+//! creates the tables, then serves on every core.
 //!
 //! | Variable | Default | |
 //! |---|---|---|
 //! | `DATABASE_URL` | (required) | `postgres://user:password@host/db` |
 //! | `REDIS_URL` | `redis://127.0.0.1:6379` | |
-//! | `LISTEN` | `0.0.0.0:8443` | |
+//! | `LISTEN` | `127.0.0.1:8443` | this machine only; `0.0.0.0:8443` to take connections from the network (the Dockerfile sets it) |
 //! | `TLS_CERT`, `TLS_KEY` | (none) | PEM files; without both, plain HTTP |
 //! | `WORKERS` | every core | |
 //! | `DB_POOL`, `CACHE_POOL` | `2`, `1` | connections per worker |
 //! | `CACHE_TTL_SECS` | `60` | |
 //! | `ACCESS_LOG` | `stdout` | or `off` |
+//! | `GIONG_MCP`, `GIONG_MCP_TOKEN` | (off) | giong-mcp, for agents: `127.0.0.1:7777` |
 
 use std::env;
 use std::process::ExitCode;
@@ -73,7 +74,7 @@ fn settings() -> Result<Settings, String> {
     Ok(Settings {
         db,
         cache,
-        listen: var("LISTEN").unwrap_or_else(|| "0.0.0.0:8443".into()),
+        listen: var("LISTEN").unwrap_or_else(|| "127.0.0.1:8443".into()),
         tls,
         workers: var("WORKERS").map(|_| number("WORKERS", 1)).transpose()?,
         db_pool: number("DB_POOL", 2)?,
@@ -83,13 +84,15 @@ fn settings() -> Result<Settings, String> {
     })
 }
 
-/// Creates the table, once, before the workers start.
+/// Creates the tables, once, before the workers start. The statements of
+/// `migrations/0001_init.sql` only create what is missing; `giong db migrate`
+/// applies that file and the ones you add after it.
 fn migrate(db: &DbConfig) -> Result<(), String> {
     giong::block_on(async {
         let pool = giong_postgres::Pool::new(db.clone(), 1);
         pool.batch_execute(SCHEMA).await
     })
-    .map_err(|e| format!("creating the table: {e}"))
+    .map_err(|e| format!("creating the tables: {e}"))
 }
 
 fn main() -> ExitCode {
@@ -116,6 +119,9 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Off unless GIONG_MCP is set: lets an agent ask the running service
+    // about its workers, tasks and pools. Keep the value alive.
+    let _mcp = giong_mcp::start_from_env(&runtime.handle());
     let result = runtime.run(move |_worker| {
         // Everything a worker uses is its own: pools, app, listener.
         let state = State {

@@ -1,0 +1,39 @@
+[package]
+name = "giong-cli"
+version = "1.4.2"
+edition = "2021"
+rust-version = "1.80"
+description = "The giong command: start, run, check and ship services on the Gióng async runtime"
+license = "MIT OR Apache-2.0"
+readme = "README.md"
+repository = "https://github.com/giong-run/Giong"
+documentation = "https://giong.run/docs/cli/"
+keywords = ["giong", "cli", "async", "developer-tools", "scaffolding"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "giong"
+path = "src/main.rs"
+# Its documentation would go to target/doc/giong/, where the giong crate's
+# goes: `cargo doc --workspace` then races the two.
+doc = false
+
+# Kept small on purpose: the command is part of the first minute with giong, and
+# it builds on every platform (Windows too), so it uses the standard library and
+# one JSON crate, with no macros.
+[dependencies]
+# preserve_order: giong ai init adds its servers to .mcp.json without reordering
+# the keys a person wrote.
+serde_json = { version = "1", features = ["preserve_order"] }
+
+# giong dev hands its listening sockets to the service: socket2 makes them
+# inheritable for the spawn only, without `unsafe` here.
+[target.'cfg(unix)'.dependencies]
+socket2 = { version = "0.6", features = ["all"] }
+# O_NOFOLLOW for giong's own files in .giong (src/state.rs); socket2 uses it too.
+libc = "0.2"
+
+[lints.rust]
+# One Windows-only module (src/noinherit.rs) needs a system call std does
+# not offer; everything else stays free of `unsafe`.
+unsafe_code = "deny"

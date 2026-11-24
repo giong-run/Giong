@@ -14,16 +14,19 @@ use giong::observe::{self, Location, PollProfile, Snapshot, WorkerState};
 use giong::{ChosenBy, DriverChoice, Handle, JoinError};
 use serde_json::{json, Map, Value};
 
+use crate::limits;
 use crate::proc;
 use crate::schema;
 use crate::watch::{Blocked, Watch};
 
 pub(crate) struct State {
-    target: Handle,
+    pub(crate) target: Handle,
     snapshot_timeout: Duration,
     watch: RefCell<Watch>,
     /// A `profile` call is running.
     profiling: Cell<bool>,
+    /// A `slow_requests` call is running.
+    pub(crate) tracing: Cell<bool>,
 }
 
 impl State {
@@ -33,6 +36,7 @@ impl State {
             snapshot_timeout,
             watch: RefCell::new(Watch::default()),
             profiling: Cell::new(false),
+            tracing: Cell::new(false),
         }
     }
 
@@ -75,13 +79,16 @@ fn tool(
 }
 
 pub(crate) fn list() -> Value {
-    json!([
+    #[allow(unused_mut)]
+    let mut tools = vec![
         tool(
             "overview",
             "Overview",
-            "Start here. The process (memory, threads, open descriptors, uptime), the runtime \
-             (workers, shutdown), each worker's state, I/O driver, live tasks and load over the \
-             last second, and warnings, such as a worker blocked inside one task.",
+            "Start here. The process (memory, threads, open descriptors, uptime), the limits a \
+             container puts on it (CPUs, CPU quota, memory, pids.max, open files), the runtime \
+             (workers and where their number came from, shutdown), each worker's state, I/O \
+             driver, live tasks and load over the last second, and warnings, such as a worker \
+             blocked inside one task.",
             json!({}),
             schema::overview(),
             true,
@@ -135,7 +142,47 @@ pub(crate) fn list() -> Value {
             schema::profile(),
             false,
         ),
-    ])
+        tool(
+            "slow_requests",
+            "Why requests are slow",
+            "Ask this when requests are slow or a route's p99 is high. Traces every request for \
+             a while (default 5 s), then answers per route: requests, p50, p90, p99 and max, \
+             where the time of the slowest requests went (receiving the request, the handler's \
+             own code, waiting for a pool connection, database commands, other services, \
+             writing the answer, and time their worker spent in other tasks' long polls), a \
+             verdict with its cause, evidence, confidence and a suggested fix, and the slowest \
+             requests in full. Routes are named by giong-web. While it runs, every request and \
+             task poll reads the clock a few times, a small cost the service pays. Refused \
+             while the service itself has request tracing on.",
+            json!({
+                "duration_ms": { "type": "integer", "minimum": 100, "maximum": 30000,
+                                 "default": 5000, "description": "How long to trace." },
+                "route": { "type": "string", "description":
+                           "Only routes whose name contains this, such as \"/checkout\"." },
+                "quantile": { "type": "number", "minimum": 0.5, "maximum": 0.9999,
+                              "default": 0.99, "description":
+                              "Which slow requests to explain: 0.99 for the slowest 1%." },
+                "limit": { "type": "integer", "minimum": 1, "maximum": 100, "default": 10,
+                           "description": "How many routes to list, the costliest tails first." },
+            }),
+            schema::slow_requests(),
+            false,
+        ),
+    ];
+    #[cfg(feature = "web")]
+    tools.push(tool(
+        "routes",
+        "Routes",
+        "The HTTP routes the service serves: every giong-web app alive on each worker, \
+             with method, pattern, path parameters, whether the body is streamed, the number \
+             of middleware and the line that added the route. Workers that serve the same \
+             routes are grouped. HEAD is answered by a path's GET route and OPTIONS by the \
+             router, unless routes for them are listed.",
+        json!({}),
+        schema::routes(),
+        true,
+    ));
+    Value::Array(tools)
 }
 
 /// `None` for an unknown tool; `Err` for a call the tool refuses, with a
@@ -157,6 +204,12 @@ pub(crate) async fn call(
             Err(e) => Err(e),
         },
         "profile" => profile(state, args).await,
+        "slow_requests" => crate::slow::slow_requests(state, args).await,
+        #[cfg(feature = "web")]
+        "routes" => match no_args(args) {
+            Ok(()) => Ok(routes(state).await),
+            Err(e) => Err(e),
+        },
         _ => return None,
     })
 }
@@ -165,7 +218,7 @@ fn no_args(args: &Map<String, Value>) -> Result<(), String> {
     check_args(args, &[])
 }
 
-fn check_args(args: &Map<String, Value>, allowed: &[&str]) -> Result<(), String> {
+pub(crate) fn check_args(args: &Map<String, Value>, allowed: &[&str]) -> Result<(), String> {
     match args.keys().find(|k| !allowed.contains(&k.as_str())) {
         None => Ok(()),
         Some(k) if allowed.is_empty() => {
@@ -178,7 +231,7 @@ fn check_args(args: &Map<String, Value>, allowed: &[&str]) -> Result<(), String>
     }
 }
 
-fn int_arg(
+pub(crate) fn int_arg(
     args: &Map<String, Value>,
     name: &str,
     default: Option<u64>,
@@ -201,7 +254,7 @@ fn int_arg(
     }
 }
 
-fn location(l: Location) -> String {
+pub(crate) fn location(l: Location) -> String {
     format!("{}:{}:{}", l.file(), l.line(), l.column())
 }
 
@@ -214,12 +267,12 @@ fn worker_state(s: WorkerState) -> &'static str {
     }
 }
 
-fn round(x: f64, places: i32) -> f64 {
+pub(crate) fn round(x: f64, places: i32) -> f64 {
     let k = 10f64.powi(places);
     (x * k).round() / k
 }
 
-fn ms(d: Duration) -> f64 {
+pub(crate) fn ms(d: Duration) -> f64 {
     round(d.as_secs_f64() * 1e3, 3)
 }
 
@@ -228,7 +281,7 @@ fn us(d: Duration) -> f64 {
 }
 
 /// `true` for a task this server spawned on a worker to ask it something.
-fn ours(l: Location) -> bool {
+pub(crate) fn ours(l: Location) -> bool {
     l.file() == file!()
 }
 
@@ -244,7 +297,7 @@ fn blocked_json(b: Option<Blocked>, now: Instant) -> Value {
 
 /// `true` for the task giong-http spawns for each connection, which runs
 /// the connection's request handlers.
-fn http_connection(l: Location) -> bool {
+pub(crate) fn http_connection(l: Location) -> bool {
     in_giong_http_server(l.file())
 }
 
@@ -316,7 +369,7 @@ where
 }
 
 /// Asks every worker at once.
-async fn ask_all<T, F, Fut>(state: &State, f: F) -> Vec<Result<T, String>>
+pub(crate) async fn ask_all<T, F, Fut>(state: &State, f: F) -> Vec<Result<T, String>>
 where
     T: Send + 'static,
     F: Fn() -> Fut + Clone + Send + 'static,
@@ -340,7 +393,7 @@ where
     out
 }
 
-async fn snapshots(state: &State) -> Vec<Result<Snapshot, String>> {
+pub(crate) async fn snapshots(state: &State) -> Vec<Result<Snapshot, String>> {
     ask_all(state, || async { observe::snapshot() })
         .await
         .into_iter()
@@ -413,11 +466,23 @@ fn overview(state: &State) -> Value {
             ));
         }
     }
+    let limits = limits::limits();
+    if let (Some(max), Some(current)) = (limits.pids_max, limits.pids_current) {
+        if current * 10 >= max * 8 {
+            warnings.push(format!(
+                "{current} of the {max} processes and threads the cgroup allows (pids.max) are \
+                 in use: past it, new threads fail (GIONG-E0020), blocking file work on epoll \
+                 included"
+            ));
+        }
+    }
     json!({
         "giong_mcp": env!("CARGO_PKG_VERSION"),
         "process": process,
+        "limits": limits::json(&limits),
         "runtime": {
             "workers": target.workers(),
+            "workers_from": limits::workers_from(target.workers(), &limits),
             "shutting_down": target.is_shutdown(),
             "profiling": target.is_profiling(),
         },
@@ -611,6 +676,55 @@ async fn sources(state: &State) -> Value {
             json!(
                 "nothing is registered: giong-postgres, giong-mysql and giong-redis pools \
                    register themselves; other code can with giong::observe::register"
+            ),
+        );
+    }
+    out
+}
+
+/// Every giong-web app alive on each worker; workers serving the same
+/// routes are grouped.
+#[cfg(feature = "web")]
+async fn routes(state: &State) -> Value {
+    let lists = ask_all(state, || async {
+        giong_web::RouteList::live()
+            .iter()
+            .map(|l| l.to_json())
+            .collect::<Vec<String>>()
+    })
+    .await;
+    // Keyed by the app's JSON, in the order first seen.
+    let mut apps: Vec<(String, Vec<usize>)> = Vec::new();
+    let mut unanswered = Vec::new();
+    for (w, answer) in lists.into_iter().enumerate() {
+        match answer {
+            Ok(list) => {
+                for json in list {
+                    match apps.iter_mut().find(|(j, _)| *j == json) {
+                        Some((_, workers)) => workers.push(w),
+                        None => apps.push((json, vec![w])),
+                    }
+                }
+            }
+            Err(e) => unanswered.push(json!({ "worker": w, "error": e })),
+        }
+    }
+    let apps: Vec<Value> = apps
+        .into_iter()
+        .map(|(j, workers)| {
+            let parsed: Value = serde_json::from_str(&j).unwrap_or_else(
+                |e| json!({ "routes": [], "error": format!("unreadable route list: {e}") }),
+            );
+            json!({ "workers": workers, "routes": parsed["routes"].clone() })
+        })
+        .collect();
+    let mut out = json!({ "apps": apps, "unanswered": unanswered });
+    if out["apps"].as_array().is_some_and(Vec::is_empty) {
+        out.as_object_mut().expect("object").insert(
+            "note".into(),
+            json!(
+                "no giong-web app is alive on any worker: the service builds none, builds it \
+                 after this call, or serves HTTP without giong-web"
             ),
         );
     }
