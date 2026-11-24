@@ -187,6 +187,31 @@ fn a_chain_of_sleeps_is_not_a_tick_late_each_time() {
     });
 }
 
+/// With precise timers on, short and long sleeps still last at least their
+/// duration and not far longer, on every driver (only kqueue acts on it).
+#[test]
+fn precise_timers_keep_sleeps_at_least_their_duration() {
+    giong::Builder::new()
+        .workers(1)
+        .precise_timers(true)
+        .build()
+        .unwrap()
+        .run(|_| async {
+            for ms in [2, 2, 5, 150] {
+                let d = Duration::from_millis(ms);
+                let start = Instant::now();
+                sleep(d).await;
+                let elapsed = start.elapsed();
+                assert!(elapsed >= d, "{d:?} woke early: {elapsed:?}");
+                assert!(
+                    elapsed < d + Duration::from_millis(500),
+                    "{d:?} woke far too late: {elapsed:?}"
+                );
+            }
+        })
+        .unwrap();
+}
+
 /// Short sleeps end within a few milliseconds of their deadline. On Windows
 /// the completion port's own timeout ends on the system's 15.6 ms clock
 /// tick, where a 1 ms sleep took 15.6 ms; a high-resolution timer ends the
