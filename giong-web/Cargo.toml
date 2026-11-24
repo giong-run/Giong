@@ -1,6 +1,6 @@
 [package]
 name = "giong-web"
-version = "1.4.1"
+version = "1.4.2"
 edition = "2021"
 rust-version = "1.80"
 description = "A router, middleware and JSON for HTTP services on the giong thread-per-core runtime"
@@ -26,8 +26,8 @@ tracing = ["dep:tracing"]
 dev = []
 
 [dependencies]
-giong = { path = "..", version = "1.4.1" }
-giong-http = { path = "../giong-http", version = "1.4.1" }
+giong = { path = "..", version = "1.4.2" }
+giong-http = { path = "../giong-http", version = "1.4.2" }
 # gzip for the Compression middleware. Already a dependency of giong-http's
 # client: the deflate implementation flate2 uses, in pure Rust.
 miniz_oxide = "0.9"
@@ -36,7 +36,7 @@ serde_json = { version = "1.0.100", optional = true }
 tracing = { version = "0.1.40", optional = true, default-features = false, features = ["std"] }
 
 [dev-dependencies]
-giong-http = { path = "../giong-http", version = "1.4.1", features = ["client"] }
+giong-http = { path = "../giong-http", version = "1.4.2", features = ["client"] }
 miniz_oxide = "0.9"
 serde = { version = "1.0.200", features = ["derive"] }
 serde_json = "1.0.100"

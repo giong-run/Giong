@@ -190,8 +190,14 @@ fn a_chain_of_sleeps_is_not_a_tick_late_each_time() {
 /// Short sleeps end within a few milliseconds of their deadline. On Windows
 /// the completion port's own timeout ends on the system's 15.6 ms clock
 /// tick, where a 1 ms sleep took 15.6 ms; a high-resolution timer ends the
-/// wait there now. Measured on CI: about 2 ms on Linux and macOS.
+/// wait there now. Measured on CI: about 2 ms on Linux and macOS. A
+/// wall-clock bound means nothing under Miri, which slows every turn of the
+/// loop: merge queue runs measured a 13 ms median there.
 #[test]
+#[cfg_attr(
+    miri,
+    ignore = "timing: measures how late sleeps end, which Miri slows down"
+)]
 fn a_short_sleep_is_not_rounded_up_to_a_clock_tick() {
     #[cfg(windows)]
     if under_wine() {

@@ -245,7 +245,7 @@ impl Channel {
         let gzip = options.compress.unwrap_or(inner.compress);
         let mut request = inner
             .client
-            .post(&format!("{}{path}", inner.base))
+            .post(&[inner.base.as_str(), path].concat())
             .timeout(limit)
             .header("content-type", "application/grpc")
             .header("grpc-timeout", codec::format_timeout(limit))
@@ -295,13 +295,15 @@ impl Channel {
         let mut responses = self
             .server_streaming::<Req, Resp>(path, message, options)
             .await?;
-        let Some(first) = responses.message().await? else {
+        // `recv`, not `message`: the wait is part of this future, which is
+        // large anyway, instead of a box of its own for each message.
+        let Some(first) = responses.recv().await? else {
             return Err(codec::protocol(
                 "the server ended a call that answers with one message without sending it, \
                  and with the status OK",
             ));
         };
-        if responses.message().await?.is_some() {
+        if responses.recv().await?.is_some() {
             return Err(codec::protocol(
                 "the server sent more than one message in a call that answers with one",
             ));
@@ -333,7 +335,9 @@ impl Channel {
     {
         let (request, deadline, gzip) = self.request(path, &options);
         let frame = codec::encode_frame(message, gzip, self.inner.max_message)?;
-        let sending = request.body(frame).send_streaming();
+        // Pinned here and bounded through a reference: the future of the
+        // request is large, and each move into another future copies it.
+        let sending = pin!(request.body(frame).send_streaming());
         let response = deadline.bound(sending).await?.map_err(transport)?;
         let mut stream = ResponseStream::new(
             Source::Open(Box::new(response)),
@@ -729,7 +733,13 @@ impl<M: MessageType> ResponseStream<M> {
         let mut metadata = Metadata::new();
         let mut bad = None;
         for (name, value) in response.headers() {
-            if let Err(name) = metadata.received(&name.to_ascii_lowercase(), value) {
+            // Lowercase already over HTTP/2: copied only when not.
+            let name = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                std::borrow::Cow::Owned(name.to_ascii_lowercase())
+            } else {
+                std::borrow::Cow::Borrowed(name)
+            };
+            if let Err(name) = metadata.received(&name, value) {
                 bad = Some(name);
             }
         }
@@ -800,6 +810,19 @@ impl<M: MessageType> ResponseStream<M> {
             }
         }
         Box::pin(self.wait_message()).await
+    }
+
+    /// [`message`](Self::message) without the box: for a caller whose own
+    /// future may hold the wait.
+    async fn recv(&mut self) -> Result<Option<Received<M>>, Status> {
+        if self.opened && matches!(self.source, Source::Open(_)) {
+            match self.deframer.next() {
+                Ok(Some(payload)) => return Ok(Some(Received::new(payload))),
+                Ok(None) => {}
+                Err(status) => return Err(self.fail(status)),
+            }
+        }
+        self.wait_message().await
     }
 
     /// [`message`](Self::message) when no message is ready.
@@ -970,13 +993,15 @@ impl<Req: MessageType, Resp: MessageType> ClientStreaming<Req, Resp> {
             mut responses,
         } = self;
         requests.finish();
-        let Some(first) = responses.message().await? else {
+        // `recv`, not `message`: the wait is part of this future, which is
+        // large anyway, instead of a box of its own for each message.
+        let Some(first) = responses.recv().await? else {
             return Err(codec::protocol(
                 "the server ended a call that answers with one message without sending it, \
                  and with the status OK",
             ));
         };
-        if responses.message().await?.is_some() {
+        if responses.recv().await?.is_some() {
             return Err(codec::protocol(
                 "the server sent more than one message in a call that answers with one",
             ));

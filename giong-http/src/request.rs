@@ -216,8 +216,9 @@ impl Request {
 
     /// The first value of the header `name` (case-insensitive).
     pub fn header(&self, name: &str) -> Option<&[u8]> {
-        self.headers()
-            .find(|(n, _)| n.eq_ignore_ascii_case(name))
+        // Compared as bytes: no UTF-8 check of every name on the way.
+        header_lines(&self.head_bytes()[self.head.headers.clone()])
+            .find(|(n, _)| n.eq_ignore_ascii_case(name.as_bytes()))
             .map(|(_, value)| value)
     }
 

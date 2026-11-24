@@ -2377,16 +2377,22 @@ enum Wake<R, W> {
 }
 
 /// Serves HTTP/2 on `io` until the connection ends. `input` holds bytes
-/// already received, which may include the client's preface.
+/// already received, which may include the client's preface. `slot` is the
+/// connection's place under `max_connections`, if it has one: it is marked
+/// idle while no stream is open, so that the accept loop may close it.
 pub(crate) async fn serve<T: Transport, H: Handler>(
     io: &T,
     cfg: Config,
     peer: Option<SocketAddr>,
     handler: &H,
     mut input: Vec<u8>,
+    slot: Option<&crate::server::Slot>,
 ) {
     let mut s = Session::new(cfg, peer);
     s.start();
+    if let Some(slot) = slot {
+        slot.allow_idle();
+    }
 
     // The client's preface, within the request timeout.
     let preface_deadline = Instant::now() + cfg.request_timeout;
@@ -2496,13 +2502,17 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
         if s.finished() && write.is_none() {
             break;
         }
-        if write.is_none() && s.open_streams() == 0 {
+        let idle = write.is_none() && s.open_streams() == 0;
+        if idle {
             // Idle: hand the buffers back, and the memory for streams once
             // the session has (see `release_streams`).
             s.release();
             if !s.keeps_streams() && tasks.capacity() > 0 {
                 tasks = Vec::new();
             }
+        }
+        if let Some(slot) = slot {
+            slot.set_idle(idle);
         }
 
         // Streams woken while the others were polled: let the rest of the

@@ -930,6 +930,60 @@ fn many_connections_at_once() {
     }
 }
 
+/// At the limit, an idle connection over a Unix socket makes room too.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_an_idle_unix_connection_makes_room() {
+    use std::os::unix::net::UnixStream;
+
+    let path = std::env::temp_dir().join(format!("giong-http-evict-{}.sock", std::process::id()));
+    let _ = std::fs::remove_file(&path);
+    let rt = giong::Builder::new().workers(1).build().unwrap();
+    let handle = rt.handle();
+    let (tx, rx) = mpsc::channel();
+    let server_path = path.clone();
+    let thread = std::thread::spawn(move || {
+        rt.run(move |_| {
+            let (tx, path) = (tx.clone(), server_path.clone());
+            async move {
+                let listener = giong::net::UnixListener::bind(path).unwrap();
+                tx.send(()).unwrap();
+                Server::new()
+                    .max_connections(1)
+                    .serve_unix(listener, echo)
+                    .await;
+            }
+        })
+        .unwrap();
+    });
+    rx.recv().unwrap();
+
+    let ask = |stream: &mut UnixStream, what: &str| {
+        stream
+            .write_all(format!("GET /{what} HTTP/1.1\r\nHost: t\r\n\r\n").as_bytes())
+            .unwrap();
+        let mut got = [0u8; 4096];
+        let n = stream.read(&mut got).unwrap();
+        String::from_utf8_lossy(&got[..n]).into_owned()
+    };
+    let mut first = UnixStream::connect(&path).unwrap();
+    first
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert!(ask(&mut first, "first").contains("GET /first "));
+    let mut second = UnixStream::connect(&path).unwrap();
+    second
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    assert!(ask(&mut second, "second").contains("GET /second "));
+    // The first connection was closed to make room.
+    assert_eq!(first.read(&mut [0u8; 64]).unwrap(), 0);
+
+    handle.shutdown();
+    thread.join().unwrap();
+    let _ = std::fs::remove_file(&path);
+}
+
 #[test]
 fn serves_over_a_unix_socket() {
     use std::os::unix::net::UnixStream;
@@ -1011,6 +1065,8 @@ fn handlers_see_the_client_address() {
     assert_eq!(c.reply().text(), expected);
 }
 
+/// On Windows idle connections are not closed for new clients: they wait.
+#[cfg(windows)]
 #[test]
 fn at_the_connection_limit_new_clients_wait_their_turn() {
     let server = TestServer::start(Server::new().max_connections(1), echo);
@@ -1054,6 +1110,168 @@ fn at_the_connection_limit_new_clients_wait_their_turn() {
         assert_eq!(c.reply().status, 200);
         c.expect_closed();
     }
+}
+
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_a_connection_mid_request_keeps_its_place() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut first = server.client();
+    // Half a request: the connection is busy, not idle, once the server
+    // has read it.
+    first.send("GET /first HTTP/1.1\r\n");
+    std::thread::sleep(Duration::from_millis(200));
+
+    // The kernel completes the second handshake, but the server does not
+    // accept the connection while the first one is receiving a request.
+    let mut second = server.client();
+    second.send("GET /second HTTP/1.1\r\nHost: t\r\n\r\n");
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let err = second.stream.read(&mut [0u8; 64]).unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "{err}"
+    );
+
+    // The first request is answered in full. Idle after it, the first
+    // connection gives its place to the waiting one: it is closed cleanly,
+    // and the second is served.
+    first.send("Host: t\r\n\r\n");
+    let r = first.reply();
+    assert!(r.text().starts_with("GET /first "), "{}", r.text());
+    first.expect_closed();
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let r = second.reply();
+    assert!(r.text().starts_with("GET /second "), "{}", r.text());
+
+    // The slot is reused again and again.
+    drop(second);
+    for i in 0..20 {
+        let mut c = server.client();
+        c.send(format!(
+            "GET /{i} HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n"
+        ));
+        assert_eq!(c.reply().status, 200);
+        c.expect_closed();
+    }
+}
+
+/// A new connection that has not sent its first request is not idle: its
+/// client would not retry a request lost on it, so it keeps its place.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_a_new_connection_keeps_its_place_until_its_first_request() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut first = server.client();
+    std::thread::sleep(Duration::from_millis(200));
+
+    let mut second = server.client();
+    second.send("GET /second HTTP/1.1\r\nHost: t\r\n\r\n");
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_millis(300)))
+        .unwrap();
+    let err = second.stream.read(&mut [0u8; 64]).unwrap_err();
+    assert!(
+        matches!(
+            err.kind(),
+            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+        ),
+        "{err}"
+    );
+
+    // The first connection is answered, then gives its place once idle.
+    first.send("GET /first HTTP/1.1\r\nHost: t\r\n\r\n");
+    let r = first.reply();
+    assert!(r.text().starts_with("GET /first "), "{}", r.text());
+    first.expect_closed();
+    second
+        .stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    let r = second.reply();
+    assert!(r.text().starts_with("GET /second "), "{}", r.text());
+}
+
+/// At the limit, idle keep-alive connections do not keep new clients out:
+/// the one idle longest is closed to make room, as nginx does.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_the_longest_idle_connection_makes_room() {
+    let server = TestServer::start(Server::new().max_connections(3), echo);
+    let mut idle: Vec<Client> = (0..3)
+        .map(|i| {
+            let mut c = server.client();
+            c.send(format!("GET /{i} HTTP/1.1\r\nHost: t\r\n\r\n"));
+            assert_eq!(c.reply().status, 200);
+            c
+        })
+        .collect();
+    // The oldest becomes the newest idle connection again.
+    idle[0].send("GET /again HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(idle[0].reply().status, 200);
+
+    // Two new clients: connections 1 and 2, idle longest, close for them.
+    let mut fresh: Vec<Client> = (0..2)
+        .map(|i| {
+            let mut c = server.client();
+            c.send(format!("GET /new{i} HTTP/1.1\r\nHost: t\r\n\r\n"));
+            let r = c.reply();
+            assert!(
+                r.text().starts_with(&format!("GET /new{i} ")),
+                "{}",
+                r.text()
+            );
+            c
+        })
+        .collect();
+    idle[1].expect_closed();
+    idle[2].expect_closed();
+    // The others carry on.
+    idle[0].send("GET /still HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert!(idle[0].reply().text().starts_with("GET /still "));
+    for c in &mut fresh {
+        c.send("GET /more HTTP/1.1\r\nHost: t\r\n\r\n");
+        assert!(c.reply().text().starts_with("GET /more "));
+    }
+}
+
+/// An idle HTTP/2 connection gives its place the same way, with a GOAWAY.
+#[cfg(unix)]
+#[test]
+fn at_the_connection_limit_an_idle_http2_connection_goes_away() {
+    let server = TestServer::start(Server::new().max_connections(1), echo);
+    let mut h2 = server.client();
+    // The preface and an empty SETTINGS frame: a connection with no stream.
+    h2.send(b"PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n\0\0\0\x04\0\0\0\0\0");
+    // Wait for the server's SETTINGS: the connection is open and idle.
+    while h2.buf.len() < 9 {
+        assert!(h2.fill());
+    }
+
+    let mut c = server.client();
+    c.send("GET /new HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert!(c.reply().text().starts_with("GET /new "));
+
+    // The HTTP/2 connection got a GOAWAY, then was closed.
+    while h2.fill() {}
+    let mut frames = Vec::new();
+    let mut at = 0;
+    while at + 9 <= h2.buf.len() {
+        let len = u32::from_be_bytes([0, h2.buf[at], h2.buf[at + 1], h2.buf[at + 2]]) as usize;
+        frames.push(h2.buf[at + 3]);
+        at += 9 + len;
+    }
+    assert_eq!(frames.last(), Some(&7), "frame types {frames:?}");
 }
 
 /// Below `min_free_memory`, new connections are refused with a `503` that
