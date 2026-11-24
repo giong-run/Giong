@@ -90,7 +90,12 @@ pub fn run(cmd: &mut Command) -> Result<String, ToolError> {
 fn kill_tree(child: &mut std::process::Child) {
     #[cfg(windows)]
     {
-        let _ = Command::new("taskkill")
+        // By full path: Windows looks in giong's own folder and PATH first.
+        let root = std::env::var_os("SystemRoot").unwrap_or_else(|| "C:\\Windows".into());
+        let taskkill = std::path::Path::new(&root)
+            .join("System32")
+            .join("taskkill.exe");
+        let _ = Command::new(taskkill)
             .args(["/T", "/F", "/PID", &child.id().to_string()])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
