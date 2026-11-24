@@ -729,7 +729,7 @@ impl Iocp {
                         None,
                     ))
                 }
-                Io::RecvMsg { fd, msg } => match self.recv_msg_for(fd) {
+                Io::RecvMsg { fd, msg, .. } => match self.recv_msg_for(fd) {
                     Err(code) => Err(code),
                     Ok(recv_msg) => wsa(recv_msg(fd, msg, &mut transferred, ov, None)),
                 },
