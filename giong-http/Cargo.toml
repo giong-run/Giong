@@ -29,6 +29,11 @@ giong-quic = { path = "../giong-quic", version = "1.4.1", optional = true }
 libc = { version = "0.2.172", optional = true }
 miniz_oxide = { version = "0.9", optional = true }
 
+# The server's accept loop peeks at sockets before closing idle connections.
+# Already a dependency of giong.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2.172"
+
 [dev-dependencies]
 miniz_oxide = "0.9"
 rcgen = "0.13"

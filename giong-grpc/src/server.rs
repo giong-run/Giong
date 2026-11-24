@@ -19,7 +19,7 @@ use giong_proto::{MessageOf, MessageType, View};
 
 use crate::codec::{self, Deframer, Payload};
 use crate::message::{Received, Reply};
-use crate::metadata::Metadata;
+use crate::metadata::{Metadata, WireValue};
 use crate::status::{Code, Status};
 
 /// The largest message a server or a channel reads or writes unless told
@@ -233,27 +233,28 @@ fn no_method(path: &str) -> Status {
 // ------------------------------------------------------------ responses
 
 /// The fields that end a call: its status, and the metadata after it.
-fn status_fields(status: &Status, extra: &Metadata) -> Vec<(String, Vec<u8>)> {
+fn status_fields<'a>(status: &'a Status, extra: &'a Metadata) -> Vec<(&'a str, WireValue<'a>)> {
+    /// Every status number as text: no formatting for the one every call
+    /// ends with.
+    const NUMBERS: [&str; 17] = [
+        "0", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12", "13", "14", "15", "16",
+    ];
     let mut fields = Vec::with_capacity(3 + status.metadata().len() + extra.len());
-    fields.push((
-        "grpc-status".to_owned(),
-        status.code().number().to_string().into_bytes(),
-    ));
+    let number = NUMBERS[usize::from(status.code().number())];
+    fields.push(("grpc-status", WireValue::Text(number.as_bytes())));
     if !status.message().is_empty() {
         fields.push((
-            "grpc-message".to_owned(),
-            codec::encode_message(status.message()).into_bytes(),
+            "grpc-message",
+            WireValue::Encoded(codec::encode_message(status.message())),
         ));
     }
     if !status.details().is_empty() {
         fields.push((
-            "grpc-status-details-bin".to_owned(),
-            crate::metadata::base64_encode(status.details()).into_bytes(),
+            "grpc-status-details-bin",
+            WireValue::Encoded(crate::metadata::base64_encode(status.details())),
         ));
     }
-    for (name, value) in extra.wire().chain(status.metadata().wire()) {
-        fields.push((name.to_owned(), value.as_bytes().to_vec()));
-    }
+    fields.extend(extra.wire().chain(status.metadata().wire()));
     fields
 }
 
@@ -263,14 +264,14 @@ fn status_fields(status: &Status, extra: &Metadata) -> Vec<(String, Vec<u8>)> {
 /// handler gave, because a client told `INTERNAL` about a call that did
 /// its work might do the work again.
 fn closing(status: &Status, extra: &Metadata) -> Trailers {
-    let mut left_out: Vec<String> = Vec::new();
+    let mut left_out: Vec<&str> = Vec::new();
     'build: loop {
         let mut trailers = Trailers::new();
         for (name, value) in status_fields(status, extra) {
             if left_out.contains(&name) {
                 continue;
             }
-            trailers = match trailers.field(&name, value) {
+            trailers = match trailers.field(name, value.as_bytes()) {
                 Ok(trailers) => trailers,
                 // Rare: built again without it, rather than copying the
                 // trailers for each field.
@@ -319,8 +320,8 @@ fn with_metadata(
 fn trailers_only(status: &Status) -> giong_http::Response {
     let mut response = head(false);
     for (name, value) in status_fields(status, &Metadata::new()) {
-        let value = String::from_utf8_lossy(&value).into_owned();
-        response = match response.try_header(&name, value) {
+        let value = String::from_utf8_lossy(value.as_bytes());
+        response = match response.try_header(name, value) {
             Ok(response) => response,
             Err(e) => {
                 let error = giong::error::Error::new(
@@ -328,7 +329,7 @@ fn trailers_only(status: &Status) -> giong_http::Response {
                     e.to_string(),
                     "choose another name.",
                 );
-                return trailers_only(&bad_trailer(&name, &error));
+                return trailers_only(&bad_trailer(name, &error));
             }
         };
     }
@@ -367,7 +368,31 @@ impl Call {
     fn new(req: &giong_http::Request, limits: Limits) -> Result<Self, Status> {
         // `None` for a request that ended with its head: no messages.
         let body = req.body_stream();
-        let timeout = match req.header("grpc-timeout") {
+        // One pass over the header fields: each `Request::header` would be
+        // another.
+        let (mut timeout, mut encoding, mut accepts) = (None, None, None);
+        let mut metadata = Metadata::new();
+        for (name, value) in req.headers() {
+            let slot = if name.eq_ignore_ascii_case("grpc-timeout") {
+                &mut timeout
+            } else if name.eq_ignore_ascii_case("grpc-encoding") {
+                &mut encoding
+            } else if name.eq_ignore_ascii_case("grpc-accept-encoding") {
+                &mut accepts
+            } else {
+                &mut None
+            };
+            // The first value, as `Request::header` gives.
+            if slot.is_none() {
+                *slot = Some(value);
+            }
+            metadata.received(name, value).map_err(|name| {
+                codec::protocol(format!(
+                    "the value of the metadata name {name} is not base64"
+                ))
+            })?;
+        }
+        let timeout = match timeout {
             None => None,
             Some(value) => Some(codec::parse_timeout(value).ok_or_else(|| {
                 codec::protocol(format!(
@@ -376,7 +401,7 @@ impl Call {
                 ))
             })?),
         };
-        let request_gzip = match req.header("grpc-encoding") {
+        let request_gzip = match encoding {
             None | Some(b"identity") => false,
             Some(b"gzip") => true,
             Some(other) => {
@@ -392,17 +417,8 @@ impl Call {
                 ))
             }
         };
-        let accepts_gzip = req
-            .header("grpc-accept-encoding")
-            .is_some_and(|v| v.split(|&b| b == b',').any(|e| trim(e) == b"gzip"));
-        let mut metadata = Metadata::new();
-        for (name, value) in req.headers() {
-            metadata.received(name, value).map_err(|name| {
-                codec::protocol(format!(
-                    "the value of the metadata name {name} is not base64"
-                ))
-            })?;
-        }
+        let accepts_gzip =
+            accepts.is_some_and(|v| v.split(|&b| b == b',').any(|e| trim(e) == b"gzip"));
         Ok(Self {
             body,
             metadata,
