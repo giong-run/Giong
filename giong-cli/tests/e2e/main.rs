@@ -4,7 +4,7 @@
 //! - `contract`: what every command promises (usage, coded errors, the JSON
 //!   document, exit status, no hangs, no writes when it fails), for every
 //!   command `giong help --json` lists, so new commands are covered at once.
-//! - one file per command with its scenarios.
+//! - one file per command with its scenarios (`dev_ctl`: giong dev --background, status, logs, stop).
 //! - `scenarios`: whole workflows across commands (new, dev, edit, reload).
 //!
 //! `GIONG_E2E_SLOW=1` also runs the scenarios that build generated projects;
@@ -21,6 +21,7 @@ mod check;
 mod clean;
 mod contract;
 mod dashboard;
+mod dev_ctl;
 mod doctor;
 mod env;
 mod explain;
