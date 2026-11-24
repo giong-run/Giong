@@ -93,6 +93,8 @@ Raised by `TcpStream`, `UnixStream` and `UdpSocket`. In code: `giong::error::Cod
 
 A one-off read (`read`, `read_from`) was used on a stream or socket that already has a multishot receive (`recv`, `recv_from`) running. The kernel keeps delivering data into the multishot receive, so a one-off read would see the data out of order.
 
+On a `UnixStream`, `recv_with_fds` counts as a one-off read: it cannot follow `recv`, and once it has been used, `recv` is refused, because a multishot receive would let the kernel close descriptors that arrive.
+
 ## How to fix it
 
 - Use one way of reading per stream or socket: `recv`/`recv_from` (buffers from the runtime's pool, best for many connections) or `read`/`read_from` (your own buffer).
@@ -210,6 +212,81 @@ A future that had started an I/O operation (a read, a write, a connect, a file o
 
 - Await a giong future to completion on the worker that first polled it, within the same `block_on` or `Runtime::run`.
 - Send data between workers and threads, not futures: `Handle::spawn_on` takes a closure and builds the future on the worker that runs it, and channels (`giong::sync`) carry values.
+
+[All error codes](README.md)
+"#),
+    (16, r#"# GIONG-E0016: this signal cannot be listened for
+
+Raised by `giong::signal::listen`. In code: `giong::error::Code::SignalNotAllowed`.
+
+## What happened
+
+`listen` was given a signal that a program cannot, or should not, receive as a stream:
+
+- `SIGKILL` and `SIGSTOP`: the kernel never lets a process catch them.
+- `SIGSEGV`, `SIGBUS`, `SIGILL` and `SIGFPE`: they report a fault in the program itself (a bad memory access, an illegal instruction). Handling them later, on a worker, would let the faulting code run on.
+- A number that is not a signal: 0, negative, or above `SIGRTMAX`.
+
+## How to fix it
+
+- Listen for the signals meant for programs to act on: `SignalKind::HANGUP` (reload the configuration), `SignalKind::USER1`/`USER2` (your own actions, such as a dump), `SignalKind::INTERRUPT`/`TERMINATE` (stop), `SignalKind::CHILD`, `SignalKind::WINDOW_CHANGE`, or a real-time signal from `SignalKind::from_raw(libc::SIGRTMIN() + n)`.
+- To stop on `SIGINT` or `SIGTERM`, `Builder::shutdown_on_signals(true)` with `giong::shutdown_signal()` is usually all you need.
+
+[All error codes](README.md)
+"#),
+    (17, r#"# GIONG-E0017: descriptors could not be passed
+
+Raised by `send_with_fds`, `send_to_with_fds` and `recv_with_fds` of `giong::net::UnixStream` and `giong::net::UnixDatagram`. In code: `giong::error::Code::FdPassing`.
+
+## What happened
+
+One of these:
+
+- **More than 253 descriptors for one message.** Linux passes at most 253 (`SCM_MAX_FD`, `giong::net::MAX_FDS`) per `sendmsg`. Nothing was sent.
+- **Descriptors with an empty buffer.** Descriptors travel with the bytes of a message, and a stream socket sends nothing at all for an empty send, so they would be lost. Nothing was sent.
+- **The kernel cut off the control data of a received message** (`MSG_CTRUNC`). The descriptors that did not fit were closed by the kernel before they arrived, and giong closed the ones that did, so the message is incomplete. giong leaves room for 253 descriptors and for credentials, so this happens only when the sender attached other control data as well, or the socket has options such as `SO_PASSCRED` turned on.
+
+## How to fix it
+
+- Send at most 253 descriptors per call; split a larger set over several messages.
+- Send at least one byte with the descriptors, such as a message that says what they are.
+- On a socket that receives descriptors, turn off other control data (`SO_PASSCRED`, `SO_TIMESTAMP` and similar), and have the sender attach only `SCM_RIGHTS`.
+
+[All error codes](README.md)
+"#),
+    (18, r#"# GIONG-E0018: the inherited socket cannot be used that way
+
+Raised by `giong::net::activated_sockets` and the methods of `giong::net::ActivatedSocket`. In code: `giong::error::Code::ActivatedSocket`.
+
+## What happened
+
+One of these:
+
+- **The sockets were already taken.** systemd (or another socket manager speaking its protocol) hands a service its sockets as descriptors 3, 4, ... and says so in `LISTEN_FDS` and `LISTEN_PID`. `activated_sockets` takes ownership of them, so a second call would hand out the same descriptors twice; it fails instead.
+- **The socket is not the kind asked for.** `tcp_listener` was called on a socket that is not a listening TCP socket (a UDP socket, a Unix socket, a TCP socket that is not listening), and likewise `unix_listener`, `udp_socket` and `unix_datagram`. The message says what the socket is.
+
+## How to fix it
+
+- Call `activated_sockets` once, early in `main`, and share the result (an `Arc<Vec<ActivatedSocket>>`) with the workers. Each worker then calls `tcp_listener()` (or the method for its kind) on the socket, which gives it its own descriptor.
+- Match the method to the socket in the `.socket` unit: `ListenStream=` with an address or port is a TCP listener, `ListenStream=` with a path a Unix listener, `ListenDatagram=` with a port a UDP socket, with a path a Unix datagram socket. `FileDescriptorName=` names a socket, and `ActivatedSocket::name` returns that name, so pick sockets by name rather than by position.
+
+[All error codes](README.md)
+"#),
+    (19, r#"# GIONG-E0019: cannot watch the child process
+
+Raised by `giong::process::Command::spawn` and the methods of `giong::process::Child`. In code: `giong::error::Code::ChildProcess`.
+
+## What happened
+
+giong waits for a child process through a pidfd, a descriptor for the process that the kernel makes readable when it exits, so that waiting needs no thread and no `SIGCHLD` handler, and a signal can never reach another process that got the same process ID later. One of these went wrong:
+
+- **The kernel refused the pidfd** (`pidfd_open`): Linux older than 5.3, or a seccomp profile that blocks the call. The child was started; giong killed and reaped it, since it could not have waited for it.
+- **Someone else reaped the child.** Code in the same process called `waitpid(-1, ...)` or `wait()`, or set `SIGCHLD` to `SIG_IGN`, which makes the kernel reap children by itself. The exit status is gone.
+
+## How to fix it
+
+- Run on Linux 5.3 or newer, and allow `pidfd_open` and `pidfd_send_signal` in the seccomp profile (Docker's default profile allows both since Docker 20.10).
+- Do not reap children that giong started: no `waitpid(-1, ...)`, no `wait()`, no `SIGCHLD` set to `SIG_IGN`, in your code or in a library you call. Listening for `SIGCHLD` with `giong::signal::listen` is fine: it does not reap.
 
 [All error codes](README.md)
 "#),
