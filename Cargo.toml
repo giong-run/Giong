@@ -10,10 +10,10 @@ repository = "https://github.com/giong-run/Giong"
 documentation = "https://docs.rs/giong"
 keywords = ["async", "runtime", "io-uring", "thread-per-core", "network"]
 categories = ["asynchronous", "network-programming"]
-exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", "giong-quic/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/", "sim/"]
+exclude = ["bench/", "giong-http/", "giong-tls/", "giong-postgres/", "giong-mysql/", "giong-redis/", "giong-web/", "giong-mcp/", "giong-compat/", "giong-quic/", "giong-cli/", ".github/", "scripts/", "assets/", "site/", "docs/", "fuzz/", "sim/"]
 
 [workspace]
-members = [".", "giong-proto", "giong-grpc-build", "giong-grpc", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "giong-quic", "examples/rest-api", "examples/proto-hello", "examples/grpc-hello"]
+members = [".", "giong-proto", "giong-grpc-build", "giong-grpc", "giong-http", "giong-tls", "giong-postgres", "giong-mysql", "giong-redis", "giong-web", "giong-mcp", "giong-compat", "giong-quic", "giong-cli", "examples/rest-api", "examples/proto-hello", "examples/grpc-hello"]
 exclude = ["bench", "sim"]
 
 [dependencies]
@@ -48,6 +48,11 @@ windows-sys = { version = "0.61", features = [
 # datagram and the source address of a send, socket buffer sizes, "don't
 # fragment". Not part of the 1.0 API: may change until it is stabilised.
 unstable-udp-offload = []
+# giong dev's socket hand-off (`GIONG_DEV_LISTEN`, see `giong dev`) in a build
+# without debug assertions. Debug builds always have it; a release build has
+# none of its code unless this is on (`giong dev --release` turns it on for its
+# own build), and refuses to start under giong dev with a coded error.
+dev = []
 
 [lints.rust]
 # Set by scripts/check.sh for ThreadSanitizer builds (see Driver::close_fd).
