@@ -22,6 +22,8 @@ mod scaffold;
 mod state;
 mod template;
 mod watch;
+#[cfg(windows)]
+mod winproc;
 
 use std::process::ExitCode;
 

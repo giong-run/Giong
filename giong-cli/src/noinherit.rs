@@ -12,8 +12,8 @@
 //! `main`, keeps them in this process. Children given `Stdio::inherit()` are
 //! unaffected: std duplicates the handle into an inheritable one for them.
 //!
-//! The only `unsafe` in giong-cli; `[lints.rust] unsafe_code = "deny"` keeps
-//! it to this module.
+//! With `winproc`, one of the two modules of giong-cli that use `unsafe`;
+//! `[lints.rust] unsafe_code = "deny"` keeps it to them.
 #![allow(unsafe_code)]
 
 use std::ffi::c_void;
