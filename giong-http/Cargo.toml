@@ -38,8 +38,6 @@ libc = "0.2.172"
 miniz_oxide = "0.9"
 rcgen = "0.13"
 rustls = { version = "0.23.33", default-features = false, features = ["ring", "std", "tls12"] }
-# To lower the limit on open files in tests/open_files.rs. Already a dependency of giong.
-libc = "0.2.172"
 # A TCP socket that is bound but does not listen. Already a dependency of giong.
 socket2 = "0.6"
 # An HTTP/3 client that is not giong's own, on Tokio in a thread of its own,

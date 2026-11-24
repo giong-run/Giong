@@ -19,6 +19,19 @@ fn limits() -> (u64, u64) {
     (lim.rlim_cur, lim.rlim_max)
 }
 
+/// The soft limit a runtime raises to: the hard limit, or `fs.nr_open`, the
+/// most Linux allows, when the hard limit is unlimited.
+fn raised(max: u64) -> u64 {
+    if max != libc::RLIM_INFINITY {
+        return max;
+    }
+    std::fs::read_to_string("/proc/sys/fs/nr_open")
+        .unwrap()
+        .trim()
+        .parse()
+        .unwrap()
+}
+
 /// In the child: a soft limit of 256, below a hard limit above it.
 fn lower_soft_limit() -> u64 {
     let (_, max) = limits();
@@ -53,7 +66,7 @@ fn a_runtime_raises_the_soft_limit_on_open_files_to_the_hard_one() {
     }
     let max = lower_soft_limit();
     giong::block_on(async {});
-    assert_eq!(limits(), (max, max));
+    assert_eq!(limits(), (raised(max), max));
 }
 
 #[test]
