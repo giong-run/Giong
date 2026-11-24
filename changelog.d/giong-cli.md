@@ -11,8 +11,8 @@
   feature (`giong dev --release` turns it on for its own builds): a release build has none
   of its code, and refuses to start under `giong dev` with a coded error.
 - **giong-cli**: `giong dev` builds and runs the service and, on every save, builds again
-  and swaps the new build in once it accepts connections: measured 0 failed requests over
-  30 restarts under constant load (io_uring and epoll). A failed build, or a build that
+  and swaps the new build in once it accepts connections: measured 0 failed requests out of
+  102,061 over 100 restarts under constant load (`bench/results/dev-restarts/`). A failed build, or a build that
   stops at start-up, leaves the running one serving. A change to `.env` alone restarts
   without building. It starts the service with `WORKERS=2` on a laptop, `.env`,
   `RUST_BACKTRACE=1` and a giong-mcp socket, and keeps `.giong/dev.json` and
