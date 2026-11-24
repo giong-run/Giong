@@ -1,0 +1,11 @@
+10 restarts, 10445 requests, errors {}
+20 restarts, 20543 requests, errors {}
+30 restarts, 30642 requests, errors {}
+40 restarts, 40668 requests, errors {}
+50 restarts, 50826 requests, errors {}
+60 restarts, 61058 requests, errors {}
+70 restarts, 71117 requests, errors {}
+80 restarts, 81470 requests, errors {}
+90 restarts, 91723 requests, errors {}
+100 restarts, 102045 requests, errors {}
+{"restarts": 100, "dev_restarts": 101, "requests": 102061, "results": {"ok": 102061}, "errors": {}, "save_to_serve_s": {"median": 0.752, "p90": 0.789, "min": 0.699, "max": 0.885}}
