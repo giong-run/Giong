@@ -252,3 +252,35 @@ New in giong 1.1. A call that fails ends with a gRPC status; the statuses giong-
 | [GIONG-E4108](E4108.md) | `GrpcDeadline` | gRPC deadline exceeded |
 | [GIONG-E4109](E4109.md) | `GrpcCancelled` | gRPC call cancelled |
 | [GIONG-E4110](E4110.md) | `GrpcUnimplemented` | gRPC method not found |
+
+## giong-cli
+
+The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can also carry the runtime's own codes (`GIONG-E0001` when io_uring is blocked, for example).
+
+| Code | Name | Meaning |
+|---|---|---|
+| [GIONG-E5000](E5000.md) | `Usage` | the command line is not valid |
+| [GIONG-E5001](E5001.md) | `NotAProject` | no Cargo project here |
+| [GIONG-E5002](E5002.md) | `CargoFailed` | cargo could not be run |
+| [GIONG-E5003](E5003.md) | `RustTooOld` | the Rust compiler is too old |
+| [GIONG-E5004](E5004.md) | `TokioCrate` | a dependency needs the Tokio runtime |
+| [GIONG-E5005](E5005.md) | `UnknownCode` | no such error code |
+| [GIONG-E5006](E5006.md) | `BlockingCall` | a blocking call inside a worker |
+| [GIONG-E5007](E5007.md) | `HostNameBind` | binding a host name |
+| [GIONG-E5008](E5008.md) | `BorrowAcrossAwait` | a RefCell borrow held across an await |
+| [GIONG-E5009](E5009.md) | `BuildFailed` | the code does not compile |
+| [GIONG-E5010](E5010.md) | `Lint` | clippy has a finding |
+| [GIONG-E5011](E5011.md) | `DiskUsed` | build directories use a lot of disk |
+| [GIONG-E5012](E5012.md) | `SlowDebugInfo` | the dev profile writes full debug information |
+| [GIONG-E5013](E5013.md) | `OpenFilesLimit` | the open-files limit is low |
+| [GIONG-E5014](E5014.md) | `PortInUse` | the port is in use |
+| [GIONG-E5015](E5015.md) | `DockerSeccomp` | Docker blocks io_uring |
+| [GIONG-E5016](E5016.md) | `EnvMissing` | a variable from .env.example is not set |
+| [GIONG-E5017](E5017.md) | `ServiceExited` | the service stopped |
+| [GIONG-E5018](E5018.md) | `ServiceNotReady` | the service did not start listening |
+| [GIONG-E5019](E5019.md) | `McpUnreachable` | the service's giong-mcp does not answer |
+| [GIONG-E5020](E5020.md) | `WatchLimit` | too many files to watch |
+| [GIONG-E5021](E5021.md) | `NoLinker` | no linker found |
+| [GIONG-E5022](E5022.md) | `DevRunning` | giong dev already serves this project |
+| [GIONG-E5023](E5023.md) | `CompilerWarning` | the compiler has a warning |
+| [GIONG-E5024](E5024.md) | `ListensOnNetwork` | the service would listen on every network interface |
