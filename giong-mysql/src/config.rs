@@ -218,7 +218,10 @@ impl Config {
     /// `value` is SQL, so a string needs quotes:
     /// `.session_variable("sql_mode", "'STRICT_ALL_TABLES'")` or
     /// `.session_variable("transaction_isolation", "'READ-COMMITTED'")`. The
-    /// name must be a plain identifier. They are set again whenever a pooled
+    /// value must be one expression: a `;`, a comment, a backslash or a `,`
+    /// outside quotes and parentheses is refused when connecting, so that a
+    /// value cannot set another variable (`'', autocommit = 0`). The name
+    /// must be a plain identifier. They are set again whenever a pooled
     /// connection's session is reset.
     ///
     /// The variables giong-mysql sets itself are refused: the character set
@@ -301,8 +304,10 @@ impl Config {
     /// of connections: processes × workers × pool size × this capacity must
     /// stay below it, with room for the other applications on the server.
     /// 64 allows 255 connections. When the server's limit is reached anyway
-    /// (error 1461), the connection closes its statements that are not in
-    /// use and prepares again, once.
+    /// (error 1461), the connection's prepares take turns: each closes the
+    /// statements the connection is not using and tries again, pausing
+    /// between tries, and fails once no prepare on the connection has
+    /// succeeded for a second.
     pub fn statement_cache_capacity(mut self, statements: usize) -> Self {
         self.statement_cache = statements;
         self
@@ -335,6 +340,14 @@ impl Config {
     ///   authorities, which is stricter than MySQL's client (it checks
     ///   nothing then, so anyone on the path could pose as the server).
     /// * `PREFERRED` is refused: it falls back to no TLS without a word.
+    ///
+    /// The user name, the password and the database name are
+    /// percent-decoded: write `/` as `%2F`, `?` as `%3F` and `@` as `%40`
+    /// in them. A URL with an `@` after the first `/` or `?` that would
+    /// otherwise not read, or with an `@` in its database name, is refused
+    /// with a message that quotes none of it, since a piece of a password
+    /// with an unescaped `/` or `?` would end up in the message (or, as the
+    /// database name, be sent to the wrong host).
     pub fn from_url(url: &str) -> Result<Self, Error> {
         parse_url(url)
     }
@@ -447,6 +460,13 @@ impl Config {
                      pool when a session changed. Leave it out"
                 )));
             }
+            if let Err(why) = one_expression(value) {
+                return Err(Error::config(format!(
+                    "the value of the session variable {name} {why}: a value is one SQL \
+                     expression, such as 'STRICT_ALL_TABLES' or 5; set each variable with its \
+                     own session_variable call"
+                )));
+            }
             sql.push_str(&format!(", SESSION {name} = {value}"));
         }
         Ok(sql)
@@ -481,6 +501,54 @@ impl FromStr for Config {
     }
 }
 
+/// Checks that `value` is one SQL expression, so that it cannot end the
+/// `SET` it is put in (`;`), set another variable (`, autocommit = 0`, which
+/// would bypass the variables refused above) or comment out the rest.
+/// Commas inside parentheses and quotes are fine. A backslash is refused:
+/// whether it escapes a quote depends on the server's `sql_mode`.
+fn one_expression(value: &str) -> Result<(), &'static str> {
+    let b = value.as_bytes();
+    let (mut depth, mut i) = (0usize, 0);
+    if value.trim().is_empty() {
+        return Err("is empty");
+    }
+    while i < b.len() {
+        match b[i] {
+            q @ (b'\'' | b'"' | b'`') => {
+                // A doubled quote stands for itself inside the string.
+                i += 1;
+                loop {
+                    match b.get(i) {
+                        None => return Err("has a quote that is not closed"),
+                        Some(&c) if c == q && b.get(i + 1) == Some(&q) => i += 2,
+                        Some(&c) if c == q => break,
+                        Some(b'\\') => return Err("holds a backslash"),
+                        Some(_) => i += 1,
+                    }
+                }
+            }
+            b'\\' => return Err("holds a backslash"),
+            b'(' => depth += 1,
+            b')' => {
+                depth = depth
+                    .checked_sub(1)
+                    .ok_or("has a ')' that closes nothing")?
+            }
+            b';' => return Err("holds a ';'"),
+            b',' if depth == 0 => return Err("holds a ',' outside parentheses and quotes"),
+            b'#' => return Err("holds a comment"),
+            b'-' if b.get(i + 1) == Some(&b'-') => return Err("holds a comment"),
+            b'/' if b.get(i + 1) == Some(&b'*') => return Err("holds a comment"),
+            _ => {}
+        }
+        i += 1;
+    }
+    if depth != 0 {
+        return Err("has a '(' that is not closed");
+    }
+    Ok(())
+}
+
 fn percent_decode(s: &str, what: &str) -> Result<String, Error> {
     let bytes = s.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
@@ -509,6 +577,42 @@ fn percent_decode(s: &str, what: &str) -> Result<String, Error> {
 }
 
 fn parse_url(url: &str) -> Result<Config, Error> {
+    // An `@` after the first `/` or `?` is most likely the end of a password
+    // holding an unescaped `/` or `?`: the URL is cut in the wrong place, so
+    // a piece of the password would be read as the port, the database name
+    // or a parameter, and quoted in the error, or sent to the server as the
+    // database name. Say what to fix instead, quoting nothing.
+    let after_cut = |accepted: bool| {
+        let Some((_, rest)) = url.split_once("://") else {
+            return false;
+        };
+        let Some(cut) = rest.find(['/', '?']) else {
+            return false;
+        };
+        if accepted {
+            // Read without an error: only a database name holding an `@`
+            // gives it away (parameters may hold one).
+            let before_query = rest.split_once('?').map_or(rest, |(r, _)| r);
+            before_query.get(cut..).is_some_and(|db| db.contains('@'))
+        } else {
+            rest[cut..].contains('@')
+        }
+    };
+    let cut_password = |read: &str| {
+        Error::config(format!(
+            "the URL {read}has an @ after a / or ?: if the password (or the user name) holds one \
+             of them, percent-encode it (/ as %2F, ? as %3F, @ as %40); write an @ in the \
+             database name as %40 too"
+        ))
+    };
+    match parse(url) {
+        Ok(_) if after_cut(true) => Err(cut_password("")),
+        Err(_) if after_cut(false) => Err(cut_password("could not be read, and it ")),
+        result => result,
+    }
+}
+
+fn parse(url: &str) -> Result<Config, Error> {
     let rest = url.strip_prefix("mysql://").ok_or_else(|| {
         Error::config(
             "a connection URL starts with mysql://, as in mysql://user:password@host:3306/database",
@@ -812,6 +916,35 @@ mod tests {
             let e = c.session_sql(Server::MySql).unwrap_err().to_string();
             assert!(e.contains("Leave it out"), "{name}: {e}");
         }
+        // A value is one expression: it cannot set a refused variable after
+        // a comma, end the SET or comment out the rest.
+        for value in [
+            "'', autocommit = 0",
+            "1; SET autocommit = 0",
+            "1 -- x",
+            "1 # x",
+            "1 /* x */",
+            "'a\\', autocommit = 0 -- '",
+            "'open",
+            "(1",
+            "1)",
+            "",
+        ] {
+            let c = Config::new().session_variable("sql_mode", value);
+            let e = c.session_sql(Server::MySql).unwrap_err().to_string();
+            assert!(e.contains("one SQL expression"), "{value:?}: {e}");
+        }
+        for value in [
+            "'STRICT_ALL_TABLES,NO_ZERO_DATE'",
+            "CONCAT(@@sql_mode, ',STRICT_ALL_TABLES')",
+            "'it''s'",
+            "`x`",
+            "5",
+            "@@GLOBAL.sql_mode",
+        ] {
+            let c = Config::new().session_variable("sql_mode", value);
+            assert!(c.session_sql(Server::MySql).is_ok(), "{value:?}");
+        }
         let lock = Config::new().session_variable("lock_wait_timeout", "5");
         assert!(lock.session_sql(Server::MySql).is_ok());
         assert_eq!(
@@ -820,5 +953,36 @@ mod tests {
                 .statement_timeout,
             Duration::from_millis(1)
         );
+    }
+    #[test]
+    fn a_password_cut_by_an_unescaped_slash_or_question_mark_is_never_quoted() {
+        for url in [
+            "mysql://app:s3cr/et@db/x",
+            "mysql://app:pa?ss@db/x",
+            "mysql://app:se:cr/et@db/x",
+            "mysql://app:pa?ss=1@db",
+            "mysql://app:pa%zz/ss@db",
+            // Read without an error, these would connect to the host "app"
+            // with a piece of the password as the port and the rest, with
+            // the real host, as the database name.
+            "mysql://app:12/34@db/x",
+            "mysql://app:p@ss/word@db/x",
+        ] {
+            let e = Config::from_url(url).unwrap_err().to_string();
+            assert!(e.contains("percent-encode"), "{url}: {e}");
+            for piece in ["s3cr", "et", "pa", "ss", "cr", "zz", "12", "34", "word"] {
+                assert!(!e.contains(&format!("\"{piece}")), "{url}: {e}");
+                assert!(!e.contains(&format!("{piece}\"")), "{url}: {e}");
+            }
+        }
+        // An @ in a parameter is fine when the URL reads.
+        let c = Config::from_url("mysql://db/x?application-name=me@here").unwrap();
+        assert_eq!(c.application_name.as_deref(), Some("me@here"));
+        // Encoded, the same passwords work, and so does an @ in the
+        // database name.
+        let c = Config::from_url("mysql://app:s3cr%2Fet@db/x%40y").unwrap();
+        assert_eq!(c.password.as_deref(), Some("s3cr/et"));
+        assert_eq!(c.target(), "db:3306");
+        assert_eq!(c.database.as_deref(), Some("x@y"));
     }
 }

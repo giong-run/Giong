@@ -3,13 +3,14 @@ name: Windows runtime
 # giong itself on real Windows: the completion port driver in the runtime,
 # with the parts of the test suite that are ported so far. A draft, and a pull
 # request that changes none of the code built here, skip the tests (job `plan`,
-# scripts/ci-scope.py --relevant); the merge queue always runs them, and
-# `windows-checks` is the one name to require for them.
+# scripts/ci-scope.py --relevant). Outside pull requests (the merge queue, a
+# push to main, a dispatch of CI) ci.yml calls this workflow, so that its
+# `all-checks` holds a merge back when a job here fails.
 on:
   pull_request:
     types: [opened, synchronize, reopened, ready_for_review]
-  merge_group:
   workflow_dispatch:
+  workflow_call:
 
 permissions:
   contents: read
@@ -27,6 +28,7 @@ env:
     --lib --test executor --test channels --test time --test shutdown
     --test observe --test spin --test net --test udp --test cancel
     --test multi --test balance --test dns --test fs --test soak
+    --test driver --test wake --test error_docs --test cancel_docs
 
 jobs:
   plan:
@@ -72,6 +74,8 @@ jobs:
       # The handle count after each of five runtime lives, for the log.
       - run: cargo test -p giong --release --locked --test soak -- --nocapture the_descriptor_count
       - run: cargo test -p giong --release --locked --test handles -- --nocapture
+      # Ctrl+Break sent to a child process in its own process group.
+      - run: cargo test -p giong --release --locked --test console
       # The long wake-up race tests and the other ignored ones.
       - run: cargo test -p giong --release --locked --no-fail-fast $SUITES -- --ignored
       # Cancellation and wake-up races depend on timing: one pass proves

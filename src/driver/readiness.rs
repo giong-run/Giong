@@ -1263,12 +1263,34 @@ impl<P: Poller> Readiness<P> {
                 self.pool.release(bid);
             }
         }
+        let mut queued = got > 1;
         if let Some(errno) = sys::take_recv_error() {
             if matches!(self.ops.get(key), Some(EOp::Multi { .. })) {
                 self.ahead.entry(key).or_default().push_back(Err(-errno));
+                queued = true;
             }
         }
+        if queued {
+            self.wake_readers(fd);
+        }
         first.map(Ok)
+    }
+
+    /// Wakes the tasks waiting for datagram socket `fd` to become readable,
+    /// after a receive put datagrams in the `ahead` queue. They are out of
+    /// the socket, which may have nothing left: no readiness event would
+    /// tell the waiting tasks (an edge-triggered event that arrives once the
+    /// socket is empty again does not say "readable"). Each woken task takes
+    /// one or waits again. All of them, since a task may have stopped
+    /// waiting without taking its waker off the list.
+    #[cold]
+    #[inline(never)]
+    fn wake_readers(&mut self, fd: RawFd) {
+        if let Some(Some(Slot::Pollable(reg))) = self.fds.get_mut(fd as usize) {
+            for waker in reg.readers.drain(..) {
+                waker.wake();
+            }
+        }
     }
 
     /// After a receive that asked for `asked` datagrams and got `got`: the

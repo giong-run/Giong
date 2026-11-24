@@ -1073,9 +1073,9 @@ fn write_head(out: &mut Vec<u8>, resp: &Response, content_length: Option<u64>) {
         );
     }
     let mut name = Vec::with_capacity(32);
-    for (n, v) in resp.headers() {
+    for (n, v) in resp.header_fields() {
         name.clear();
-        name.extend(n.bytes().map(|b| b.to_ascii_lowercase()));
+        name.extend(n.iter().map(u8::to_ascii_lowercase));
         // Fields about one connection have no meaning here (section 4.2).
         if matches!(
             &name[..],
@@ -1093,7 +1093,7 @@ fn write_head(out: &mut Vec<u8>, resp: &Response, content_length: Option<u64>) {
         } else {
             Index::Yes
         };
-        Encoder::field(&name, v.as_bytes(), index, &mut block);
+        Encoder::field(&name, v, index, &mut block);
     }
     Header::write(out, kind::HEADERS, block.len() as u64);
     out.extend_from_slice(&block);
