@@ -1150,9 +1150,14 @@ impl Uring {
     }
 
     /// Makes sure the ring a receive of this kind takes buffers from holds
-    /// one. `false` if no buffer is free for it.
-    pub(crate) fn ensure_recv_buffer(&self, datagram: bool) -> bool {
-        let ring = if datagram {
+    /// one: the ring of whole buffers for a receive of datagrams or of one
+    /// buffer (`whole`, or any stream receive under heap pressure), else the
+    /// stream ring. `false` if no buffer is free
+    /// for it.
+    pub(crate) fn ensure_recv_buffer(&self, whole: bool) -> bool {
+        // Under heap pressure stream receives take one buffer at a time too
+        // (see `arm_multi`).
+        let ring = if whole || self.heap_pressure {
             RingId::Whole
         } else {
             self.stream_ring()
@@ -1182,12 +1187,20 @@ impl Uring {
             // One buffer, taken only once the data is there: the rest stays
             // in the socket for the reader's own buffer. The completion has
             // no `IORING_CQE_F_MORE`, so the next poll arms again.
+            //
+            // From the ring of whole buffers, never the packed one. There a
+            // single-shot receive can complete without
+            // `IORING_CQE_F_BUF_MORE` while the kernel keeps the buffer at the
+            // head of the ring for the next receive (seen on Linux 7.0 with
+            // kernel TLS): the pool takes the buffer back, lends it again,
+            // and two receives write the same memory, one stream's data into
+            // another's.
             MultiIo::Recv { fd, once: true } => (
                 opcode::Recv::new(types::Fd(fd), std::ptr::null_mut(), 0)
-                    .buf_group(stream_ring.group())
+                    .buf_group(RingId::Whole.group())
                     .build()
                     .flags(squeue::Flags::BUFFER_SELECT),
-                stream_ring,
+                RingId::Whole,
             ),
             MultiIo::Recv { fd, once: false } => (
                 opcode::RecvMulti::new(types::Fd(fd), stream_ring.group()).build(),

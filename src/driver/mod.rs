@@ -1150,10 +1150,11 @@ impl Driver {
     }
 
     /// Makes sure a receive of this kind can get a pool buffer before it is
-    /// armed (a datagram receive, or a stream one). `false` if none is free.
-    pub(crate) fn ensure_recv_buffer(&self, datagram: bool) -> bool {
-        split!(self, d => d.ensure_recv_buffer(datagram), {
-            let _ = datagram;
+    /// armed (`whole`: a receive of datagrams, or a stream receive of one
+    /// buffer; else a multishot stream receive). `false` if none is free.
+    pub(crate) fn ensure_recv_buffer(&self, whole: bool) -> bool {
+        split!(self, d => d.ensure_recv_buffer(whole), {
+            let _ = whole;
             d.pool().ensure_published(None)
         })
     }
