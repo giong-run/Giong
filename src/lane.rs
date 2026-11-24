@@ -132,7 +132,6 @@ impl Lanes {
                 idle: IDLE,
                 nice: 0,
                 stack_size: None,
-                run_inline_on_failure: false,
                 fair: false,
             }),
             compute: Pool::new(PoolConfig {
@@ -141,7 +140,6 @@ impl Lanes {
                 idle: IDLE,
                 nice: COMPUTE_NICE,
                 stack_size: None,
-                run_inline_on_failure: false,
                 fair: true,
             }),
             compute_backlog: cfg.compute_backlog,

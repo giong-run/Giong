@@ -13,9 +13,8 @@
   CPU-bound job per CPU running next to an echo server, the 99th percentile echo time
   stays at the idle level with the compute lane and grows several times without its
   lower priority or with Tokio's `spawn_blocking` (`bench/lanes.sh`, numbers in
-  `bench/results/lanes/`). The epoll driver's file pool now shares the pool code
-  (`src/pool.rs`) but stays a separate pool, so application jobs cannot starve file
-  operations.
+  `bench/results/lanes/`). The drivers' file pool stays separate, so application
+  jobs cannot starve file operations.
 
 - **giong**: budgets per tenant (`giong::budget`): a `Budget` gives one tenant (a customer, an API
   key, a class of traffic) limits of its own (`Limits::tasks`, `memory`, `io`, `compute`)

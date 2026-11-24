@@ -1,8 +1,8 @@
 //! A pool of plain threads that grows on demand and shrinks when idle.
 //!
-//! Three pools use it: the epoll driver's file pool
-//! ([`driver::blocking`](crate::driver)), and the blocking and compute lanes
-//! of [`crate::lane`]. A thread starts whenever more jobs are queued than idle
+//! The blocking and compute lanes of [`crate::lane`] use it; the drivers'
+//! file pool (`driver::blocking`) has its own, which also starts threads
+//! past its limit when every thread is stuck. A thread starts whenever more jobs are queued than idle
 //! threads can take, up to the pool's limit, and ends after its idle time
 //! without work: a job that blocks for a long time holds up only its own
 //! thread.
@@ -39,9 +39,6 @@ pub(crate) struct PoolConfig {
     pub(crate) nice: i32,
     /// Stack size of its threads; `None` for the standard library's default.
     pub(crate) stack_size: Option<usize>,
-    /// When no thread can be started and none exists: `true` runs the
-    /// queued jobs on the calling thread, `false` drops them.
-    pub(crate) run_inline_on_failure: bool,
     /// One queue per class, served by thread time used for the class's
     /// weight, instead of one FIFO.
     pub(crate) fair: bool,
@@ -258,18 +255,11 @@ impl Pool {
             let mut state = lock(&self.state);
             state.threads -= 1;
             if state.threads == 0 {
-                // No thread will ever take them. Run what is queued here
-                // rather than leave the operations hanging, or drop it,
-                // which cancels each job's handle.
+                // No thread will ever take them: dropping them cancels each
+                // job's handle rather than leave it waiting.
                 let jobs = state.jobs.take_all();
                 drop(state);
-                if self.cfg.run_inline_on_failure {
-                    for job in jobs {
-                        job();
-                    }
-                } else {
-                    drop(jobs);
-                }
+                drop(jobs);
             }
         }
         Ok(())

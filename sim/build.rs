@@ -74,6 +74,10 @@ const SKIP: &[(&str, &str)] = &[
         "a FIFO blocks in the real kernel",
     ),
     (
+        "fs::a_full_pool_of_stuck_file_operations_does_not_hold_up_the_others",
+        "a FIFO blocks in the real kernel",
+    ),
+    (
         "fs::a_file_is_closed_only_once_a_blocking_thread_is_done_with_it",
         "a FIFO blocks in the real kernel",
     ),
