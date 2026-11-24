@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
 
-use super::dev::{alive, unix_ms};
+use super::dev::{is_runner, is_service, unix_ms};
 use crate::args::Args;
 use crate::code::Code;
 use crate::procs;
@@ -93,8 +93,8 @@ pub fn registered() -> Vec<PathBuf> {
         };
         let root = PathBuf::from(root);
         // The pid must still be the runner of that project (pids are reused).
-        let state_pid = read_state(&root).and_then(|s| s["pid"].as_u64());
-        if state_pid != Some(pid) || !alive(pid) {
+        let state = read_state(&root).unwrap_or(Value::Null);
+        if state["pid"].as_u64() != Some(pid) || !is_runner(Some(pid), &state["pid_started"]) {
             let _ = fs::remove_file(&path);
             continue;
         }
@@ -136,10 +136,12 @@ fn root_here() -> Result<PathBuf, Failure> {
 pub fn project_status(root: &Path) -> (Value, Vec<Finding>) {
     let state = read_state(root).unwrap_or(Value::Null);
     let pid = state["pid"].as_u64();
-    let running = pid.is_some_and(|p| p != u64::from(std::process::id()) && alive(p));
+    // A pid counts only while it is still the process dev.json names: a
+    // killed runner leaves the file behind, and its pids get reused.
+    let running = is_runner(pid, &state["pid_started"]);
     let service_pid = state["service_pid"]
         .as_u64()
-        .filter(|p| running && alive(*p));
+        .filter(|p| running && is_service(Some(*p), &state["service_started"], pid.unwrap_or(0)));
     let addresses: Vec<String> = state["addresses"]
         .as_array()
         .or_else(|| state["listen"].as_array())
@@ -185,8 +187,13 @@ pub fn project_status(root: &Path) -> (Value, Vec<Finding>) {
             .fix("giong dev logs shows its last lines; fix the cause and save a file to start it again"),
         );
     }
-    let processes: Vec<Value> = procs::list(root)
+    let all = procs::list(root);
+    for e in all.iter().filter(|e| !e.is_safe()) {
+        findings.push(unsafe_entry(e));
+    }
+    let processes: Vec<Value> = all
         .iter()
+        .filter(|e| e.is_safe())
         .map(|e| {
             let mut v = procs::to_json(e);
             v["running"] = json!(container_running(&e.engine, &e.name));
@@ -215,9 +222,24 @@ pub fn project_status(root: &Path) -> (Value, Vec<Finding>) {
     (doc, findings)
 }
 
-/// Whether a container runs: `None` when its engine cannot be asked.
+/// An entry of `.giong/processes.json` giong will not act on.
+fn unsafe_entry(e: &procs::Entry) -> Finding {
+    Finding::new(
+        Code::USAGE,
+        Severity::Warning,
+        format!(
+            ".giong/processes.json names {:?} run by {:?}, which giong does not run",
+            e.name, e.engine
+        ),
+    )
+    .detail("giong only runs docker or podman, on a plain container name")
+    .fix("remove the entry from .giong/processes.json (giong db up writes valid ones)")
+}
+
+/// Whether a container runs: `None` when its engine cannot be asked. Only
+/// for an entry that [`procs::Entry::is_safe`] accepts.
 fn container_running(engine: &str, name: &str) -> Option<bool> {
-    if engine.is_empty() {
+    if !matches!(engine, "docker" | "podman") {
         return None;
     }
     let out = Process::new(engine)
@@ -384,7 +406,9 @@ fn stop_project(root: &Path, report: &mut Report, stopped: &mut Vec<Value>) {
     let state_dir = root.join(".giong");
     let state = read_state(root).unwrap_or(Value::Null);
     let pid = state["pid"].as_u64();
-    if let Some(pid) = pid.filter(|p| *p != u64::from(std::process::id()) && alive(*p)) {
+    let started = &state["pid_started"];
+    let runs = |pid: u64| is_runner(Some(pid), started);
+    if let Some(pid) = pid.filter(|p| runs(*p)) {
         let request = state_dir.join("stop");
         let _ = fs::write(&request, b"");
         // A runner in a build looks for the request only once cargo ends.
@@ -394,15 +418,15 @@ fn stop_project(root: &Path, report: &mut Report, stopped: &mut Vec<Value>) {
             STOP_WAIT
         };
         let until = Instant::now() + wait;
-        while alive(pid) && Instant::now() < until {
+        while runs(pid) && Instant::now() < until {
             std::thread::sleep(Duration::from_millis(100));
         }
-        let forced = alive(pid);
+        let forced = runs(pid);
         if forced {
             force_stop(pid, &state);
         }
         let _ = fs::remove_file(&request);
-        if !alive(pid) {
+        if !runs(pid) {
             let _ = fs::remove_file(state_dir.join("dev.json"));
         }
         report.line(format!(
@@ -416,19 +440,17 @@ fn stop_project(root: &Path, report: &mut Report, stopped: &mut Vec<Value>) {
         ));
         stopped.push(json!({"kind": "dev", "pid": pid, "root": root.display().to_string()}));
     } else if state.is_object() {
-        // A runner that was killed: its service may still run.
-        if let Some(service) = super::dev::stop_leftover(&state) {
-            report.line(format!(
-                "Stopped the service (pid {service}) a killed giong dev left in {}",
-                root.display()
-            ));
-            stopped.push(json!({"kind": "service", "pid": service,
-                                "root": root.display().to_string()}));
-        }
+        // A runner that was killed: its service, if it still runs, holds
+        // the port, and the next giong dev names it (GIONG-E5014). Nothing
+        // from a dead runner's file is signalled.
         let _ = fs::remove_file(state_dir.join("dev.json"));
     }
     for e in procs::list(root) {
-        if e.kind != "db" || e.engine.is_empty() {
+        if e.kind != "db" {
+            continue;
+        }
+        if !e.is_safe() {
+            report.push(unsafe_entry(&e));
             continue;
         }
         let out = Process::new(&e.engine)
@@ -469,20 +491,31 @@ fn stop_project(root: &Path, report: &mut Report, stopped: &mut Vec<Value>) {
 
 /// A runner that did not stop by itself: SIGTERM, then SIGKILL, to its
 /// process group when `--background` gave it one (cargo and the service go
-/// with it), else to it and its service.
+/// with it), else to it and its service. Each signal goes only to a process
+/// that is still the one `dev.json` names (its start time matches).
 fn force_stop(pid: u64, state: &Value) {
+    let runs = |p: u64, when: &Value| is_runner(Some(p), when);
     #[cfg(unix)]
     {
         let group = state["background"].as_bool().unwrap_or(false);
-        let mut targets = vec![if group {
-            format!("-{pid}")
-        } else {
-            pid.to_string()
-        }];
-        if let Some(s) = state["service_pid"].as_u64() {
-            targets.push(s.to_string());
-        }
         for signal in ["-TERM", "-KILL"] {
+            let mut targets = Vec::new();
+            if runs(pid, &state["pid_started"]) {
+                // --background made the runner lead a process group of its own.
+                targets.push(if group {
+                    format!("-{pid}")
+                } else {
+                    pid.to_string()
+                });
+            }
+            if let Some(s) = state["service_pid"].as_u64() {
+                if is_service(Some(s), &state["service_started"], pid) {
+                    targets.push(s.to_string());
+                }
+            }
+            if targets.is_empty() {
+                break;
+            }
             let _ = Process::new("kill")
                 .arg(signal)
                 .arg("--")
@@ -491,17 +524,19 @@ fn force_stop(pid: u64, state: &Value) {
                 .stderr(Stdio::null())
                 .status();
             let until = Instant::now() + Duration::from_secs(3);
-            while alive(pid) && Instant::now() < until {
+            while runs(pid, &state["pid_started"]) && Instant::now() < until {
                 std::thread::sleep(Duration::from_millis(100));
             }
-            if !alive(pid) {
+            if !runs(pid, &state["pid_started"]) {
                 break;
             }
         }
     }
     #[cfg(not(unix))]
     {
-        let _ = state;
+        if !runs(pid, &state["pid_started"]) {
+            return;
+        }
         let _ = Process::new("taskkill")
             .args(["/PID", &pid.to_string(), "/T", "/F"])
             .stdout(Stdio::null())
@@ -946,6 +981,97 @@ mod tests {
         let (p, findings) = project_status(&root);
         assert_eq!(p["running"], false);
         assert!(findings.is_empty());
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_state_file_never_aims_stop_at_another_program() {
+        let Ok(mut other) = Process::new("sleep").arg("30").spawn() else {
+            return; // no sleep here (CI's docker job)
+        };
+        let pid = u64::from(other.id());
+        let root = std::env::temp_dir().join(format!("giong-devctl-stale-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".giong")).unwrap();
+        // The pids of a runner killed long ago, now another program's: no
+        // start time, then the wrong one.
+        for started in [Value::Null, json!("1")] {
+            fs::write(
+                root.join(".giong").join("dev.json"),
+                json!({"pid": pid, "pid_started": started, "service_pid": pid,
+                       "service_started": started, "background": true,
+                       "build": {"state": "building"}})
+                .to_string(),
+            )
+            .unwrap();
+            let (p, _) = project_status(&root);
+            assert_eq!(p["running"], false);
+            assert_eq!(p["service_pid"], Value::Null);
+            let mut report = Report::new("dev");
+            let mut stopped = Vec::new();
+            stop_project(&root, &mut report, &mut stopped);
+            assert!(stopped.is_empty(), "{stopped:?}");
+            assert!(
+                matches!(other.try_wait(), Ok(None)),
+                "the other process was signalled"
+            );
+        }
+        // Even its real start time does not make another program the runner.
+        let started = super::super::dev::started(pid);
+        assert!(started.is_some());
+        fs::write(
+            root.join(".giong").join("dev.json"),
+            json!({"pid": pid, "pid_started": started, "background": true,
+                   "build": {"state": "building"}})
+            .to_string(),
+        )
+        .unwrap();
+        assert_eq!(project_status(&root).0["running"], false);
+        let mut stopped = Vec::new();
+        stop_project(&root, &mut Report::new("dev"), &mut stopped);
+        assert!(stopped.is_empty() && matches!(other.try_wait(), Ok(None)));
+        // Nor pid 1 with its start time.
+        let init = json!({"pid": 1, "pid_started": super::super::dev::started(1)});
+        fs::write(root.join(".giong").join("dev.json"), init.to_string()).unwrap();
+        assert_eq!(project_status(&root).0["running"], false);
+        let _ = other.kill();
+        let _ = other.wait();
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn a_hostile_processes_file_runs_nothing() {
+        let root = std::env::temp_dir().join(format!("giong-devctl-procs-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join(".giong")).unwrap();
+        let marker = root.join("ran");
+        let script = root.join("x.sh");
+        fs::write(&script, format!("#!/bin/sh\ntouch {}\n", marker.display())).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+        }
+        fs::write(
+            root.join(".giong").join("processes.json"),
+            json!({"processes": [
+                {"kind": "db", "name": "a", "engine": script.display().to_string()},
+                {"kind": "db", "name": "-v", "engine": "docker"},
+            ]})
+            .to_string(),
+        )
+        .unwrap();
+        let (p, findings) = project_status(&root);
+        assert_eq!(p["processes"], json!([]));
+        assert_eq!(findings.len(), 2);
+        assert!(findings.iter().all(|f| f.severity == Severity::Warning));
+        let mut report = Report::new("dev");
+        let mut stopped = Vec::new();
+        stop_project(&root, &mut report, &mut stopped);
+        assert!(stopped.is_empty());
+        assert_eq!(report.findings().len(), 2);
+        assert!(!marker.exists(), "the script ran");
         let _ = fs::remove_dir_all(&root);
     }
 

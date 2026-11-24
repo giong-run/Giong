@@ -168,7 +168,7 @@ pub(crate) fn poll_accept(
     // The readiness drivers take a connection only when asked: nothing is
     // held, so stopping is immediate.
     if stopping && driver.kind() != DriverKind::IoUring {
-        stopped();
+        stopped(sock.as_raw_fd());
         return Poll::Pending;
     }
     loop {
@@ -180,7 +180,7 @@ pub(crate) fn poll_accept(
             MultiPoll::Item(res) => return Poll::Ready(Err(io::Error::from_raw_os_error(-res))),
             MultiPoll::Data(_) => unreachable!("accept never receives data"),
             MultiPoll::NeedArm if stopping => {
-                stopped();
+                stopped(sock.as_raw_fd());
                 return Poll::Pending;
             }
             MultiPoll::NeedArm => {
@@ -219,8 +219,22 @@ fn wait_for_stop(waker: &Waker) {
     }
 }
 
-/// One `d` to `giong dev`: this listener holds no connection.
-fn stopped() {
+/// One `d` to `giong dev`: this listener holds no connection. Once per
+/// listener (its descriptor), however often its task is polled after the
+/// stop: `giong dev` counts one `d` per bind, and a second from one listener
+/// would end the count while another still holds connections.
+fn stopped(listener: RawFd) {
+    static SAID: Mutex<Vec<RawFd>> = Mutex::new(Vec::new());
+    let first = SAID.lock().is_ok_and(|mut said| {
+        let first = !said.contains(&listener);
+        if first {
+            said.push(listener);
+        }
+        first
+    });
+    if !first {
+        return;
+    }
     if let Some(Ok(i)) = INHERITED.get() {
         if let Some(fd) = i.ready {
             send_byte(fd, b'd');

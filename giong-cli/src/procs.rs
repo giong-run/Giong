@@ -29,6 +29,25 @@ pub struct Entry {
     pub started_at: u64,
 }
 
+impl Entry {
+    /// Whether giong may act on it. The file is in the project folder, which
+    /// a cloned repository can fill: only `docker` or `podman` (by name,
+    /// looked up on PATH, never a path) and a container name that cannot be
+    /// read as an option are run.
+    pub fn is_safe(&self) -> bool {
+        matches!(self.engine.as_str(), "docker" | "podman")
+            && self
+                .name
+                .chars()
+                .next()
+                .is_some_and(|c| c.is_ascii_alphanumeric())
+            && self
+                .name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-'))
+    }
+}
+
 fn path(root: &Path) -> PathBuf {
     root.join(".giong").join("processes.json")
 }
@@ -115,6 +134,21 @@ mod tests {
         remove(&root, "db", "b").unwrap();
         remove(&root, "db", "nope").unwrap();
         assert_eq!(list(&root), [db("a", 3)]);
+        assert!(db("giong-shop-postgres-3fa2c1", 0).is_safe());
+        for (engine, name) in [
+            ("./x.sh", "a"),
+            ("/usr/bin/docker", "a"),
+            ("docker", "-v"),
+            ("docker", "a;b"),
+            ("docker", ""),
+            ("sh", "a"),
+        ] {
+            let e = Entry {
+                engine: engine.into(),
+                ..db(name, 0)
+            };
+            assert!(!e.is_safe(), "{engine} {name}");
+        }
         fs::write(path(&root), "not json").unwrap();
         assert!(list(&root).is_empty());
         let _ = fs::remove_dir_all(&root);
