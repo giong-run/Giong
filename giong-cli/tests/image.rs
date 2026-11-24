@@ -113,12 +113,23 @@ fn runtime() -> Option<String> {
     ["docker", "podman"]
         .into_iter()
         .map(String::from)
-        .find(|c| {
-            Command::new(c)
-                .args(["info", "--format", "{{.ServerVersion}}"])
-                .output()
-                .is_ok_and(|o| o.status.success())
-        })
+        .find(|c| linux_containers(c))
+}
+
+/// Whether `rt` answers and runs Linux containers: Docker on a Windows
+/// runner answers in Windows-container mode, where no Linux image pulls.
+fn linux_containers(rt: &str) -> bool {
+    let os = Command::new(rt)
+        .args(["info", "--format", "{{.OSType}}"])
+        .output();
+    match os {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "linux",
+        // Podman has no OSType field, and runs only Linux containers.
+        _ => Command::new(rt)
+            .args(["info", "--format", "{{.ServerVersion}}"])
+            .output()
+            .is_ok_and(|o| o.status.success()),
+    }
 }
 
 fn list(archive: &str) -> Vec<String> {
@@ -320,9 +331,9 @@ fn the_image_loads_runs_as_nonroot_and_serves() {
     let Some(rt) = runtime() else {
         assert!(
             std::env::var("GIONG_IMAGE_REQUIRED").is_err(),
-            "GIONG_IMAGE_REQUIRED is set and neither Docker nor Podman answers"
+            "GIONG_IMAGE_REQUIRED is set and neither Docker nor Podman runs Linux containers"
         );
-        eprintln!("skipped: neither Docker nor Podman answers");
+        eprintln!("skipped: neither Docker nor Podman runs Linux containers");
         return;
     };
     if !tools(&["cargo"]) {

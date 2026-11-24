@@ -464,10 +464,15 @@ fn a_project_is_built_started_and_compared_with_a_commit() {
     assert_eq!(code, 0, "{v}");
     // One round a build: no "every round" verdict either way.
     assert_eq!(v["data"]["compare"]["p99"]["every_round"], "overlap", "{v}");
-    assert!(
-        v["data"]["notes"].to_string().contains("same binary"),
-        "{v}"
-    );
+    // A Windows executable names the path of its .pdb, which differs
+    // between the worktree's build and this one, so only elsewhere are the
+    // two builds byte for byte the same.
+    if !cfg!(windows) {
+        assert!(
+            v["data"]["notes"].to_string().contains("same binary"),
+            "{v}"
+        );
+    }
 
     let (code, v) = giong(&dir, &["bench", "--against", "no-such-ref"]);
     assert_eq!(

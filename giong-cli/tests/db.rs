@@ -13,12 +13,23 @@ fn runtime() -> Option<String> {
         Ok(r) if !r.is_empty() => vec![r],
         _ => vec!["docker".to_string(), "podman".to_string()],
     };
-    candidates.into_iter().find(|c| {
-        Command::new(c)
+    candidates.into_iter().find(|c| linux_containers(c))
+}
+
+/// Whether `rt` answers and runs Linux containers: Docker on a Windows
+/// runner answers in Windows-container mode, where no Linux image pulls.
+fn linux_containers(rt: &str) -> bool {
+    let os = Command::new(rt)
+        .args(["info", "--format", "{{.OSType}}"])
+        .output();
+    match os {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).trim() == "linux",
+        // Podman has no OSType field, and runs only Linux containers.
+        _ => Command::new(rt)
             .args(["info", "--format", "{{.ServerVersion}}"])
             .output()
-            .is_ok_and(|o| o.status.success())
-    })
+            .is_ok_and(|o| o.status.success()),
+    }
 }
 
 fn skip() -> bool {
@@ -27,9 +38,9 @@ fn skip() -> bool {
     }
     assert!(
         std::env::var("GIONG_DB_REQUIRED").is_err(),
-        "GIONG_DB_REQUIRED is set and neither Docker nor Podman answers"
+        "GIONG_DB_REQUIRED is set and neither Docker nor Podman runs Linux containers"
     );
-    eprintln!("skipped: neither Docker nor Podman answers");
+    eprintln!("skipped: neither Docker nor Podman runs Linux containers");
     true
 }
 
