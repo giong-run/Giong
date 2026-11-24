@@ -207,6 +207,9 @@ struct Service {
     /// The `\n` bytes read so far.
     #[cfg(unix)]
     binds: usize,
+    /// When it started ([`started`]): with the pid, names this process in
+    /// `dev.json` even after the pid is reused.
+    started: Option<String>,
 }
 
 /// An old build finishing its requests.
@@ -813,7 +816,9 @@ impl Dev {
             ready: None,
             #[cfg(unix)]
             binds: 0,
+            started: None,
         };
+        service.started = started(u64::from(service.pid));
         self.tee(&mut service);
         #[cfg(unix)]
         if let Some(ours) = ready {
@@ -1149,7 +1154,9 @@ impl Dev {
         let current = self.current.as_ref();
         let doc = json!({
             "pid": std::process::id(),
+            "pid_started": started(u64::from(std::process::id())),
             "service_pid": current.map(|s| s.pid),
+            "service_started": current.and_then(|s| s.started.clone()),
             "exe": self.exe.as_ref().map(|p| p.display().to_string()),
             "started_at": self.started_at,
             "mcp_socket": current
@@ -1304,26 +1311,135 @@ fn terminate(child: &Child) {
     }
 }
 
-/// Whether a process is alive (`kill -0`; `tasklist` on Windows).
-pub(crate) fn alive(pid: u64) -> bool {
-    if cfg!(unix) {
-        Process::new("kill")
-            .args(["-0", &pid.to_string()])
-            .stdout(Stdio::null())
+/// When process `pid` started, as this system tells it, or `None` when it
+/// does not run: the start time in clock ticks on Linux (`/proc/<pid>/stat`),
+/// `ps -o lstart=` elsewhere on Unix, the image name on Windows (which has
+/// no start time without unsafe code). A pid from `dev.json` is trusted only
+/// when this matches what was written with it: a runner killed with SIGKILL,
+/// or a reboot, leaves the file behind, and its pid may belong to another
+/// process later.
+pub(crate) fn started(pid: u64) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        // Fields after the command name, which may hold spaces and ')'.
+        let rest = &stat[stat.rfind(')')? + 1..];
+        // starttime is field 22; `rest` starts at field 3.
+        rest.split_whitespace().nth(19).map(String::from)
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let out = Process::new("ps")
+            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            .stdin(Stdio::null())
             .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|s| s.success())
-    } else {
-        Process::new("tasklist")
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        (out.status.success() && !text.is_empty()).then_some(text)
+    }
+    #[cfg(not(unix))]
+    {
+        let out = Process::new("tasklist")
             .args(["/FI", &format!("PID eq {pid}"), "/NH", "/FO", "CSV"])
             .stderr(Stdio::null())
             .output()
-            .is_ok_and(|o| String::from_utf8_lossy(&o.stdout).contains(&format!("\"{pid}\"")))
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout);
+        let row = text.lines().find(|l| l.contains(&format!("\"{pid}\"")))?;
+        row.split(',')
+            .next()
+            .map(|n| n.trim_matches('"').to_string())
     }
 }
 
-/// Refuses to start when another giong dev serves the project; stops the
-/// service a killed giong dev left behind.
+/// Whether `pid` is still the process that started at `when` (from
+/// `dev.json`); never when either is unknown.
+pub(crate) fn is_process(pid: Option<u64>, when: &Value) -> bool {
+    match (pid, when.as_str()) {
+        (Some(pid), Some(when)) => {
+            pid != u64::from(std::process::id()) && started(pid).as_deref() == Some(when)
+        }
+        _ => false,
+    }
+}
+
+/// Whether `pid` is the giong dev that `dev.json` describes: the start time
+/// written with it, and a program of the same name as this one (`dev.json`
+/// is in the project folder, which a cloned repository can fill: a pid and a
+/// start time alone could aim `giong dev stop` at another program). Never
+/// pid 0 or 1.
+pub(crate) fn is_runner(pid: Option<u64>, when: &Value) -> bool {
+    let own = std::env::current_exe()
+        .ok()
+        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()));
+    pid.is_some_and(|p| p > 1)
+        && is_process(pid, when)
+        && own.is_some()
+        && program_name(pid.unwrap_or(0)) == own
+}
+
+/// Whether `pid` is the service of the runner `runner`: the start time
+/// written with it, and that runner as its parent.
+pub(crate) fn is_service(pid: Option<u64>, when: &Value, runner: u64) -> bool {
+    pid.is_some_and(|p| p > 1) && is_process(pid, when) && parent(pid.unwrap_or(0)) == Some(runner)
+}
+
+/// The file name of the program `pid` runs.
+fn program_name(pid: u64) -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        let exe = fs::read_link(format!("/proc/{pid}/exe")).ok()?;
+        let name = exe.file_name()?.to_string_lossy().into_owned();
+        // A binary rebuilt while it runs.
+        Some(name.trim_end_matches(" (deleted)").to_string())
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let out = Process::new("ps")
+            .args(["-o", "comm=", "-p", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        Path::new(&text)
+            .file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+    }
+    #[cfg(not(unix))]
+    {
+        // tasklist's first column, which `started` also gives.
+        started(pid)
+    }
+}
+
+/// The parent of `pid`.
+fn parent(pid: u64) -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+        let rest = &stat[stat.rfind(')')? + 1..];
+        rest.split_whitespace().nth(1)?.parse().ok()
+    }
+    #[cfg(all(unix, not(target_os = "linux")))]
+    {
+        let out = Process::new("ps")
+            .args(["-o", "ppid=", "-p", &pid.to_string()])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
+        None
+    }
+}
+
+/// Refuses to start when another giong dev serves the project.
 fn refuse_if_running(state_dir: &Path) -> Result<(), Failure> {
     let Ok(text) = fs::read_to_string(state_dir.join("dev.json")) else {
         return Ok(());
@@ -1332,7 +1448,7 @@ fn refuse_if_running(state_dir: &Path) -> Result<(), Failure> {
         return Ok(());
     };
     if let Some(pid) = v["pid"].as_u64() {
-        if pid != u64::from(std::process::id()) && alive(pid) {
+        if is_runner(Some(pid), &v["pid_started"]) {
             let urls: Vec<String> = v["addresses"]
                 .as_array()
                 .into_iter()
@@ -1354,23 +1470,8 @@ fn refuse_if_running(state_dir: &Path) -> Result<(), Failure> {
             ));
         }
     }
-    stop_leftover(&v);
     let _ = fs::remove_file(state_dir.join("dev.json"));
     Ok(())
-}
-
-/// Stops the service a killed giong dev left behind (a giong older than 1.5,
-/// or not Linux), if it is still the binary `dev.json` names; its pid.
-pub(crate) fn stop_leftover(state: &Value) -> Option<u64> {
-    let (pid, exe) = (state["service_pid"].as_u64()?, state["exe"].as_str()?);
-    let ours = fs::read_link(format!("/proc/{pid}/exe")).is_ok_and(|p| p == Path::new(exe));
-    if ours && alive(pid) {
-        let _ = Process::new("kill")
-            .args(["-TERM", &pid.to_string()])
-            .status();
-        return Some(pid);
-    }
-    None
 }
 
 /// The package and binary to run: `--bin`, else the package of the current

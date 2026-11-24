@@ -372,6 +372,7 @@ struct Config {
     buf_count: u16,
     buf_size: usize,
     shutdown_grace: Duration,
+    precise_timers: bool,
 }
 
 /// Everything a worker thread owns. Reached through a thread-local.
@@ -441,6 +442,18 @@ pub(crate) struct Worker {
     pub(crate) next_task_uid: Cell<u64>,
     /// How long to busy-poll for new work before blocking in the kernel.
     spin: Option<Duration>,
+    /// Work that arrives without a completion (an IPC ring another process
+    /// writes), watched while the worker spins (see [`SpinProbe`]).
+    probes: RefCell<Vec<Probe>>,
+    /// The id the next probe gets (see [`Worker::remove_probe`]).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `ipc` only
+    next_probe: Cell<u64>,
+    /// `probes` is not empty: read in the spin loop without borrowing it.
+    has_probes: Cell<bool>,
+    /// Writes held back until the end of the turn (see [`Publish`]).
+    publishers: RefCell<Vec<Rc<dyn Publish>>>,
+    /// `publishers` is not empty.
+    publish_waiting: Cell<bool>,
     /// Tasks on this worker waiting for a shutdown request.
     shutdown_waiters: RefCell<Slab<Waker>>,
     /// How long remaining tasks may keep running after the main future is done.
@@ -451,6 +464,34 @@ pub(crate) struct Worker {
     main_location: Cell<Location>,
     /// Registered sources and the profile being gathered.
     pub(crate) observe: observe::Local,
+}
+
+/// Something a spinning worker can watch for work that arrives without a
+/// completion: the peer of an IPC channel writes shared memory, and wakes
+/// this worker through the kernel only when told it sleeps.
+///
+/// While the worker spins it calls [`ready`](Self::ready); before it
+/// blocks in the kernel it calls [`arm`](Self::arm), after which the peer
+/// must wake it through the kernel. A probe found ready, and every armed
+/// probe, is removed and the task that registered it woken.
+/// A registered [`SpinProbe`]: its id, the probe, and the waker of the task
+/// waiting for it.
+type Probe = (u64, Box<dyn SpinProbe>, Waker);
+
+pub(crate) trait SpinProbe {
+    /// Whether the work is there. Called many times per microsecond.
+    fn ready(&self) -> bool;
+    /// Switches the peer to waking through the kernel.
+    fn arm(&self);
+}
+
+/// A write to memory another process polls, held back until the tasks of
+/// this turn have run: an IPC sender makes a burst of messages visible
+/// with one store instead of one per message. The worker calls
+/// [`publish`](Self::publish) once the runnable tasks have been polled,
+/// before it looks for I/O, spins or blocks.
+pub(crate) trait Publish {
+    fn publish(&self);
 }
 
 thread_local! {
@@ -504,8 +545,9 @@ impl Worker {
     fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
         let pool = BufPool::new(cfg.buf_count, cfg.buf_size)?;
-        let (driver, choice) =
+        let (mut driver, choice) =
             Driver::new(cfg.driver, cfg.chosen_by, cfg.ring_entries, pool.clone())?;
+        driver.set_precise_timers(cfg.precise_timers);
         // A worker instance is built once, so the slots are always empty
         // here.
         let _ = shared.wake.set(driver.waker());
@@ -530,6 +572,11 @@ impl Worker {
             pool,
             next_task_uid: Cell::new(1),
             spin: cfg.spin,
+            probes: RefCell::new(Vec::new()),
+            next_probe: Cell::new(0),
+            has_probes: Cell::new(false),
+            publishers: RefCell::new(Vec::new()),
+            publish_waiting: Cell::new(false),
             shutdown_waiters: RefCell::new(Slab::new()),
             shutdown_grace: cfg.shutdown_grace,
             draining: Cell::new(false),
@@ -681,6 +728,9 @@ impl Worker {
                 0
             };
             self.run_tasks(&mut || done = poll_main());
+            if self.publish_waiting.get() {
+                self.publish_deferred();
+            }
             if self.sends_waiting.get() {
                 self.flush_sends(tick);
             }
@@ -737,7 +787,10 @@ impl Worker {
             // Announce that we are going to sleep, then re-check for injected
             // work (see `WorkerShared::inject`) and balanced jobs (see
             // `RuntimeShared::push_job`): `prepare_park` ends with the fence.
-            let mode = if self.shared.bell.prepare_park() || self.rt.jobs_len.any() {
+            let mode = if (self.has_probes.get() && self.fire_probes(true))
+                || self.shared.bell.prepare_park()
+                || self.rt.jobs_len.any()
+            {
                 Park::Poll
             } else {
                 wait
@@ -760,6 +813,94 @@ impl Worker {
 
             self.fire_timers();
         }
+    }
+
+    /// Whether this worker busy-polls before blocking (`spin_before_park`):
+    /// only then are [`SpinProbe`]s watched.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `ipc` only
+    pub(crate) fn spins(&self) -> bool {
+        self.spin.is_some()
+    }
+
+    /// Registers `probe`; `waker` is woken when it fires. Returns the id
+    /// that [`remove_probe`](Self::remove_probe) takes.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `ipc` only
+    pub(crate) fn add_probe(&self, probe: Box<dyn SpinProbe>, waker: Waker) -> u64 {
+        let id = self.next_probe.get();
+        self.next_probe.set(id.wrapping_add(1));
+        self.probes.borrow_mut().push((id, probe, waker));
+        self.has_probes.set(true);
+        id
+    }
+
+    /// Removes the probe `id` if it has not fired: its task stopped
+    /// waiting for it (woken for another reason, or cancelled).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `ipc` only
+    pub(crate) fn remove_probe(&self, id: u64) {
+        let mut probes = self.probes.borrow_mut();
+        if let Some(i) = probes.iter().position(|(p, _, _)| *p == id) {
+            let removed = probes.swap_remove(i);
+            self.has_probes.set(!probes.is_empty());
+            drop(probes);
+            // The probe and waker are dropped outside the borrow.
+            drop(removed);
+        }
+    }
+
+    /// Holds `p` until the end of this turn (see [`Publish`]).
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `ipc` only
+    pub(crate) fn defer_publish(&self, p: Rc<dyn Publish>) {
+        self.publishers.borrow_mut().push(p);
+        self.publish_waiting.set(true);
+    }
+
+    /// Publishes what is held back now: a task about to busy-wait for an
+    /// answer must not hold back its own question.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `ipc` only
+    pub(crate) fn publish_now(&self) {
+        if self.publish_waiting.get() {
+            self.publish_deferred();
+        }
+    }
+
+    fn publish_deferred(&self) {
+        self.publish_waiting.set(false);
+        // `publish` stores and may write an eventfd; it never reaches back
+        // into the worker, so the list stays borrowed (and keeps its room).
+        for p in self.publishers.borrow_mut().drain(..) {
+            p.publish();
+        }
+    }
+
+    /// Wakes the tasks of the probes that are ready (`arm`: after arming
+    /// each one, before blocking; every probe is removed then) and removes
+    /// them. `true` if any task was woken.
+    fn fire_probes(&self, arm: bool) -> bool {
+        let mut fired = Vec::new();
+        {
+            let mut probes = self.probes.borrow_mut();
+            let mut i = 0;
+            while i < probes.len() {
+                let (_, probe, _) = &probes[i];
+                // An armed probe's task is woken whatever `arm` found: it
+                // now waits through the kernel, which it sets up when polled.
+                if arm || probe.ready() {
+                    if arm {
+                        probe.arm();
+                    }
+                    let (_, _, waker) = probes.swap_remove(i);
+                    fired.push(waker);
+                } else {
+                    i += 1;
+                }
+            }
+            self.has_probes.set(!probes.is_empty());
+        }
+        let any = !fired.is_empty();
+        for waker in fired {
+            waker.wake();
+        }
+        any
     }
 
     /// Hands a descriptor that was given up while the driver was borrowed to
@@ -870,6 +1011,7 @@ impl Worker {
                 if self.shared.bell.peek()
                     || self.rt.jobs_len.any()
                     || self.driver.borrow_mut().has_completions()
+                    || (self.has_probes.get() && self.fire_probes(false))
                 {
                     return true;
                 }
@@ -1006,6 +1148,7 @@ pub struct Builder {
     signals: bool,
     spin: Option<Duration>,
     shutdown_grace: Duration,
+    precise_timers: bool,
     /// Makes this worker panic before it reports that it started. A field
     /// of the builder, not a static, so that the runtimes of other tests
     /// running at the same time are not touched.
@@ -1035,6 +1178,7 @@ impl Builder {
             signals: false,
             spin: None,
             shutdown_grace: Duration::ZERO,
+            precise_timers: false,
             #[cfg(test)]
             panic_on_start: None,
         }
@@ -1150,6 +1294,24 @@ impl Builder {
         self
     }
 
+    /// Wake short timed waits on time on macOS (default: `false`).
+    ///
+    /// macOS adds timer slack to a wait's time limit, to batch wake-ups and
+    /// save power: a 2 ms sleep takes 2 to 4 ms. With this on, a wait of up
+    /// to 100 ms is timed with a kernel timer marked critical, which fires
+    /// on time; longer waits keep the limit, whose slack is under 1% of
+    /// them. The cost, measured on the CI runners with a task that sleeps
+    /// 2 ms in a loop: about a third more CPU time (7.05 against 5.28 ms
+    /// per second), more interrupt wake-ups (411 against 348 per second)
+    /// and a higher Energy Impact (2.77 against 2.08). Turn it on where
+    /// the latency of short sleeps and timeouts matters more than battery.
+    /// Linux and Windows time their waits without this slack, and ignore
+    /// the option.
+    pub fn precise_timers(mut self, enable: bool) -> Self {
+        self.precise_timers = enable;
+        self
+    }
+
     /// Request a runtime shutdown when the process receives SIGINT or SIGTERM
     /// (default: `false`). Only applies to [`Runtime::run`].
     ///
@@ -1222,6 +1384,7 @@ impl Builder {
             buf_count: self.buf_count,
             buf_size: self.buf_size,
             shutdown_grace: self.shutdown_grace,
+            precise_timers: self.precise_timers,
         })
     }
 

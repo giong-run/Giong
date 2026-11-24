@@ -1,0 +1,76 @@
+name: CI gate
+
+# The one status the merge queue and pull requests need: "CI gate", set on the commit a
+# run of CI tested. When that run fails only outside the code (a mirror, a lost runner),
+# this reruns the failed jobs of the same run, and only those, while the merge queue
+# keeps the pull request in place. scripts/ci-gate.py says what counts as outside the
+# code; a failing test fails the gate at once, except a known flake with an open issue
+# (.github/known-flakes.txt), rerun once.
+#
+# workflow_run always runs this file, and the script, as they are on main: a pull
+# request cannot change how its own run is judged.
+
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [requested, completed]
+
+permissions:
+  # Rerun failed jobs, read job logs.
+  actions: write
+  # Read the annotations that say a job ran out of time or lost its runner.
+  checks: read
+  contents: read
+  # Whether a pull request's head is still the commit of the run.
+  pull-requests: read
+  # Whether a known flake's issue is still open.
+  issues: read
+  statuses: write
+
+# One gate per run of CI, in order: the gate of a run that ended waits for nothing but
+# the reruns it starts itself.
+concurrency:
+  group: ci-gate-${{ github.event.workflow_run.id }}
+  cancel-in-progress: false
+
+jobs:
+  gate:
+    # The runs that gate something: pull requests, the merge queue, and the dispatch
+    # that prepare-release.yml starts for the release pull request.
+    if: >
+      contains(fromJSON('["pull_request", "merge_group", "workflow_dispatch"]'),
+      github.event.workflow_run.event)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 130
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          sparse-checkout: |
+            scripts/ci-gate.py
+            .github/known-flakes.txt
+          sparse-checkout-cone-mode: false
+      - name: CI started
+        if: github.event.action == 'requested'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+        run: python3 scripts/ci-gate.py requested --run-id "$RUN_ID"
+      - name: CI ended
+        if: github.event.action == 'completed'
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          RUN_ID: ${{ github.event.workflow_run.id }}
+          ATTEMPT: ${{ github.event.workflow_run.run_attempt }}
+        run: python3 scripts/ci-gate.py completed --run-id "$RUN_ID" --attempt "$ATTEMPT"
+      # The gate itself broke (an API outage): say so on the commit rather than leave
+      # it pending until the merge queue times out.
+      - name: The gate could not decide
+        if: failure() && github.event.action == 'completed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SHA: ${{ github.event.workflow_run.head_sha }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: >
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$SHA"
+          -f state=error -f context="CI gate" -f description="The gate could not decide; see its run"
+          -f target_url="$URL"

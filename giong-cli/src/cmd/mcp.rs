@@ -587,7 +587,7 @@ fn dev_status(dir: Option<PathBuf>) -> Value {
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
     {
         // A giong dev that was killed leaves its file behind.
-        Some(v) if v["pid"].as_u64().is_some_and(super::dev::alive) => {
+        Some(v) if super::dev::is_runner(v["pid"].as_u64(), &v["pid_started"]) => {
             json!({"running": true, "dev": v})
         }
         Some(_) => json!({"running": false,
