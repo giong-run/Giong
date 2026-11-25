@@ -101,6 +101,7 @@ when it is no longer raised.
 | [GIONG-E0201](E0201.md) | `FileTooShort` | the file ended before the bytes to send |
 | [GIONG-E0202](E0202.md) | `OffsetOutOfRange` | file offset out of range |
 | [GIONG-E0203](E0203.md) | `InvalidOpenOptions` | invalid combination of open options |
+| [GIONG-E0204](E0204.md) | `FileTooLarge` | file too large to read into memory |
 
 ## giong-http
 

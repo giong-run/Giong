@@ -729,11 +729,16 @@ pub async fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
     // Read with a plain `fstat` (see `File::len`): one system call instead
     // of a trip through the ring for a number that is only a hint.
     let hint = file.len().unwrap_or(0) as usize;
-    let mut data = Vec::with_capacity(hint.saturating_add(1));
+    // Every allocation is fallible: a file that claims more than memory
+    // holds (a sparse disk image, a core dump) gives an error, not an
+    // abort of the whole process.
+    let mut data = Vec::new();
+    reserve(&mut data, hint.saturating_add(1))?;
     let mut chunk = Vec::new();
     loop {
         if data.len() == data.capacity() {
-            data.reserve(data.capacity().clamp(4096, 1 << 20));
+            let more = data.capacity().clamp(4096, 1 << 20);
+            reserve(&mut data, more)?;
         }
         // Read straight into the result while it is empty (the common case
         // of one read for the whole file), into a scratch buffer afterwards.
@@ -745,15 +750,36 @@ pub async fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
             }
         } else {
             chunk.clear();
-            chunk.reserve((data.capacity() - data.len()).min(1 << 20));
+            let room = (data.capacity() - data.len()).min(1 << 20);
+            reserve(&mut chunk, room)?;
             let (res, buf) = file.read_at(chunk, data.len() as u64).await;
             chunk = buf;
             if res? == 0 {
                 return Ok(data);
             }
+            reserve(&mut data, chunk.len())?;
             data.extend_from_slice(&chunk);
         }
     }
+}
+
+/// `Vec::try_reserve`, failing with [`Code::FileTooLarge`].
+fn reserve(v: &mut Vec<u8>, additional: usize) -> io::Result<()> {
+    v.try_reserve(additional)
+        .map_err(|_| file_too_large(v.len(), additional))
+}
+
+#[cold]
+fn file_too_large(have: usize, more: usize) -> io::Error {
+    raise(
+        Code::FileTooLarge,
+        format!(
+            "fs::read could not allocate {} more bytes (after {have}) to hold the whole file",
+            more
+        ),
+        "read the file in pieces with File::read_at, or check its length (File::len) before \
+         reading it whole; a sparse file can claim far more than it holds",
+    )
 }
 
 /// Writes `data` to `path`, creating the file or replacing its contents.
