@@ -8,6 +8,333 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.5.0] - 2026-11-25
+
+### Added
+
+- **giong**: blocking and compute lanes (`giong::lane`): `spawn_blocking(f)` runs a closure that
+  waits (`std::fs`, C libraries, `getaddrinfo`) on a pool of up to 128 threads
+  (`Builder::max_blocking_threads`); `spawn_compute(f)` runs CPU-bound work on at most one
+  thread per CPU of the process's budget (`Builder::compute_threads`), at nice +10 (the utility QoS class on macOS, below-normal priority on Windows) so the
+  workers get their core back as soon as they have work; `try_spawn_compute(f)` refuses
+  with the new code `GIONG-E0014` (`Code::ComputeBusy`) once `Builder::compute_backlog`
+  closures wait. All three return a `Send` `BlockingHandle<T>` that resolves to
+  `Result<T, JoinError>`; a panic stays in the handle. `Handle::spawn_blocking`,
+  `Handle::spawn_compute` and `Handle::try_spawn_compute` work from any thread, and
+  `Handle::lane_stats()` reports threads, busy threads and queued closures. With one
+  CPU-bound job per CPU running next to an echo server, the 99th percentile echo time
+  stays at the idle level with the compute lane and grows several times without its
+  lower priority or with Tokio's `spawn_blocking` (`bench/lanes.sh`, numbers in
+  `bench/results/lanes/`). The drivers' file pool stays separate, so application
+  jobs cannot starve file operations.
+
+- **giong**: budgets per tenant (`giong::budget`): a `Budget` gives one tenant (a customer, an API
+  key, a class of traffic) limits of its own (`Limits::tasks`, `memory`, `io`, `compute`)
+  and charges each resource to the tenant while it holds it. `Budget::spawn`,
+  `Budget::reserve` and `Budget::spawn_compute` wait for room, in order; `try_spawn`,
+  `try_reserve` and `try_spawn_compute` refuse with the new code `GIONG-E0080`
+  (`Code::BudgetFull`), and a reservation larger than the whole budget fails with
+  `GIONG-E0081` (`Code::BudgetTooSmall`). `giong::spawn` and `giong::spawn_compute` inside a
+  task of a budget charge the same budget; `Budget::enter(fut)` runs a future in a budget
+  without a task of its own; `budget::current()` and `Budget::stats()` tell which budget
+  runs and what it holds; `Budget::set_limits` changes the limits at run time. An I/O
+  operation started in a budget holds one of its I/O slots until the kernel completes it:
+  when its future is dropped, the slot stays with the operation's buffers until the
+  cancellation completes. The compute lane keeps one queue per budget and serves the one
+  that has used the least compute time for its `Limits::compute_weight`, so a tenant with
+  long jobs cannot make another tenant's short jobs wait behind them. Code that uses no
+  budget pays one test per operation start: 0 to 0.3% more instructions per operation
+  (`scripts/instr.py`), and a spawn takes 1.5-1.9% fewer than before. In a container of 1 CPU
+  and 128 MiB with tenant A sending far more than the box can serve, tenant B keeps its
+  in-deadline successes with budgets, and loses them all without (`bench/tenants.sh`,
+  numbers in `bench/results/tenants/`).
+- **giong**: on Linux a runtime raises the soft limit on open files (`RLIMIT_NOFILE`) to the
+  hard one when it is built, once per process, as Go programs do. containerd, and so most
+  Kubernetes nodes, starts containers at 1,024 soft and 524,288 hard, which stopped a
+  server near 1,000 connections. `Builder::raise_open_files_limit(false)` keeps the soft
+  limit.
+- **giong-http**: a server that cannot accept a connection because the process is out of file
+  descriptors (`EMFILE`, `ENFILE`) says so on stderr, at most once a minute per worker, with the
+  limits on open files: `GIONG-E1123` (`Code::HttpServerOutOfFiles`). It said nothing before,
+  while new clients waited in the listen queue.
+- **giong-mcp**: `overview` has a `limits` object (CPUs, CPU quota, memory limit, `pids.max`
+  and `pids.current`, soft and hard open files, read from the cgroup and `/proc`), says in
+  `runtime.workers_from` whether the worker count came from the CPUs, the CPU quota or the
+  program, and warns when four fifths of `pids.max` are in use.
+- **rest-api example**: a `Dockerfile` (a 44 MB distroless image) and a `compose.yaml` that
+  runs it with PostgreSQL and Redis, a CPU and a memory limit, and the lines that allow
+  io_uring.
+- **docs**: DEPLOYMENT.md says how giong sizes its workers to a CPU limit, with measurements
+  of why a fraction is rounded down; what a container's thread and file limits do, and that
+  containerd starts containers at 1,024 open files; and how `SIGTERM` reaches process 1.
+  llms.txt and AGENTS.md carry the short version.
+- **giong-cli**: `giong db up` starts a development PostgreSQL, MySQL or Redis in Docker or
+  Podman (the engines the project depends on), with a random password, a free port and a
+  labelled volume, and writes `DATABASE_URL` or `REDIS_URL` into `.env` (mode 0600,
+  git-ignored). Each checkout gets its own container (package, engine and a short hash of the
+  project's path), and a container `.giong/db.json` does not list is refused rather than given
+  a guessed password (`GIONG-E5049`). Its containers are recorded in `.giong/processes.json`,
+  so `giong dev status` lists them and `giong dev stop` stops them. `giong db new <name>`, `migrate` and `status` apply forward-only SQL files
+  from `migrations/` (`NNNN_name.sql`), each PostgreSQL file in one transaction, record a
+  SHA-256 checksum per file, refuse a changed applied file (`GIONG-E5043`) and name the line
+  that failed (`GIONG-E5044`). `giong db reset --yes` and `down [--volumes]` complete it. A
+  `.giong/db.json` entry `giong db up` could not have written (another runtime, another
+  checkout's container or volume, an image or names outside the plain forms) is ignored with
+  a warning (`GIONG-E5048`), and a new container takes only an official image from the file.
+  Docker in Windows-container mode is refused up front with the switch to make
+  (`GIONG-E5040`).
+- **giong-cli**: `giong env` shows every key of `.env.example`, `.env` and the environment
+  with where its value comes from, secrets masked; `giong env check` reports keys with no
+  value at the line of `.env.example` that lists them, keys only in `.env`, and lines `.env`
+  cannot parse; `giong env init` writes an owner-only, git-ignored `.env`; `giong env get
+  <KEY>` prints one value for scripts. A value only the environment sets is shown as set,
+  not printed, unless `--reveal` is given.
+- **giong-cli**: `giong top` shows a running service's workers, memory, descriptors, tasks
+  by spawn line, pools and warnings through giong-mcp, refreshed live, or once with
+  `--once`/`--json`; a worker stuck in one task is an error (`GIONG-E5055`).
+- **giong-cli**: `giong bench` measures latency at a fixed rate without coordinated omission
+  (each request counts from when it was due), at half the measured maximum by default, or
+  throughput with `--rate max`. Without a URL it builds the service in release mode and
+  starts it with every core. `giong bench --against <ref>` builds that commit in a git
+  worktree and alternates the two builds round by round; `--max-regression <percent>` fails
+  only when the change is slower in every round of at least three (`GIONG-E5064`). Every
+  round goes to a CSV file.
+- **giong-cli**: `giong image` builds an OCI image of the service without Docker or a
+  Dockerfile: one layer with the release binary, CA certificates and a nonroot user, no
+  shell, static with musl when that target is installed. The same source gives the same
+  digest. `--load` hands it to Docker or Podman, `--push` to skopeo, crane, Docker or
+  Podman. Every `--add` path must resolve inside the project, so a linked folder cannot
+  pull in files from elsewhere, and a link goes in only when it points at a file inside the
+  project.
+- **giong-cli**: `giong db`, `env` and `bench` never read or write `.env`, `.gitignore` or
+  their files in `.giong/` through a symbolic link, which a cloned repository could commit.
+- **giong-web**: `App::routes()` lists what a built app serves (method, full pattern,
+  parameters, catch-all, streaming body limit, middleware count, the line that added the
+  route), with `RouteList::to_json()` for tools and `RouteList::live()` for the apps alive
+  on the current worker. Made once at `build`; nothing runs on the request path.
+- **giong-web**: `middleware::Record`, for development: one `exchange` JSON line per
+  answered request with headers and bodies, the input of `giong test record`. Secret
+  headers, and query parameters, form fields and JSON keys whose names say secret
+  (`password`, `token`, `api_key`, `card`, `cvv`, ...), are written as `[redacted]`;
+  `redact_field` and `keep_field` adjust the names. Opt-in; code that does not add it
+  pays nothing. A release build has it only with giong-web's new `dev` feature: without
+  it the recording code is left out and `Record::new` panics with `GIONG-E1213`.
+- **giong-mcp**: a `routes` tool behind the new `web` feature: the routes of the giong-web
+  apps the workers serve, workers with the same routes grouped.
+- **giong-cli**: `giong new <path> [--template web|grpc|worker] [--db postgres,mysql,redis]
+  [--tls]` writes a project that builds and passes its tests from the first minute: one
+  worker per core with graceful shutdown and giong-mcp, an end to end test, migrations,
+  `.env.example`, a Dockerfile, a GitHub Actions workflow with the database services, and
+  fast dev builds (`debug = "line-tables-only"`: on a PostgreSQL, Redis and TLS service a clean
+  debug build takes 12.6 s instead of 15.3 s, the target directory 296 MB instead of 640 MB,
+  `bench/results/devkit/template-profile/`). `web` is a users API on PostgreSQL or MySQL
+  (with Redis as a cache), counters on Redis, or a plain JSON service; `grpc` a service from a
+  `.proto` (no `protoc`); `worker` jobs claimed from a table (`FOR UPDATE SKIP LOCKED`, with
+  retries), from a Redis list, or on a timer. Every combination is built, linted and tested
+  against real servers in CI (`scripts/templates.sh`), and `examples/rest-api` is now the
+  `web` template's output. A service listens on `127.0.0.1` unless `LISTEN` says otherwise,
+  so in development nobody else on the network reaches it; the Dockerfile sets `0.0.0.0`.
+- **giong-cli**: `giong ai init` (also run by `giong new`) writes `AGENTS.md`, `CLAUDE.md`, a
+  Cursor rule, the Gióng skill of the release in `.claude/skills/giong/`, and the `giong` MCP
+  server in `.mcp.json`. They teach the agent one way to work on the service, like
+  `npm run dev`: `giong dev --background` once, edit the code and let it rebuild, `curl` the
+  address it prints, `giong dev status` and `giong dev logs` for errors and requests,
+  `giong dev stop` at the end, and never `cargo run`, a release build or Docker for it. It
+  can run again at any time: it replaces only its own marked block or files and never
+  reorders or drops anything else. It never writes through a symbolic link a repository
+  commits (`GIONG-E5036`), except `CLAUDE.md` and `AGENTS.md` naming each other.
+- **giong-cli**: `giong fix` applies the fixes that need no judgement: the compiler's and
+  clippy's machine-applicable suggestions and `giong check`'s own, in the project's files only,
+  each whole or not at all, never two that overlap. It refuses a working tree with
+  uncommitted changes (`--allow-dirty` to go ahead), and `--dry-run` shows the diff.
+- **giong-cli**: `giong test` runs the suite with the variables of `.env`, then again with
+  `GIONG_DRIVER=epoll` on Linux (the driver a container without io_uring gets), and reports
+  each failure with its driver and its output. A run that takes over 30 minutes
+  (`--timeout`) is stopped with every process it started, naming the tests still running;
+  cargo and rustc settings in `.env` are left out of the build. `--quick` runs once,
+  `--nextest` uses cargo-nextest.
+- **giong-cli**: codes `GIONG-E5030` to `GIONG-E5039` and `GIONG-E5080` to `GIONG-E5088`,
+  each with a page in `docs/errors/`.
+- **giong-cli**: `giong record` turns requests recorded by giong-web's `Record` middleware into
+  tests. `list` and `show` read the exchanges in the service's log (`giong dev` keeps it in
+  `.giong/dev.log`); `save` writes chosen ones to `tests/recorded/<name>.json` as cases, with
+  dates, UUIDs, tokens and ids the service made masked, ids that later requests use captured
+  and reused, and secret-named fields, query values and headers (and `Record`'s redacted ones)
+  read from `GIONG_RECORD_<NAME>`. `save` refuses, writing nothing, when a value left still
+  looks like a card number or a JWT, unless `--keep-secrets` is given. `replay` sends the cases
+  in order to the running service and checks each answer (status, `Content-Type`, `Location`,
+  body field by field), exit status 1 on a difference, so it runs in CI. Codes `GIONG-E5050`
+  and `GIONG-E5065` to `GIONG-E5069`.
+- **giong-cli**: `giong dashboard` (and `giong dev --ui`) serves a local page on
+  `http://127.0.0.1:7700` for the service `giong dev` runs: build state, the live request log
+  with bodies when `Record` is on, routes with curl lines and an OpenAPI download, workers and
+  tasks with a one-second profile, connection pools, warnings with their error pages offline,
+  a box to send requests, and "save as test". It reads the service's output and giong-mcp, so
+  the service runs no extra code; only this machine can open it, its API needs the random token
+  in the address giong prints (`/#t=...`), and other web pages cannot use it. Codes
+  `GIONG-E5051`, `GIONG-E5053` and `GIONG-E5054`.
+- **giong-cli** (new crate, binary `giong`): one command to start, run, check and ship
+  services on giong. Every command prints text, or one JSON document with `--json`, and
+  every problem it reports carries a `GIONG-E50xx` code with the cause and the fix.
+  `giong explain <code>` prints the page of any giong error code offline.
+- **giong**: `TcpListener::bind` takes the listening socket that `giong dev` hands down in
+  `GIONG_DEV_LISTEN` for the same address, so a service restarted after a rebuild keeps its
+  port and no connection is refused between two builds. Without the variable nothing
+  changes. The hand-off is compiled only into debug builds and builds with the new `dev`
+  feature (`giong dev --release` turns it on for its own builds): a release build has none
+  of its code, and refuses to start under `giong dev` with a coded error.
+- **giong-cli**: `giong dev` builds and runs the service and, on every save, builds again
+  and swaps the new build in once it accepts connections: measured 0 failed requests out of
+  102,061 over 100 restarts under constant load (`bench/results/dev-restarts/`). A failed build, or a build that
+  stops at start-up, leaves the running one serving. A change to `.env` alone restarts
+  without building. It starts the service with `WORKERS=2` on a laptop, `.env`,
+  `RUST_BACKTRACE=1` and a giong-mcp socket, and keeps `.giong/dev.json` and
+  `.giong/dev.log` for other tools; `--json` prints one event per line. A `LISTEN` of
+  `0.0.0.0` or `[::]` is served on loopback with a warning (`GIONG-E5024`) unless `--lan`
+  is given, so a service under development is not on the network by accident.
+- **giong-cli**: local development as one runner per project. `giong dev --background`
+  starts `giong dev` detached from the terminal, waits until the service serves on
+  localhost and prints its address (a failed build comes back as findings, and it builds
+  again on the next save); `giong dev status` says what runs and how the last build went,
+  `--all` across projects; `giong dev logs` prints the service's last lines; `giong dev stop`
+  stops it gracefully, and the database container `giong db up` started, data kept. When a
+  port is taken, the error names the process that holds it.
+- **giong-cli**: `giong check` reports the compiler's errors and warnings, clippy's lints and
+  giong's own checks of the source in one report: blocking calls in async code
+  (`GIONG-E5006`), listeners bound to a host name (`GIONG-E5007`), `RefCell` borrows held
+  across an `.await` (`GIONG-E5008`). Machine-applicable fixes come as edits.
+- **giong-cli**: `giong mcp` serves giong's commands as tools to coding agents over MCP on
+  standard input and output, each answering with the command's JSON document (`dev status`
+  and `dev logs` read; `dev --background` and `dev stop` need `--allow-writes`). The tools only read unless `--allow-writes` is
+  given; `db reset`, `db down`, `clean --all`, `env get`, `--reveal` and `image --push` are
+  never tools, and every tool carries MCP's read-only, destructive and idempotent hints.
+- **giong-cli**: every release attaches the `giong` command prebuilt for Linux (static,
+  x86_64 and aarch64), macOS (Apple silicon and Intel) and Windows (x86_64), each with its
+  SHA-256. `curl -fsSL https://giong.run/install.sh | sh` (or
+  `powershell -c "irm https://giong.run/install.ps1 | iex"` on Windows) installs it in
+  `~/.giong/bin` without root, checks the checksum, and builds it with `cargo install`
+  where no binary is published.
+- **giong**: `giong::ipc`, message channels between two processes on one Linux host, over
+  shared memory ([#189](https://github.com/giong-run/Giong/pull/189)). `IpcListener::bind`
+  and `ipc::connect` meet on a Unix socket path, hand over a sealed memfd and four
+  eventfds, and give each side a `Sender` and a `Receiver`. Messages are bounded (a quarter
+  of the capacity), sending waits while the channel is full, and `Receiver::recv` copies
+  each message out of the shared memory into a buffer it keeps, so a peer cannot change
+  the bytes while they are read; `Receiver::recv_in_place` (`unsafe`) reads them where they
+  lie, for a peer the caller trusts ([#319](https://github.com/giong-run/Giong/issues/319)). The listener runs handshakes as tasks of their own, up to 64 at once with 5 seconds each, so a process that connects and sends nothing holds up no other ([#246](https://github.com/giong-run/Giong/issues/246)). Descriptors received in a handshake are close-on-exec, so none leaks into a program the service runs, and a handshake given up while its message arrives closes them ([#286](https://github.com/giong-run/Giong/issues/286)). A process that dies is reported (`GIONG-E0094`), and so is one that corrupts the
+  ring (`GIONG-E0091`); the receiving process checks every position and length it reads.
+  On a spinning worker (`spin_before_park`), a waiting receiver is watched from the spin
+  loop and neither side makes a system call. A sender publishes a burst of messages with
+  one store, at the end of the worker's turn or before it waits for an answer. Measured
+  between two pinned processes on a 4 vCPU VM against giong's `UnixStream`: round trips
+  6.4 times faster with spinning workers (0.90 against 5.75 µs) and 7.8 times without,
+  streams of 64-byte messages 1.4 times the rate at 0.7 times the CPU, with `recv`'s copy
+  (which costs 3 to 5% at 64 bytes against `recv_in_place`; `bench/results/ipc-giong/`). Codes `GIONG-E0090` to `GIONG-E0095`.
+- **giong**: `Builder::precise_timers(true)` makes short timed waits on macOS end on time
+  instead of late by the timer slack macOS adds to `kevent`'s timeout (a 2 ms sleep took 2.0
+  to 3.8 ms on CI's machines). For waits up to 100 ms the kqueue driver then arms a one-shot
+  `EVFILT_TIMER` with `NOTE_CRITICAL` in the same `kevent` call, which the kernel fires on
+  time. It is off by default because it costs power: a task sleeping 2 ms in a loop used
+  7.05 instead of 5.28 ms of CPU per second, with 411 instead of 348 interrupt wake-ups per
+  second. Linux and Windows ignore it ([#281](https://github.com/giong-run/Giong/issues/281)).
+- **giong**: child processes, pipes and signals (a 1.x feature).
+  `giong::process::Command` (the standard library's builder) with `spawn`, `status` and
+  `output`; `Child::wait`, `try_wait`, `wait_with_output`, `signal` and `kill`. A child is
+  watched through a pidfd polled on the worker's ring, so waiting needs no thread and no
+  `SIGCHLD` handler, and a signal can never reach a process that reused the child's ID; a
+  dropped child is reaped (or killed first, with `kill_on_drop`). Piped stdio is
+  `PipeReader` / `PipeWriter`, also from `process::pipe()`, and `process::stdin()`,
+  `stdout()` and `stderr()` read and write this process's own streams without blocking the
+  worker (never made non-blocking, since the parent shares them). Needs Linux 5.3; Linux
+  only for now.
+- **giong**: `giong::signal::listen(SignalKind)`: any signal a program may handle, as a
+  stream that every listener sees, on any thread, on Linux and macOS; it works together with
+  `Builder::shutdown_on_signals`. `GIONG-E0016` for the signals that cannot be listened for.
+- **giong**: passing open descriptors between processes over Unix sockets:
+  `send_with_fds` / `recv_with_fds` on `UnixStream` and the new `UnixDatagram`. A send
+  keeps its own copies of the descriptors until the kernel has read them, and a dropped
+  receive closes what it received, so nothing leaks and no wrong file is sent. Linux only
+  for now.
+  `GIONG-E0017` for too many descriptors, none of the bytes to carry them, or a cut-off
+  receive. Also `UnixListener::bind_addr`, `UnixStream::connect_addr` (abstract names),
+  `peer_cred`, and `AsFd` for every socket.
+- **giong**: socket activation: `net::activated_sockets()` takes the sockets systemd passes
+  (`LISTEN_FDS`, `LISTEN_FDNAMES`), and `ActivatedSocket::tcp_listener` (and
+  `unix_listener`, `udp_socket`, `unix_datagram`) gives each worker its own listener on
+  one; `GIONG-E0018` for a second call or the wrong kind of socket. `GIONG-E0019` when a
+  child cannot be watched.
+- **examples**: `stdio`, a line protocol over stdin and stdout that runs programs and notes
+  `SIGHUP`.
+- **giong**: request tracing, so that a service can say why a request is slow.
+  `Handle::set_request_tracing(true)` makes every worker follow each request from its first
+  bytes to the last byte of its answer and split its time into phases: receiving it, its
+  handler's own polls, waits for pool connections, database commands and other services
+  (`giong::observe::wait`, with `Wait::Pool`, `Wait::Query` and `Wait::Upstream`), the rest
+  of the handler's time, and writing the answer. Every task poll of 1 ms or more is noted,
+  so that a request that waited while another task held its worker names that task, and the
+  route of the request whose handler took the poll. Requests are grouped by route
+  (`observe::set_route`, `observe::Route`); `observe::take_requests` returns, per route, the
+  number of requests and abandoned ones, latency quantiles to within a quarter, where the time
+  of any latency band went (`RouteStats::breakdown`), and the slowest eight in full. The
+  numbers are kept on each worker, in buckets of fixed size: nothing is sampled away and
+  nothing grows with the load. Protocol crates follow requests with
+  `observe::RequestTrace`. Off (the default), it costs one read of a thread-local per
+  request and per database command
+  ([#181](https://github.com/giong-run/Giong/pull/181)).
+- **giong-http**: HTTP/1.1 and HTTP/2 servers follow requests while request tracing is on
+  (HTTP/2 from the handler's start to its answer); the client times its requests as
+  `Wait::Upstream`.
+- **giong-web**: requests are named by their route's method and pattern, such as
+  `GET /users/{id}`.
+- **giong-postgres**, **giong-mysql**, **giong-redis**: pools time the wait for a connection
+  (`Wait::Pool`) and clients time each command (`Wait::Query`).
+- **giong-mcp**: a `slow_requests` tool. It traces requests for a while (default 5 s), then
+  answers per route: requests, p50, p90, p99 and max, where the time of the slowest requests
+  went compared with the faster half, a verdict (a waiting pool, slow queries, a slow
+  upstream, the handler's own code, a worker blocked by another route or task, a saturated
+  worker, slow clients) with the evidence it rests on, a confidence and a suggested fix, and
+  the slowest requests in full. It only proposes: nothing in the service changes.
+
+### Changed
+
+- **giong**: lookups of one name that run on a worker at the same time share one pair of
+  queries: when a cached name expires under load, 500 requests that need it send 2 queries,
+  not 1,000. A name that does not exist is remembered as missing for its zone's negative
+  TTL (the SOA record of the answer, RFC 2308, at most 30 seconds), so a client retrying a
+  mistyped host no longer sends two queries per attempt. And once one of the `A` and
+  `AAAA` queries has answered with addresses, the other is waited for only 50 ms (or as
+  long as the first answer took, if longer): a DNS server that never answers `AAAA`
+  queries used to hold the `A` records for the whole timeout, 5 seconds by default, on
+  every lookup. Addresses of one family found that way are cached for at most 30 seconds.
+  Fixes [#265](https://github.com/giong-run/Giong/issues/265).
+
+### Fixed
+
+- **giong**: on Windows, the resolver's query sockets bind their port exclusively
+  (`SO_EXCLUSIVEADDRUSE`). Before, another socket of any process could bind the same port
+  on a more specific address, such as `127.0.0.1`, and take the answers sent to it: the
+  lookup then waited out its timeout, or lost one address family.
+- **giong**: on io_uring, peers that keep sending to tasks that stopped reading (an HTTP client
+  that pipelines requests and never reads the answers) no longer make each connection hold
+  about half a megabyte of heap. Once more than the receive pool's size waits on the heap,
+  stream receives take one buffer per read until half of that is gone, and the rest waits in
+  the socket under TCP flow control. 128 such connections held 57 MB; now 16 MB
+  ([#322](https://github.com/giong-run/Giong/issues/322)). Those one-buffer receives, and
+  the ones a large giong-http request body uses, take a whole buffer from the pool, never a
+  piece of the packed buffer ring (Linux 6.12 and newer): with kernel TLS on Linux 7.0 a
+  single-shot receive there could report a buffer full while the kernel kept it, and two
+  receives then wrote into the same buffer. That is what took this change out of 1.4.1.
+- **giong**: dropping a `TcpListener` whose descriptor was lent out (`as_fd`, `as_raw_fd`)
+  no longer shuts the socket down for every copy of it: a listener passed to another
+  process, or duplicated, keeps listening.
+
+### Security
+
+- **giong-cli**: `giong openapi --out` refuses a symbolic link at the file or at a folder
+  between it and the project, as `giong record save` does, so a repository that commits
+  `docs -> ~/.config` cannot have the document written outside the project
+  ([#397](https://github.com/giong-run/Giong/issues/397)).
+
 ## [1.4.2] - 2026-11-24
 
 Faster requests and the rest of the fixes from the review of 1.4.0, with nothing new to
@@ -3148,7 +3475,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.4.2...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.0...HEAD
+[1.5.0]: https://github.com/giong-run/Giong/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/giong-run/Giong/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/giong-run/Giong/compare/v1.4.0...v1.4.1
 [1.4.0]: https://github.com/giong-run/Giong/compare/v1.3.0...v1.4.0

@@ -141,7 +141,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.4.2"
+version = "1.5.0"
 dependencies = [
  "io-uring",
  "libc",
@@ -151,7 +151,7 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.4.2"
+version = "1.5.0"
 dependencies = [
  "giong",
  "giong-quic",
@@ -174,7 +174,7 @@ dependencies = [
 
 [[package]]
 name = "giong-quic"
-version = "1.4.2"
+version = "1.5.0"
 dependencies = [
  "bytes",
  "giong",
@@ -185,7 +185,7 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "1.4.2"
+version = "1.5.0"
 dependencies = [
  "giong",
  "libc",
