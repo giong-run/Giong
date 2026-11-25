@@ -271,9 +271,12 @@ fn new_project_is_complete_and_doctor_is_happy() {
         .env_remove("CARGO_TARGET_DIR")
         .output()
         .unwrap();
+    // The failing assertion is in the test binary's stdout; cargo's
+    // stderr only says which binary failed.
     assert!(
         build.status.success(),
-        "the generated project's own tests fail:\n{}",
+        "the generated project's own tests fail:\n{}\n{}",
+        String::from_utf8_lossy(&build.stdout),
         String::from_utf8_lossy(&build.stderr)
     );
 }
