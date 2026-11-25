@@ -182,12 +182,32 @@ static TERM_IGNORED: AtomicBool = AtomicBool::new(false);
 const SAME_REQUEST_NS: u64 = 250_000_000;
 
 /// `CLOCK_MONOTONIC` in nanoseconds; never 0. Async-signal-safe.
-fn monotonic_ns() -> u64 {
+pub(crate) fn monotonic_ns() -> u64 {
+    clock_ns(libc::CLOCK_MONOTONIC)
+}
+
+/// Nanoseconds on the clock `std::time::Instant` reads; never 0: on macOS
+/// `CLOCK_UPTIME_RAW`, which neither runs through system sleep nor is
+/// slewed by time synchronization (macOS's `CLOCK_MONOTONIC` is both, and
+/// runs up to 0.05% fast or slow against it), elsewhere `CLOCK_MONOTONIC`.
+pub(crate) fn instant_ns() -> u64 {
+    #[cfg(target_os = "macos")]
+    {
+        clock_ns(libc::CLOCK_UPTIME_RAW)
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        clock_ns(libc::CLOCK_MONOTONIC)
+    }
+}
+
+#[inline]
+fn clock_ns(clock: libc::clockid_t) -> u64 {
     // SAFETY: all-zero is a valid timespec, which the call fills in.
     let mut ts: libc::timespec = unsafe { mem::zeroed() };
     // SAFETY: a valid clock and pointer; `clock_gettime` is
     // async-signal-safe.
-    unsafe { libc::clock_gettime(libc::CLOCK_MONOTONIC, &mut ts) };
+    unsafe { libc::clock_gettime(clock, &mut ts) };
     (ts.tv_sec as u64)
         .wrapping_mul(1_000_000_000)
         .wrapping_add(ts.tv_nsec as u64)

@@ -49,18 +49,18 @@ instructions per request.
 | `oneshot` | a oneshot channel: create, send, receive | 278 | 278 |
 | `channel` | a round trip between two tasks over two bounded channels | 1,444 | 1,342 |
 | `timeout` | a timeout around a future that is ready at once | 98 | 98 |
-| `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,464 | 4,403 |
-| `udp-echo` | a 64-byte datagram to an echo task and back | 3,962 | 4,704 |
-| `file-read` | read 4 KiB at an offset of an open file (page cache) | 191 | 243 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 8,587 | 9,428 |
-| `http1-client` | giong-http client and server, HTTP/1.1 | 22,041 | 23,064 |
-| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 29,918 | 30,939 |
-| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 241,007 | 242,026 |
-| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 34,146 | 35,148 |
-| `web` | a giong-web router with a path parameter, raw client | 11,565 | 12,412 |
-| `redis-get` | giong-redis `GET` against a fake server | 8,044 | 8,741 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 9,854 | 10,595 |
-| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,317 | 14,058 |
+| `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,214 | 4,153 |
+| `udp-echo` | a 64-byte datagram to an echo task and back | 3,712 | 4,454 |
+| `file-read` | read 4 KiB at an offset of an open file (page cache) | 190 | 242 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 8,343 | 9,179 |
+| `http1-client` | giong-http client and server, HTTP/1.1 | 21,791 | 22,820 |
+| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 29,665 | 30,687 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 240,854 | 241,879 |
+| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 33,902 | 34,898 |
+| `web` | a giong-web router with a path parameter, raw client | 11,309 | 12,163 |
+| `redis-get` | giong-redis `GET` against a fake server | 7,788 | 8,485 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 9,604 | 10,345 |
+| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,067 | 13,808 |
 
 Each turn of a worker's event loop called helpers out of line that almost always find
 nothing to do: the deferred-close list, the timers, the io_uring completion queue, and the
