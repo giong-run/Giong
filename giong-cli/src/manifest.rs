@@ -293,10 +293,17 @@ fn key_value(s: &str) -> Option<(String, Range<usize>)> {
 
 /// The range of a string's content (inside its quotes), if `value` is one
 /// basic or literal string.
+///
+/// One string: a quote of its kind inside ends it, so `"1.4" } x = ["a"`
+/// (an inline table cut at a stray `}`) is no requirement. Taken as one,
+/// its edit replaced the bytes between two strings, and the file read back
+/// with other values in them. A requirement never holds a quote, so the
+/// escaped `\"` that a basic string may hold is refused too.
 fn string_content(value: &str) -> Option<Range<usize>> {
     let q = value.chars().next()?;
     if (q == '"' || q == '\'') && value.len() >= 2 && value.ends_with(q) {
-        Some(1..value.len() - 1)
+        let inner = 1..value.len() - 1;
+        (!value[inner.clone()].contains(q)).then_some(inner)
     } else {
         None
     }
@@ -634,6 +641,25 @@ name = \"giong\"
             out,
             "[dependencies]\r\n  giong   =   \"1.5\"   # pinned for now\r\n\"giong-web\" = {version=\"1.5.0\"}\r\n"
         );
+    }
+
+    #[test]
+    fn a_requirement_is_one_string() {
+        // A stray `}` ends the inline table early for the reader, and the
+        // comma inside the list after it splits the rest: `version` was
+        // then read as `1.4" }tures = ["a`, and editing it took out the
+        // bytes between the strings. Found by the manifest fuzz target.
+        let text = "[dependencies]\nrt = { version = \"1.4\" }tures = [\"a\", \"b\"] }\n";
+        let deps = scan(text);
+        assert_eq!(deps.len(), 1, "{deps:?}");
+        assert_eq!(deps[0].req, None, "{deps:?}");
+        assert_eq!(deps[0].req_span, None);
+        for value in ["\"1.4\" \"1.5\"", "'1.4' x '2'", "\"1\\\"2\""] {
+            assert_eq!(string_content(value), None, "{value}");
+        }
+        assert_eq!(string_content("\"1.4\""), Some(1..4));
+        assert_eq!(string_content("'~1.4'"), Some(1..5));
+        assert_eq!(string_content("\"a'b\""), Some(1..4));
     }
 
     #[test]
