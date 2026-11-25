@@ -491,10 +491,12 @@ mod tests {
 
     #[test]
     fn a_chunk_size_too_large_for_memory_is_an_error() {
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nab\r\n";
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nab\r\n";
         assert!(!complete(raw, false).unwrap());
         assert_eq!(parse(raw, false).unwrap_err(), "a chunk is cut short");
-        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffe\r\nab\r\n";
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffe\r\nab\r\n";
         assert_eq!(parse(raw, false).unwrap_err(), "a chunk is cut short");
     }
 
