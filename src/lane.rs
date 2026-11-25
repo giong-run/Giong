@@ -195,13 +195,13 @@ impl Lanes {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        let (class, weight) = (charge.class(), charge.weight());
+        let (class, weight, owner) = (charge.class(), charge.weight(), charge.owner());
         let (handle, job) = job(move || {
             let value = f();
             drop(charge);
             value
         });
-        drop(self.compute.spawn_in(class, weight, job));
+        drop(self.compute.spawn_in(class, weight, Some(owner), job));
         handle
     }
 
