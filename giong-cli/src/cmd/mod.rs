@@ -30,6 +30,7 @@ pub mod record;
 pub mod routes;
 pub mod test;
 pub mod top;
+pub mod upgrade;
 pub mod version;
 
 /// A command of `giong`.
@@ -70,6 +71,7 @@ pub const COMMANDS: &[&Command] = &[
     &top::COMMAND,
     &clean::COMMAND,
     &mcp::COMMAND,
+    &upgrade::COMMAND,
     &version::COMMAND,
     &help::COMMAND,
 ];

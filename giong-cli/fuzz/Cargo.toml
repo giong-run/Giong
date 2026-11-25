@@ -57,3 +57,10 @@ path = "fuzz_targets/dashboard_http.rs"
 test = false
 doc = false
 bench = false
+
+[[bin]]
+name = "manifest"
+path = "fuzz_targets/manifest.rs"
+test = false
+doc = false
+bench = false

@@ -150,6 +150,7 @@ the cause and the fix.
 | What does this error mean? | `giong explain GIONG-E0102` |
 | Run the tests | `giong test` (on io_uring, then on epoll; reads `.env`) |
 | A database | `giong db up`, `giong db migrate` |
+| A newer giong release | `giong upgrade` (all giong crates at once; `--dry-run` first) |
 
 `giong new` writes a project that builds and passes its tests: the service, an end to end
 test, migrations, `.env.example`, a Dockerfile, a CI workflow and fast dev builds. Extend it

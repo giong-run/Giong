@@ -22,3 +22,7 @@ pub mod lint;
 pub mod record;
 #[path = "../../src/dashboard/http.rs"]
 pub mod dashboard_http;
+#[path = "../../src/manifest.rs"]
+pub mod manifest;
+#[path = "../../src/lockfile.rs"]
+pub mod lockfile;

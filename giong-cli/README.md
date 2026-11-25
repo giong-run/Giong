@@ -16,6 +16,7 @@ giong doctor     # is this machine (and project) ready?
 giong dev --background  # build, run on localhost and rebuild on every save; returns once it serves
 giong dev status        # what runs, where, and how the last build went (logs, stop: the same way)
 giong check      # compiler errors, clippy and giong's own checks in one report
+giong upgrade    # move the project (and this command) to the newest giong release
 ```
 
 ## One shape for every command
@@ -111,10 +112,23 @@ Applies the fixes that need no judgement: the compiler's and clippy's machine-ap
 ## giong doctor
 
 ```sh
-giong doctor [--machine]
+giong doctor [--machine] [--offline]
 ```
 
 Checks the Rust toolchain and the linker, the kernel and whether io_uring is allowed, the locked-memory and open-files limits, and a container's seccomp profile; inside a project also the crates that need the Tokio runtime, a dev profile that writes full debug information (slow builds), `.env` against `.env.example`, the port the service uses, and the disk its builds take. Every problem comes with its code and its fix.
+
+In a project that takes giong crates from crates.io, it also reads `Cargo.lock`: giong crates on different releases (`GIONG-E5091`), a newer giong release out (`GIONG-E5090`) and this command older than it (`GIONG-E5092`). The newest release comes from `cargo info giong`, with your cargo configuration, at most once a day (`~/.giong/cache/releases.json`); `--offline` or `CARGO_NET_OFFLINE=true` skips the question, and `GIONG_LATEST=1.5.0` answers it (a mirror, or a company that approves releases).
+
+## giong upgrade
+
+```sh
+giong upgrade [--to 1.5.0] [--dry-run] [--offline]
+giong upgrade --self [--to 1.5.0] [--dry-run]
+```
+
+Moves every giong crate of the project to the newest release (or `--to`). The giong crates are released together with one version, and a 1.x release only adds, so this is one step: the version of each giong dependency in every `Cargo.toml` of the workspace, written as you wrote it (`"1.4"` becomes `"1.5"`, `"~1.4.2"` becomes `"~1.5.0"`; comments, features and every other byte stay), `cargo update` of the giong crates to exactly that release, the release's `rust-version` against rustc and the project's own `rust-version`, and `cargo check`. If a step fails, every file is put back as it was (`.giong/upgrade/` holds the originals while it runs). Then the agent files `giong ai init` wrote are refreshed for the new release. It never moves back, across a major version, or past a pinned requirement (`=1.4.2`: `GIONG-E5095`); path and git dependencies are left to you. `--dry-run` lists the edits; `--offline` moves to this command's own release with cargo offline.
+
+This command writes templates and agent files for its own release, so a release newer than the command updates the command first, then the new command moves the project. `giong upgrade --self` updates only the command, the way it was installed: from the install script's folder with the release archive (checked against its SHA-256, `GIONG_DOWNLOAD_URL` honoured), or with `cargo install giong-cli --locked --version x.y.z`. A command installed another way is left alone, with the command to use (`GIONG-E5096`). In `giong mcp`, `upgrade --dry-run` reads and `upgrade` writes; neither ever replaces the command.
 
 ## giong clean
 
@@ -130,7 +144,7 @@ Frees the disk old builds use and keeps what the next build needs: removes what 
 claude mcp add giong -- giong mcp
 ```
 
-Serves every command as a tool to coding agents over the Model Context Protocol on standard input and output, each answering with the command's JSON document. `dev` is a tool for `status` and `logs` (read-only) and, with `--allow-writes`, `--background` and `stop`; `dev_status` reads `.giong/dev.json` as it is.
+Serves every command as a tool to coding agents over the Model Context Protocol on standard input and output, each answering with the command's JSON document. `upgrade` is a tool with `--dry-run` (read-only) and, with `--allow-writes`, without it; `--self` never is. `dev` is a tool for `status` and `logs` (read-only) and, with `--allow-writes`, `--background` and `stop`; `dev_status` reads `.giong/dev.json` as it is.
 
 ## giong routes and giong openapi
 
