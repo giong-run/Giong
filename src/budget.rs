@@ -226,6 +226,9 @@ pub(crate) struct Waiter {
     need: usize,
     /// The units are taken for this waiter; it owns them.
     granted: AtomicBool,
+    /// The limit was lowered below `need`: it can never be granted, and
+    /// left the queue.
+    refused: AtomicBool,
     waker: Mutex<Option<Waker>>,
 }
 
@@ -304,14 +307,22 @@ impl Gate {
         }
     }
 
+    /// A waiter that needs more than the whole limit (lowered since it
+    /// queued) is refused rather than left at the front, where it would
+    /// hold up every waiter behind it for ever.
     fn grant_locked(&self, queue: &mut VecDeque<Arc<Waiter>>, woken: &mut Vec<Waker>) {
         while let Some(front) = queue.front() {
-            if !self.take(front.need) {
+            let fits = front.need <= self.limit.load(Ordering::SeqCst);
+            if fits && !self.take(front.need) {
                 break;
             }
             let front = queue.pop_front().expect("front exists");
             self.waiting.fetch_sub(1, Ordering::SeqCst);
-            front.granted.store(true, Ordering::Release);
+            if fits {
+                front.granted.store(true, Ordering::Release);
+            } else {
+                front.refused.store(true, Ordering::Release);
+            }
             let waker = lock(&front.waker).take();
             if let Some(waker) = waker {
                 woken.push(waker);
@@ -328,6 +339,7 @@ impl Gate {
         let waiter = Arc::new(Waiter {
             need: n,
             granted: AtomicBool::new(false),
+            refused: AtomicBool::new(false),
             waker: Mutex::new(Some(waker.clone())),
         });
         let mut woken = Vec::new();
@@ -342,28 +354,34 @@ impl Gate {
         for w in woken {
             w.wake();
         }
-        if waiter.granted.load(Ordering::Acquire) {
-            None
-        } else {
-            Some(waiter)
-        }
+        Some(waiter)
     }
 
-    /// `true` once `waiter` was handed its units; otherwise keeps `waker`.
-    fn poll_waiter(&self, waiter: &Waiter, waker: &Waker) -> bool {
-        if waiter.granted.load(Ordering::Acquire) {
-            return true;
+    /// `Some(true)` once `waiter` was handed its units, `Some(false)` once
+    /// it was refused; otherwise keeps `waker`.
+    fn poll_waiter(&self, waiter: &Waiter, waker: &Waker) -> Option<bool> {
+        let done = || {
+            if waiter.granted.load(Ordering::Acquire) {
+                Some(true)
+            } else if waiter.refused.load(Ordering::Acquire) {
+                Some(false)
+            } else {
+                None
+            }
+        };
+        if let Some(done) = done() {
+            return Some(done);
         }
         let mut slot = lock(&waiter.waker);
-        // Granted between the two looks: the granter took the old waker.
-        if waiter.granted.load(Ordering::Acquire) {
-            return true;
+        // Decided between the two looks: the granter took the old waker.
+        if let Some(done) = done() {
+            return Some(done);
         }
         match &*slot {
             Some(w) if w.will_wake(waker) => {}
             _ => *slot = Some(waker.clone()),
         }
-        false
+        None
     }
 
     /// The waiting future is gone: leave the queue, or give back what it
@@ -530,8 +548,11 @@ impl Budget {
 
     /// Changes the limits from now on, for a tenant whose plan changed or a
     /// container that was resized. A lower limit takes nothing back: what
-    /// is in use stays, and new work waits until use is under it. A higher
-    /// one lets waiting calls through at once.
+    /// is in use stays, and new work waits until use is under it; a
+    /// [`reserve`](Self::reserve) waiting for more than the new memory limit
+    /// fails with [`GIONG-E0081`](crate::error::Code::BudgetTooSmall), as it
+    /// would have when asked. A higher one lets waiting calls through at
+    /// once.
     pub fn set_limits(&self, limits: Limits) {
         let i = &self.inner;
         i.weight.store(limits.weight as usize, Ordering::Relaxed);
@@ -581,7 +602,8 @@ impl Budget {
         // The handle is the value: the task runs whether or not it is awaited.
         #[allow(clippy::async_yields_async)]
         async move {
-            Acquire::new(&self.inner.tasks, 1).await;
+            // Never refused: a task limit is at least 1.
+            let _granted = Acquire::new(&self.inner.tasks, 1).await;
             spawn_charged(self.inner.clone(), fut, location)
         }
     }
@@ -622,10 +644,17 @@ impl Budget {
     ///
     /// [`GIONG-E0081`](crate::error::Code::BudgetTooSmall) (`InvalidInput`)
     /// at once when `bytes` is more than [`Limits::memory`]: it could never
-    /// fit.
+    /// fit; and while it waits, once [`set_limits`](Self::set_limits)
+    /// lowers the limit below `bytes`.
     pub async fn reserve(&self, bytes: usize) -> io::Result<Reservation> {
-        self.check_fits(bytes)?;
-        Acquire::new(&self.inner.memory, bytes).await;
+        // Refused: the limit was lowered below `bytes` while it waited, and
+        // the check says so (unless it was raised again meanwhile).
+        loop {
+            self.check_fits(bytes)?;
+            if Acquire::new(&self.inner.memory, bytes).await {
+                break;
+            }
+        }
         Ok(Reservation {
             budget: self.inner.clone(),
             bytes,
@@ -667,7 +696,8 @@ impl Budget {
         F: FnOnce() -> T + Send + 'static,
         T: Send + 'static,
     {
-        Acquire::new(&self.inner.compute, 1).await;
+        // Never refused: a compute limit is at least 1.
+        let _granted = Acquire::new(&self.inner.compute, 1).await;
         let charge = ComputeCharge(self.inner.clone());
         runtime::with_worker(|w| w.rt.lanes.spawn_compute_in(charge, f))
     }
@@ -1038,7 +1068,8 @@ impl<F: Future> Future for InBudget<F> {
 
 // --------------------------------------------------------------- waiting
 
-/// Waits until `gate` hands over `n` units. Owns them once ready.
+/// Waits until `gate` hands over `n` units: `true`, and it owns them. `false`
+/// when the limit was lowered below `n` meanwhile, so they never could be.
 struct Acquire<'a> {
     gate: &'a Gate,
     n: usize,
@@ -1058,24 +1089,25 @@ impl<'a> Acquire<'a> {
 }
 
 impl Future for Acquire<'_> {
-    type Output = ();
+    type Output = bool;
 
-    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
+    fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<bool> {
         let this = &mut *self;
         if !this.started {
             this.started = true;
             match this.gate.take_or_wait(this.n, cx.waker()) {
-                None => return Poll::Ready(()),
+                None => return Poll::Ready(true),
                 Some(waiter) => this.waiter = Some(waiter),
             }
-            return Poll::Pending;
         }
         let waiter = this.waiter.as_ref().expect("waiting");
-        if this.gate.poll_waiter(waiter, cx.waker()) {
-            this.waiter = None;
-            return Poll::Ready(());
+        match this.gate.poll_waiter(waiter, cx.waker()) {
+            Some(granted) => {
+                this.waiter = None;
+                Poll::Ready(granted)
+            }
+            None => Poll::Pending,
         }
-        Poll::Pending
     }
 }
 
