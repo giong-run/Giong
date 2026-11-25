@@ -48,6 +48,7 @@ fn giong(cwd: &Path, args: &[&str]) -> (i32, Value) {
     cmd.args(args)
         .arg("--json")
         .current_dir(cwd)
+        .env("GIONG_HOME", home_of(cwd))
         .env_remove("WORKERS");
     for k in OUTER_BUILD {
         cmd.env_remove(k);
@@ -61,6 +62,11 @@ fn giong(cwd: &Path, args: &[&str]) -> (i32, Value) {
         )
     });
     (out.status.code().unwrap_or(-1), v)
+}
+
+/// The `GIONG_HOME` of a run in `cwd`: next to it, not in the user's.
+fn home_of(cwd: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", cwd.display()))
 }
 
 /// An HTTP/1.1 keep-alive server: `/fail` answers 500, anything else 200
@@ -449,6 +455,11 @@ fn a_project_is_built_started_and_compared_with_a_commit() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&list.stdout).lines().count(), 1);
+    // It was made under GIONG_HOME, never below the temporary directory,
+    // where any user can put a .cargo/config.toml that the build would read.
+    let worktrees = home_of(&dir).join("bench");
+    assert!(worktrees.is_dir(), "{}", worktrees.display());
+    assert_eq!(std::fs::read_dir(&worktrees).unwrap().count(), 0);
 
     // The same code twice: no regression, and the report says it is noise.
     git(&dir, &["checkout", "-q", "--", "src/main.rs"]);
@@ -519,4 +530,5 @@ fn a_service_that_exits_is_reported_with_its_log() {
         "{v}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(home_of(&dir));
 }
