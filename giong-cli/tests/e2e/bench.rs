@@ -341,7 +341,21 @@ fn an_unreachable_url_fails_fast_with_a_code() {
     if !has_command("bench") {
         return;
     }
-    // A port nothing listens on: bind, note it, close.
+    // A port nothing listens on. On Unix it stays bound without listening
+    // for the whole test, so a connection is refused and no other test of
+    // this run gets the same port from bind(0) and serves on it (one did:
+    // giong dev's tests free and bind their service's port again).
+    #[cfg(unix)]
+    let held = {
+        use socket2::{Domain, Socket, Type};
+        let s = Socket::new(Domain::IPV4, Type::STREAM, None).unwrap();
+        s.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+            .unwrap();
+        s
+    };
+    #[cfg(unix)]
+    let port = held.local_addr().unwrap().as_socket().unwrap().port();
+    #[cfg(not(unix))]
     let port = TcpListener::bind("127.0.0.1:0")
         .unwrap()
         .local_addr()
@@ -356,6 +370,8 @@ fn an_unreachable_url_fails_fast_with_a_code() {
         "took {:?}",
         out.elapsed
     );
+    #[cfg(unix)]
+    drop(held);
 }
 
 /// Values that make no sense are usage errors, before any load is sent; a
