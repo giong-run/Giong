@@ -180,11 +180,14 @@ fn dev_flow(offer: &Offer) -> &'static str {
      for this project, it reports that one. A failed build says why (`GIONG-E5009`) and keeps\n   \
      watching: fix the code.\n\
      2. Edit the code. `giong dev` rebuilds and swaps the service by itself, without refusing\n   \
-     a connection.\n\
-     3. Try it with `curl` on the printed address.\n\
-     4. `giong dev status --json` says whether it is building, serving or failed (`state`), its\n   \
-     `urls` and the last build's first error (`build.error`); `giong dev logs --lines 100` shows\n   \
-     the service's output and requests.\n\
+     a connection. A change that does not compile or does not start stops the service: no old\n   \
+     build answers, a request is refused until the code works, and the next save serves again.\n\
+     3. Try it with `curl` on the printed address. Refused, or not what you expected: ask\n   \
+     `giong dev status --json`.\n\
+     4. `giong dev status --json` says whether it is building, starting, serving or failed\n   \
+     (`state`) and its `urls`; when it failed, `failure` says why: `code`, `title`, the\n   \
+     compiler's errors or the service's last lines in `detail`, and `fix`.\n   \
+     `giong dev logs --lines 100` shows the service's output and requests.\n\
      5. `giong dev stop` when you are done. `--all` on `status` and `stop` covers every project\n   \
      on this machine.\n\n\
      Do not run the service with `cargo run`, `cargo build --release`, Docker or a second\n\

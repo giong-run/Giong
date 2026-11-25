@@ -2828,7 +2828,7 @@ Raised by the `giong` command (giong-cli): `giong check` and `giong dev`. In JSO
 
 ## What happened
 
-The compiler reported an error. `giong dev` keeps the last build that worked running until the code compiles again.
+The compiler reported an error. `giong dev` stops the build that was running, so that no request is answered by code older than the files, and builds again on the next save; `giong dev status` shows the first errors in `failure`.
 
 ## How to fix it
 
@@ -2910,11 +2910,12 @@ Raised by the `giong` command (giong-cli): `giong doctor` and `giong dev`. In JS
 
 ## What happened
 
-Another process listens on the port the service is configured to use, so the service cannot bind it.
+Another process listens on the port the service is configured to use, so the service cannot bind it: when `giong dev` binds it for the service, or when the service, started by `giong dev`, stops at start-up because its own bind failed. In the second case `giong dev` stopped the build that ran before it too, and starts again on the next save.
 
 ## How to fix it
 
-- Stop the other process, or use another port. `giong dev` names the process that listens there when the system says (Linux, macOS); otherwise `ss -ltnp` on Linux or `lsof -i :PORT` on macOS shows which one.
+- Stop the other process, or use another port. `giong dev` names the process that listens there when the system says (Linux, macOS, Windows); otherwise `ss -ltnp` on Linux, `lsof -i :PORT` on macOS or `netstat -ano` on Windows shows which one.
+- When the process is `giong dev` itself, it holds the port for the service and hands the socket down: the service must bind exactly `LISTEN` with `giong::net::TcpListener` (giong 1.5 or later, which giong-web's `serve` uses), not `std::net::TcpListener` or another runtime's listener.
 - When it is a `giong dev` of another project, the message names the project: `giong dev stop` there, or `giong dev stop --all` stops every `giong dev` on this machine. `giong dev status --all` lists them.
 
 [All error codes](README.md)
@@ -2955,11 +2956,12 @@ Raised by the `giong` command (giong-cli): `giong dev`. In JSON output: `"code":
 
 ## What happened
 
-The service `giong dev` started exited by itself (it panicked, returned an error from `main`, or was killed). The finding carries its exit status and the last lines it printed.
+The service `giong dev` started exited by itself (it panicked, returned an error from `main`, or was killed), at start-up or later. The finding carries its exit status and the last lines it printed. When it was a new build that stopped before it served, `giong dev` stopped the build that ran before it too: nothing older than the files answers. `giong dev status` shows the same finding in `failure` until a build serves again; `giong dev` does not restart a service that stopped on its own until the next save.
 
 ## How to fix it
 
 - Read the last lines of its output in the finding: a panic message names the file and line.
+- `giong dev logs` prints more of its output.
 - Fix the code and save: `giong dev` builds and starts it again.
 
 [All error codes](README.md)
@@ -2970,7 +2972,7 @@ Raised by the `giong` command (giong-cli): `giong dev`. In JSON output: `"code":
 
 ## What happened
 
-The new build of the service did not accept connections within the time `giong dev` waits for it (30 seconds by default). The previous build keeps serving.
+The new build of the service did not accept connections within the time `giong dev` waits for it (30 seconds by default). `giong dev` stopped it, and the previous build too, so that nothing older than the files answers; the next save builds and starts again.
 
 ## How to fix it
 
