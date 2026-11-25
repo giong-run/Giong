@@ -1438,8 +1438,9 @@ fn runnable(exe: &Path, n: u64) -> Result<PathBuf, Finding> {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("giong-dev");
-        let _ = fs::create_dir_all(&dir);
+        // Copies of earlier starts first (it removes the folder when empty).
         remove_copies(exe);
+        let _ = fs::create_dir_all(&dir);
         let stem = exe
             .file_stem()
             .map(|s| s.to_string_lossy().into_owned())
