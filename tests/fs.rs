@@ -117,6 +117,40 @@ fn open_fds(path: &std::path::Path) -> usize {
         .count()
 }
 
+/// A file whose length is more than memory holds (here a sparse file of
+/// 2^60 bytes) gives an error from `fs::read`, not an abort of the whole
+/// process (issue #296). Skipped where no file system at hand takes such a
+/// length.
+#[test]
+fn reading_a_file_too_large_for_memory_is_an_error() {
+    let dir = TempDir::new("huge");
+    let mut candidates = vec![dir.path("huge")];
+    if cfg!(target_os = "linux") {
+        candidates.push(PathBuf::from(format!(
+            "/dev/shm/giong-fs-huge-{}",
+            std::process::id()
+        )));
+    }
+    let Some(path) = candidates.into_iter().find(|path| {
+        std::fs::File::create(path)
+            .and_then(|f| f.set_len(1 << 60))
+            .is_ok()
+    }) else {
+        eprintln!("skipped: no file system here takes a 2^60-byte sparse file");
+        return;
+    };
+    let result = giong::block_on(async { fs::read(&path).await.map(|data| data.len()) });
+    let _ = std::fs::remove_file(&path);
+    let err = result.unwrap_err();
+    assert_eq!(err.kind(), ErrorKind::OutOfMemory, "{err}");
+    assert_eq!(
+        giong::error::code(&err),
+        Some(giong::error::Code::FileTooLarge),
+        "{err}"
+    );
+    assert!(err.to_string().contains("File::read_at"), "{err}");
+}
+
 #[test]
 fn whole_files_roundtrip() {
     let dir = TempDir::new("whole");

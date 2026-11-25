@@ -275,6 +275,10 @@ codes! {
     /// `open(2)` cannot do: no access mode, `truncate` or `create` without
     /// `write`, or `append` with `truncate`. Nothing was opened.
     InvalidOpenOptions = 203, InvalidInput, "invalid combination of open options";
+    /// [`fs::read`](crate::fs::read) could not get the memory for the
+    /// whole file (its length, which may be that of a sparse file, is more
+    /// than the allocator gives). Nothing is kept; the process goes on.
+    FileTooLarge = 204, OutOfMemory, "file too large to read into memory";
 
     // ------------------------------------------------- giong-http client
     /// The URL, a header, the method or the client's settings are not
