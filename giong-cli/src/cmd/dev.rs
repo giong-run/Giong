@@ -892,7 +892,8 @@ impl Dev {
         self.starts += 1;
         let mcp = mcp_socket(&state_dir, self.starts);
         let _ = fs::remove_file(&mcp);
-        let mut cmd = Process::new(exe);
+        let program = runnable(exe, self.starts)?;
+        let mut cmd = Process::new(&program);
         cmd.args(&self.service_args)
             .env_remove(devctl::BACKGROUND_VAR)
             .current_dir(&self.project.root)
@@ -1414,11 +1415,76 @@ impl Dev {
             let _ = r.child.wait();
         }
         let _ = fs::remove_file(self.project.root.join(".giong").join("dev.json"));
+        if let Some(exe) = &self.exe {
+            remove_copies(exe);
+        }
         devctl::unregister();
         // The folder of short socket paths, when the project's was too long.
         #[cfg(unix)]
         let _ = fs::remove_dir(short_socket_dir());
     }
+}
+
+/// The program to start for a build. On Windows a running program cannot be
+/// removed or replaced, so cargo's next build of it fails ("failed to remove
+/// file ... Access is denied") for as long as the service runs: each start
+/// runs a copy instead, in `giong-dev/` next to cargo's file. Elsewhere a new
+/// build replaces the file without touching the running process, which
+/// runs cargo's file itself.
+fn runnable(exe: &Path, n: u64) -> Result<PathBuf, Finding> {
+    #[cfg(windows)]
+    {
+        let dir = exe
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("giong-dev");
+        let _ = fs::create_dir_all(&dir);
+        remove_copies(exe);
+        let stem = exe
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "service".into());
+        let copy = dir.join(format!("{stem}-{}-{n}.exe", std::process::id()));
+        fs::copy(exe, &copy).map_err(|e| {
+            start_failed(format!(
+                "{} cannot be copied to {} to run it: {e}",
+                exe.display(),
+                copy.display()
+            ))
+        })?;
+        Ok(copy)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = n;
+        Ok(exe.to_path_buf())
+    }
+}
+
+/// Removes the copies [`runnable`] made of `exe` (Windows): one whose
+/// process still runs cannot be removed and stays until the next call.
+fn remove_copies(exe: &Path) {
+    #[cfg(windows)]
+    {
+        let dir = exe
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("giong-dev");
+        let prefix = format!(
+            "{}-",
+            exe.file_stem()
+                .map(|s| s.to_string_lossy())
+                .unwrap_or_default()
+        );
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let _ = fs::remove_dir(&dir);
+    }
+    #[cfg(not(windows))]
+    let _ = exe;
 }
 
 /// Where the giong-mcp socket of the `n`th start goes: `.giong/` in the

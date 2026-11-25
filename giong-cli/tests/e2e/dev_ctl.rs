@@ -311,10 +311,22 @@ fn status(dir: &TempDir, port: u16) -> serde_json::Value {
     dev(dir, &["status"], port).run().report("dev")
 }
 
-/// The state is `failed` with a failure of `stage`.
-fn failed_at(dir: &TempDir, port: u16, stage: &str) -> bool {
-    let v = status(dir, port);
-    v["data"]["state"] == "failed" && v["data"]["failure"]["stage"] == stage
+/// Waits until the state is `failed` with a failure of `stage`, and says
+/// what the status was when it never is.
+fn wait_failed(dir: &TempDir, port: u16, stage: &str) {
+    let start = Instant::now();
+    loop {
+        let v = status(dir, port);
+        if v["data"]["state"] == "failed" && v["data"]["failure"]["stage"] == stage {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(240),
+            "timed out waiting for a failure at {stage}; the last status: {v:#}\nthe runner's log:\n{}",
+            std::fs::read_to_string(dir.join(".giong/runner.log")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// K's rule for development: a change that breaks the service shows the
@@ -341,9 +353,7 @@ fn a_change_that_fails_stops_the_old_build_and_says_why() {
 
     // It does not compile: the old build stops.
     dir.write("src/main.rs", "fn main() { let x: u32 = \"no\"; }\n");
-    wait_for("the failed build", Duration::from_secs(240), || {
-        failed_at(&dir, port, "build")
-    });
+    wait_failed(&dir, port, "build");
     assert!(!answers(port), "an old build answers after a failed build");
     let v = status(&dir, port);
     let failure = &v["data"]["failure"];
@@ -371,9 +381,7 @@ fn a_change_that_fails_stops_the_old_build_and_says_why() {
         "src/main.rs",
         "fn main() { panic!(\"e2e boot failure\"); }\n",
     );
-    wait_for("the failed start", Duration::from_secs(240), || {
-        failed_at(&dir, port, "start")
-    });
+    wait_failed(&dir, port, "start");
     assert!(!answers(port), "an old build answers after a failed start");
     let v = status(&dir, port);
     let failure = &v["data"]["failure"];
@@ -401,9 +409,7 @@ fn a_change_that_fails_stops_the_old_build_and_says_why() {
              panic!(\"e2e late crash\"); });",
         ).replace("fn main() {", "fn main() {\n    std::panic::set_hook(Box::new(|i| { eprintln!(\"{i}\"); std::process::exit(101); }));"),
     );
-    wait_for("the crash", Duration::from_secs(240), || {
-        failed_at(&dir, port, "exited")
-    });
+    wait_failed(&dir, port, "exited");
     let v = status(&dir, port);
     assert!(
         v["data"]["failure"]["detail"]
@@ -417,9 +423,7 @@ fn a_change_that_fails_stops_the_old_build_and_says_why() {
     // Its port is taken: the finding names who holds it.
     let holder = TcpListener::bind(("127.0.0.1", port)).unwrap();
     dir.write("src/main.rs", SERVICE);
-    wait_for("the port in use", Duration::from_secs(240), || {
-        failed_at(&dir, port, "start")
-    });
+    wait_failed(&dir, port, "start");
     let v = status(&dir, port);
     let failure = &v["data"]["failure"];
     assert_eq!(failure["code"], "GIONG-E5014", "{v:#}");

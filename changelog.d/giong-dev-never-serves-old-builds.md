@@ -26,3 +26,6 @@
 - **giong-cli**: `giong dev` no longer binds `LISTEN` for a project that does not depend on
   giong at all (no giong in `Cargo.lock`): nothing in such a service takes the socket, so it
   only kept the service from binding its own port.
+- **giong-cli**: on Windows, `giong dev` runs a copy of each build (`giong-dev/` next to
+  cargo's file), because a running program there cannot be replaced: cargo's next build
+  failed with "Access is denied" for as long as the service ran.
