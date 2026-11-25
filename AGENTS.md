@@ -11,8 +11,8 @@ pull requests, handoff), is in [docs/DEVELOPMENT.md](docs/DEVELOPMENT.md).
 
 giong is a thread-per-core async runtime, built on io_uring on Linux, with an epoll
 driver where io_uring is blocked or the kernel is too old, a kqueue driver on macOS (for
-development) and an I/O completion port driver on Windows (the `giong` crate only, from
-1.4). Linux is the platform it is tuned and measured on. It aims to be the best Rust
+development) and an I/O completion port driver on Windows (the runtime from 1.4, every
+crate from 1.5). Linux is the platform it is tuned and measured on. It aims to be the best Rust
 async runtime on technical merit, replaces the Tokio ecosystem with crates of its own, and
 is built for code that agents write: strict types, coded errors with the cause and the
 fix, and an API that stays on major version 1 for many years. One Cargo
@@ -95,8 +95,8 @@ and its confidence). It listens on loopback or a Unix socket only and only reads
 ## The machine you need
 
 - **Linux 6.0 or newer with io_uring allowed**, to test both Linux drivers. Every crate
-  also builds and passes its tests on macOS (kqueue); on Windows only the `giong` crate
-  builds (`cargo test -p giong`), and Unix sockets are `cfg(unix)`. A change to a shared
+  also builds and passes its tests on macOS (kqueue) and on Windows (IOCP; Unix sockets
+  are Winsock's `AF_UNIX`, kernel TLS is `cfg(unix)`). A change to a shared
   file in `src/driver/` or `src/sys/` must keep all three building: CI runs macOS and
   Windows jobs, and `docs/design/portability.md` has the `cfg` rules.
 - **Docker blocks io_uring with its default seccomp profile.** Inside such a container,
@@ -127,7 +127,7 @@ scripts/preflight.sh --install           # the toolchains and tools the gate nee
 cargo build --workspace --all-features
 cargo test --workspace --all-features            # everything, debug build
 cargo test -p giong-http --all-features          # its HTTPS and client tests need the features
-cargo check -p giong --target x86_64-pc-windows-msvc   # Windows, runtime crate only (rustup target add it first)
+cargo check --workspace --all-features --target x86_64-pc-windows-msvc   # Windows (rustup target add it first)
 
 cargo fmt --all --check
 cargo clippy --workspace --all-targets --all-features -- -D warnings
@@ -181,8 +181,8 @@ in `docs/kani.md`; a change to the slab, the buffer pool, `KernelBox` or the io_
 operation lifecycle keeps them passing), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
 profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`), HTTP/3 and QUIC with h3spec
 (`h3spec`) and the database crates against other server versions (`servers`) on every pull
-request, every crate's tests on macOS 15 and 26 (`macos.yml`) and the runtime's on Windows
-Server 2022 and 2025 (`windows-runtime.yml`), and fuzzes the parsers
+request, every crate's tests on macOS 15 and 26 (`macos.yml`) and on Windows Server 2022
+and 2025 (`windows-runtime.yml`), and fuzzes the parsers
 (`giong`, `giong-http`, `giong-tls`, `giong-postgres`, `giong-mysql`, `giong-redis`,
 `giong-web`, `giong-mcp`, each in its `fuzz/`) and runs the soak test every night, on the
 runner's kernel and on Linux 6.18 in QEMU; the 6.12 and 6.18 `kernels` jobs soak for a

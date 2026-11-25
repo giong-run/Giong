@@ -1080,6 +1080,13 @@ impl Driver {
         each!(self, d => d.finish_multi(key))
     }
 
+    /// Ends the receives that wait on stream `fd`, whose reading side was
+    /// shut (see `Iocp::end_reads`).
+    #[cfg(windows)]
+    pub(crate) fn end_reads(&mut self, fd: RawSock) {
+        each!(self, d => d.end_reads(fd))
+    }
+
     /// Takes a connection an accept has completed with and nobody has
     /// collected yet (see `Iocp::take_accepted`).
     #[cfg(windows)]
@@ -1104,7 +1111,7 @@ impl Driver {
             return None;
         }
         // SAFETY: the caller's header points at live buffers.
-        send_now(|| unsafe { libc::sendmsg(fd, msg, libc::MSG_NOSIGNAL | libc::MSG_DONTWAIT) })
+        send_now(|| unsafe { crate::sys::sendmsg_nowait(fd, msg) })
     }
 
     /// A future that waited on multishot operation `key` with `waker` was

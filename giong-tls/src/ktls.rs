@@ -25,7 +25,6 @@ use std::fmt;
 use std::future::Future;
 use std::io;
 use std::mem;
-use std::os::fd::{AsRawFd, RawFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -46,6 +45,7 @@ use rustls::{
     ServerConfig, SupportedCipherSuite,
 };
 
+use crate::sys::{AsRawFd, RawFd};
 use crate::{coded, tls_error, Engine, TlsStream};
 
 /// The error the kernel's TLS returns while it waits for new keys after a
@@ -53,7 +53,7 @@ use crate::{coded, tls_error, Engine, TlsStream};
 /// and the value is never seen, so it is one no system call returns.
 #[cfg(target_os = "linux")]
 const EKEYEXPIRED: i32 = libc::EKEYEXPIRED;
-#[cfg(target_os = "macos")]
+#[cfg(not(target_os = "linux"))]
 const EKEYEXPIRED: i32 = -1;
 
 /// Whether TLS connections hand their records to the kernel after the
@@ -99,11 +99,14 @@ pub enum Ktls {
 // ------------------------------------------------------------ kernel ABI
 
 // From <linux/tcp.h> and <linux/tls.h>; stable kernel ABI.
+#[cfg(unix)]
 const TCP_ULP: libc::c_int = 31;
 const SOL_TLS: libc::c_int = 282;
 const TLS_TX: libc::c_int = 1;
 const TLS_RX: libc::c_int = 2;
+#[cfg(unix)]
 const TLS_SET_RECORD_TYPE: libc::c_int = 1;
+#[cfg(unix)]
 const TLS_GET_RECORD_TYPE: libc::c_int = 2;
 /// Linux 6.0+: the peer does not pad TLS 1.3 records, so the kernel may
 /// decrypt straight into the receiver's buffer (`TLS_RX_EXPECT_NO_PAD`).
@@ -350,6 +353,7 @@ impl CryptoInfo {
     }
 
     /// A zero key for `cipher`, for the probe.
+    #[cfg(unix)]
     fn dummy(version: Version, cipher: Cipher, key_byte: u8) -> Self {
         let header = |cipher_type| InfoHeader {
             version: version.wire(),
@@ -392,6 +396,7 @@ impl CryptoInfo {
     }
 
     /// The record sequence number in the struct.
+    #[cfg(unix)]
     fn rec_seq(&mut self) -> u64 {
         let seq = match self {
             CryptoInfo::Aes128(i) => i.rec_seq,
@@ -450,6 +455,7 @@ fn tls12_gcm_explicit_iv(iv: [u8; 8], used: u64) -> [u8; 8] {
     start.wrapping_add(block).to_be_bytes()
 }
 
+#[cfg(unix)]
 fn setsockopt(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &[u8]) -> io::Result<()> {
     // SAFETY: `value` is valid for reads of its length for the whole call.
     let res = unsafe {
@@ -470,12 +476,14 @@ fn setsockopt(fd: RawFd, level: libc::c_int, name: libc::c_int, value: &[u8]) ->
 
 /// Attaches the kernel's `tls` upper-layer protocol to a connected TCP
 /// socket. Until keys are installed it behaves like plain TCP.
+#[cfg(unix)]
 fn attach_ulp(fd: RawFd) -> io::Result<()> {
     setsockopt(fd, libc::IPPROTO_TCP, TCP_ULP, b"tls")
 }
 
 /// The key material the kernel holds for one direction, with the sequence
 /// number of the next record.
+#[cfg(unix)]
 fn installed(fd: RawFd, cipher: Cipher, version: Version, sending: bool) -> io::Result<CryptoInfo> {
     let mut info = CryptoInfo::dummy(version, cipher, 0);
     let name = if sending { TLS_TX } else { TLS_RX };
@@ -492,6 +500,7 @@ fn installed(fd: RawFd, cipher: Cipher, version: Version, sending: bool) -> io::
 }
 
 /// The sequence number of the next record the kernel will send.
+#[cfg(unix)]
 fn sent_records(fd: RawFd, cipher: Cipher, version: Version) -> io::Result<u64> {
     Ok(installed(fd, cipher, version, true)?.rec_seq())
 }
@@ -507,11 +516,13 @@ fn sent_records(fd: RawFd, cipher: Cipher, version: Version) -> io::Result<u64> 
 /// keys as soon as a real `KeyUpdate` is complete; so when the kernel still
 /// waits, the keys have not changed, and it gets back the ones it has, at the
 /// sequence number it has reached.
+#[cfg(unix)]
 fn resume_receiving(fd: RawFd, cipher: Cipher, version: Version) -> io::Result<()> {
     installed(fd, cipher, version, false)?.install(fd, false)
 }
 
 /// A control message that sets the type of the record `sendmsg` sends.
+#[cfg(unix)]
 fn record_type_cmsg(record_type: u8) -> Vec<u8> {
     // SAFETY: CMSG_SPACE and CMSG_LEN only compute sizes.
     let (space, len) = unsafe { (libc::CMSG_SPACE(1) as usize, libc::CMSG_LEN(1) as usize) };
@@ -538,6 +549,7 @@ fn record_type_cmsg(record_type: u8) -> Vec<u8> {
 /// Sends one whole record of the given type through the kernel without
 /// waiting: `Ok(true)` if the socket took it, `Ok(false)` if it has no room
 /// now (nothing was sent).
+#[cfg(unix)]
 fn send_record_now(fd: RawFd, record_type: u8, data: &[u8]) -> io::Result<bool> {
     let mut control = record_type_cmsg(record_type);
     let mut iov = libc::iovec {
@@ -554,7 +566,7 @@ fn send_record_now(fd: RawFd, record_type: u8, data: &[u8]) -> io::Result<bool> 
         // SAFETY: `msg` points at `iov`, `data` and `control`, which live
         // until the call returns, with their true lengths; the kernel only
         // reads `data`.
-        let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | crate::NO_SIGNAL) };
+        let n = unsafe { libc::sendmsg(fd, &msg, libc::MSG_DONTWAIT | crate::sys::NO_SIGNAL) };
         if n >= 0 {
             return if n as usize == data.len() {
                 Ok(true)
@@ -583,6 +595,7 @@ fn send_record_now(fd: RawFd, record_type: u8, data: &[u8]) -> io::Result<bool> 
 /// a multishot receive ends with the error that brought us here, and only
 /// one task receives on a `TlsStream`. Returns `WouldBlock` if there is no
 /// such record after all, in which case the `EIO` was something else.
+#[cfg(unix)]
 fn recv_record(fd: RawFd) -> io::Result<(u8, Vec<u8>)> {
     let mut data = vec![0u8; MAX_PLAINTEXT + 256];
     let mut control = [0u64; 8];
@@ -625,6 +638,49 @@ fn recv_record(fd: RawFd) -> io::Result<(u8, Vec<u8>)> {
     }
     data.truncate(n);
     Ok((record_type, data))
+}
+
+/// Windows has no kernel TLS: [`probe`] says so, no plan tries it, and
+/// these calls, which only a connection handed to the kernel makes, fail.
+#[cfg(windows)]
+fn no_ktls() -> io::Error {
+    io::Error::new(io::ErrorKind::Unsupported, "Windows has no kernel TLS")
+}
+
+#[cfg(windows)]
+fn setsockopt(_: RawFd, _: libc::c_int, _: libc::c_int, _: &[u8]) -> io::Result<()> {
+    Err(no_ktls())
+}
+
+#[cfg(windows)]
+fn attach_ulp(_: RawFd) -> io::Result<()> {
+    Err(no_ktls())
+}
+
+#[cfg(windows)]
+fn sent_records(_: RawFd, _: Cipher, _: Version) -> io::Result<u64> {
+    Err(no_ktls())
+}
+
+#[cfg(windows)]
+fn resume_receiving(_: RawFd, _: Cipher, _: Version) -> io::Result<()> {
+    Err(no_ktls())
+}
+
+/// Never sent: no connection reaches the kernel on Windows.
+#[cfg(windows)]
+fn record_type_cmsg(_: u8) -> Vec<u8> {
+    Vec::new()
+}
+
+#[cfg(windows)]
+fn send_record_now(_: RawFd, _: u8, _: &[u8]) -> io::Result<bool> {
+    Err(no_ktls())
+}
+
+#[cfg(windows)]
+fn recv_record(_: RawFd) -> io::Result<(u8, Vec<u8>)> {
+    Err(no_ktls())
 }
 
 fn unexpected(what: &str) -> io::Error {
@@ -747,6 +803,17 @@ pub fn ktls_support() -> &'static KtlsSupport {
     SUPPORT.get_or_init(probe)
 }
 
+/// Windows has no kernel TLS.
+#[cfg(windows)]
+fn probe() -> KtlsSupport {
+    KtlsSupport {
+        unavailable: Some("Windows has no kernel TLS".to_string()),
+        ciphers: [[false; 3]; 2],
+        key_update: false,
+    }
+}
+
+#[cfg(unix)]
 fn probe() -> KtlsSupport {
     let mut support = KtlsSupport {
         unavailable: None,
@@ -821,6 +888,7 @@ fn probe() -> KtlsSupport {
 }
 
 /// The release of the running kernel (`uname -r`).
+#[cfg(unix)]
 fn kernel_release() -> Option<String> {
     // SAFETY: all-zero is a valid `utsname`; `uname` fills it.
     let mut name: libc::utsname = unsafe { mem::zeroed() };
@@ -834,6 +902,7 @@ fn kernel_release() -> Option<String> {
 }
 
 /// `(major, minor)` of a kernel release such as `6.0.19-060019-generic`.
+#[cfg(unix)]
 fn major_minor(release: &str) -> Option<(u32, u32)> {
     let mut parts = release.split(|c: char| !c.is_ascii_digit());
     Some((parts.next()?.parse().ok()?, parts.next()?.parse().ok()?))
@@ -841,6 +910,7 @@ fn major_minor(release: &str) -> Option<(u32, u32)> {
 
 /// Why kernel TLS must not be used on this kernel, if it is one whose
 /// kernel TLS giong-tls knows to be broken.
+#[cfg(unix)]
 fn kernel_known_bad() -> Option<String> {
     let release = kernel_release()?;
     match major_minor(&release)? {
@@ -2401,6 +2471,7 @@ fn confidentiality_limit(suite: &SupportedCipherSuite) -> u64 {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn kernel_releases_are_read_and_6_0_is_refused() {
         assert_eq!(major_minor("6.0.19-060019-generic"), Some((6, 0)));
@@ -2575,6 +2646,7 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[test]
     fn the_record_type_control_message_is_well_formed() {
         let c = record_type_cmsg(ALERT);

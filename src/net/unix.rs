@@ -1,15 +1,29 @@
 //! Unix domain sockets: streams, datagrams, and passing descriptors
 //! between processes over either.
+//!
+//! On Windows (10 version 1803 and later, Server 2019 and later) the
+//! streams are Winsock's `AF_UNIX` stream sockets: a path names the socket
+//! as on Unix, and the server's file is left behind when the listener
+//! closes, as on Unix. Windows has no abstract names, no datagram sockets,
+//! no passing of handles or credentials over them and no `socketpair`:
+//! [`UnixStream::pair`] connects two sockets through a listener of its own
+//! instead.
 
 use std::cell::Cell;
 use std::io;
+#[cfg(unix)]
 use std::mem::ManuallyDrop;
 use std::net::Shutdown;
+#[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
-use std::os::unix::net::{SocketAddr, UnixStream as StdStream};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::SocketAddr;
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as StdStream;
 use std::path::Path;
 use std::task::{Context, Poll};
 
+#[cfg(unix)]
 use socket2::{Domain, SockAddr, Socket, Type};
 
 use super::{ListenSocket, StreamSocket};
@@ -29,8 +43,18 @@ use {
     std::os::fd::OwnedFd,
 };
 
+/// The address of a Unix domain socket, as [`UnixListener::local_addr`],
+/// [`UnixStream::local_addr`] and [`UnixStream::peer_addr`] return it: the
+/// standard library's [`std::os::unix::net::SocketAddr`] on Unix.
+#[cfg(unix)]
+pub type UnixSocketAddr = std::os::unix::net::SocketAddr;
+
+#[cfg(windows)]
+pub use super::unix_windows::UnixSocketAddr;
+
 /// Lets the standard library read an address of `sock`: it knows how to
 /// represent all three kinds (path, abstract, unnamed).
+#[cfg(unix)]
 fn with_std<T>(sock: &Socket, f: impl FnOnce(&StdStream) -> io::Result<T>) -> io::Result<T> {
     // SAFETY: the descriptor is open for the duration of the call, and
     // `ManuallyDrop` keeps the borrowed wrapper from closing it.
@@ -38,9 +62,37 @@ fn with_std<T>(sock: &Socket, f: impl FnOnce(&StdStream) -> io::Result<T>) -> io
     f(&std)
 }
 
+#[cfg(unix)]
+fn local_addr(sock: &Socket) -> io::Result<UnixSocketAddr> {
+    with_std(sock, StdStream::local_addr)
+}
+
+#[cfg(unix)]
+fn peer_addr(sock: &Socket) -> io::Result<UnixSocketAddr> {
+    with_std(sock, StdStream::peer_addr)
+}
+
+#[cfg(unix)]
 fn new_socket() -> io::Result<Socket> {
     Socket::new(Domain::UNIX, Type::STREAM, None)
 }
+
+/// The address of the socket file `path`.
+#[cfg(unix)]
+fn socket_addr(path: &Path) -> io::Result<SockAddr> {
+    SockAddr::unix(path)
+}
+
+/// Binds a new socket to `path`.
+#[cfg(unix)]
+fn bind_socket(path: &Path) -> io::Result<Socket> {
+    let sock = new_socket()?;
+    sock.bind(&socket_addr(path)?)?;
+    Ok(sock)
+}
+
+#[cfg(windows)]
+use super::unix_windows::{bind_socket, local_addr, new_socket, peer_addr, socket_addr};
 
 /// A Unix domain socket listening for connections.
 ///
@@ -53,9 +105,13 @@ pub struct UnixListener {
 
 impl UnixListener {
     /// Creates the socket file `path` and listens on it.
+    ///
+    /// On Windows, a file already at `path` fails with
+    /// [`Code::UnixSocketInUse`](crate::error::Code::UnixSocketInUse) and a
+    /// path of 108 bytes or more (in UTF-8) with
+    /// [`Code::UnixPathTooLong`](crate::error::Code::UnixPathTooLong).
     pub fn bind<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let sock = new_socket()?;
-        sock.bind(&SockAddr::unix(path)?)?;
+        let sock = bind_socket(path.as_ref())?;
         sock.listen(4096)?;
         Ok(Self {
             inner: ListenSocket::new(sock),
@@ -75,7 +131,9 @@ impl UnixListener {
         })
     }
 
-    /// Wraps a listener created by the standard library.
+    /// Wraps a listener created by the standard library. Unix only: the
+    /// standard library has no Unix sockets on Windows.
+    #[cfg(unix)]
     pub fn from_std(listener: std::os::unix::net::UnixListener) -> Self {
         // SAFETY: we take over the descriptor that `listener` owned.
         let sock = unsafe { Socket::from_raw_fd(listener.into_raw_fd()) };
@@ -85,8 +143,8 @@ impl UnixListener {
     }
 
     /// The address this listener is bound to.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        with_std(self.inner.socket(), StdStream::local_addr)
+    pub fn local_addr(&self) -> io::Result<UnixSocketAddr> {
+        local_addr(self.inner.socket())
     }
 
     /// Waits for the next incoming connection.
@@ -98,23 +156,38 @@ impl UnixListener {
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for UnixListener {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
     }
 }
 
+#[cfg(unix)]
 impl AsFd for UnixListener {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.inner.socket().as_fd()
     }
 }
 
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for UnixListener {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(self.inner.socket())
+    }
+}
+
 impl std::fmt::Debug for UnixListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnixListener")
-            .field("fd", &self.as_raw_fd())
-            .finish()
+        let mut d = f.debug_struct("UnixListener");
+        #[cfg(unix)]
+        d.field("fd", &self.as_raw_fd());
+        #[cfg(windows)]
+        d.field(
+            "socket",
+            &std::os::windows::io::AsRawSocket::as_raw_socket(self),
+        );
+        d.finish()
     }
 }
 
@@ -144,8 +217,11 @@ impl UnixStream {
     ///
     /// Cancel safe: if the future is dropped, the socket is closed and no
     /// connection is left behind.
+    ///
+    /// On Windows, a path of 108 bytes or more (in UTF-8) fails with
+    /// [`Code::UnixPathTooLong`](crate::error::Code::UnixPathTooLong).
     pub async fn connect<P: AsRef<Path>>(path: P) -> io::Result<Self> {
-        let addr = SockAddr::unix(path)?;
+        let addr = socket_addr(path.as_ref())?;
         let inner = StreamSocket::connect_new(new_socket, addr).await?;
         Ok(Self::wrap(inner))
     }
@@ -162,15 +238,26 @@ impl UnixStream {
     }
 
     /// Creates two connected sockets.
+    ///
+    /// Windows has no `socketpair`: there the pair is made by connecting
+    /// to a listener bound to a fresh path in the temporary directory,
+    /// whose file is removed before this returns. Both sockets behave as
+    /// a pair made on Unix, but their addresses are named after that path
+    /// instead of unnamed.
     pub fn pair() -> io::Result<(Self, Self)> {
+        #[cfg(unix)]
         let (a, b) = Socket::pair(Domain::UNIX, Type::STREAM, None)?;
+        #[cfg(windows)]
+        let (a, b) = super::unix_windows::pair()?;
         Ok((
             Self::wrap(StreamSocket::new(a)),
             Self::wrap(StreamSocket::new(b)),
         ))
     }
 
-    /// Wraps a connected stream created by the standard library.
+    /// Wraps a connected stream created by the standard library. Unix only:
+    /// the standard library has no Unix sockets on Windows.
+    #[cfg(unix)]
     pub fn from_std(stream: std::os::unix::net::UnixStream) -> Self {
         // SAFETY: we take over the descriptor that `stream` owned.
         let sock = unsafe { Socket::from_raw_fd(stream.into_raw_fd()) };
@@ -334,39 +421,56 @@ impl UnixStream {
         self.inner.write_all_vectored(bufs).await
     }
 
-    /// Shuts down the read half, the write half, or both.
+    /// Shuts down the read half, the write half, or both. Shutting down the
+    /// read half ends a [`recv`](Self::recv) that waits: it returns the end
+    /// of the stream.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        self.inner.socket().shutdown(how)
+        self.inner.shutdown(how)
     }
 
     /// The address of the peer (unnamed for most clients).
-    pub fn peer_addr(&self) -> io::Result<SocketAddr> {
-        with_std(self.inner.socket(), StdStream::peer_addr)
+    pub fn peer_addr(&self) -> io::Result<UnixSocketAddr> {
+        peer_addr(self.inner.socket())
     }
 
     /// The local address of this connection.
-    pub fn local_addr(&self) -> io::Result<SocketAddr> {
-        with_std(self.inner.socket(), StdStream::local_addr)
+    pub fn local_addr(&self) -> io::Result<UnixSocketAddr> {
+        local_addr(self.inner.socket())
     }
 }
 
+#[cfg(unix)]
 impl AsRawFd for UnixStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
     }
 }
 
+#[cfg(unix)]
 impl AsFd for UnixStream {
     fn as_fd(&self) -> BorrowedFd<'_> {
         self.inner.socket().as_fd()
     }
 }
 
+#[cfg(windows)]
+impl std::os::windows::io::AsRawSocket for UnixStream {
+    fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        std::os::windows::io::AsRawSocket::as_raw_socket(self.inner.socket())
+    }
+}
+
 impl std::fmt::Debug for UnixStream {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("UnixStream")
-            .field("fd", &self.as_raw_fd())
-            .finish()
+        let mut d = f.debug_struct("UnixStream");
+        #[cfg(unix)]
+        d.field("fd", &self.as_raw_fd());
+        #[cfg(windows)]
+        d.field(
+            "socket",
+            &std::os::windows::io::AsRawSocket::as_raw_socket(self),
+        );
+        d.finish()
     }
 }
 

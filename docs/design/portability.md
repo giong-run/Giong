@@ -194,8 +194,26 @@ What the boundary still assumes, and what was agreed with the IOCP work
    multishot receive becomes a zero-byte `WSARecv` (no pool buffer held by
    an idle connection) followed by a receive into a pool buffer, the same
    "try on poll" the readiness driver does.
-6. Unix sockets, file modes and `DirEntry::ino` are left out of a Windows
-   build, as the 1.0 API freeze decided.
+6. File modes and `DirEntry::ino` are left out of a Windows build, as the
+   1.0 API freeze decided. Unix sockets came to Windows in 1.5: Winsock's
+   `AF_UNIX` (Windows 10 version 1803 and later), stream sockets only.
+   `AcceptEx` takes them as they are; `ConnectEx` once the socket is bound to
+   the unnamed address (the family alone, which leaves no file). The address
+   type is `net::UnixSocketAddr` (the standard library's on Unix, one with the
+   same `as_pathname` and `is_unnamed` on Windows); `UnixStream::pair`
+   connects through a listener on a fresh path in the temporary directory,
+   since Windows has no `socketpair`; a file already at a path is
+   `GIONG-E0060`, never removed, and a path over 107 bytes `GIONG-E0061`.
+7. The UDP offloads (`unstable-udp-offload`) are Winsock's control messages,
+   through `WSASendMsg` and `WSARecvMsg`: `UDP_SEND_MSG_SIZE` for GSO,
+   `UDP_RECV_MAX_COALESCED_SIZE` and `UDP_COALESCED_INFO` for GRO (URO),
+   `IP_ECN`/`IPV6_ECN` and `IP_RECVECN`/`IPV6_RECVECN` for ECN, `IP_PKTINFO`
+   and `IPV6_PKTINFO` for the local address. Which of them a Windows has is
+   asked at run time (`gso_supported`; ECN once per process), and a missing
+   one falls back as a missing GSO does on macOS. A multishot receive with
+   control messages keeps the `WSAMSG` it gave the kernel in the boxed state
+   of the operation until the completion, and the datagrams a shared port's
+   thread hands out carry their control messages in the same room.
 
 ## 4. macOS: what passes, and the real semantic gaps
 

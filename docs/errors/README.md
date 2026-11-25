@@ -57,6 +57,14 @@ when it is no longer raised.
 |---|---|---|
 | [GIONG-E0028](E0028.md) | `NetworkBuffersExhausted` | the system ran out of network buffers |
 
+## Windows
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E0060](E0060.md) | `UnixSocketInUse` | a file is already at the Unix socket path |
+| [GIONG-E0061](E0061.md) | `UnixPathTooLong` | Unix socket path too long |
+| [GIONG-E0062](E0062.md) | `UnixSocketsUnavailable` | no Unix domain sockets on this Windows |
+
 ## Messages between processes (`giong::ipc`)
 
 | Code | `Code::` | Meaning |
@@ -93,6 +101,7 @@ when it is no longer raised.
 | [GIONG-E0201](E0201.md) | `FileTooShort` | the file ended before the bytes to send |
 | [GIONG-E0202](E0202.md) | `OffsetOutOfRange` | file offset out of range |
 | [GIONG-E0203](E0203.md) | `InvalidOpenOptions` | invalid combination of open options |
+| [GIONG-E0204](E0204.md) | `FileTooLarge` | file too large to read into memory |
 
 ## giong-http
 

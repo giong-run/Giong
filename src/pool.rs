@@ -15,7 +15,7 @@
 //! more than about one of its jobs per thread. Other pools are plain FIFOs.
 
 use std::collections::{BTreeSet, HashMap, VecDeque};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -50,6 +50,15 @@ pub(crate) const NO_CLASS: u64 = 0;
 /// Virtual time is thread time in nanoseconds times this, over the weight.
 const WEIGHT_SCALE: u64 = 1024;
 
+/// Classes remembered before the first sweep of the idle ones (see
+/// [`Queue::sweep`]).
+const SWEEP_MIN: usize = 64;
+
+/// What a class belongs to (its budget): once nothing holds it, no job of
+/// the class can come again. `None` for [`NO_CLASS`], which lives as long
+/// as the pool.
+pub(crate) type Owner = Option<Weak<dyn Send + Sync>>;
+
 struct Class {
     jobs: VecDeque<Job>,
     /// Thread time this class has used, scaled by [`WEIGHT_SCALE`] over its
@@ -58,6 +67,7 @@ struct Class {
     weight: u64,
     /// Jobs of the class running now.
     running: usize,
+    owner: Owner,
 }
 
 /// The queue of a pool: one FIFO, or one per class served fairly.
@@ -72,14 +82,20 @@ struct Queue {
     /// queued starts from here, so time it spent idle is no credit.
     floor: u64,
     len: usize,
+    /// Remembered classes at which the next sweep runs.
+    sweep_at: usize,
 }
 
 impl Queue {
-    fn push(&mut self, fair: bool, class: u64, weight: u32, job: Job) {
+    fn push(&mut self, fair: bool, class: u64, weight: u32, owner: Owner, job: Job) {
         self.len += 1;
         if !fair {
             self.fifo.push_back(job);
             return;
+        }
+        if self.classes.len() >= self.sweep_at.max(SWEEP_MIN) && !self.classes.contains_key(&class)
+        {
+            self.sweep();
         }
         let floor = self.floor;
         let c = self.classes.entry(class).or_insert_with(|| Class {
@@ -87,6 +103,7 @@ impl Queue {
             vtime: floor,
             weight: 1,
             running: 0,
+            owner,
         });
         c.weight = u64::from(weight.max(1));
         if c.jobs.is_empty() {
@@ -134,6 +151,24 @@ impl Queue {
             // Nothing to remember: it would start from the floor anyway.
             self.classes.remove(&class);
         }
+    }
+
+    /// Forgets the idle classes that no longer matter: those whose virtual
+    /// time the floor has passed (they would start from the floor anyway),
+    /// and those whose budget is gone, so no job of theirs can come again.
+    /// An idle class is otherwise remembered after its last job (so that
+    /// going idle for a moment is no credit), and a server that makes a
+    /// budget per tenant and drops it later would leave one entry per budget
+    /// for ever. Runs when the classes have doubled since the last sweep, so
+    /// it costs O(1) per new class.
+    fn sweep(&mut self) {
+        let floor = self.floor;
+        self.classes.retain(|_, c| {
+            !c.jobs.is_empty()
+                || c.running > 0
+                || (c.vtime > floor && c.owner.as_ref().map_or(true, |o| o.strong_count() > 0))
+        });
+        self.sweep_at = self.classes.len() * 2;
     }
 
     fn take_all(&mut self) -> VecDeque<Job> {
@@ -204,8 +239,14 @@ impl Pool {
 
     /// Queues `job` in `class` with `weight` (a fair pool's share). Gives it
     /// back if the pool was stopped.
-    pub(crate) fn spawn_in(self: &Arc<Self>, class: u64, weight: u32, job: Job) -> Result<(), Job> {
-        self.queue(class, weight, job, |_| true)
+    pub(crate) fn spawn_in(
+        self: &Arc<Self>,
+        class: u64,
+        weight: u32,
+        owner: Owner,
+        job: Job,
+    ) -> Result<(), Job> {
+        self.queue(class, weight, owner, job, |_| true)
     }
 
     /// Queues `job` if `admit(jobs already waiting)` agrees, under the same
@@ -216,13 +257,14 @@ impl Pool {
         job: Job,
         admit: impl FnOnce(usize) -> bool,
     ) -> Result<(), Job> {
-        self.queue(NO_CLASS, 1, job, admit)
+        self.queue(NO_CLASS, 1, None, job, admit)
     }
 
     fn queue(
         self: &Arc<Self>,
         class: u64,
         weight: u32,
+        owner: Owner,
         job: Job,
         admit: impl FnOnce(usize) -> bool,
     ) -> Result<(), Job> {
@@ -230,7 +272,7 @@ impl Pool {
         if state.stopped || !admit(state.jobs.len) {
             return Err(job);
         }
-        state.jobs.push(self.cfg.fair, class, weight, job);
+        state.jobs.push(self.cfg.fair, class, weight, owner, job);
         // Each queued job needs a thread of its own. An idle thread is
         // counted as idle until it runs again, so jobs queued before it wakes
         // up must not all count on it: one that blocks would hold up the
@@ -322,5 +364,77 @@ impl Pool {
             completed: state.completed,
             max_threads: self.cfg.max_threads,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn run_one(q: &mut Queue, class: u64, owner: Owner) {
+        q.push(true, class, 1, owner, Box::new(|| {}));
+        let (c, job) = q.pop(true).expect("just queued");
+        job();
+        q.charge(c, Duration::from_millis(1));
+    }
+
+    /// A server that makes a budget per tenant, runs a closure or two in it
+    /// and drops it leaves nothing behind in the compute lane; budgets that
+    /// live on keep their place.
+    #[test]
+    fn the_classes_of_dropped_budgets_are_forgotten() {
+        let mut q = Queue::default();
+        let mut live = Vec::new();
+        for class in 1..=10_000u64 {
+            let budget: Arc<dyn Send + Sync> = Arc::new(class);
+            run_one(&mut q, class, Some(Arc::downgrade(&budget)));
+            if class % 100 == 0 {
+                live.push((class, budget));
+            }
+        }
+        // Before the fix: all 10 000, for ever.
+        assert!(
+            q.classes.len() <= 2 * SWEEP_MIN + live.len(),
+            "{}",
+            q.classes.len()
+        );
+        for (class, _) in &live {
+            let c = &q.classes[class];
+            assert!(c.vtime > q.floor, "a live idle class keeps what it used");
+        }
+        // Work outside any budget is remembered as long as the pool lives.
+        run_one(&mut q, NO_CLASS, None);
+        for class in 10_001..=20_000u64 {
+            let budget: Arc<dyn Send + Sync> = Arc::new(class);
+            run_one(&mut q, class, Some(Arc::downgrade(&budget)));
+        }
+        assert!(q.classes.contains_key(&NO_CLASS));
+        assert!(
+            q.classes.len() <= 2 * SWEEP_MIN + live.len() + 1,
+            "{}",
+            q.classes.len()
+        );
+    }
+
+    /// A class whose budget is dropped while one of its jobs runs is not
+    /// forgotten until that job is charged.
+    #[test]
+    fn a_class_with_a_job_running_is_kept() {
+        let mut q = Queue::default();
+        let budget: Arc<dyn Send + Sync> = Arc::new(0u8);
+        q.push(true, 1, 1, Some(Arc::downgrade(&budget)), Box::new(|| {}));
+        let (c, job) = q.pop(true).expect("queued");
+        drop(budget);
+        for class in 2..=(4 * SWEEP_MIN as u64) {
+            run_one(&mut q, class, None);
+        }
+        assert!(q.classes.contains_key(&1));
+        job();
+        q.charge(c, Duration::from_millis(1));
+        for class in (4 * SWEEP_MIN as u64 + 1)..=(40 * SWEEP_MIN as u64) {
+            let b: Arc<dyn Send + Sync> = Arc::new(class);
+            run_one(&mut q, class, Some(Arc::downgrade(&b)));
+        }
+        assert!(!q.classes.contains_key(&1));
     }
 }

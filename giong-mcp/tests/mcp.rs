@@ -3,6 +3,7 @@
 
 use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::rc::{Rc, Weak};
 use std::sync::mpsc;
@@ -13,6 +14,45 @@ use giong::error::Code;
 use giong::observe::{self, Source};
 use giong_mcp::Config;
 use serde_json::{json, Value};
+
+/// A listener on the Unix socket `path` made outside giong-mcp, as another
+/// process would make it. Windows' standard library has no Unix sockets.
+#[cfg(unix)]
+fn other_unix_listener(path: &std::path::Path) -> std::os::unix::net::UnixListener {
+    std::os::unix::net::UnixListener::bind(path).unwrap()
+}
+
+#[cfg(windows)]
+fn other_unix_listener(path: &std::path::Path) -> socket2::Socket {
+    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    sock.bind(&socket2::SockAddr::unix(path).unwrap()).unwrap();
+    sock.listen(8).unwrap();
+    sock
+}
+
+/// A blocking connection to the Unix socket `path`.
+#[cfg(unix)]
+fn unix_connect(path: &std::path::Path) -> std::os::unix::net::UnixStream {
+    std::os::unix::net::UnixStream::connect(path).unwrap()
+}
+
+#[cfg(windows)]
+fn unix_connect(path: &std::path::Path) -> socket2::Socket {
+    let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).unwrap();
+    sock.connect(&socket2::SockAddr::unix(path).unwrap())
+        .unwrap();
+    sock
+}
+
+/// A server on the Unix socket `path` without a token: allowed on Unix,
+/// where the file's mode keeps other users out; on Windows only when the
+/// code says so, as on TCP.
+fn unix_config(path: impl Into<std::path::PathBuf>) -> Config {
+    let config = Config::unix(path);
+    #[cfg(windows)]
+    let config = config.allow_unauthenticated();
+    config
+}
 
 /// One HTTP/1.1 request; returns the status and the body.
 fn http(addr: SocketAddr, method: &str, headers: &[(&str, &str)], body: &str) -> (u16, String) {
@@ -324,10 +364,7 @@ fn overview_workers_tasks_and_sources() {
         assert_eq!(t["total_tasks"], 7, "{t}");
         let row = &t["by_location"][0];
         let loc = row["location"].as_str().unwrap();
-        assert!(
-            loc.contains("tests/mcp.rs") && loc.contains(&format!(":{line}:")),
-            "{loc}"
-        );
+        assert!(loc.contains(&format!("{}:{line}:", file!())), "{loc}");
         assert_eq!(row["tasks"], 7);
         assert_eq!(row["per_worker"], json!([4, 3]));
         let t1 = tool(addr, "tasks", json!({ "worker": 1, "limit": 1 }));
@@ -370,7 +407,7 @@ fn a_blocked_worker_is_reported_with_its_task() {
                 "{warning}"
             );
             assert!(
-                warning.contains(&format!("tests/mcp.rs:{line}:")),
+                warning.contains(&format!("{}:{line}:", file!())),
                 "{warning}"
             );
             let b = &o["workers"][1]["blocked"];
@@ -389,7 +426,7 @@ fn a_blocked_worker_is_reported_with_its_task() {
             assert!(w["workers"][1]["blocked"]["in_task"]
                 .as_str()
                 .unwrap()
-                .contains("tests/mcp.rs"));
+                .contains(file!()));
             assert!(w["workers"][0]["snapshot_error"].is_null(), "{w}");
 
             giong::block_on(async { blocker.await.unwrap() });
@@ -429,7 +466,7 @@ fn profile_finds_the_busy_task() {
             top["location"]
                 .as_str()
                 .unwrap()
-                .contains(&format!("tests/mcp.rs:{line}:")),
+                .contains(&format!("{}:{line}:", file!())),
             "{p}"
         );
         assert!(top["share_of_all_workers"].as_f64().unwrap() > 0.2, "{p}");
@@ -588,17 +625,20 @@ fn it_listens_on_loopback_or_a_unix_socket_only() {
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("mcp.sock");
     // A stale socket file, as a killed process leaves behind.
-    drop(std::os::unix::net::UnixListener::bind(&path).unwrap());
-    let server = Config::unix(&path).start(&handle).unwrap();
+    drop(other_unix_listener(&path));
+    let server = unix_config(&path).start(&handle).unwrap();
     assert_eq!(server.local_addr(), None);
     assert_eq!(server.unix_path(), Some(path.as_path()));
     assert_eq!(server.url(), None);
     // Only the service's user can connect, whatever the umask.
-    let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
-    assert_eq!(mode, 0o600, "{mode:o}");
+    #[cfg(unix)]
+    {
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "{mode:o}");
+    }
     // No temporary name is left behind.
     assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
-    let mut s = std::os::unix::net::UnixStream::connect(&path).unwrap();
+    let mut s = unix_connect(&path);
     let body = r#"{"jsonrpc":"2.0","id":7,"method":"ping"}"#;
     write!(
         s,
@@ -708,6 +748,22 @@ fn many_clients_at_once_do_not_grow_the_process() {
                 .unwrap();
             kb * 1024
         };
+        // The working set, Windows' resident memory.
+        #[cfg(windows)]
+        let rss = || {
+            use windows_sys::Win32::System::ProcessStatus::{
+                K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+            };
+            use windows_sys::Win32::System::Threading::GetCurrentProcess;
+            // SAFETY: all-zero is a valid value of this plain structure.
+            let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+            let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+            // SAFETY: the pseudo handle of this process, and a structure of
+            // the size given.
+            let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+            assert!(ok != 0, "GetProcessMemoryInfo failed");
+            counters.WorkingSetSize as u64
+        };
         let before = rss();
         let clients: Vec<_> = (0..24)
             .map(|_| thread::spawn(move || http(addr, "POST", &[JSON], &workers_batch(800))))
@@ -781,7 +837,18 @@ fn tcp_needs_a_proper_token() {
     // A Unix socket needs none: its file mode keeps other users out.
     let dir = std::env::temp_dir().join(format!("giong-mcp-token-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
+    #[cfg(unix)]
     let unix = Config::unix(dir.join("s")).start(&handle).unwrap();
+    // Except on Windows, where the file cannot be restricted to one user.
+    #[cfg(windows)]
+    let unix = {
+        let err = Config::unix(dir.join("s")).start(&handle).unwrap_err();
+        assert_eq!(giong::error::code(&err), Some(Code::McpNoToken), "{err}");
+        Config::unix(dir.join("s"))
+            .token("0123456789abcdef")
+            .start(&handle)
+            .unwrap()
+    };
     // But an empty one is still a mistake there.
     let err = Config::unix(dir.join("t"))
         .token("")
@@ -815,21 +882,21 @@ fn a_busy_address_is_a_coded_error() {
     let dir = std::env::temp_dir().join(format!("giong-mcp-busy-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let path = dir.join("mcp.sock");
-    let first = Config::unix(&path).start(&handle).unwrap();
-    let err = Config::unix(&path).start(&handle).unwrap_err();
+    let first = unix_config(&path).start(&handle).unwrap();
+    let err = unix_config(&path).start(&handle).unwrap_err();
     assert_eq!(giong::error::code(&err), Some(Code::McpBind), "{err}");
     assert_eq!(err.kind(), std::io::ErrorKind::AddrInUse);
     // Nor is a file that is not a socket.
     let file = dir.join("file");
     std::fs::write(&file, b"keep").unwrap();
-    let err = Config::unix(&file).start(&handle).unwrap_err();
+    let err = unix_config(&file).start(&handle).unwrap_err();
     assert_eq!(giong::error::code(&err), Some(Code::McpBind), "{err}");
     assert_eq!(std::fs::read(&file).unwrap(), b"keep");
 
     // A process that replaced the socket after this one started keeps it
     // when this one stops.
     std::fs::remove_file(&path).unwrap();
-    let successor = std::os::unix::net::UnixListener::bind(&path).unwrap();
+    let successor = other_unix_listener(&path);
     first.stop();
     assert!(path.exists(), "the successor's socket was removed");
     drop(successor);
@@ -918,7 +985,7 @@ fn routes_lists_the_apps_on_every_worker() {
             assert!(routes[0]["added_at"]
                 .as_str()
                 .unwrap()
-                .contains("tests/mcp.rs:"));
+                .contains(&format!("{}:", file!())));
             let admin = apps
                 .iter()
                 .find(|a| a["workers"] == json!([0]))
@@ -1011,11 +1078,22 @@ fn load(
 
 /// A one-worker service answering HTTP/1.1 with `handler` on a loopback
 /// port, and an MCP server, until the closure returns.
+///
+/// One at a time: each caller drives its service with five client threads
+/// that send as fast as they are answered, and the tests of this file run
+/// in parallel. Two of them at once on a three-core macOS runner left the
+/// service's worker unscheduled for up to 177 ms, inside 1 ms sleeps: the
+/// slowest requests were then the ones caught in that gap, and both
+/// slow_requests verdicts were about it instead of the pool or the hold.
 fn with_http_service<H, Fut>(handler: H, f: impl FnOnce(SocketAddr, SocketAddr) + Send + 'static)
 where
     H: Fn(giong_http::Request) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = giong_http::Response> + 'static,
 {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that failed while holding it leaves it poisoned: the next one
+    // still runs.
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let rt = giong::Builder::new().workers(1).build().unwrap();
     let handle = rt.handle();
     let server = open().start(&handle).unwrap();

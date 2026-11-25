@@ -13,9 +13,19 @@ fn thread_name() -> String {
     std::thread::current().name().unwrap_or("").to_owned()
 }
 
+#[cfg(unix)]
 fn nice() -> i32 {
     // SAFETY: plain syscall; `who == 0` is the calling thread on Linux.
     unsafe { libc::getpriority(libc::PRIO_PROCESS, 0) }
+}
+
+/// Windows has no nice values: the calling thread's priority level
+/// (`THREAD_PRIORITY_NORMAL` is 0, `THREAD_PRIORITY_BELOW_NORMAL` -1).
+#[cfg(windows)]
+fn nice() -> i32 {
+    use windows_sys::Win32::System::Threading::{GetCurrentThread, GetThreadPriority};
+    // SAFETY: the pseudo handle of the calling thread is always valid.
+    unsafe { GetThreadPriority(GetCurrentThread()) }
 }
 
 /// The calling thread's quality-of-service class.
@@ -57,6 +67,9 @@ fn a_compute_closure_runs_below_the_workers_priority() {
         assert_eq!(name, "giong-lane-cpu");
         #[cfg(target_os = "linux")]
         assert_eq!(prio, nice() + 10);
+        // Windows: one level below the workers' (`THREAD_PRIORITY_BELOW_NORMAL`).
+        #[cfg(windows)]
+        assert_eq!(prio, nice() - 1);
         // The nice value is the process's on macOS: the compute thread takes
         // a lower QoS class and leaves the workers' priority alone.
         #[cfg(target_os = "macos")]

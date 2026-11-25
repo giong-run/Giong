@@ -130,6 +130,13 @@ impl Default for Config {
     }
 }
 
+/// Whether `host` names a Unix socket rather than a server on the network:
+/// an absolute path, which on Windows may also start with a drive letter
+/// (`C:\run\...`), as Windows' own Unix sockets are named.
+fn is_socket_path(host: &str) -> bool {
+    host.starts_with('/') || (cfg!(windows) && std::path::Path::new(host).is_absolute())
+}
+
 impl Config {
     /// The server and database, without user or password, for diagnostics:
     /// `db.internal:5432/app`.
@@ -170,9 +177,10 @@ impl Config {
 
     /// The server's host: a DNS name, an IP address, or the absolute path of
     /// the directory holding its Unix socket (such as
-    /// `/var/run/postgresql`).
+    /// `/var/run/postgresql`, or on Windows `C:\pgsql\run`: PostgreSQL 13
+    /// and later listen on Unix sockets there too).
     pub fn host(mut self, host: &str) -> Self {
-        self.host = if host.starts_with('/') {
+        self.host = if is_socket_path(host) {
             Host::Unix(PathBuf::from(host))
         } else {
             let host = host
@@ -787,6 +795,16 @@ mod tests {
         assert!(!format!("{c:?}").contains("p:ss@w"));
     }
 
+    /// On Windows a path with a drive letter names a socket directory too.
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_socket_directories() {
+        let c = Config::new().host(r"C:\pgsql\run");
+        assert_eq!(c.host, Host::Unix(r"C:\pgsql\run".into()));
+        let c = Config::new().host("db.internal");
+        assert_eq!(c.host, Host::Tcp("db.internal".into()));
+    }
+
     #[test]
     fn hosts_can_be_ipv6_or_sockets() {
         let c = Config::from_url("postgresql://u@[::1]:5433").unwrap();
@@ -797,7 +815,9 @@ mod tests {
 
         let c = Config::from_url("postgres:///shop?host=/var/run/postgresql&user=u").unwrap();
         assert_eq!(c.host, Host::Unix("/var/run/postgresql".into()));
-        assert_eq!(c.target(), "/var/run/postgresql/.s.PGSQL.5432");
+        // The socket file's path, joined as the system joins paths.
+        let socket = std::path::Path::new("/var/run/postgresql").join(".s.PGSQL.5432");
+        assert_eq!(c.target(), socket.display().to_string());
         let c = Config::from_url("postgres://u@%2Ftmp/shop").unwrap();
         assert_eq!(c.host, Host::Unix("/tmp".into()));
     }

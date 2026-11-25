@@ -583,9 +583,9 @@ pub fn find_target_dirs(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
 /// `project_dir` uses (its rust-toolchain file counts): a one-file crate is
 /// built in a temporary directory and its fingerprint read.
 pub fn current_rustc_hash(project_dir: &Path) -> Result<Option<u64>, Failure> {
-    let probe = std::env::temp_dir().join(format!("giong-clean-probe-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&probe);
-    fs::create_dir_all(probe.join("src")).map_err(probe_failed)?;
+    // A folder no other user can enter: cargo builds what is in it.
+    let probe = crate::tmp::fresh("giong-clean-probe").map_err(probe_failed)?;
+    fs::create_dir(probe.join("src")).map_err(probe_failed)?;
     fs::write(
         probe.join("Cargo.toml"),
         "[package]\nname = \"giong-clean-probe\"\nversion = \"0.0.0\"\nedition = \"2021\"\n\n[workspace]\n",

@@ -94,6 +94,13 @@ impl Default for Config {
     }
 }
 
+/// Whether `host` names a Unix socket rather than a server on the network:
+/// an absolute path, which on Windows may also start with a drive letter
+/// (`C:\run\...`), as Windows' own Unix sockets are named.
+fn is_socket_path(host: &str) -> bool {
+    host.starts_with('/') || (cfg!(windows) && std::path::Path::new(host).is_absolute())
+}
+
 impl Config {
     /// The server and database, without user or password, for diagnostics:
     /// `cache.internal:6379/0`.
@@ -125,9 +132,10 @@ impl Config {
     }
 
     /// The server's host: a DNS name, an IP address, or the absolute path
-    /// of its Unix socket (such as `/run/redis/redis.sock`).
+    /// of its Unix socket (such as `/run/redis/redis.sock`, or on Windows
+    /// `C:\redis\redis.sock`).
     pub fn host(mut self, host: &str) -> Self {
-        self.host = if host.starts_with('/') {
+        self.host = if is_socket_path(host) {
             Host::Unix(PathBuf::from(host))
         } else {
             let host = host
@@ -441,12 +449,20 @@ fn parse(url: &str) -> Result<Config, Error> {
             }
         }
         "redis+unix" | "unix" => {
-            if !rest.starts_with('/') {
+            // On Windows also `redis+unix://C:/run/redis.sock`.
+            if !is_socket_path(rest) {
                 return Err(Error::config(
                     "a Unix socket URL has an absolute path: redis+unix:///run/redis/redis.sock",
                 ));
             }
-            config.host = Host::Unix(PathBuf::from(percent_decode(rest, "socket path")?));
+            let path = percent_decode(rest, "socket path")?;
+            // `unix:///C:/run/redis.sock`: on Windows the path is what
+            // follows the slash in front of the drive letter.
+            let path = match path.strip_prefix('/') {
+                Some(p) if cfg!(windows) && std::path::Path::new(p).is_absolute() => p.to_owned(),
+                _ => path,
+            };
+            config.host = Host::Unix(PathBuf::from(path));
         }
         other => {
             return Err(Error::config(format!(
@@ -497,6 +513,19 @@ fn parse(url: &str) -> Result<Config, Error> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// On Windows a path with a drive letter names a socket too, in a URL
+    /// as well.
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_sockets() {
+        let c = Config::new().host(r"C:\redis\redis.sock");
+        assert_eq!(c.host, Host::Unix(r"C:\redis\redis.sock".into()));
+        let c = Config::from_url("redis+unix:///C:/run/redis.sock").unwrap();
+        assert_eq!(c.host, Host::Unix("C:/run/redis.sock".into()));
+        let c = Config::from_url("redis+unix://C:/run/redis.sock").unwrap();
+        assert_eq!(c.host, Host::Unix("C:/run/redis.sock".into()));
+    }
 
     #[test]
     fn urls_are_read_strictly() {

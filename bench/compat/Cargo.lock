@@ -54,6 +54,7 @@ dependencies = [
  "giong",
  "libc",
  "tokio",
+ "windows-sys",
 ]
 
 [[package]]

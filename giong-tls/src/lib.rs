@@ -82,14 +82,10 @@ mod certs;
 #[cfg(target_os = "macos")]
 mod keychain;
 mod ktls;
-
-/// The flag that makes a send to a closed peer fail with `EPIPE` instead of
-/// raising `SIGPIPE`. macOS has none: giong's sockets carry `SO_NOSIGPIPE`.
-#[cfg(target_os = "linux")]
-const NO_SIGNAL: libc::c_int = libc::MSG_NOSIGNAL;
-#[cfg(target_os = "macos")]
-const NO_SIGNAL: libc::c_int = 0;
 mod received;
+mod sys;
+#[cfg(windows)]
+mod winstore;
 
 pub use certs::Certificates;
 pub use ktls::{ktls_stats, ktls_support, Ktls, KtlsStats, KtlsSupport};
@@ -841,7 +837,7 @@ impl TlsConnector {
     ///
     /// They are read from the file named by the `SSL_CERT_FILE` environment
     /// variable and the directories named by `SSL_CERT_DIR` (separated by
-    /// `:`) if either is set, the way OpenSSL does. Otherwise from the first
+    /// `:`, or `;` on Windows) if either is set, the way OpenSSL does. Otherwise from the first
     /// bundle found among the places Linux distributions keep it
     /// (`/etc/ssl/certs/ca-certificates.crt` on Debian, Ubuntu, Alpine and
     /// Arch, `/etc/pki/tls/certs/ca-bundle.crt` on Fedora and RHEL, and so
@@ -853,6 +849,14 @@ impl TlsConnector {
     /// turned off. If the keychain cannot be read, the bundle in
     /// `/etc/ssl/cert.pem` is used.
     ///
+    /// On Windows, when neither variable is set, they are the certificates
+    /// in the `ROOT` store valid for TLS server authentication: the roots
+    /// Microsoft ships and the ones an administrator, a group policy or the
+    /// user added, without those in the `Disallowed` store. Windows fetches
+    /// some of Microsoft's roots only when its own verifier first needs
+    /// them, so a fresh machine may lack a root a server uses; set
+    /// `SSL_CERT_FILE` or use `TlsConnector::with_webpki_roots` there.
+    ///
     /// Fails with [`io::ErrorKind::NotFound`] if there are none, as in a
     /// container image built `FROM scratch` or without the `ca-certificates`
     /// package. Install that package, or enable the `webpki-roots` feature and
@@ -860,10 +864,14 @@ impl TlsConnector {
     pub fn with_system_roots() -> io::Result<Self> {
         let file = std::env::var_os("SSL_CERT_FILE");
         let dirs = std::env::var_os("SSL_CERT_DIR");
-        #[cfg(target_os = "macos")]
+        #[cfg(any(target_os = "macos", windows))]
         if file.is_none() && dirs.is_none() {
+            #[cfg(target_os = "macos")]
+            let system = keychain::trusted_roots();
+            #[cfg(windows)]
+            let system = winstore::trusted_roots();
             let mut roots = RootCertStore::empty();
-            roots.add_parsable_certificates(keychain::trusted_roots());
+            roots.add_parsable_certificates(system);
             if !roots.is_empty() {
                 return Self::from_roots(roots);
             }
@@ -1525,26 +1533,20 @@ impl TlsStream {
             if len == 0 {
                 return Ok(());
             }
-            // SAFETY: `unsent` is valid for `len` bytes for the call.
-            let n = unsafe {
-                libc::send(
-                    std::os::fd::AsRawFd::as_raw_fd(&self.tcp),
-                    unsent.as_ptr().cast(),
-                    len,
-                    libc::MSG_DONTWAIT | NO_SIGNAL,
-                )
-            };
-            if n >= 0 {
-                if n as usize == unsent.len() {
-                    // All sent: an idle connection keeps no buffer for this.
-                    *unsent = Vec::new();
-                } else {
-                    // What the socket did not take waits in `unsent`.
-                    unsent.drain(..n as usize);
+            let fd = sys::AsRawFd::as_raw_fd(&self.tcp);
+            let e = match sys::send_now(fd, &unsent[..len], false) {
+                Ok(n) => {
+                    if n == unsent.len() {
+                        // All sent: an idle connection keeps no buffer for this.
+                        *unsent = Vec::new();
+                    } else {
+                        // What the socket did not take waits in `unsent`.
+                        unsent.drain(..n);
+                    }
+                    return Ok(());
                 }
-                return Ok(());
-            }
-            let e = io::Error::last_os_error();
+                Err(e) => e,
+            };
             match e.kind() {
                 io::ErrorKind::Interrupted => {}
                 io::ErrorKind::WouldBlock => return Ok(()),
@@ -1945,37 +1947,25 @@ impl TlsStream {
                 conn.write_tls(wire)?;
             }
         }
-        // Linux holds the bytes for the FIN (`MSG_MORE`) and takes
-        // `MSG_NOSIGNAL`; elsewhere this is a plain send that does not wait,
-        // on a socket giong made with `SO_NOSIGPIPE`.
-        #[cfg(target_os = "linux")]
-        const FLAGS: libc::c_int = libc::MSG_MORE | libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL;
-        #[cfg(target_os = "macos")]
-        const FLAGS: libc::c_int = libc::MSG_DONTWAIT;
-        // SAFETY: `wire` is valid for `wire.len()` bytes for the call.
-        let n = unsafe {
-            libc::send(
-                std::os::fd::AsRawFd::as_raw_fd(&self.tcp),
-                wire.as_ptr().cast(),
-                wire.len(),
-                FLAGS,
-            )
-        };
-        if n >= 0 {
-            wire.drain(..n as usize);
-        } else {
-            let e = io::Error::last_os_error();
+        // Linux holds the bytes for the FIN (`MSG_MORE`); elsewhere this is
+        // a plain send that does not wait.
+        match sys::send_now(sys::AsRawFd::as_raw_fd(&self.tcp), wire, true) {
+            Ok(n) => {
+                wire.drain(..n);
+            }
             // Out of network buffers (macOS): `send_wire` below waits for
             // them, as for room in the socket.
-            if !matches!(
-                e.kind(),
-                io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
-            ) && !no_buffers(&e)
+            Err(e)
+                if !matches!(
+                    e.kind(),
+                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                ) && !no_buffers(&e) =>
             {
                 self.broken.set(true);
                 wire.clear();
                 return Err(e);
             }
+            Err(_) => {}
         }
         if !wire.is_empty() {
             self.send_wire(wire).await?;
@@ -2306,6 +2296,7 @@ mod tests {
         std::fs::write(certs.join("b.pem"), ca_pem("b")).unwrap();
         std::fs::write(certs.join("README"), "not a certificate").unwrap();
         // OpenSSL's hashed names are links to the same files.
+        #[cfg(unix)]
         std::os::unix::fs::symlink(certs.join("a.pem"), certs.join("1a2b3c4d.0")).unwrap();
         let system = dir.join("system.pem");
         std::fs::write(&system, ca_pem("system")).unwrap();

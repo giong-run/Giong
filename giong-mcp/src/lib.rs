@@ -54,7 +54,9 @@
 //! a loopback port, so a TCP server without a token does not start
 //! ([`Code::McpNoToken`]) unless the code says it should
 //! ([`Config::allow_unauthenticated`]). A Unix socket is created readable
-//! and writable by the service's user only, and needs no token.
+//! and writable by the service's user only, and needs no token. On Windows
+//! the socket file takes the permissions of its directory, which giong-mcp
+//! cannot narrow, so a Unix socket there needs a token as TCP does.
 //!
 //! What one request can cost is bounded, so that a client cannot make the
 //! service's process run out of memory: a body of at most 64 KiB, a batch
@@ -82,8 +84,10 @@ pub mod fuzzing;
 use std::fmt;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+#[cfg(unix)]
 use std::os::unix::fs::{FileTypeExt, MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+#[cfg(unix)]
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
 use std::thread;
@@ -127,6 +131,11 @@ impl Config {
     /// the process's user only (mode `0600`), so that it needs no token. A
     /// stale socket file left by a process that is gone is replaced; a live
     /// one is not ([`Code::McpBind`]).
+    ///
+    /// On Windows (10 version 1803 and later) the socket file takes the
+    /// permissions of its directory, so there a token is required as on TCP
+    /// ([`Code::McpNoToken`]); a stale socket file is replaced as on Unix,
+    /// and any other file at `path` is left alone.
     ///
     /// Most MCP clients speak HTTP over TCP only; to reach the socket from
     /// one, bridge it to a loopback port with a token-less forwarder the
@@ -184,7 +193,8 @@ impl Config {
     ///
     /// On TCP a token is required: any process on the machine can connect
     /// to a loopback port. On a Unix socket it is optional, since the
-    /// socket's file permissions already keep other users out.
+    /// socket's file permissions already keep other users out, except on
+    /// Windows, where giong-mcp cannot set them and requires it.
     pub fn token(mut self, token: impl Into<String>) -> Self {
         self.token = Some(token.into());
         self
@@ -227,16 +237,27 @@ impl Config {
         };
         if let Some(token) = &self.token {
             check_token(token)?;
-        } else if matches!(listen, Listen::Tcp(_)) && !self.unauthenticated {
+        } else if (matches!(listen, Listen::Tcp(_)) || cfg!(windows)) && !self.unauthenticated {
+            #[cfg(unix)]
+            let what = "giong-mcp will not serve TCP without a token: every local process could \
+                        read the service's internals";
+            #[cfg(windows)]
+            let what = "giong-mcp will not serve without a token on Windows: every local process \
+                        could read the service's internals, over TCP or a Unix socket whose \
+                        file it cannot restrict to one user";
             return Err(Error::new(
                 Code::McpNoToken,
-                "giong-mcp will not serve TCP without a token: every local process could read \
-                 the service's internals",
+                what,
                 format!(
                     "set GIONG_MCP_TOKEN (or call Config::token) to a secret of at least \
                      {MIN_TOKEN_LEN} characters, such as the output of `openssl rand -hex 16`, \
-                     and give clients `Authorization: Bearer <token>`; or listen on a Unix \
-                     socket; or, on a trusted machine, call Config::allow_unauthenticated."
+                     and give clients `Authorization: Bearer <token>`; {}or, on a trusted \
+                     machine, call Config::allow_unauthenticated.",
+                    if cfg!(unix) {
+                        "or listen on a Unix socket; "
+                    } else {
+                        ""
+                    }
                 ),
             )
             .into());
@@ -413,6 +434,7 @@ struct FileId {
 }
 
 impl FileId {
+    #[cfg(unix)]
     fn of(meta: &std::fs::Metadata) -> Self {
         Self {
             dev: meta.dev(),
@@ -420,8 +442,51 @@ impl FileId {
         }
     }
 
+    #[cfg(unix)]
     fn at(path: &Path) -> Option<Self> {
         std::fs::symlink_metadata(path).ok().map(|m| Self::of(&m))
+    }
+
+    /// Windows: the volume's serial number and the file's index, read from
+    /// the socket file itself (not what a reparse point leads to). The
+    /// creation time would not do: NTFS gives a file created under a name
+    /// deleted moments before the old file's creation time.
+    #[cfg(windows)]
+    fn at(path: &Path) -> Option<Self> {
+        use std::os::windows::ffi::OsStrExt;
+        use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE,
+            FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+        // SAFETY: a NUL-terminated path; no access is asked for, only the
+        // file's attributes, and the handle is checked and closed.
+        let file = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                0,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_BACKUP_SEMANTICS,
+                std::ptr::null_mut(),
+            )
+        };
+        if file == INVALID_HANDLE_VALUE {
+            return None;
+        }
+        // SAFETY: all-zero is a valid value of this plain structure.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: an open handle and a structure to fill.
+        let ok = unsafe { GetFileInformationByHandle(file, &mut info) };
+        // SAFETY: the handle is open and closed once.
+        unsafe { CloseHandle(file) };
+        (ok != 0).then(|| Self {
+            dev: u64::from(info.dwVolumeSerialNumber),
+            ino: (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+        })
     }
 }
 
@@ -573,12 +638,59 @@ fn in_use(path: &Path) -> io::Error {
     )
 }
 
+/// Binds a Unix socket at `path`, replacing a stale socket file but no
+/// other file. Windows cannot restrict the file here (see [`Config::unix`]).
+#[cfg(windows)]
+fn bind_unix(path: &Path) -> io::Result<(UnixListener, FileId)> {
+    if std::fs::symlink_metadata(path).is_ok() {
+        if !is_socket_file(path) {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("{} exists and is not a socket", path.display()),
+            ));
+        }
+        if !is_stale(path) {
+            return Err(in_use(path));
+        }
+        let _ = std::fs::remove_file(path);
+    }
+    let listener = UnixListener::bind(path)?;
+    let id = FileId::at(path).ok_or_else(|| io::Error::other("the socket file vanished"))?;
+    Ok((listener, id))
+}
+
+/// Whether the file at `path` is a Unix socket: on Windows a reparse point
+/// tagged `IO_REPARSE_TAG_AF_UNIX`.
+#[cfg(windows)]
+fn is_socket_file(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindClose, FindFirstFileW, FILE_ATTRIBUTE_REPARSE_POINT, WIN32_FIND_DATAW,
+    };
+    const IO_REPARSE_TAG_AF_UNIX: u32 = 0x8000_0023;
+    let wide: Vec<u16> = path.as_os_str().encode_wide().chain(Some(0)).collect();
+    // SAFETY: all-zero is a valid value of this plain structure.
+    let mut data: WIN32_FIND_DATAW = unsafe { std::mem::zeroed() };
+    // SAFETY: a NUL-terminated path and a structure to fill; the handle is
+    // checked and closed.
+    let find = unsafe { FindFirstFileW(wide.as_ptr(), &mut data) };
+    if find == INVALID_HANDLE_VALUE {
+        return false;
+    }
+    // SAFETY: an open search handle, closed once.
+    unsafe { FindClose(find) };
+    data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0
+        && data.dwReserved0 == IO_REPARSE_TAG_AF_UNIX
+}
+
 /// Binds a Unix socket at `path` that only this user can use. It is bound
 /// under a temporary name in the same directory, restricted to mode `0600`,
 /// and then linked to `path`, so it is never reachable with looser
 /// permissions, and a live socket at `path` is never replaced: linking
 /// fails if anything is there. A stale socket (nobody listening) is
 /// removed first.
+#[cfg(unix)]
 fn bind_unix(path: &Path) -> io::Result<(UnixListener, FileId)> {
     static NEXT: AtomicU32 = AtomicU32::new(0);
     let dir = match path.parent() {
@@ -604,6 +716,7 @@ fn bind_unix(path: &Path) -> io::Result<(UnixListener, FileId)> {
     Ok((listener, id))
 }
 
+#[cfg(unix)]
 fn link_over_stale(tmp: &Path, path: &Path) -> io::Result<FileId> {
     let id = FileId::at(tmp).ok_or_else(|| io::Error::other("the socket file vanished"))?;
     for _ in 0..2 {
@@ -631,6 +744,7 @@ fn link_over_stale(tmp: &Path, path: &Path) -> io::Result<FileId> {
 
 /// Where the temporary name would be too long for a socket address: bind
 /// at `path` itself and restrict it right after.
+#[cfg(unix)]
 fn bind_in_place(path: &Path) -> io::Result<(UnixListener, FileId)> {
     if std::fs::symlink_metadata(path).is_ok_and(|m| m.file_type().is_socket()) {
         if !is_stale(path) {
@@ -645,11 +759,26 @@ fn bind_in_place(path: &Path) -> io::Result<(UnixListener, FileId)> {
 }
 
 /// Nobody listens on the socket at `path`.
+#[cfg(unix)]
 fn is_stale(path: &Path) -> bool {
     matches!(
         std::os::unix::net::UnixStream::connect(path),
         Err(e) if e.kind() == io::ErrorKind::ConnectionRefused
     )
+}
+
+/// Nobody listens on the socket at `path` (Windows' standard library has no
+/// Unix sockets: a blocking connect of socket2's).
+#[cfg(windows)]
+fn is_stale(path: &Path) -> bool {
+    use socket2::{Domain, SockAddr, Socket, Type};
+    let Ok(addr) = SockAddr::unix(path) else {
+        return false;
+    };
+    let Ok(sock) = Socket::new(Domain::UNIX, Type::STREAM, None) else {
+        return false;
+    };
+    matches!(sock.connect(&addr), Err(e) if e.kind() == io::ErrorKind::ConnectionRefused)
 }
 
 /// Removes the file at `path` if it is still `id`.

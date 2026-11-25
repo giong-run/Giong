@@ -473,6 +473,17 @@ pub(crate) unsafe fn send_nowait(fd: RawSock, buf: *const u8, len: usize) -> isi
     libc::send(fd, buf.cast(), len, super::MSG_NOSIGNAL | MSG_DONTWAIT)
 }
 
+/// `sendmsg(2)` that does not wait: the bytes sent, or -1 with `errno` set.
+///
+/// # Safety
+///
+/// `msg` must point at a live header whose pointers are valid.
+#[cfg(feature = "unstable-udp-offload")]
+#[inline(always)]
+pub(crate) unsafe fn sendmsg_nowait(fd: RawSock, msg: *const super::MsgHdr) -> isize {
+    libc::sendmsg(fd, msg, super::MSG_NOSIGNAL | MSG_DONTWAIT)
+}
+
 /// `sendto(2)` that does not wait: the bytes sent, or -1 with `errno` set.
 ///
 /// # Safety

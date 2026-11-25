@@ -289,7 +289,9 @@ fn dev_reloads_an_edit_without_dropping_a_request() {
         return;
     }
     let dir = TempDir::new("scenario-dev");
-    let (out, app) = new_project(&dir, "app", &[]);
+    // The service without a database: /hello answers with a string literal
+    // of the source (the default, on SQLite, answers with rows).
+    let (out, app) = new_project(&dir, "app", &["--db", "none"]);
     out.expect_code(0);
     let port = free_port();
     let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();

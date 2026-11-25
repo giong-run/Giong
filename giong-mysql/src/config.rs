@@ -11,6 +11,10 @@ use giong_tls::TlsConnector;
 
 use crate::error::{Error, ErrorKind};
 
+/// The longest statement timeout the servers take: a year (MariaDB's
+/// `max_statement_time`, and `lock_wait_timeout` on both).
+const MAX_STATEMENT_TIMEOUT: Duration = Duration::from_secs(365 * 24 * 3600);
+
 /// How the connection is encrypted.
 ///
 /// More ways may be added (pinning a certificate, a client certificate), so
@@ -129,6 +133,13 @@ impl Default for Config {
     }
 }
 
+/// Whether `host` names a Unix socket rather than a server on the network:
+/// an absolute path, which on Windows may also start with a drive letter
+/// (`C:\run\...`), as Windows' own Unix sockets are named.
+fn is_socket_path(host: &str) -> bool {
+    host.starts_with('/') || (cfg!(windows) && std::path::Path::new(host).is_absolute())
+}
+
 impl Config {
     /// The server and database, without user or password, for diagnostics:
     /// `db.internal:3306/app`.
@@ -167,9 +178,12 @@ impl Config {
     }
 
     /// The server's host: a DNS name, an IP address, or the absolute path of
-    /// its Unix socket (such as `/var/run/mysqld/mysqld.sock`).
+    /// its Unix socket (such as `/var/run/mysqld/mysqld.sock`; on Windows a
+    /// path such as `C:\mysql\mysql.sock`, though MySQL and MariaDB on
+    /// Windows offer named pipes instead, which giong-mysql does not speak:
+    /// connect over TCP there).
     pub fn host(mut self, host: &str) -> Self {
-        self.host = if host.starts_with('/') {
+        self.host = if is_socket_path(host) {
             Host::Unix(PathBuf::from(host))
         } else {
             let host = host
@@ -278,8 +292,13 @@ impl Config {
     /// On MariaDB it is set as `max_statement_time`, which stops every
     /// statement, writes and DDL included (error 1969), and as
     /// `lock_wait_timeout` too.
+    ///
+    /// The servers take at most a year (MariaDB's `max_statement_time` and
+    /// `lock_wait_timeout`) and about 49 days for MySQL's
+    /// `max_execution_time` (`u32::MAX` milliseconds): a longer timeout,
+    /// `Duration::MAX` included, is sent as those maximums.
     pub fn statement_timeout(mut self, timeout: Duration) -> Self {
-        self.statement_timeout = timeout.max(Duration::from_millis(1));
+        self.statement_timeout = timeout.clamp(Duration::from_millis(1), MAX_STATEMENT_TIMEOUT);
         self
     }
 
@@ -422,7 +441,7 @@ impl Config {
             crate::connect::Server::MySql => format!(
                 "SET NAMES utf8mb4 COLLATE utf8mb4_0900_ai_ci, time_zone = '+00:00', \
                  max_execution_time = {}, lock_wait_timeout = {lock_secs}",
-                micros.div_ceil(1000)
+                micros.div_ceil(1000).min(u128::from(u32::MAX))
             ),
             crate::connect::Server::MariaDb => format!(
                 "SET NAMES utf8mb4, time_zone = '+00:00', max_statement_time = {}.{:06}, \
@@ -689,7 +708,7 @@ fn parse(url: &str) -> Result<Config, Error> {
             "ssl-mode" => ssl_mode = Some(value.to_ascii_uppercase()),
             "ssl-ca" => ssl_ca = Some(value),
             "socket" => {
-                if !value.starts_with('/') {
+                if !is_socket_path(&value) {
                     return Err(Error::config(format!(
                         "socket={value} is not an absolute path to the server's socket file"
                     )));
@@ -822,6 +841,14 @@ mod tests {
         assert!(!format!("{c:?}").contains("p:ss@w"));
     }
 
+    /// On Windows a path with a drive letter names a socket too.
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_sockets() {
+        let c = Config::new().host(r"C:\mysql\mysql.sock");
+        assert_eq!(c.host, Host::Unix(r"C:\mysql\mysql.sock".into()));
+    }
+
     #[test]
     fn hosts_can_be_ipv6_or_sockets() {
         let c = Config::from_url("mysql://u@[::1]:3307").unwrap();
@@ -880,6 +907,23 @@ mod tests {
         assert!(err("mysql://u@h/db?ssl-ca=/nonexistent/ca.pem").contains("cannot read"));
         assert!(err("mysql://u@h/db?socket=relative.sock").contains("absolute"));
         assert!(err("mysql://u@h/db?flag").contains("no value"));
+    }
+
+    /// `Duration::MAX` ("no limit") is sent as the longest each server
+    /// takes, not as a number no server accepts (issue #298).
+    #[test]
+    fn an_unbounded_statement_timeout_is_sent_as_the_servers_maximum() {
+        let c = Config::new().statement_timeout(Duration::MAX);
+        let mysql = c.session_sql(Server::MySql).unwrap();
+        assert!(
+            mysql.contains("max_execution_time = 4294967295, lock_wait_timeout = 31536000,"),
+            "{mysql}"
+        );
+        let mariadb = c.session_sql(Server::MariaDb).unwrap();
+        assert!(
+            mariadb.contains("max_statement_time = 31536000.000000, lock_wait_timeout = 31536000,"),
+            "{mariadb}"
+        );
     }
 
     #[test]

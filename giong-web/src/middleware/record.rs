@@ -566,7 +566,13 @@ fn unescape(raw: &str) -> Cow<'_, str> {
         match chars.next() {
             Some('u') => {
                 let hex: String = chars.by_ref().take(4).collect();
-                if let Some(ch) = u32::from_str_radix(&hex, 16).ok().and_then(char::from_u32) {
+                // Four hex digits: from_str_radix alone also takes "+041".
+                let digits = hex.len() == 4 && hex.bytes().all(|b| b.is_ascii_hexdigit());
+                if let Some(ch) = digits
+                    .then(|| u32::from_str_radix(&hex, 16).ok())
+                    .flatten()
+                    .and_then(char::from_u32)
+                {
                     out.push(ch);
                 }
             }
@@ -625,6 +631,15 @@ mod tests {
         // A sign is not a hex digit (u8::from_str_radix takes "+5").
         assert_eq!(percent_decode("%+5"), "% 5");
         assert_eq!(percent_decode("%4"), "%4");
+    }
+
+    #[test]
+    fn json_keys_unescape_four_hex_digits_only() {
+        assert_eq!(unescape(r"\u0070assword"), "password");
+        assert_eq!(unescape(r"a\tb"), "a\tb");
+        // A sign is not a hex digit (u32::from_str_radix takes "+041").
+        assert_eq!(unescape(r"\u+041x"), "x");
+        assert_eq!(unescape(r"\u41"), "");
     }
 
     #[test]

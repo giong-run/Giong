@@ -1393,7 +1393,10 @@ impl Builder {
     /// keeps its core busy even when there is nothing to do, so use it for
     /// latency-sensitive services on dedicated cores, with a duration on the
     /// order of the gaps between requests (tens to hundreds of microseconds).
+    /// A duration longer than a century (`Duration::MAX`) counts as a
+    /// century: spin for as long as there is no work.
     pub fn spin_before_park(mut self, duration: Duration) -> Self {
+        let duration = duration.min(Duration::from_secs(100 * 365 * 24 * 3600));
         self.spin = (!duration.is_zero()).then_some(duration);
         self
     }

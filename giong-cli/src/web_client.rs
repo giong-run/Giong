@@ -357,7 +357,8 @@ fn complete(raw: &[u8], head_only: bool) -> Result<bool, String> {
         return Ok(match framing(status, &headers, head_only)? {
             Framing::None => true,
             Framing::Length(n) => rest.len() >= n,
-            Framing::Chunked => dechunk(rest).is_ok(),
+            // Walked without copying: this runs after every read.
+            Framing::Chunked => dechunk(rest, None).is_ok(),
             Framing::ToEnd => false,
         });
     }
@@ -385,7 +386,11 @@ pub fn parse(raw: &[u8], head_only: bool) -> Result<Answer, String> {
                 }
                 rest[..n].to_vec()
             }
-            Framing::Chunked => dechunk(rest)?,
+            Framing::Chunked => {
+                let mut body = Vec::new();
+                dechunk(rest, Some(&mut body))?;
+                body
+            }
             Framing::ToEnd => rest.to_vec(),
         };
         return Ok(Answer {
@@ -397,32 +402,38 @@ pub fn parse(raw: &[u8], head_only: bool) -> Result<Answer, String> {
     }
 }
 
-fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>, String> {
-    let mut out = Vec::new();
+/// Walks a chunked body to its end, copying the data into `out` if given.
+fn dechunk(mut rest: &[u8], mut out: Option<&mut Vec<u8>>) -> Result<(), String> {
     loop {
         let line_end = find(rest, b"\r\n").ok_or("a chunk size line is cut short")?;
         let size_text = String::from_utf8_lossy(&rest[..line_end]);
-        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| format!("a bad chunk size {size_text:?}"))?;
+        let digits = size_text.split(';').next().unwrap_or("").trim();
+        // Hex digits only: from_str_radix alone also takes "+5".
+        let size = Some(digits)
+            .filter(|d| d.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|d| usize::from_str_radix(d, 16).ok())
+            .ok_or_else(|| format!("a bad chunk size {size_text:?}"))?;
         rest = &rest[line_end + 2..];
         if size == 0 {
             // Trailers, then the empty line.
             loop {
                 let end = find(rest, b"\r\n").ok_or("the trailers are cut short")?;
                 if end == 0 {
-                    return Ok(out);
+                    return Ok(());
                 }
                 rest = &rest[end + 2..];
             }
         }
-        if rest.len() < size + 2 {
-            return Err("a chunk is cut short".into());
+        // A size near usize::MAX is just a chunk that never arrives.
+        let (data, after) = match rest.get(size..size.saturating_add(2)) {
+            Some(crlf) if crlf == b"\r\n" => (&rest[..size], &rest[size + 2..]),
+            Some(_) => return Err("a chunk does not end with CRLF".into()),
+            None => return Err("a chunk is cut short".into()),
+        };
+        if let Some(out) = out.as_deref_mut() {
+            out.extend_from_slice(data);
         }
-        if &rest[size..size + 2] != b"\r\n" {
-            return Err("a chunk does not end with CRLF".into());
-        }
-        out.extend_from_slice(&rest[..size]);
-        rest = &rest[size + 2..];
+        rest = after;
     }
 }
 
@@ -480,6 +491,20 @@ mod tests {
             false
         )
         .is_err());
+    }
+
+    #[test]
+    fn a_chunk_size_too_large_for_memory_is_an_error() {
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nab\r\n";
+        assert!(!complete(raw, false).unwrap());
+        assert_eq!(parse(raw, false).unwrap_err(), "a chunk is cut short");
+        let raw =
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffe\r\nab\r\n";
+        assert_eq!(parse(raw, false).unwrap_err(), "a chunk is cut short");
+        // A sign is not a hex digit (usize::from_str_radix takes "+2").
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n+2\r\nab\r\n0\r\n\r\n";
+        assert!(parse(raw, false).unwrap_err().contains("bad chunk size"));
     }
 
     #[test]

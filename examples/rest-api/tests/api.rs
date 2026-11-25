@@ -7,6 +7,7 @@
 //! `PATH`. Without them the test is skipped,
 //! unless `GIONG_PG_REQUIRED=1` or `GIONG_REDIS_REQUIRED=1` (CI sets both).
 
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
@@ -32,9 +33,7 @@ fn spawn(cmd: &mut Command, uid: Option<(u32, u32)>) -> Daemon {
     cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
-    if let Some((u, g)) = uid {
-        cmd.uid(u).gid(g);
-    }
+    as_owner(cmd, uid);
     // Linux only: elsewhere a killed test binary leaves the server running.
     #[cfg(target_os = "linux")]
     // SAFETY: prctl is async-signal-safe and touches only the child.
@@ -45,6 +44,23 @@ fn spawn(cmd: &mut Command, uid: Option<(u32, u32)>) -> Daemon {
         });
     }
     Daemon(cmd.spawn().expect("start the server"))
+}
+
+/// Runs `cmd` as `owner` (see [`pg_user`]).
+#[cfg(unix)]
+fn as_owner(cmd: &mut Command, owner: Option<(u32, u32)>) {
+    if let Some((u, g)) = owner {
+        cmd.uid(u).gid(g);
+    }
+}
+
+/// Windows: the servers run as the test's user.
+#[cfg(windows)]
+fn as_owner(_: &mut Command, _: Option<(u32, u32)>) {}
+
+/// `name` with the system's suffix for programs (`.exe` on Windows).
+fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
 fn required(var: &str) -> bool {
@@ -60,17 +76,22 @@ fn pg_bin() -> Option<PathBuf> {
         .flatten()
         .flatten()
         .map(|e| e.path().join("bin"))
-        .filter(|bin| bin.join("initdb").exists())
+        .filter(|bin| bin.join(exe("initdb")).exists())
         .collect();
     versions.sort();
-    versions.pop().or_else(|| on_path("initdb"))
+    // The GitHub runners' Windows images name theirs in PGBIN.
+    let pgbin = std::env::var_os("PGBIN")
+        .map(PathBuf::from)
+        .filter(|bin| bin.join(exe("initdb")).exists());
+    versions.pop().or(pgbin).or_else(|| on_path("initdb"))
 }
 
 fn on_path(name: &str) -> Option<PathBuf> {
-    std::env::split_paths(&std::env::var_os("PATH")?).find(|dir| dir.join(name).exists())
+    std::env::split_paths(&std::env::var_os("PATH")?).find(|dir| dir.join(exe(name)).exists())
 }
 
 /// PostgreSQL refuses to run as root: then it runs as `postgres`.
+#[cfg(unix)]
 fn pg_user() -> Option<(u32, u32)> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
@@ -83,11 +104,21 @@ fn pg_user() -> Option<(u32, u32)> {
     })
 }
 
+/// Windows: the server runs as the test's user.
+#[cfg(windows)]
+fn pg_user() -> Option<(u32, u32)> {
+    None
+}
+
+#[cfg(unix)]
 fn chown(path: &Path, owner: Option<(u32, u32)>) {
     if let Some((u, g)) = owner {
         std::os::unix::fs::chown(path, Some(u), Some(g)).unwrap();
     }
 }
+
+#[cfg(windows)]
+fn chown(_: &Path, _: Option<(u32, u32)>) {}
 
 fn wait_for(path: &Path, what: &str) {
     let start = Instant::now();
@@ -107,14 +138,12 @@ fn postgres(dir: &Path, bin: &Path) -> (Daemon, String) {
     std::fs::create_dir_all(&socket).unwrap();
     chown(dir, owner);
     chown(&socket, owner);
-    let mut initdb = Command::new(bin.join("initdb"));
+    let mut initdb = Command::new(bin.join(exe("initdb")));
     initdb
         .arg("-D")
         .arg(&data)
         .args(["-U", "postgres", "-A", "trust", "--no-sync"]);
-    if let Some((u, g)) = owner {
-        initdb.uid(u).gid(g);
-    }
+    as_owner(&mut initdb, owner);
     let out = initdb.output().expect("run initdb");
     assert!(
         out.status.success(),
@@ -122,7 +151,7 @@ fn postgres(dir: &Path, bin: &Path) -> (Daemon, String) {
         String::from_utf8_lossy(&out.stderr)
     );
     let daemon = spawn(
-        Command::new(bin.join("postgres"))
+        Command::new(bin.join(exe("postgres")))
             .arg("-D")
             .arg(&data)
             .args(["-c", "listen_addresses=", "-c", "fsync=off", "-c"])
@@ -140,6 +169,7 @@ fn postgres(dir: &Path, bin: &Path) -> (Daemon, String) {
 }
 
 /// A Redis server on a Unix socket; its URL.
+#[cfg(unix)]
 fn redis(dir: &Path, bin: &Path) -> (Daemon, String) {
     let socket = dir.join("redis.sock");
     let daemon = spawn(
@@ -151,6 +181,34 @@ fn redis(dir: &Path, bin: &Path) -> (Daemon, String) {
     );
     wait_for(&socket, "Redis");
     (daemon, format!("redis+unix://{}", socket.display()))
+}
+
+/// A Redis server on a loopback port; its URL. Redis for Windows (its
+/// Cygwin and MSYS2 builds) emulates Unix sockets with a file that
+/// Winsock's own Unix sockets cannot reach.
+#[cfg(windows)]
+fn redis(dir: &Path, bin: &Path) -> (Daemon, String) {
+    let port = std::net::TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let daemon = spawn(
+        Command::new(bin)
+            .args(["--port", &port.to_string(), "--bind", "127.0.0.1"])
+            .args(["--save", "", "--appendonly", "no", "--dir"])
+            .arg(dir),
+        None,
+    );
+    let start = Instant::now();
+    while std::net::TcpStream::connect(("127.0.0.1", port)).is_err() {
+        assert!(
+            start.elapsed() < Duration::from_secs(30),
+            "Redis did not start"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    (daemon, format!("redis://127.0.0.1:{port}"))
 }
 
 /// A certificate for `localhost`, and a client that trusts it.
@@ -191,13 +249,19 @@ fn crud_through_the_cache_over_https() {
     let redis_dir = std::env::var_os("GIONG_REDIS_BIN").map(PathBuf::from);
     let redis_bin = redis_dir
         .or_else(|| on_path("redis-server"))
-        .map(|dir| dir.join("redis-server"));
+        .map(|dir| dir.join(exe("redis-server")));
     let pg = pg_bin();
+    // Each variable makes its own server a must: CI's Windows runners have
+    // PostgreSQL (and set GIONG_PG_REQUIRED) but no Redis.
+    assert!(
+        pg.is_some() || !required("GIONG_PG_REQUIRED"),
+        "PostgreSQL is required but was not found"
+    );
+    assert!(
+        redis_bin.is_some() || !required("GIONG_REDIS_REQUIRED"),
+        "Redis is required but was not found"
+    );
     let (Some(pg), Some(redis_bin)) = (pg, redis_bin) else {
-        assert!(
-            !required("GIONG_PG_REQUIRED") && !required("GIONG_REDIS_REQUIRED"),
-            "PostgreSQL or Redis is required but was not found"
-        );
         eprintln!("skipping: PostgreSQL or Redis not found");
         return;
     };

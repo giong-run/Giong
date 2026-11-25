@@ -2,7 +2,7 @@
 //! parsers return a verdict without panicking.
 
 use crate::config::Config;
-use crate::fuzzing::{flags, messages, scram, session, split_answers};
+use crate::fuzzing::{flags, messages, scram, session, session_with, split_answers};
 
 /// xorshift64*: deterministic, so a failure can be reproduced from its seed.
 struct Rng(u64);
@@ -281,8 +281,12 @@ fn session_seed() -> (u8, Vec<Vec<u8>>) {
 fn the_session_seed_is_a_conversation_that_works() {
     // Otherwise the mutations below would start from a session that fails
     // early, and never reach the later states.
+    // A server that waits as long as the session may last: one that gives
+    // up after the fuzzing's 10 ms closed this conversation under
+    // ThreadSanitizer on a busy machine.
     let (flags, answers) = session_seed();
-    let outcomes = giong::block_on(session(flags, answers.clone()));
+    let patience = std::time::Duration::from_secs(4);
+    let outcomes = giong::block_on(session_with(flags, answers.clone(), patience));
     assert_eq!(outcomes.len(), 6, "{outcomes:?}");
     for (i, outcome) in outcomes.iter().enumerate() {
         match i {

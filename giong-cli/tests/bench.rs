@@ -110,6 +110,19 @@ fn finding<'a>(v: &'a Value, code: &str) -> &'a Value {
         .unwrap_or_else(|| panic!("no {code} in {v}"))
 }
 
+/// A port nothing listens on. A port the system handed out and took back
+/// is no good: the other tests here run alongside and bind port 0, so one of
+/// their servers can get it and answer the probe. This one is below the
+/// system's ephemeral ports (from 32768 on Linux, 49152 on macOS and
+/// Windows), which binding port 0 never gives.
+fn closed_port() -> u16 {
+    let pid = std::process::id() as usize;
+    (0..2000)
+        .map(|i| 20_000 + ((pid + i * 7) % 12_000) as u16)
+        .find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok())
+        .expect("a free port from 20000 to 31999")
+}
+
 fn scratch(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!("giongclibench-{tag}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&d);
@@ -229,11 +242,7 @@ fn failures_are_reported_and_refusals_are_coded() {
     assert_eq!(r["statuses"]["500"], r["statuses"]["200"]);
 
     // Nothing listens: the probe finds no answer.
-    let closed = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let closed = closed_port();
     let (code, v) = giong(&dir, &["bench", &format!("http://127.0.0.1:{closed}/")]);
     assert_eq!(code, 2, "{v}");
     assert_eq!(v["error"]["code"], "GIONG-E5060");

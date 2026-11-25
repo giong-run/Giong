@@ -35,8 +35,9 @@ mod share;
 #[cfg(windows)]
 mod spread;
 pub(crate) mod udp;
-#[cfg(unix)]
 mod unix;
+#[cfg(windows)]
+mod unix_windows;
 
 #[cfg(target_os = "linux")]
 pub use activation::{activated_sockets, ActivatedSocket};
@@ -50,8 +51,7 @@ pub use udp::{Datagram, UdpSocket};
 pub use udp::{SendOptions, GRO_RECV_BUFFER};
 #[cfg(target_os = "linux")]
 pub use unix::UnixDatagram;
-#[cfg(unix)]
-pub use unix::{UnixListener, UnixStream};
+pub use unix::{UnixListener, UnixSocketAddr, UnixStream};
 
 use std::cell::{Cell, OnceCell};
 use std::future::poll_fn;
@@ -532,9 +532,13 @@ impl StreamSocket {
         // non-blocking from the start: a send made outside the driver, as
         // giong-compat's direct sends are, must never hold the worker. The
         // driver would set the mode at the first operation anyway.
-        #[cfg(target_os = "macos")]
+        // Windows has no per-call flag at all: a send made outside the
+        // driver (giong-compat, giong-tls) waits unless the socket is
+        // non-blocking, and an accepted socket meets the driver only at its
+        // first operation, which may come after such a send.
+        #[cfg(any(target_os = "macos", windows))]
         let nonblocking = sock.set_nonblocking(true).is_ok();
-        #[cfg(any(target_os = "linux", windows))]
+        #[cfg(target_os = "linux")]
         let nonblocking = false;
         Self {
             sock: ManuallyDrop::new(sock),
@@ -691,6 +695,23 @@ impl StreamSocket {
 
     pub(crate) fn socket(&self) -> &Socket {
         &self.sock
+    }
+
+    /// Shuts down the read half, the write half, or both. A reader waiting
+    /// then sees the end of the stream, as on Unix: Windows ends no
+    /// receive that waits in the kernel when the reading side is shut, so
+    /// the driver ends it.
+    pub(crate) fn shutdown(&self, how: Shutdown) -> io::Result<()> {
+        self.sock.shutdown(how)?;
+        #[cfg(windows)]
+        if how != Shutdown::Write {
+            runtime::try_with_worker(|w| {
+                if let Ok(mut driver) = w.driver.try_borrow_mut() {
+                    driver.end_reads(self.sock.as_raw_fd());
+                }
+            });
+        }
+        Ok(())
     }
 
     pub(crate) async fn recv(&self) -> io::Result<RecvBuf> {
@@ -1942,9 +1963,11 @@ impl TcpStream {
         return self.inner.send_file(file, offset, len).await;
     }
 
-    /// Shuts down the read half, the write half, or both.
+    /// Shuts down the read half, the write half, or both. Shutting down the
+    /// read half ends a [`recv`](Self::recv) that waits: it returns the end
+    /// of the stream.
     pub fn shutdown(&self, how: Shutdown) -> io::Result<()> {
-        self.inner.socket().shutdown(how)
+        self.inner.shutdown(how)
     }
 
     /// Enables or disables Nagle's algorithm (`TCP_NODELAY`).
