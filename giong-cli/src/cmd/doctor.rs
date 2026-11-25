@@ -731,11 +731,38 @@ fn debug_set_elsewhere(root: &Path) -> bool {
     })
 }
 
+/// A `.env`-style file of the project, never read through a link: a cloned
+/// repository can commit `.env.example -> ~/.aws/credentials`, and the keys
+/// of what it names would reach the report. `None` when it does not exist,
+/// or is a link (said once in the report).
+fn env_file(
+    root: &Path,
+    name: &str,
+    r: &mut Report,
+) -> Option<(Vec<dotenv::Var>, Vec<dotenv::BadLine>)> {
+    match crate::state::read_to_string(&root.join(name)) {
+        Ok(text) => Some(dotenv::parse(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            r.push(
+                Finding::new(
+                    Code::ENV_MISSING,
+                    Severity::Warning,
+                    format!("{name} is not read"),
+                )
+                .detail(e.to_string())
+                .fix(format!("make {name} a plain file in the project")),
+            );
+            None
+        }
+    }
+}
+
 fn env_checks(root: &Path, r: &mut Report) {
-    let Some((example, _)) = dotenv::read(&root.join(".env.example")) else {
+    let Some((example, _)) = env_file(root, ".env.example", r) else {
         return;
     };
-    let (local, bad) = dotenv::read(&root.join(".env")).unwrap_or_default();
+    let (local, bad) = env_file(root, ".env", r).unwrap_or_default();
     for b in bad {
         r.push(
             Finding::new(
@@ -984,6 +1011,39 @@ mod tests {
         assert_eq!(find_line(m, "rt"), (6, 1));
         assert_eq!(find_line(m, "tokio"), (1, 1));
         assert_eq!(find_line(m, "sqlx"), (7, 1));
+    }
+
+    /// A linked `.env.example` or `.env` is not read (it could name a file
+    /// outside the project), and the report says so.
+    #[cfg(unix)]
+    #[test]
+    fn env_files_are_never_read_through_a_link() {
+        let d = std::env::temp_dir().join(format!("giong-cli-doctor-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("p")).unwrap();
+        std::fs::write(d.join("secret"), "aws_secret_access_key=abc\n").unwrap();
+        std::os::unix::fs::symlink(d.join("secret"), d.join("p/.env.example")).unwrap();
+        let mut r = Report::new("doctor");
+        env_checks(&d.join("p"), &mut r);
+        let titles: Vec<&str> = r.findings().iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(titles, [".env.example is not read"]);
+
+        // A plain .env.example, a linked .env: its keys count as unset.
+        std::fs::remove_file(d.join("p/.env.example")).unwrap();
+        std::fs::write(d.join("p/.env.example"), "KEY_ONLY_IN_EXAMPLE=\n").unwrap();
+        std::fs::write(d.join("secret"), "KEY_ONLY_IN_EXAMPLE=1\n").unwrap();
+        std::os::unix::fs::symlink(d.join("secret"), d.join("p/.env")).unwrap();
+        let mut r = Report::new("doctor");
+        env_checks(&d.join("p"), &mut r);
+        let titles: Vec<&str> = r.findings().iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                ".env is not read",
+                "KEY_ONLY_IN_EXAMPLE is in .env.example but not set"
+            ]
+        );
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]
