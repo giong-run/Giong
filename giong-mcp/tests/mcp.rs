@@ -1283,15 +1283,24 @@ fn slow_requests_name_the_route_that_blocks_the_worker() {
                 .contains("GET /report"),
             "{answer}"
         );
-        assert_eq!(fast["slowest"][0]["blocked_by"]["route"], "GET /report");
-        // The slowest request, which the verdict is built from, spent its
-        // time behind the hold. Not the tail's mean: latencies are bucketed
-        // to a quarter, so on a slow runner (#381) the tail took in hundreds
-        // of `/fast` requests that were never behind one of the few holds.
-        assert!(
-            fast["slowest"][0]["blocked_ms"].as_f64().unwrap() >= 10.0,
-            "{answer}"
-        );
+        // The slow request the verdict's culprit comes from: the one held
+        // longest. Not necessarily the slowest of all: on a loaded runner
+        // (Windows Server schedules threads in long slices) a request can be
+        // slowest because the system did not run the worker at all, which no
+        // task's hold explains and none is blamed for.
+        let held = |s: &Value| s["blocked_by"]["held_ms"].as_f64().unwrap_or(-1.0);
+        let worst = fast["slowest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .max_by(|a, b| held(a).total_cmp(&held(b)))
+            .unwrap();
+        assert_eq!(worst["blocked_by"]["route"], "GET /report", "{answer}");
+        // That request spent its time behind the hold. Not the tail's mean:
+        // latencies are bucketed to a quarter, so on a slow runner (#381)
+        // the tail took in hundreds of `/fast` requests that were never
+        // behind one of the few holds.
+        assert!(worst["blocked_ms"].as_f64().unwrap() >= 10.0, "{answer}");
         let lp = &answer["long_polls"][0];
         assert_eq!(lp["giong_http_connection"], true, "{answer}");
         assert!(lp["max_ms"].as_f64().unwrap() >= 40.0, "{answer}");
