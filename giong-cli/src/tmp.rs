@@ -6,10 +6,13 @@
 //! one and making it again: giong would then write into a folder the other
 //! user can change, and run what is in it (a downloaded binary, a build
 //! script). So giong only works in folders it made itself, with mode 0700:
+//! [`fresh`] makes a new folder with a name no one chose before, for one run.
 //!
-//! - [`fresh`]: a new folder with a name no one chose before, for one run.
-//! - [`mine`]: a stable path inside `giong-<uid>`, a folder of this user's that
-//!   only they can enter, for paths that must stay the same between runs.
+//! Cargo never runs below the temporary directory, even in such a folder: it
+//! reads `.cargo/config.toml` from every folder above the one it runs in, and
+//! any user can make `/tmp/.cargo/config.toml` (a `build.rustc-wrapper` there
+//! runs as whoever builds below `/tmp`). Builds that need a path that stays
+//! the same between runs go under `~/.giong` instead.
 //!
 //! On macOS and Windows the temporary directory is the user's own already;
 //! the same rules hold there and cost nothing.
@@ -62,50 +65,6 @@ fn fresh_in(base: &Path, prefix: &str) -> io::Result<PathBuf> {
     Err(last.unwrap_or_else(|| io::Error::other("no free name")))
 }
 
-/// `<temp>/giong-<uid>/<name>`: a path that stays the same between runs,
-/// inside a folder only this user can enter. The folder is made if it is not
-/// there; `name` is not.
-pub fn mine(name: &str) -> io::Result<PathBuf> {
-    Ok(user_dir(&std::env::temp_dir())?.join(name))
-}
-
-#[cfg(unix)]
-fn user_dir(base: &Path) -> io::Result<PathBuf> {
-    use std::os::unix::fs::{MetadataExt, PermissionsExt};
-    // This user's id, without unsafe: the owner of a folder just made.
-    let probe = fresh_in(base, "giong-uid")?;
-    let uid = fs::symlink_metadata(&probe).map(|m| m.uid());
-    let _ = fs::remove_dir(&probe);
-    let uid = uid?;
-    let dir = base.join(format!("giong-{uid}"));
-    match make_private(&dir) {
-        Ok(()) => return Ok(dir),
-        Err(e) if e.kind() == io::ErrorKind::AlreadyExists => {}
-        Err(e) => return Err(e),
-    }
-    // Not followed: a link there could point anywhere.
-    let m = fs::symlink_metadata(&dir)?;
-    if m.is_dir() && m.uid() == uid && m.permissions().mode() & 0o077 == 0 {
-        Ok(dir)
-    } else {
-        Err(io::Error::new(
-            io::ErrorKind::PermissionDenied,
-            format!(
-                "{} is not a folder that only this user can enter; remove it, or set TMPDIR \
-                 to a folder of your own",
-                dir.display()
-            ),
-        ))
-    }
-}
-
-#[cfg(not(unix))]
-fn user_dir(base: &Path) -> io::Result<PathBuf> {
-    let dir = base.join("giong");
-    fs::create_dir_all(&dir)?;
-    Ok(dir)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -124,43 +83,5 @@ mod tests {
         }
         fs::remove_dir(a).unwrap();
         fs::remove_dir(b).unwrap();
-    }
-
-    #[test]
-    fn the_user_folder_is_private_and_kept() {
-        let a = mine("x").unwrap();
-        let b = mine("x").unwrap();
-        assert_eq!(a, b);
-        let dir = a.parent().unwrap();
-        assert!(dir.is_dir());
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(dir).unwrap().permissions().mode();
-            assert_eq!(mode & 0o077, 0, "{mode:o}");
-        }
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn a_user_folder_others_can_enter_is_refused() {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        // Its own base folder, so the real giong-<uid> is not touched.
-        let base = fresh("giong-tmp-open").unwrap();
-        let uid = fs::metadata(&base).unwrap().uid();
-        let open = base.join(format!("giong-{uid}"));
-        fs::create_dir(&open).unwrap();
-        fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
-        let refused = |base: &Path| user_dir(base).unwrap_err().kind();
-        assert_eq!(refused(&base), io::ErrorKind::PermissionDenied);
-        // A link to a private folder is refused too.
-        fs::remove_dir(&open).unwrap();
-        let target = fresh_in(&base, "target").unwrap();
-        std::os::unix::fs::symlink(&target, &open).unwrap();
-        assert_eq!(refused(&base), io::ErrorKind::PermissionDenied);
-        // Once it is gone, it is made private.
-        fs::remove_file(&open).unwrap();
-        assert_eq!(user_dir(&base).unwrap(), open);
-        fs::remove_dir_all(&base).unwrap();
     }
 }

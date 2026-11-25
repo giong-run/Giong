@@ -126,11 +126,17 @@ pub fn latest(cached: bool) -> Result<Latest, String> {
 }
 
 /// `cargo info giong`, run outside any project so that a lock file does not
-/// answer instead of the registry.
+/// answer instead of the registry. In `~/.giong`, not the temporary
+/// directory: cargo reads `.cargo/config.toml` from every folder above the one
+/// it runs in, and any user can make `/tmp/.cargo/config.toml` (a source
+/// replacement there would name another latest version).
 fn ask_cargo() -> Result<Version, String> {
+    let dir = giong_home().ok_or("there is no home folder to run cargo info in")?;
+    std::fs::create_dir_all(&dir)
+        .map_err(|e| format!("{} could not be made: {e}", dir.display()))?;
     let mut cmd = crate::project::cargo();
     cmd.args(["info", "giong"])
-        .current_dir(std::env::temp_dir())
+        .current_dir(&dir)
         .env("CARGO_TERM_COLOR", "never");
     match host::run_once_within(&mut cmd, LOOKUP_TIMEOUT) {
         Ok(out) => parse_cargo_info(&out)
