@@ -1387,10 +1387,12 @@ impl Builder {
     ///
     /// It is raised once per process, by the first runtime built with this
     /// on, and never lowered; a limit the program set itself before that is
-    /// raised too. Pass `false` to keep the soft limit as it is, for example
-    /// for a program that starts children which use `select(2)`, whose
-    /// descriptors must stay below 1,024 (children inherit the limit). A hard
-    /// limit of `unlimited` is read as `fs.nr_open`, the most Linux allows.
+    /// raised too. A child started with [`giong::process`](crate::process)
+    /// gets the soft limit from before, so that a child which uses
+    /// `select(2)`, whose descriptors must stay below 1,024, keeps working;
+    /// a child started another way inherits the raised one. Pass `false` to
+    /// keep the soft limit as it is. A hard limit of `unlimited` is read as
+    /// `fs.nr_open`, the most Linux allows.
     pub fn raise_open_files_limit(mut self, enable: bool) -> Self {
         self.open_files = enable;
         self
@@ -1799,10 +1801,30 @@ fn raise_open_files_limit() {
         if lim.rlim_cur >= max {
             return;
         }
+        let before = lim.rlim_cur;
         lim.rlim_cur = max;
         // SAFETY: `setrlimit` reads the struct it is given, which is of its type.
-        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+        if unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) } == 0 {
+            let _ = OPEN_FILES_RAISED.set((before, max));
+        }
     });
+}
+
+/// The soft `RLIMIT_NOFILE` the process had before the first runtime raised
+/// it, and what it was raised to: unset when nothing was raised.
+/// `giong::process` gives a child the limit from before, as Go does.
+#[cfg(all(target_os = "linux", not(miri)))]
+static OPEN_FILES_RAISED: OnceLock<(libc::rlim_t, libc::rlim_t)> = OnceLock::new();
+
+/// See [`OPEN_FILES_RAISED`].
+#[cfg(all(target_os = "linux", not(miri)))]
+pub(crate) fn open_files_raised() -> Option<(libc::rlim_t, libc::rlim_t)> {
+    OPEN_FILES_RAISED.get().copied()
+}
+
+#[cfg(all(target_os = "linux", miri))]
+pub(crate) fn open_files_raised() -> Option<(libc::rlim_t, libc::rlim_t)> {
+    None
 }
 
 /// Other systems keep their limit: their hard limits and caps differ from

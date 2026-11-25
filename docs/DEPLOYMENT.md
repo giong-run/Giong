@@ -303,10 +303,11 @@ listen queue: measured with the `defaults` example in a container limited to 1,0
 
 So on Linux giong raises the soft limit to the hard one when a runtime is built, as Go
 programs do: a process may do that without privileges, and with it all 1,100 clients are
-answered in the same container. A hard limit of `unlimited` is read as `fs.nr_open`. To
-keep the soft limit, for a program that starts children which still use `select(2)` and
-need descriptors below 1,024 (children inherit the limit), build with
-`Builder::raise_open_files_limit(false)`. A hard limit below what the service needs is
+answered in the same container. A hard limit of `unlimited` is read as `fs.nr_open`. A
+child started with `giong::process::Command` gets the soft limit from before, as Go does, so
+a child that still uses `select(2)` and needs descriptors below 1,024 keeps working; a child
+started another way (`std::process::Command`) inherits the raised limit. To keep the soft
+limit for the whole process, build with `Builder::raise_open_files_limit(false)`. A hard limit below what the service needs is
 raised from outside: `docker run --ulimit nofile=65536:65536`, `ulimits` in Compose,
 `LimitNOFILE` in systemd. When a server does run out, each worker says so on stderr at most
 once a minute, with the limits it found ([GIONG-E1123](errors/E1123.md)), and giong-mcp's
