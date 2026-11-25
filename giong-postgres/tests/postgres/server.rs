@@ -461,7 +461,15 @@ fn launch(
     let started = Instant::now();
     loop {
         let text = log();
-        if text.contains("FATAL") {
+        // A probe that comes too early gets a FATAL line of its own ("the
+        // database system is starting up", or "is not yet accepting
+        // connections" on newer servers), which is not the server failing.
+        let failed = text.lines().any(|line| {
+            line.contains("FATAL")
+                && !line.contains("is starting up")
+                && !line.contains("not yet accepting connections")
+        });
+        if failed {
             return Err(text);
         }
         if PID.load(Ordering::SeqCst) == 0 {
