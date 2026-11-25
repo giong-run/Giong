@@ -372,6 +372,10 @@ async fn serve_traced<F: std::future::Future>(
 fn requests_are_split_into_phases_and_grouped_by_route() {
     use observe::{RequestTrace, Route, Wait};
     static CHECKOUT: Route = Route::from_static("POST /checkout");
+    // The slow request's pool wait. Short sleeps can end tens of
+    // milliseconds late (a 2 ms one took 45 ms under TSan on macOS), so the
+    // slow request must stand out by far more than that.
+    const SLOW: u64 = 250;
     let report = giong::block_on(async {
         let h = giong::handle();
         assert!(!h.is_request_tracing());
@@ -385,7 +389,7 @@ fn requests_are_split_into_phases_and_grouped_by_route() {
             serve_traced(&mut trace, async {
                 observe::set_route(&CHECKOUT);
                 let pool = observe::wait(Wait::Pool, "postgres");
-                let ms = if i == 19 { 40 } else { 1 };
+                let ms = if i == 19 { SLOW } else { 1 };
                 giong::time::sleep(Duration::from_millis(ms)).await;
                 pool.end();
                 let _query = observe::wait(Wait::Query, "postgres");
@@ -431,16 +435,19 @@ fn requests_are_split_into_phases_and_grouped_by_route() {
     assert_eq!(checkout.route, Some(CHECKOUT.clone()));
     assert_eq!(checkout.requests, 20);
     assert_eq!(checkout.abandoned, 1);
-    assert!(checkout.max >= Duration::from_millis(43), "{checkout:?}");
     assert!(
-        checkout.quantile(0.5) < Duration::from_millis(30),
+        checkout.max >= Duration::from_millis(SLOW + 3),
+        "{checkout:?}"
+    );
+    assert!(
+        checkout.quantile(0.5) < Duration::from_millis(SLOW / 2),
         "{checkout:?}"
     );
     let slowest = &checkout.slowest[0];
     assert_eq!(slowest.protocol, "test");
     assert_eq!(slowest.status, 200);
     assert!(
-        slowest.pool.total >= Duration::from_millis(40),
+        slowest.pool.total >= Duration::from_millis(SLOW),
         "{slowest:?}"
     );
     assert_eq!(slowest.pool.count, 1);
@@ -469,7 +476,7 @@ fn requests_are_split_into_phases_and_grouped_by_route() {
     // The slowest one stands out in the tail.
     let tail = checkout.breakdown(0.99, 1.0);
     assert_eq!(tail.requests, 1);
-    assert!(tail.pool >= Duration::from_millis(40));
+    assert!(tail.pool >= Duration::from_millis(SLOW), "{tail:?}");
     let fast = checkout.breakdown(0.0, 0.5);
     assert!(fast.requests >= 10);
     assert!(fast.pool < Duration::from_millis(3) * fast.requests as u32);
