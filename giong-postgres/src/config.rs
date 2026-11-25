@@ -518,6 +518,7 @@ fn percent_decode(s: &str, what: &str) -> Result<String, Error> {
             let hex = bytes
                 .get(i + 1..i + 3)
                 .and_then(|h| std::str::from_utf8(h).ok())
+                .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
                 .ok_or_else(|| {
                     Error::config(format!(
@@ -865,6 +866,8 @@ mod tests {
         assert!(err("postgres://u@h1,h2/db").contains("several hosts"));
         assert!(err("postgres://u@[::1/db").contains("closing"));
         assert!(err("postgres://u:%zz@h/db").contains("%25"));
+        // A sign is not a hex digit (u8::from_str_radix takes "+5").
+        assert!(err("postgres://u:%+5@h/db").contains("%25"));
         assert!(err("postgres://u@h/db?connect_timeout=0").contains("above zero"));
         assert!(err("postgres://u@h/db?sslrootcert=/nonexistent/ca.pem").contains("cannot read"));
         assert!(err("postgres://u@h/db?flag").contains("no value"));

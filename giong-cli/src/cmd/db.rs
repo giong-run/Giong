@@ -652,15 +652,22 @@ fn percent_decode(s: &str) -> String {
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let Ok(v) = u8::from_str_radix(&s[i + 1..i + 3], 16) {
+        // Bytes, not `&s[..]`: the two after a '%' may cut a character. And
+        // two hex digits, not from_str_radix alone, which also takes "+5".
+        let hex = b.get(i + 1..i + 3).and_then(|h| {
+            let (hi, lo) = ((h[0] as char).to_digit(16)?, (h[1] as char).to_digit(16)?);
+            Some((hi * 16 + lo) as u8)
+        });
+        match (b[i], hex) {
+            (b'%', Some(v)) => {
                 out.push(v);
                 i += 3;
-                continue;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
             }
         }
-        out.push(b[i]);
-        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -2543,6 +2550,11 @@ mod tests {
         assert_eq!(replace_database("postgres://h", "x"), "postgres://h/x");
         assert_eq!(percent_decode("a%2"), "a%2");
         assert_eq!(percent_decode("%zz%41"), "%zzA");
+        // A character cut by the two bytes after '%' (it panicked), and a
+        // sign, which from_str_radix takes, are left as written.
+        assert_eq!(percent_decode("%€x"), "%€x");
+        assert_eq!(percent_decode("p%+5"), "p%+5");
+        assert_eq!(parse_url("postgres://u:p%€@h/d").unwrap().1.password, "p%€");
     }
 
     #[test]

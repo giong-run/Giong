@@ -428,6 +428,10 @@ fn percent_decode(s: &str) -> Option<Vec<u8>> {
     while i < b.len() {
         if b[i] == b'%' {
             let hex = std::str::from_utf8(b.get(i + 1..i + 3)?).ok()?;
+            // Two hex digits: from_str_radix alone also takes "+5".
+            if !hex.bytes().all(|c| c.is_ascii_hexdigit()) {
+                return None;
+            }
             out.push(u8::from_str_radix(hex, 16).ok()?);
             i += 3;
         } else {
@@ -505,6 +509,7 @@ mod tests {
             ("http://proxy/path", "no path"),
             ("http://:pw@proxy", "user name is empty"),
             ("http://u:%zz@proxy", "%-escape"),
+            ("http://u:%+5@proxy", "%-escape"),
         ] {
             let e = parse_server(input, false).unwrap_err().to_string();
             assert!(e.contains(says), "{input}: {e}");
