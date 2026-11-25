@@ -897,6 +897,18 @@ impl Dev {
         let _ = fs::remove_file(&mcp);
         let program = runnable(exe, self.starts)?;
         let mut cmd = Process::new(&program);
+        // The copy runs from another folder: the DLLs next to cargo's file
+        // (and in deps/, as cargo run finds them) are found through PATH.
+        #[cfg(windows)]
+        if let Some(dir) = exe.parent() {
+            let mut paths = vec![dir.to_path_buf(), dir.join("deps")];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(path) = std::env::join_paths(paths) {
+                cmd.env("PATH", path);
+            }
+        }
         cmd.args(&self.service_args)
             .env_remove(devctl::BACKGROUND_VAR)
             .current_dir(&self.project.root)
@@ -1473,14 +1485,12 @@ fn remove_copies(exe: &Path) {
             .parent()
             .unwrap_or_else(|| Path::new("."))
             .join("giong-dev");
-        let prefix = format!(
-            "{}-",
-            exe.file_stem()
-                .map(|s| s.to_string_lossy())
-                .unwrap_or_default()
-        );
+        let stem = exe
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
         for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
-            if entry.file_name().to_string_lossy().starts_with(&prefix) {
+            if is_copy_of(&stem, &entry.file_name().to_string_lossy()) {
                 let _ = fs::remove_file(entry.path());
             }
         }
@@ -1488,6 +1498,24 @@ fn remove_copies(exe: &Path) {
     }
     #[cfg(not(windows))]
     let _ = exe;
+}
+
+/// Whether `name` is a copy [`runnable`] made of the binary `stem`:
+/// `<stem>-<pid>-<n>.exe`, and not one of another binary whose name starts
+/// the same (`app` and `app-worker`).
+#[cfg_attr(not(windows), allow(dead_code))] // tested everywhere
+fn is_copy_of(stem: &str, name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(stem)
+        .and_then(|r| r.strip_prefix('-'))
+        .and_then(|r| r.strip_suffix(".exe"))
+    else {
+        return false;
+    };
+    let digits =
+        |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let mut parts = rest.split('-');
+    digits(parts.next()) && digits(parts.next()) && parts.next().is_none()
 }
 
 /// Where the giong-mcp socket of the `n`th start goes: `.giong/` in the
@@ -2237,6 +2265,18 @@ mod tests {
         let e = listen_addresses(Some("localhost:8080"), &[]).unwrap_err();
         assert_eq!(e.code, Code::HOST_NAME_BIND);
         assert!(listen_addresses(Some("127.0.0.1:0"), &[]).is_err());
+    }
+
+    #[test]
+    fn only_copies_of_the_same_binary_are_removed() {
+        assert!(is_copy_of("app", "app-1234-1.exe"));
+        assert!(is_copy_of("app", "app-1234-27.exe"));
+        assert!(!is_copy_of("app", "app-worker-1234-1.exe"));
+        assert!(!is_copy_of("app", "app-1234.exe"));
+        assert!(!is_copy_of("app", "app-1234-1-2.exe"));
+        assert!(!is_copy_of("app", "app-12a4-1.exe"));
+        assert!(!is_copy_of("app", "app.exe"));
+        assert!(is_copy_of("app-worker", "app-worker-9-3.exe"));
     }
 
     #[test]
