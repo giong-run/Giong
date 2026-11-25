@@ -74,6 +74,7 @@ Take the first that fits:
 | Protocol Buffers | `giong-proto` (views over the buffer) | prost |
 | HTTP/3, QUIC | `giong-http` feature `unstable-http3`, `giong-quic` (Rust 1.85; may change) | quinn, h3 |
 | PostgreSQL | `giong-postgres` (`Pool` per worker) | sqlx, tokio-postgres |
+| SQLite | rusqlite (feature `bundled`), every call inside `giong::spawn_blocking`: one write connection and a few read connections in WAL mode, shared by the workers (`src/db.rs` of `giong new`) | sqlx, a query on a worker |
 | MySQL, MariaDB | `giong-mysql` | sqlx, mysql_async |
 | Redis | `giong-redis` | redis-rs, fred |
 | Files, timers, names | `giong::fs`, `giong::time`, `giong::net::lookup_host` | `tokio::fs`, `tokio::time` |
@@ -142,7 +143,7 @@ the cause and the fix.
 
 | You want | Run |
 |---|---|
-| Start a project | `giong new api --template web --db postgres` (templates `web`, `grpc`, `worker`; `--db postgres`, `mysql`, `redis`, comma-separated; `--tls`) |
+| Start a project | `giong new api` (a users API on SQLite; templates `web`, `grpc`, `worker`; `--db postgres`, `mysql`, `sqlite`, `redis`, comma-separated, or `none`; `--tls`) |
 | Teach this project to your agent | `giong ai init` (`giong new` does it) |
 | Work on it | `giong dev --background`, once (see Local development) |
 | Is my machine right? | `giong doctor` |

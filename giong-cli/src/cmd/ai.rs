@@ -236,7 +236,8 @@ skill in `.claude/skills/giong/SKILL.md` has every rule; the ones that matter mo
   never on the text; `giong explain GIONG-E0102` prints the cause and the fix.
 - **The giong crate for the job**: giong-web (not axum), giong-http's client (not reqwest),
   giong-postgres and giong-mysql (not sqlx), giong-redis (not redis-rs), giong-grpc (not
-  tonic). A crate that needs the Tokio runtime panics on a worker.
+  tonic). A crate that needs the Tokio runtime panics on a worker. SQLite is rusqlite with
+  every call inside `giong::spawn_blocking` (what `src/db.rs` of `giong new` does).
 
 {rows}{dev}{mcp}{END}
 "#

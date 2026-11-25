@@ -13,6 +13,9 @@
 {{#if mysql}}
 //! | `DATABASE_URL` | (required) | `mysql://user:password@host/db` |
 {{/if}}
+{{#if sqlite}}
+//! | `DATABASE_URL` | `sqlite:data/{{crate}}.db` | the file, relative to where the service starts, or `sqlite:///abs/path.db`; made with its directory when missing |
+{{/if}}
 {{#if redis}}
 //! | `REDIS_URL` | `redis://127.0.0.1:6379` | |
 {{/if}}
@@ -21,12 +24,20 @@
 //! | `TLS_CERT`, `TLS_KEY` | (none) | PEM files; without both, plain HTTP |
 {{/if}}
 //! | `WORKERS` | every core | |
-{{#if sql & redis}}
+{{#if sql_server & redis}}
 //! | `DB_POOL`, `CACHE_POOL` | `2`, `1` | connections per worker |
+{{/if}}
+{{#if sqlite & redis}}
+//! | `CACHE_POOL` | `1` | Redis connections per worker |
+{{/if}}
+{{#if sql & redis}}
 //! | `CACHE_TTL_SECS` | `60` | |
 {{/if}}
-{{#if sql & !redis}}
+{{#if sql_server & !redis}}
 //! | `DB_POOL` | `2` | connections per worker |
+{{/if}}
+{{#if sqlite}}
+//! | `DB_READERS` | `4` | read connections, shared by every worker (one more writes) |
 {{/if}}
 {{#if redis & !sql}}
 //! | `REDIS_POOL` | `1` | connections per worker |
@@ -35,6 +46,9 @@
 //! | `GIONG_MCP`, `GIONG_MCP_TOKEN` | (off) | giong-mcp, for agents: `127.0.0.1:7777` |
 
 use std::env;
+{{#if sqlite}}
+use std::path::PathBuf;
+{{/if}}
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -55,6 +69,9 @@ use giong_redis::Config as RedisConfig;
 use giong_tls::{Certificates, TlsAcceptor};
 {{/if}}
 use giong_web::Server;
+{{#if sqlite}}
+use {{crate}}::db::Db;
+{{/if}}
 {{#if sql}}
 use {{crate}}::{app, AccessLog, State, SCHEMA};
 {{#else}}
@@ -62,8 +79,11 @@ use {{crate}}::{app, AccessLog, State};
 {{/if}}
 
 struct Settings {
-{{#if sql}}
+{{#if sql_server}}
     db: DbConfig,
+{{/if}}
+{{#if sqlite}}
+    db: Db,
 {{/if}}
 {{#if redis & sql}}
     cache: CacheConfig,
@@ -76,7 +96,7 @@ struct Settings {
     tls: Option<TlsAcceptor>,
 {{/if}}
     workers: Option<usize>,
-{{#if sql}}
+{{#if sql_server}}
     db_pool: usize,
 {{/if}}
 {{#if redis & sql}}
@@ -112,6 +132,10 @@ fn settings() -> Result<Settings, String> {
     let url = var("DATABASE_URL")
         .ok_or("DATABASE_URL is not set; give mysql://user:password@host/db")?;
     let db = DbConfig::from_url(&url).map_err(|e| format!("DATABASE_URL: {e}"))?;
+{{/if}}
+{{#if sqlite}}
+    let url = var("DATABASE_URL").unwrap_or_else(|| "sqlite:data/{{crate}}.db".into());
+    let db = Db::open(&sqlite_path(&url)?, number("DB_READERS", 4)?)?;
 {{/if}}
 {{#if redis & sql}}
     let cache_url = var("REDIS_URL").unwrap_or_else(|| "redis://127.0.0.1:6379".into());
@@ -154,7 +178,7 @@ fn settings() -> Result<Settings, String> {
         tls,
 {{/if}}
         workers: var("WORKERS").map(|_| number("WORKERS", 1)).transpose()?,
-{{#if sql}}
+{{#if sql_server}}
         db_pool: number("DB_POOL", 2)?,
 {{/if}}
 {{#if redis & sql}}
@@ -191,6 +215,26 @@ fn migrate(db: &DbConfig) -> Result<(), String> {
         pool.batch_execute(SCHEMA).await
     })
     .map_err(|e| format!("creating the tables: {e}"))
+}
+
+{{/if}}
+{{#if sqlite}}
+/// The file of a `sqlite:` URL: `sqlite:data/app.db`, relative to the
+/// directory the service starts in, or `sqlite:///var/lib/app/app.db`.
+fn sqlite_path(url: &str) -> Result<PathBuf, String> {
+    url.strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .filter(|path| !path.is_empty() && !path.starts_with(':'))
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("DATABASE_URL={url:?}: give sqlite:path/to/file.db"))
+}
+
+/// Creates the tables, once, before the workers start. The statements of
+/// `migrations/0001_init.sql` only create what is missing; `giong db migrate`
+/// applies that file and the ones you add after it.
+fn migrate(db: &Db) -> Result<(), String> {
+    db.setup(SCHEMA)
+        .map_err(|e| format!("creating the tables: {e}"))
 }
 
 {{/if}}
@@ -235,6 +279,9 @@ fn main() -> ExitCode {
 {{/if}}
 {{#if mysql}}
             db: giong_mysql::Pool::new(settings.db.clone(), settings.db_pool),
+{{/if}}
+{{#if sqlite}}
+            db: settings.db.clone(),
 {{/if}}
 {{#if redis & sql}}
             cache: giong_redis::Pool::new(settings.cache.clone(), settings.cache_pool),

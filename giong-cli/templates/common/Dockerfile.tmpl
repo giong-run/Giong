@@ -14,9 +14,19 @@ FROM rust:1-bookworm AS build
 WORKDIR /src
 COPY . .
 RUN cargo build --release && cp target/release/{{name}} /{{name}}
+{{#if sqlite}}
+RUN mkdir /data
+{{/if}}
 
 FROM gcr.io/distroless/cc-debian12
 COPY --from=build /{{name}} /{{name}}
+{{#if sqlite}}
+# The SQLite file: mount a volume here (docker run -v {{name}}-data:/data), or
+# the data goes with the container.
+COPY --from=build --chown=nonroot:nonroot /data /data
+ENV DATABASE_URL=sqlite:///data/{{crate}}.db
+VOLUME /data
+{{/if}}
 {{#if !worker}}
 # Every interface: the container's own network is the boundary.
 ENV LISTEN=0.0.0.0:{{default_port}}

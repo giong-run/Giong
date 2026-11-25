@@ -11,7 +11,7 @@ cargo install giong-cli --locked                            # anywhere Rust runs
 The install scripts download the prebuilt binary of the latest release from GitHub, check its SHA-256 and put it in `~/.giong/bin` (`%USERPROFILE%\.giong\bin` on Windows) without asking for root; where no binary is published they build it with cargo. `GIONG_VERSION=1.5.0` picks a version, `GIONG_INSTALL=/path` another folder, `GIONG_DOWNLOAD_URL` a mirror of the release downloads. Then:
 
 ```sh
-giong new api --db postgres   # a service that builds and passes its tests now
+giong new api    # a users API on SQLite that builds and passes its tests now, nothing to install
 giong doctor     # is this machine (and project) ready?
 giong dev --background  # build, run on localhost and rebuild on every save; returns once it serves
 giong dev status        # what runs, where, and how the last build went (logs, stop: the same way)
@@ -56,18 +56,20 @@ The service gets the variables of `.env` (those not already set), `WORKERS=2` so
 ## giong new
 
 ```sh
-giong new <dir> [--template web|grpc|worker] [--db postgres,mysql,redis] [--tls] [--name NAME] [--no-git] [--no-ai] [--dry-run]
+giong new <dir> [--template web|grpc|worker] [--db sqlite|postgres|mysql|none[,redis]] [--tls] [--name NAME] [--no-git] [--no-ai] [--dry-run]
 ```
 
 Writes a project that builds, passes `clippy -D warnings` and passes its tests from the first minute, then runs `git init` and `giong ai init` in it. Every project has one worker per core with graceful shutdown on `SIGTERM`, giong-mcp (off until `GIONG_MCP` is set), an end to end test, `.env.example`, a Dockerfile, a GitHub Actions workflow with the database services it needs, and a dev profile that builds faster: on a PostgreSQL, Redis and TLS service a clean debug build takes 12.6 s instead of 15.3 s and the target directory 296 MB instead of 640 MB (Rust 1.100, [method](https://github.com/giong-run/Giong/tree/main/bench/results/devkit/template-profile)).
 
 | Template | What it is |
 |---|---|
-| `web` (default) | A JSON API on giong-web with `/health` (and `/ready` when it has a database): a users API on PostgreSQL or MySQL (with Redis as a cache when both are chosen), counters on Redis, or a hello service without a database. Migrations in `migrations/`. |
+| `web` (default) | A JSON API on giong-web with `/health` (and `/ready` when it has a database): a users API on SQLite by default, or on PostgreSQL or MySQL with `--db` (with Redis as a cache when `redis` is added), counters on Redis (`--db redis`), or a hello service without a database (`--db none`). Migrations in `migrations/`. |
 | `grpc` | A gRPC service from `proto/service.proto` with health and reflection, built by giong-grpc-build (no `protoc` to install). |
 | `worker` | A job runner: jobs claimed from a table with `FOR UPDATE SKIP LOCKED` (PostgreSQL) or in a transaction (MySQL), from a Redis list, or on a timer, with retries and backoff. |
 
-`--tls` serves HTTPS or gRPC over TLS when `TLS_CERT` and `TLS_KEY` are set. `postgres` and `mysql` exclude each other, `grpc` takes no database and `worker` one, without `--tls`: anything else is refused with `GIONG-E5032` and the choices that work. The directory must be new or empty (`GIONG-E5031`); a write that fails takes back everything it made. Every combination is built, linted, tested on io_uring and on epoll against real databases, started and stopped with `SIGTERM` on every pull request.
+SQLite needs nothing installed or started: the database is the file `data/<name>.db`, made at the first start, compiled in through rusqlite (feature `bundled`). Its calls block, so the project's `src/db.rs` runs each one on giong's blocking lane (`giong::spawn_blocking`), with one write connection and a few read connections in WAL mode shared by every worker; the tests use a file of their own each, and the CI workflow starts no service. One copy of the service owns a file; for several machines start from `--db postgres`.
+
+`--tls` serves HTTPS or gRPC over TLS when `TLS_CERT` and `TLS_KEY` are set. `sqlite`, `postgres` and `mysql` exclude each other, `grpc` takes no database and `worker` one, without `--tls`: anything else is refused with `GIONG-E5032` and the choices that work. The directory must be new or empty (`GIONG-E5031`); a write that fails takes back everything it made. Every combination is built, linted, tested on io_uring and on epoll against real databases, started and stopped with `SIGTERM` on every pull request.
 
 ## giong ai init
 
@@ -196,13 +198,15 @@ It reads what the service already gives, its output and its giong-mcp, so the se
 ## giong db
 
 ```sh
-giong db up            # a development PostgreSQL, MySQL or Redis in Docker or Podman
+giong db up            # a development PostgreSQL, MySQL or Redis in Docker or Podman (SQLite: nothing to start)
 giong db new add_users # migrations/0002_add_users.sql
 giong db migrate       # apply what is new; giong db status shows what is applied
 giong db down          # stop it; --volumes also deletes the data
 ```
 
 Starts the databases the project depends on in containers, with a random password, a free port and a volume, and writes `DATABASE_URL` or `REDIS_URL` into `.env` (owner-only, git-ignored). Each checkout gets its own container, named after the package, the engine and a short hash of the project's path (`giong-shop-postgres-3fa2c1`), so two copies of a project never share a database. The container is recorded in `.giong/processes.json`: `giong dev status` lists it and `giong dev stop` stops it, keeping its data. Migrations are forward-only SQL files `migrations/NNNN_name.sql`; each PostgreSQL file runs in one transaction (unless its first line is `-- giong:no-transaction`), each applied file is recorded with its SHA-256 checksum, a changed applied file is refused and a failing one names its line. With a `DATABASE_URL` of your own, `migrate` and `status` work on that database. `giong db reset --yes` empties a database `giong db up` started.
+
+SQLite (a project that depends on rusqlite) has no server: `giong db up` only writes `DATABASE_URL=sqlite:data/<name>.db` into `.env` when it names no SQLite file yet, and without it `migrate` and `status` use the file the service opens by default. They run through the `sqlite3` shell (apt install sqlite3, brew install sqlite; macOS has it), each file in one transaction. `giong db reset --yes` drops every table of the file when the file is inside the project, and keeps the file, so a running service carries on with the emptied one.
 
 ## giong env
 

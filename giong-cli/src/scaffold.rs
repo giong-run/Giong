@@ -65,24 +65,34 @@ impl fmt::Display for Template {
 pub enum Db {
     Postgres,
     Mysql,
+    /// A file in the project, through rusqlite on the blocking lane: no
+    /// server to start.
+    Sqlite,
     Redis,
 }
 
 impl Db {
-    pub const ALL: [Db; 3] = [Db::Postgres, Db::Mysql, Db::Redis];
+    pub const ALL: [Db; 4] = [Db::Postgres, Db::Mysql, Db::Sqlite, Db::Redis];
 
     pub fn name(self) -> &'static str {
         match self {
             Db::Postgres => "postgres",
             Db::Mysql => "mysql",
+            Db::Sqlite => "sqlite",
             Db::Redis => "redis",
         }
+    }
+
+    /// Whether `giong db up` has a server to start for it.
+    pub fn has_server(self) -> bool {
+        self != Db::Sqlite
     }
 
     pub fn parse(s: &str) -> Option<Db> {
         match s {
             "postgres" | "postgresql" | "pg" => Some(Db::Postgres),
             "mysql" | "mariadb" => Some(Db::Mysql),
+            "sqlite" | "sqlite3" => Some(Db::Sqlite),
             "redis" | "valkey" => Some(Db::Redis),
             _ => None,
         }
@@ -119,8 +129,22 @@ impl Options {
     }
 }
 
-/// Parses `--db postgres,redis` into a sorted list without repeats.
+/// The stores of a template when `--db` is not given: SQLite for web, so a
+/// new project serves a real API with nothing to install or start; none for
+/// the others (a worker's queue is shared, which a file cannot be).
+pub fn default_dbs(template: Template) -> Vec<Db> {
+    match template {
+        Template::Web => vec![Db::Sqlite],
+        Template::Grpc | Template::Worker => Vec::new(),
+    }
+}
+
+/// Parses `--db postgres,redis` into a sorted list without repeats; `none`
+/// is the empty list.
 pub fn parse_dbs(list: &str) -> Result<Vec<Db>, Failure> {
+    if list.trim().eq_ignore_ascii_case("none") {
+        return Ok(Vec::new());
+    }
     let mut dbs = Vec::new();
     for word in list.split(',').map(str::trim) {
         if word.is_empty() {
@@ -130,7 +154,8 @@ pub fn parse_dbs(list: &str) -> Result<Vec<Db>, Failure> {
             Failure::new(
                 Code::BAD_TEMPLATE_CHOICE,
                 format!("--db {word:?} is not a store giong new knows"),
-                "use postgres, mysql or redis, several separated by commas: --db postgres,redis",
+                "use sqlite, postgres, mysql or redis, several separated by commas (--db \
+                 postgres,redis), or none",
             )
         })?;
         if !dbs.contains(&db) {
@@ -269,10 +294,17 @@ pub fn check_choices(o: &Options) -> Result<(), Failure> {
             fix.to_string(),
         ))
     };
-    if o.has(Db::Postgres) && o.has(Db::Mysql) {
+    let sql: Vec<&str> = o
+        .dbs
+        .iter()
+        .filter(|d| **d != Db::Redis)
+        .map(|d| d.name())
+        .collect();
+    if sql.len() > 1 {
         return refuse(
-            "--db asks for both postgres and mysql".into(),
-            "pick one SQL database: --db postgres or --db mysql (redis goes with either)",
+            format!("--db asks for {}", sql.join(" and ")),
+            "pick one SQL database: --db sqlite, --db postgres or --db mysql (redis goes with \
+             any of them)",
         );
     }
     match o.template {
@@ -290,6 +322,13 @@ pub fn check_choices(o: &Options) -> Result<(), Failure> {
         Template::Worker if o.dbs.len() > 1 => refuse(
             "the worker template takes its jobs from one store".into(),
             "pick one of --db postgres, --db mysql or --db redis (or none, for a timer)",
+        ),
+        Template::Worker if o.has(Db::Sqlite) => refuse(
+            "the worker template has no sqlite queue: its jobs are shared by every copy of \
+             the worker, which a file on one machine cannot be"
+                .into(),
+            "use --db postgres, mysql or redis for the queue (or none, for a timer); for \
+             SQLite, start from --template web",
         ),
         Template::Worker => Ok(()),
     }
@@ -379,8 +418,13 @@ pub fn context(o: &Options) -> Context {
     for db in Db::ALL {
         cx.flag(db.name(), o.has(db));
     }
-    cx.flag("sql", o.has(Db::Postgres) || o.has(Db::Mysql))
+    let sql_server = o.has(Db::Postgres) || o.has(Db::Mysql);
+    cx.flag("sql", sql_server || o.has(Db::Sqlite))
+        // A SQL database reached over the network, through a pool per worker.
+        .flag("sql_server", sql_server)
         .flag("db", !o.dbs.is_empty())
+        // A store `giong db up` starts (and CI runs as a service).
+        .flag("servers", o.dbs.iter().any(|d| d.has_server()))
         .flag("tls", o.tls)
         .flag("local", o.giong_path.is_some())
         .flag(
@@ -463,7 +507,7 @@ mod tests {
     /// Every combination the templates accept, and only those.
     pub fn every_choice() -> Vec<Options> {
         let mut all = Vec::new();
-        let db_sets: Vec<Vec<Db>> = (0u8..8)
+        let db_sets: Vec<Vec<Db>> = (0u8..1 << Db::ALL.len())
             .map(|bits| {
                 Db::ALL
                     .into_iter()
@@ -494,9 +538,9 @@ mod tests {
     #[test]
     fn every_template_renders_with_every_choice() {
         let all = every_choice();
-        // web: 6 db sets (not pg+mysql) x tls x local; grpc: 1 x 2 x 2;
-        // worker: 4 x 1 x 2.
-        assert_eq!(all.len(), 6 * 2 * 2 + 2 * 2 + 4 * 2);
+        // web: 8 db sets (at most one SQL database, redis or not) x tls x
+        // local; grpc: 1 x 2 x 2; worker: 4 (none, pg, mysql, redis) x 1 x 2.
+        assert_eq!(all.len(), 8 * 2 * 2 + 2 * 2 + 4 * 2);
         for o in all {
             let files = render(&o).unwrap_or_else(|f| panic!("{o:?}: {f}"));
             let paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
@@ -514,7 +558,7 @@ mod tests {
                 assert!(paths.contains(&must), "{o:?} lacks {must}: {paths:?}");
             }
             assert!(paths.iter().any(|p| p.starts_with("tests/")), "{o:?}");
-            let sql = o.has(Db::Postgres) || o.has(Db::Mysql);
+            let sql = o.has(Db::Postgres) || o.has(Db::Mysql) || o.has(Db::Sqlite);
             assert_eq!(paths.contains(&"migrations/0001_init.sql"), sql, "{o:?}");
             for f in &files {
                 let tag_left = f.text.match_indices("{{").any(|(i, _)| {
@@ -547,9 +591,22 @@ mod tests {
             assert!(cargo.contains("name = \"my-api\""));
             assert!(cargo.contains("debug = \"line-tables-only\""));
             for db in Db::ALL {
-                let dep = format!("giong-{} =", db.name());
+                let dep = match db {
+                    Db::Sqlite => "rusqlite =".to_string(),
+                    _ => format!("giong-{} =", db.name()),
+                };
                 assert_eq!(cargo.contains(&dep), o.has(db), "{o:?}: {dep}");
             }
+            // SQLite needs no server: nothing to start, in development or CI.
+            let ci = &files
+                .iter()
+                .find(|f| f.path == ".github/workflows/ci.yml")
+                .unwrap()
+                .text;
+            let servers = o.dbs.iter().any(|d| d.has_server());
+            assert_eq!(ci.contains("services:"), servers, "{o:?}");
+            let readme = &files.iter().find(|f| f.path == "README.md").unwrap().text;
+            assert_eq!(readme.contains("giong db up"), servers, "{o:?}");
             if o.giong_path.is_some() {
                 assert!(cargo.contains("giong = { path = '/src/giong' }"), "{cargo}");
                 assert!(!cargo.contains(GIONG_VERSION), "{cargo}");
@@ -691,6 +748,20 @@ mod tests {
             refused(Template::Worker, &[Db::Postgres, Db::Redis], false),
             Code::BAD_TEMPLATE_CHOICE
         );
+        assert_eq!(
+            refused(Template::Web, &[Db::Postgres, Db::Sqlite], false),
+            Code::BAD_TEMPLATE_CHOICE
+        );
+        assert_eq!(
+            refused(Template::Worker, &[Db::Sqlite], false),
+            Code::BAD_TEMPLATE_CHOICE
+        );
+        assert_eq!(
+            refused(Template::Grpc, &[Db::Sqlite], false),
+            Code::BAD_TEMPLATE_CHOICE
+        );
+        assert_eq!(parse_dbs("redis,sqlite").unwrap(), [Db::Sqlite, Db::Redis]);
+        assert_eq!(parse_dbs("SQLite3").unwrap(), [Db::Sqlite]);
         assert_eq!(Template::parse("web"), Some(Template::Web));
         assert_eq!(Template::parse("Web"), None);
     }

@@ -5,7 +5,10 @@
 //! (whichever answers; `GIONG_CONTAINER_RUNTIME` picks one), waits until it
 //! accepts queries over TCP, and writes `DATABASE_URL` / `REDIS_URL` into
 //! `.env`. What it started is kept in `.giong/db.json`, so `down`, `status`
-//! and `reset` act on that and nothing else.
+//! and `reset` act on that and nothing else. SQLite (a project on rusqlite)
+//! has no server: `up` only makes sure `.env` names its file
+//! (`sqlite:data/<crate>.db`), and `reset` empties that file when it is in
+//! the project.
 //!
 //! Migrations: `migrations/NNNN_name.sql` (at least four digits, unique,
 //! applied in order), plain SQL, forward only. Each file runs once, in one
@@ -15,7 +18,8 @@
 //! files are recorded in `giong_migrations` with a SHA-256 checksum, and a
 //! changed applied file is refused. The SQL goes through the database's own
 //! client: `psql` / `mysql` inside the container giong started, or installed
-//! locally for any other `DATABASE_URL`.
+//! locally for any other `DATABASE_URL`; `sqlite3` for SQLite, where a file
+//! runs in one transaction too.
 
 use std::io::Write;
 use std::net::TcpListener;
@@ -38,7 +42,7 @@ pub const COMMAND: Command = Command {
     name: "db",
     summary: "start a development database and apply SQL migrations",
     usage:
-        "giong db up [--engine postgres|mysql|redis] [--port <n>] [--image <ref>] [--timeout <s>]\n\
+        "giong db up [--engine sqlite|postgres|mysql|redis] [--port <n>] [--image <ref>] [--timeout <s>]\n\
             giong db down [--volumes]\n\
             giong db status\n\
             giong db new <name>\n\
@@ -47,18 +51,21 @@ pub const COMMAND: Command = Command {
             up: starts the database the project uses (from its giong-postgres, giong-mysql or \
             giong-redis dependency, or --engine) in Docker or Podman, waits until it answers \
             queries, and writes DATABASE_URL or REDIS_URL into .env (other keys untouched). Run \
-            again, it reuses what it started. down: stops and removes it; --volumes also \
+            again, it reuses what it started. SQLite (a rusqlite dependency) starts nothing: up \
+            writes DATABASE_URL=sqlite:data/<crate>.db into .env unless it names a file \
+            already, and migrate, status and reset use the sqlite3 shell. down: stops and removes it; --volumes also \
             deletes its data. status: what runs, where, and which migrations are applied or \
             pending. new: writes migrations/NNNN_<name>.sql with the next number. migrate: \
             applies the pending migrations in order, each once, each in a transaction on \
             PostgreSQL; an applied file that was changed is refused. reset: drops and \
             recreates the database giong started, then migrates (only that one, never \
-            another DATABASE_URL; --yes is required).",
+            another DATABASE_URL; for SQLite, only a file inside the project; --yes is \
+            required).",
     flags: &[
         Flag {
             name: "engine",
             kind: Kind::Value,
-            help: "postgres, mysql or redis (default: from the project's dependencies)",
+            help: "sqlite, postgres, mysql or redis (default: from the project's dependencies)",
         },
         Flag {
             name: "port",
@@ -95,6 +102,8 @@ pub const COMMAND: Command = Command {
 pub enum Engine {
     Postgres,
     Mysql,
+    /// A file, through the application's own SQLite: nothing to start.
+    Sqlite,
     Redis,
 }
 
@@ -103,6 +112,7 @@ impl Engine {
         match s.to_ascii_lowercase().as_str() {
             "postgres" | "postgresql" | "pg" => Some(Engine::Postgres),
             "mysql" | "mariadb" => Some(Engine::Mysql),
+            "sqlite" | "sqlite3" => Some(Engine::Sqlite),
             "redis" => Some(Engine::Redis),
             _ => None,
         }
@@ -112,8 +122,16 @@ impl Engine {
         match self {
             Engine::Postgres => "postgres",
             Engine::Mysql => "mysql",
+            Engine::Sqlite => "sqlite",
             Engine::Redis => "redis",
         }
+    }
+
+    /// Whether `giong db up` runs a server for it. The container settings
+    /// below are those of the engines that have one; SQLite's are empty and
+    /// never used.
+    pub fn has_server(self) -> bool {
+        self != Engine::Sqlite
     }
 
     fn default_image(self) -> &'static str {
@@ -121,6 +139,7 @@ impl Engine {
             Engine::Postgres => "postgres:17-alpine",
             Engine::Mysql => "mysql:8.4",
             Engine::Redis => "redis:7-alpine",
+            Engine::Sqlite => "",
         }
     }
 
@@ -129,6 +148,7 @@ impl Engine {
             Engine::Postgres => 5432,
             Engine::Mysql => 3306,
             Engine::Redis => 6379,
+            Engine::Sqlite => 0,
         }
     }
 
@@ -137,13 +157,14 @@ impl Engine {
             Engine::Postgres => "/var/lib/postgresql/data",
             Engine::Mysql => "/var/lib/mysql",
             Engine::Redis => "/data",
+            Engine::Sqlite => "",
         }
     }
 
     /// The `.env` key its URL goes into.
     pub fn env_key(self) -> &'static str {
         match self {
-            Engine::Postgres | Engine::Mysql => "DATABASE_URL",
+            Engine::Postgres | Engine::Mysql | Engine::Sqlite => "DATABASE_URL",
             Engine::Redis => "REDIS_URL",
         }
     }
@@ -179,6 +200,7 @@ impl Started {
                 self.user, self.password, self.port, self.database
             ),
             Engine::Redis => format!("redis://127.0.0.1:{}", self.port),
+            Engine::Sqlite => String::new(),
         }
     }
 
@@ -323,6 +345,7 @@ fn official_image(engine: Engine, image: &str) -> bool {
         Engine::Postgres => &["postgres"],
         Engine::Mysql => &["mysql", "mariadb"],
         Engine::Redis => &["redis", "valkey/valkey"],
+        Engine::Sqlite => &[],
     };
     repos.contains(&repo)
         && !tag.is_empty()
@@ -459,6 +482,7 @@ pub fn engines_in(manifest: &str) -> Vec<Engine> {
     for (krate, engine) in [
         ("giong-postgres", Engine::Postgres),
         ("giong-mysql", Engine::Mysql),
+        ("rusqlite", Engine::Sqlite),
         ("giong-redis", Engine::Redis),
     ] {
         let named = manifest.lines().any(|l| {
@@ -745,6 +769,7 @@ impl Runner {
                         cmd.arg(&s.container);
                         cmd.args(["redis-cli"]);
                     }
+                    Engine::Sqlite => return Err(bad_url("sqlite in a container")),
                 }
             }
             Runner::Local { engine, url } => match engine {
@@ -783,6 +808,15 @@ impl Runner {
                 Engine::Redis => {
                     cmd = Proc::new("redis-cli");
                     cmd.args(["-u", url]);
+                }
+                Engine::Sqlite => {
+                    let path = sqlite_path(url).ok_or_else(|| bad_url(url))?;
+                    cmd = Proc::new("sqlite3");
+                    // Stop at the first error, rows tab-separated without a
+                    // header, and wait for a lock the service holds.
+                    cmd.args(["-bail", "-batch", "-noheader", "-separator", "\t"]);
+                    cmd.args(["-cmd", ".timeout 5000"]);
+                    cmd.arg(path);
                 }
             },
         }
@@ -825,6 +859,24 @@ fn psql_args() -> [&'static str; 9] {
     ]
 }
 
+/// What the service of a project on rusqlite opens without `DATABASE_URL`
+/// (the template's default), so `giong db migrate` works before `.env` exists.
+fn default_sqlite_url(root: &Path) -> Option<String> {
+    let manifest = std::fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let engines = engines_in(&manifest);
+    (engines.contains(&Engine::Sqlite) && !engines.iter().any(|e| e.sql() && e.has_server()))
+        .then(|| format!("sqlite:data/{}.db", project_name(root).replace('-', "_")))
+}
+
+/// The file of a `sqlite:path` or `sqlite://path` URL (`sqlite:///abs`
+/// for an absolute one), as the template's service reads it.
+pub fn sqlite_path(url: &str) -> Option<PathBuf> {
+    url.strip_prefix("sqlite://")
+        .or_else(|| url.strip_prefix("sqlite:"))
+        .filter(|p| !p.is_empty() && !p.starts_with(':'))
+        .map(PathBuf::from)
+}
+
 /// A URL with the password replaced by `***`.
 pub fn redact(url: &str) -> String {
     let Some((scheme, rest)) = url.split_once("://") else {
@@ -856,17 +908,24 @@ fn bad_url(url: &str) -> Failure {
     Failure::new(
         Code::DB_URL,
         format!("{} is not a database URL giong db understands", redact(url)),
-        "write it as postgres://user:password@host:5432/db, mysql://user:password@host:3306/db \
-         or redis://host:6379",
+        "write it as postgres://user:password@host:5432/db, mysql://user:password@host:3306/db, \
+         sqlite:path/to/file.db or redis://host:6379",
     )
 }
 
 fn client_missing(r: &Runner, program: &str, e: std::io::Error) -> Failure {
-    let client = match r.engine() {
-        Engine::Postgres => "psql (postgresql-client)",
-        Engine::Mysql => "mysql (mysql-client or mariadb-client)",
-        Engine::Redis => "redis-cli (redis-tools)",
-    };
+    let client =
+        match r.engine() {
+            Engine::Postgres => "psql (postgresql-client)",
+            Engine::Mysql => "mysql (mysql-client or mariadb-client)",
+            Engine::Redis => "redis-cli (redis-tools)",
+            Engine::Sqlite => return Failure::new(
+                Code::DB_CLIENT_MISSING,
+                format!("cannot run {program} for {}: {e}", r.describe()),
+                "install the sqlite3 shell (apt install sqlite3, brew install sqlite; macOS has \
+                 it); the service itself needs nothing, it creates its tables at start",
+            ),
+        };
     Failure::new(
         Code::DB_CLIENT_MISSING,
         format!("cannot run {program} for {}: {e}", r.describe()),
@@ -911,7 +970,8 @@ fn runner(root: &Path, want: Option<Engine>) -> Result<Runner, Failure> {
                 .map(|t| dotenv::parse(&t))
                 .and_then(|(vars, _)| vars.into_iter().find(|v| v.key == key).map(|v| v.value))
                 .filter(|u| !u.is_empty())
-        });
+        })
+        .or_else(|| default_sqlite_url(root).filter(|_| key == "DATABASE_URL"));
     let Some(url) = url else {
         return Err(Failure::new(
             Code::DB_URL,
@@ -919,6 +979,17 @@ fn runner(root: &Path, want: Option<Engine>) -> Result<Runner, Failure> {
             format!("run giong db up, or set {key} in the environment or in .env"),
         ));
     };
+    if let Some(path) = sqlite_path(&url) {
+        if want.is_some_and(|w| w != Engine::Sqlite) {
+            return Err(bad_url(&url));
+        }
+        // Relative to the project, where giong dev starts the service.
+        let path = root.join(path);
+        return Ok(Runner::Local {
+            engine: Engine::Sqlite,
+            url: format!("sqlite:{}", path.display()),
+        });
+    }
     let (engine, _) = parse_url(&url).ok_or_else(|| bad_url(&url))?;
     if let Some(w) = want {
         if w != engine {
@@ -1120,7 +1191,9 @@ pub fn apply_script(engine: Engine, m: &Migration) -> String {
     );
     let body = format!("{}\n;\n", m.sql.trim_end());
     match engine {
-        Engine::Postgres if m.transaction => format!("BEGIN;\n{body}{record}COMMIT;\n"),
+        Engine::Postgres | Engine::Sqlite if m.transaction => {
+            format!("BEGIN;\n{body}{record}COMMIT;\n")
+        }
         _ => format!("{body}{record}"),
     }
 }
@@ -1165,7 +1238,7 @@ fn migrate(r: &Runner, root: &Path, rep: &mut Report) -> Result<(), Failure> {
         let started = Instant::now();
         let out = r.run(&apply_script(r.engine(), m), None, false)?;
         if !out.ok {
-            let wrapped = r.engine() == Engine::Postgres && m.transaction;
+            let wrapped = matches!(r.engine(), Engine::Postgres | Engine::Sqlite) && m.transaction;
             let line = error_line(&out.stderr)
                 .map(|l| l.saturating_sub(u32::from(wrapped)).max(1))
                 .unwrap_or(1);
@@ -1177,7 +1250,7 @@ fn migrate(r: &Runner, root: &Path, rep: &mut Report) -> Result<(), Failure> {
                 )
                 .detail(first_lines(&out.stderr, 6))
                 .fix(match r.engine() {
-                    Engine::Postgres if m.transaction => {
+                    Engine::Postgres | Engine::Sqlite if m.transaction => {
                         "fix the SQL and run giong db migrate again: the file ran in a \
                          transaction, so nothing of it was applied"
                     }
@@ -1206,8 +1279,9 @@ fn migrate(r: &Runner, root: &Path, rep: &mut Report) -> Result<(), Failure> {
     Ok(())
 }
 
-/// The script line an error names: psql's `psql:<stdin>:8: ERROR` or
-/// mysql's `ERROR 1146 (42S02) at line 2:`.
+/// The script line an error names: psql's `psql:<stdin>:8: ERROR`,
+/// mysql's `ERROR 1146 (42S02) at line 2:` or sqlite3's `Parse error near
+/// line 4:`.
 pub fn error_line(stderr: &str) -> Option<u32> {
     for l in stderr.lines() {
         if let Some(rest) = l.strip_prefix("psql:<stdin>:") {
@@ -1215,11 +1289,12 @@ pub fn error_line(stderr: &str) -> Option<u32> {
                 return Some(n);
             }
         }
-        if let Some(i) = l.find(" at line ") {
-            let n: String = l[i + 9..]
-                .chars()
-                .take_while(char::is_ascii_digit)
-                .collect();
+        if let Some(i) = l
+            .find(" at line ")
+            .map(|i| i + 9)
+            .or_else(|| l.find("near line ").map(|i| i + 10))
+        {
+            let n: String = l[i..].chars().take_while(char::is_ascii_digit).collect();
             if let Ok(n) = n.parse() {
                 return Some(n);
             }
@@ -1280,8 +1355,11 @@ pub(crate) fn ignore_secrets(root: &Path) -> Result<Vec<String>, Failure> {
         Err(e) => return Err(io_failure(&path, e)),
     };
     let has = |p: &str| {
+        let bare = p.trim_end_matches('/');
         text.lines().any(|l| {
-            l.trim() == p || l.trim() == format!("/{p}") || l.trim() == p.trim_end_matches('/')
+            [p, bare]
+                .iter()
+                .any(|p| l.trim() == *p || l.trim() == format!("/{p}"))
         })
     };
     let mut added = Vec::new();
@@ -1363,8 +1441,8 @@ fn up(args: &Args, root: &Path, project: &str, rep: &mut Report) -> Result<(), F
         Some(e) => vec![Engine::parse(e).ok_or_else(|| {
             Failure::new(
                 Code::USAGE,
-                format!("--engine {e:?} is not postgres, mysql or redis"),
-                "give --engine postgres, mysql or redis",
+                format!("--engine {e:?} is not sqlite, postgres, mysql or redis"),
+                "give --engine sqlite, postgres, mysql or redis",
             )
         })?],
         None => {
@@ -1374,20 +1452,51 @@ fn up(args: &Args, root: &Path, project: &str, rep: &mut Report) -> Result<(), F
                     Code::USAGE,
                     "the project uses no giong database crate, so giong db up does not know \
                      which database to start",
-                    "pass --engine postgres, mysql or redis, or add giong-postgres, giong-mysql \
-                     or giong-redis to Cargo.toml",
+                    "pass --engine postgres, mysql, redis or sqlite, or add giong-postgres, \
+                     giong-mysql, giong-redis or rusqlite to Cargo.toml",
                 ));
             }
             found
         }
     };
-    if engines.contains(&Engine::Postgres) && engines.contains(&Engine::Mysql) {
+    let sql: Vec<&str> = engines
+        .iter()
+        .filter(|e| e.sql())
+        .map(|e| e.name())
+        .collect();
+    if sql.len() > 1 {
         return Err(Failure::new(
             Code::USAGE,
-            "the project uses both giong-postgres and giong-mysql, and both would use \
-             DATABASE_URL",
-            "start one with --engine postgres or --engine mysql",
+            format!(
+                "the project uses {}, and each would use DATABASE_URL",
+                sql.join(" and ")
+            ),
+            format!("start one with --engine {}", sql.join(" or --engine ")),
         ));
+    }
+    let added = ignore_secrets(root)?;
+    if !added.is_empty() {
+        rep.line(format!(
+            "added {} to .gitignore (they hold the password)",
+            added.join(" and ")
+        ));
+    }
+    let mut out = Vec::new();
+    let (engines, files): (Vec<Engine>, Vec<Engine>) =
+        engines.into_iter().partition(|e| e.has_server());
+    if !files.is_empty() {
+        out.push(sqlite_up(root, project, rep)?);
+    }
+    if engines.is_empty() {
+        if args.value("port").is_some() || args.value("image").is_some() {
+            return Err(Failure::new(
+                Code::USAGE,
+                "SQLite has no server, so --port and --image have nothing to set",
+                "drop them: the database is a file the service opens",
+            ));
+        }
+        rep.data("databases", json!(out));
+        return Ok(());
     }
     if args.value("port").is_some() && engines.len() > 1 {
         return Err(Failure::new(
@@ -1407,14 +1516,6 @@ fn up(args: &Args, root: &Path, project: &str, rep: &mut Report) -> Result<(), F
     }
     let runtime = container_runtime()?;
     let mut state = read_state(root);
-    let added = ignore_secrets(root)?;
-    if !added.is_empty() {
-        rep.line(format!(
-            "added {} to .gitignore (they hold the password)",
-            added.join(" and ")
-        ));
-    }
-    let mut out = Vec::new();
     for engine in engines {
         let existing = state.iter().find(|s| s.engine == engine).cloned();
         let mut s = match existing {
@@ -1587,6 +1688,48 @@ fn up(args: &Args, root: &Path, project: &str, rep: &mut Report) -> Result<(), F
     Ok(())
 }
 
+/// SQLite: nothing to start. Makes sure `.env` names the file (a `sqlite:`
+/// URL there is kept) and that its directory exists.
+fn sqlite_up(root: &Path, project: &str, rep: &mut Report) -> Result<Value, Failure> {
+    let have = state::read_to_string(&root.join(".env"))
+        .ok()
+        .and_then(|t| {
+            dotenv::parse(&t)
+                .0
+                .into_iter()
+                .find(|v| v.key == "DATABASE_URL")
+                .map(|v| v.value)
+        })
+        .filter(|u| sqlite_path(u).is_some());
+    let url = match have {
+        Some(url) => url,
+        None => {
+            let url = format!("sqlite:data/{}.db", project.replace('-', "_"));
+            set_env(root, "DATABASE_URL", &url)?;
+            url
+        }
+    };
+    let file = sqlite_path(&url).unwrap_or_default();
+    let path = root.join(&file);
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| io_failure(dir, e))?;
+    }
+    let made = path.is_file();
+    rep.line(format!(
+        "sqlite: {} ({}; a file, nothing to start); DATABASE_URL={url} in .env",
+        file.display(),
+        if made {
+            "there already"
+        } else {
+            "made by the service at its first start"
+        }
+    ));
+    Ok(json!({
+        "engine": "sqlite", "file": file.display().to_string(), "exists": made,
+        "action": "none", "env_key": "DATABASE_URL", "url": url,
+    }))
+}
+
 fn docker_run_args(s: &Started, root: &Path) -> Vec<String> {
     let mut a: Vec<String> = vec![
         "run".into(),
@@ -1616,7 +1759,7 @@ fn docker_run_args(s: &Started, root: &Path) -> Vec<String> {
             env(&mut a, "MYSQL_ROOT_PASSWORD", &s.password);
             env(&mut a, "MYSQL_DATABASE", &s.database);
         }
-        Engine::Redis => {}
+        Engine::Redis | Engine::Sqlite => {}
     }
     a.push(s.image.clone());
     a
@@ -1776,7 +1919,39 @@ fn status(root: &Path, rep: &mut Report) -> Result<(), Failure> {
     );
     match runner(root, None) {
         Ok(r) if r.engine().sql() => {
-            let done = applied(&r)?;
+            if r.engine() == Engine::Sqlite {
+                let path = sqlite_file(&r);
+                match std::fs::metadata(&path) {
+                    Ok(m) => rep.line(format!(
+                        "sqlite: {} ({} KiB)",
+                        path.display(),
+                        m.len().div_ceil(1024)
+                    )),
+                    Err(_) => {
+                        rep.line(format!(
+                            "sqlite: {} is not made yet (the service makes it at its first \
+                             start, giong db migrate too)",
+                            path.display()
+                        ));
+                        rep.data(
+                            "pending",
+                            json!(files.iter().map(|m| &m.file).collect::<Vec<_>>()),
+                        );
+                        return Ok(());
+                    }
+                }
+            }
+            let done = match applied(&r) {
+                Ok(done) => done,
+                Err(f) if r.engine() == Engine::Sqlite && f.code == Code::DB_CLIENT_MISSING => {
+                    rep.line(format!("Migrations not checked: {}", f.what));
+                    rep.push(
+                        Finding::new(f.code, Severity::Warning, f.what.clone()).fix(f.fix.clone()),
+                    );
+                    return Ok(());
+                }
+                Err(f) => return Err(f),
+            };
             let p = plan(&files, &done);
             rep.line(format!(
                 "migrations on {}: {} applied, {} pending, {} changed, {} unknown",
@@ -1872,12 +2047,17 @@ fn reset(args: &Args, root: &Path, rep: &mut Report) -> Result<(), Failure> {
         ));
     }
     let state = read_state(root);
-    if state.is_empty() {
+    // A SQLite file is the project's own when it is inside the project.
+    let file = runner(root, Some(Engine::Sqlite)).ok();
+    if state.is_empty() && file.is_none() {
         return Err(Failure::new(
             Code::DB_NOT_MANAGED,
             "giong db reset works only on a database giong db up started, and there is none here",
             "start one with giong db up; giong never drops a database given by DATABASE_URL",
         ));
+    }
+    if let Some(r) = &file {
+        reset_sqlite(r, root, rep)?;
     }
     for s in &state {
         let r = Runner::Container(s.clone());
@@ -1899,6 +2079,8 @@ fn reset(args: &Args, root: &Path, rep: &mut Report) -> Result<(), Failure> {
                 true,
             ),
             Engine::Redis => ("FLUSHALL\n".to_string(), None, false),
+            // Never started, so never in the state file.
+            Engine::Sqlite => continue,
         };
         let out = r.run(&sql, db, admin)?;
         if !out.ok || out.stderr.contains("ERR") {
@@ -1908,7 +2090,87 @@ fn reset(args: &Args, root: &Path, rep: &mut Report) -> Result<(), Failure> {
     }
     if let Some(sql) = state.iter().find(|s| s.engine.sql()) {
         migrate(&Runner::Container(sql.clone()), root, rep)?;
+    } else if let Some(r) = &file {
+        migrate(r, root, rep)?;
     }
+    Ok(())
+}
+
+/// The file a SQLite runner works on (absolute: the runner joined it to the
+/// project).
+fn sqlite_file(r: &Runner) -> PathBuf {
+    match r {
+        Runner::Local { url, .. } => sqlite_path(url).unwrap_or_default(),
+        Runner::Container(_) => PathBuf::new(),
+    }
+}
+
+/// Makes the directory of a SQLite file, which `sqlite3` does not.
+fn sqlite_dir(r: &Runner) -> Result<(), Failure> {
+    if r.engine() != Engine::Sqlite {
+        return Ok(());
+    }
+    match sqlite_file(r).parent() {
+        Some(dir) => std::fs::create_dir_all(dir).map_err(|e| io_failure(dir, e)),
+        None => Ok(()),
+    }
+}
+
+/// Drops every table, view and trigger of a SQLite file inside the project.
+/// The file stays, so a service that has it open keeps working on the
+/// emptied file (deleting it would leave the service on the deleted one).
+fn reset_sqlite(r: &Runner, root: &Path, rep: &mut Report) -> Result<(), Failure> {
+    let path = sqlite_file(r);
+    let Ok(file) = std::fs::canonicalize(&path) else {
+        rep.line(format!("sqlite: {} is not made yet", path.display()));
+        return sqlite_dir(r);
+    };
+    let inside = std::fs::canonicalize(root).is_ok_and(|root| file.starts_with(root));
+    if !inside {
+        return Err(Failure::new(
+            Code::DB_NOT_MANAGED,
+            format!(
+                "giong db reset empties only a SQLite file inside the project, and \
+                 DATABASE_URL names {}",
+                file.display()
+            ),
+            "point DATABASE_URL at a file in the project for development; giong never empties \
+             a database file kept elsewhere",
+        ));
+    }
+    // Views and triggers first, then virtual tables (which drop their own
+    // shadow tables), then the rest.
+    let list = "SELECT type, name FROM sqlite_master WHERE name NOT LIKE 'sqlite\\_%' \
+                ESCAPE '\\' AND type IN ('table', 'view', 'trigger') ORDER BY CASE \
+                WHEN type = 'view' THEN 0 WHEN type = 'trigger' THEN 1 \
+                WHEN sql LIKE 'CREATE VIRTUAL%' THEN 2 ELSE 3 END;\n";
+    let out = r.run(list, None, false)?;
+    if !out.ok {
+        return Err(sql_failure(r, "listing the tables", &out));
+    }
+    let mut script = String::from("PRAGMA foreign_keys = OFF;\nBEGIN;\n");
+    let mut count = 0;
+    for (kind, name) in out.stdout.lines().filter_map(|l| l.split_once('\t')) {
+        let kind = match kind {
+            "view" => "VIEW",
+            "trigger" => "TRIGGER",
+            _ => "TABLE",
+        };
+        script.push_str(&format!(
+            "DROP {kind} IF EXISTS \"{}\";\n",
+            name.replace('"', "\"\"")
+        ));
+        count += 1;
+    }
+    script.push_str("COMMIT;\nVACUUM;\n");
+    let out = r.run(&script, None, false)?;
+    if !out.ok {
+        return Err(sql_failure(r, "resetting", &out));
+    }
+    rep.line(format!(
+        "sqlite: emptied {} ({count} tables, views and triggers dropped)",
+        path.display()
+    ));
     Ok(())
 }
 
@@ -1949,6 +2211,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
             if !r.engine().sql() {
                 return Err(bad_url("redis"));
             }
+            sqlite_dir(&r)?;
             migrate(&r, &root, &mut rep)?;
         }
         "reset" => reset(args, &root, &mut rep)?,
@@ -2161,6 +2424,89 @@ mod tests {
             [Engine::Mysql]
         );
         assert!(engines_in("[dependencies]\ngiong-postgres-extra = \"1\"").is_empty());
+    }
+
+    #[test]
+    fn sqlite_files_scripts_and_errors() {
+        let m = "[dependencies]\nrusqlite = { version = \"0.43\", features = [\"bundled\"] }\n\
+                 giong-redis = \"1.5\"\n";
+        assert_eq!(engines_in(m), [Engine::Sqlite, Engine::Redis]);
+        assert!(!Engine::Sqlite.has_server() && Engine::Sqlite.sql());
+        assert_eq!(Engine::parse("SQLite3"), Some(Engine::Sqlite));
+        assert_eq!(Engine::Sqlite.env_key(), "DATABASE_URL");
+
+        // The forms the template's service reads, and nothing else.
+        assert_eq!(
+            sqlite_path("sqlite:data/app.db"),
+            Some("data/app.db".into())
+        );
+        assert_eq!(
+            sqlite_path("sqlite://data/app.db"),
+            Some("data/app.db".into())
+        );
+        assert_eq!(
+            sqlite_path("sqlite:///var/lib/app.db"),
+            Some("/var/lib/app.db".into())
+        );
+        assert_eq!(sqlite_path("sqlite::memory:"), None);
+        assert_eq!(sqlite_path("sqlite:"), None);
+        assert_eq!(sqlite_path("postgres://h/db"), None);
+
+        // A migration runs in one transaction, as on PostgreSQL.
+        let m = Migration {
+            version: 2,
+            name: "add_age".into(),
+            file: "0002_add_age.sql".into(),
+            sql: "ALTER TABLE users ADD COLUMN age INTEGER;\n".into(),
+            checksum: "ab".repeat(32),
+            transaction: true,
+        };
+        let script = apply_script(Engine::Sqlite, &m);
+        assert!(script.starts_with("BEGIN;\nALTER TABLE"), "{script}");
+        assert!(script.ends_with("COMMIT;\n"), "{script}");
+        assert_eq!(
+            error_line("Parse error near line 9: no such table: nope"),
+            Some(9)
+        );
+        assert_eq!(
+            error_line("Runtime error near line 3: UNIQUE constraint failed: users.email (19)"),
+            Some(3)
+        );
+    }
+
+    /// A project on rusqlite alone has a database before `.env` exists:
+    /// the file its service opens without `DATABASE_URL`.
+    #[test]
+    fn a_sqlite_project_needs_no_env() {
+        let root = std::env::temp_dir().join(format!("giongdbsqlite-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"my-shop\"\n\n[dependencies]\nrusqlite = \"0.43\"\n",
+        )
+        .unwrap();
+        // DATABASE_URL from the environment wins, as for every engine.
+        let from_env = std::env::var_os("DATABASE_URL").is_some();
+        if !from_env {
+            let r = runner(&root, None).unwrap();
+            assert_eq!(r.engine(), Engine::Sqlite);
+            assert_eq!(sqlite_file(&r), root.join("data/my_shop.db"));
+        }
+        // With a server database too, DATABASE_URL is that one's.
+        std::fs::write(
+            root.join("Cargo.toml"),
+            "[package]\nname = \"my-shop\"\n\n[dependencies]\nrusqlite = \"0.43\"\n\
+             giong-postgres = \"1.5\"\n",
+        )
+        .unwrap();
+        if !from_env {
+            assert_eq!(runner(&root, None).unwrap_err().code, Code::DB_URL);
+        }
+        // .gitignore's `/.giong` counts as `.giong/`.
+        std::fs::write(root.join(".gitignore"), "/target\n/.giong\n.env\n").unwrap();
+        assert!(ignore_secrets(&root).unwrap().is_empty());
+        std::fs::remove_dir_all(&root).unwrap();
     }
 
     #[test]
