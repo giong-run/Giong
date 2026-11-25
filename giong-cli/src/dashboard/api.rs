@@ -677,6 +677,28 @@ mod tests {
     }
 
     #[test]
+    fn the_page_quotes_the_method_of_a_copied_curl_line() {
+        // A recorded method comes from any client; `GET|sh` must not reach
+        // a shell as a pipe when the line is pasted.
+        let uses: Vec<&str> = PAGE
+            .match_indices("\" -X \" + ")
+            .map(|(i, _)| &PAGE[i..])
+            .collect();
+        assert!(
+            !uses.is_empty(),
+            "curlFor no longer sets the method with -X"
+        );
+        for rest in uses {
+            assert!(
+                rest.starts_with("\" -X \" + shWord("),
+                "{}",
+                &rest[..40.min(rest.len())]
+            );
+        }
+        assert!(PAGE.contains("/^[A-Za-z0-9_-]+$/.test(s) ? s : shQuote(s)"));
+    }
+
+    #[test]
     fn the_page_is_served_with_a_policy() {
         let req = Req {
             method: "GET".into(),

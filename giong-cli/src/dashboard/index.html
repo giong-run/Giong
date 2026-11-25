@@ -235,6 +235,10 @@ function pretty(text, ctype) {
   return t;
 }
 function shQuote(s) { return "'" + String(s).replace(/'/g, "'\\''") + "'"; }
+// A word as it is when a shell would read it so (a method such as PURGE),
+// else quoted: a recorded method comes from whatever client sent it, and
+// the token rules allow | & $ and backquotes. As routes::shell_word.
+function shWord(s) { s = String(s); return /^[A-Za-z0-9_-]+$/.test(s) ? s : shQuote(s); }
 
 // ---------- tabs ----------
 let tab = "requests";
@@ -385,7 +389,7 @@ function sideView(title, side) {
 }
 function curlFor(method, url, headers, body) {
   let s = "curl -i";
-  if (method !== "GET") s += " -X " + method;
+  if (method !== "GET") s += " -X " + shWord(method);
   for (const [k, v] of headers) if (v !== "[redacted]" && !["host", "content-length", "connection"].includes(k.toLowerCase())) s += " -H " + shQuote(k + ": " + v);
   if (body) s += " --data-binary " + shQuote(body);
   return s + " " + shQuote(url);
