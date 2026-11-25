@@ -108,9 +108,11 @@ const OPENING_WAIT: Duration = Duration::from_millis(20);
 /// then a `Duration` turned back into nanoseconds) cost about 70
 /// instructions a reading, a few percent of a small TCP echo. Only
 /// differences between readings are used, so where the clock starts (boot)
-/// does not matter.
+/// does not matter. It stays out of line: inlined into the worker loop it
+/// moved that loop's code so that every turn on epoll cost one or two
+/// instructions more, sleeping or not.
 #[cfg(unix)]
-#[inline]
+#[inline(never)]
 fn clock_ns() -> u64 {
     crate::sys::monotonic_ns() & !ASLEEP
 }
