@@ -425,6 +425,75 @@ const START_ATTEMPTS: usize = 5;
 /// Starts PostgreSQL on `port` and waits until it answers on its Unix
 /// socket, having bound both addresses; or, if it exits or could not bind
 /// one, stops it and gives its log.
+/// Starts the server through `pg_ctl`, which Windows needs: PostgreSQL
+/// refuses to run with administrative rights (as CI's runners give every
+/// process), and `pg_ctl` starts it with a token that has them taken away.
+/// The server's process is then not a child of this one: its PID comes from
+/// `postmaster.pid`, and a start that failed shows as a `FATAL` line in the
+/// log.
+#[cfg(windows)]
+fn launch(
+    bin: &Path,
+    data: &Path,
+    dir: &Path,
+    socket_dir: &Path,
+    port: u16,
+    _owner: Option<(u32, u32)>,
+) -> Result<(), String> {
+    let log_path = dir.join("server.log");
+    let _ = std::fs::remove_file(&log_path);
+    let status = Command::new(bin.join(exe("pg_ctl")))
+        .arg("start")
+        .arg("-W")
+        .arg("-D")
+        .arg(data)
+        .arg("-l")
+        .arg(&log_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run pg_ctl start");
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    if !status.success() {
+        return Err(format!("pg_ctl start failed ({status}):\n{}", log()));
+    }
+    let started = Instant::now();
+    loop {
+        let text = log();
+        if text.contains("FATAL") {
+            return Err(text);
+        }
+        if PID.load(Ordering::SeqCst) == 0 {
+            let pid = std::fs::read_to_string(data.join("postmaster.pid"))
+                .ok()
+                .and_then(|f| f.lines().next()?.trim().parse::<i32>().ok());
+            if let Some(pid) = pid {
+                PID.store(pid, Ordering::SeqCst);
+            }
+        }
+        if PID.load(Ordering::SeqCst) != 0 && ready(bin, socket_dir, port, None) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "PostgreSQL did not start within 30 s:\n{}",
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let text = log();
+    if text.contains("could not bind") {
+        kill(PID.swap(0, Ordering::SeqCst));
+        let _ = std::fs::remove_file(socket_dir.join(format!(".s.PGSQL.{port}")));
+        let _ = std::fs::remove_file(socket_dir.join(format!(".s.PGSQL.{port}.lock")));
+        let _ = std::fs::remove_file(data.join("postmaster.pid"));
+        return Err(text);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn launch(
     bin: &Path,
     data: &Path,

@@ -251,11 +251,17 @@ fn crud_through_the_cache_over_https() {
         .or_else(|| on_path("redis-server"))
         .map(|dir| dir.join(exe("redis-server")));
     let pg = pg_bin();
+    // Each variable makes its own server a must: CI's Windows runners have
+    // PostgreSQL (and set GIONG_PG_REQUIRED) but no Redis.
+    assert!(
+        pg.is_some() || !required("GIONG_PG_REQUIRED"),
+        "PostgreSQL is required but was not found"
+    );
+    assert!(
+        redis_bin.is_some() || !required("GIONG_REDIS_REQUIRED"),
+        "Redis is required but was not found"
+    );
     let (Some(pg), Some(redis_bin)) = (pg, redis_bin) else {
-        assert!(
-            !required("GIONG_PG_REQUIRED") && !required("GIONG_REDIS_REQUIRED"),
-            "PostgreSQL or Redis is required but was not found"
-        );
         eprintln!("skipping: PostgreSQL or Redis not found");
         return;
     };
