@@ -376,10 +376,13 @@ fn a_change_that_fails_stops_the_old_build_and_says_why() {
     assert_eq!(v["data"]["state"], "serving", "{v:#}");
     assert!(v["data"]["failure"].is_null(), "{v:#}");
 
-    // It compiles but stops at start-up.
+    // It compiles but stops at start-up, before it binds. The pause stands
+    // for a slow start (a loaded machine, a new file scanned on Windows):
+    // a build that has not bound yet has not started.
     dir.write(
         "src/main.rs",
-        "fn main() { panic!(\"e2e boot failure\"); }\n",
+        "fn main() { std::thread::sleep(std::time::Duration::from_millis(800)); \
+         panic!(\"e2e boot failure\"); }\n",
     );
     wait_failed(&dir, port, "start");
     assert!(!answers(port), "an old build answers after a failed start");
