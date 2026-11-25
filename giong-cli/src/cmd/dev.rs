@@ -983,9 +983,21 @@ impl Dev {
             service.ready = Some(ours);
             return Ok(service);
         }
-        // Without a ready signal: alive after a moment counts as started.
-        let until = Instant::now() + Duration::from_millis(300);
-        while Instant::now() < until {
+        // Without a ready signal (Windows, a giong older than 1.5): the old
+        // build was stopped first, so the port is free until the new one
+        // binds it. With an address, the build has started when it accepts
+        // a connection there; without one, or with --once (a program that
+        // may never listen), alive after a moment counts.
+        let spawned = Instant::now();
+        let floor = spawned + Duration::from_millis(300);
+        let deadline = spawned + self.ready_timeout;
+        let probes: Vec<SocketAddr> = if self.once {
+            Vec::new()
+        } else {
+            self.addresses.iter().map(|a| probe_address(*a)).collect()
+        };
+        let mut settle_until = probes.is_empty().then_some(floor);
+        loop {
             if let Ok(Some(status)) = service.child.try_wait() {
                 // With --once, a program that finishes its work at once and
                 // succeeds is a run like any other.
@@ -994,9 +1006,45 @@ impl Dev {
                 }
                 return Err(self.exited_finding(&service, Some(status)));
             }
+            let now = Instant::now();
+            if settle_until.is_some_and(|t| now >= t) {
+                break;
+            }
+            if settle_until.is_none() {
+                if accepts(&probes) {
+                    // A build that binds and then fails in its start-up
+                    // must not count as started either.
+                    settle_until = Some(floor.max(Instant::now() + SETTLE_AFTER_READY));
+                    continue;
+                }
+                if now > deadline {
+                    let _ = service.child.kill();
+                    let _ = service.child.wait();
+                    return Err(self.not_ready(&service, &self.addresses));
+                }
+            }
             std::thread::sleep(Duration::from_millis(20));
         }
         Ok(service)
+    }
+
+    /// A new build that did not bind `addrs` within `--ready-timeout`.
+    fn not_ready(&self, service: &Service, addrs: &[SocketAddr]) -> Finding {
+        let addrs: Vec<String> = addrs.iter().map(|a| a.to_string()).collect();
+        Finding::new(
+            Code::SERVICE_NOT_READY,
+            Severity::Error,
+            format!(
+                "the new build did not bind {} within {} s",
+                addrs.join(" or "),
+                self.ready_timeout.as_secs()
+            ),
+        )
+        .detail(tail_text(service))
+        .fix(
+            "check that the service binds exactly the LISTEN address (giong dev hands \
+             that socket over), and that it starts within --ready-timeout",
+        )
     }
 
     /// Spawns with the listening sockets and the ready socket open in the
@@ -1066,21 +1114,7 @@ impl Dev {
             if Instant::now() > deadline {
                 let _ = service.child.kill();
                 let _ = service.child.wait();
-                let addrs: Vec<String> = self.listen.iter().map(|a| a.to_string()).collect();
-                return Err(Finding::new(
-                    Code::SERVICE_NOT_READY,
-                    Severity::Error,
-                    format!(
-                        "the new build did not bind {} within {} s",
-                        addrs.join(" or "),
-                        self.ready_timeout.as_secs()
-                    ),
-                )
-                .detail(tail_text(service))
-                .fix(
-                    "check that the service binds exactly the LISTEN address (giong dev hands \
-                     that socket over), and that it starts within --ready-timeout",
-                ));
+                return Err(self.not_ready(service, &self.listen));
             }
         }
     }
@@ -1657,6 +1691,26 @@ fn describe_status(s: ExitStatus) -> String {
     }
 }
 
+/// Where to connect to reach a service that listens on `addr`: the
+/// loopback address of its family for an unspecified one (`0.0.0.0` with
+/// `--lan`), which cannot be connected to everywhere.
+fn probe_address(addr: SocketAddr) -> SocketAddr {
+    let ip = match addr.ip() {
+        std::net::IpAddr::V4(ip) if ip.is_unspecified() => std::net::Ipv4Addr::LOCALHOST.into(),
+        std::net::IpAddr::V6(ip) if ip.is_unspecified() => std::net::Ipv6Addr::LOCALHOST.into(),
+        ip => ip,
+    };
+    SocketAddr::new(ip, addr.port())
+}
+
+/// Whether something accepts connections on one of `addrs`. The connection
+/// is closed at once: the service sees a client that sent nothing.
+fn accepts(addrs: &[SocketAddr]) -> bool {
+    addrs
+        .iter()
+        .any(|a| std::net::TcpStream::connect_timeout(a, Duration::from_millis(100)).is_ok())
+}
+
 /// SIGTERM on Unix (the service shuts down gracefully when it asked for
 /// `shutdown_on_signals`); a kill elsewhere.
 fn terminate(child: &Child) {
@@ -2161,6 +2215,20 @@ fn lock_version(lock: &str, crate_name: &str) -> Option<(crate::host::Version, b
 mod tests {
     use super::*;
     use crate::host::Version;
+
+    #[test]
+    fn a_build_without_a_ready_signal_is_probed_on_loopback() {
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        assert_eq!(probe_address(at("0.0.0.0:8080")), at("127.0.0.1:8080"));
+        assert_eq!(probe_address(at("[::]:8080")), at("[::1]:8080"));
+        assert_eq!(probe_address(at("127.0.0.2:8080")), at("127.0.0.2:8080"));
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let bound = listener.local_addr().unwrap();
+        assert!(accepts(&[at("127.0.0.1:0"), bound]));
+        // Port 0 can never be connected to: nothing accepts there.
+        assert!(!accepts(&[at("127.0.0.1:0")]));
+        assert!(!accepts(&[]));
+    }
 
     #[cfg(unix)]
     #[test]
