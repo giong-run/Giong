@@ -974,6 +974,12 @@ pre.code .t { color: var(--code-type); }
 /* ---------- milestones as cards: home and roadmap ---------- */
 .nexts { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1.25rem; }
 .nexts-4 { grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 1rem; }
+.nexts-3 { grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 1rem; }
+.dk-step .nx-top { justify-content: flex-start; gap: 0.6rem; }
+.dk-step .cmd { max-width: 100%; }
+.nx-points.dk-facts { margin: 1.5rem 0 0; }
+.dk-bench h3 { margin: 2rem 0 0.4rem; }
+.dk-bench .chart-src { margin-top: 0.5rem; }
 .nx { position: relative; display: flex; flex-direction: column; gap: 0.7rem; padding: 1.4rem 1.4rem 1.25rem; border: 1px solid var(--line); border-radius: calc(var(--radius) + 4px);
   background: var(--ink); min-width: 0; color: inherit; text-decoration: none; transition: border-color 0.2s, transform 0.2s; }
 .band-alt .nx { background: var(--ink); }
@@ -1053,6 +1059,7 @@ a.nx:hover { border-color: var(--ember); transform: translateY(-2px); }
   .losses { grid-template-columns: minmax(0, 1fr); }
   .losses ul { grid-template-columns: minmax(0, 1fr); }
   .nexts { grid-template-columns: minmax(0, 1fr); }
+  .nexts-3 { grid-template-columns: minmax(0, 1fr); }
   .nx.is-feature .nx-points { grid-template-columns: minmax(0, 1fr); }
 }
 @media (max-width: 560px) {

@@ -458,9 +458,11 @@ def code_window(samples, ident="code"):
 
 
 def crate_links(c, guide=False):
-    links = [("guide", link(doc_page_name(c["name"])))] if guide and any(e[0] == c["name"] for e in DOCS) else []
-    links += [("docs.rs", f"https://docs.rs/{c['name']}/{VERSION}" if DOC_PREFIX else f"https://docs.rs/{c['name']}"),
-             ("crates.io", f"https://crates.io/crates/{c['name']}"),
+    page = "cli" if c["name"] == "giong-cli" and any(e[0] == "cli" for e in DOCS) else c["name"]
+    links = [("guide", link(doc_page_name(page)))] if guide and any(e[0] == page for e in DOCS) else []
+    if not c.get("binary"):      # a command has no API on docs.rs
+        links.append(("docs.rs", f"https://docs.rs/{c['name']}/{VERSION}" if DOC_PREFIX else f"https://docs.rs/{c['name']}"))
+    links += [("crates.io", f"https://crates.io/crates/{c['name']}"),
              ("source", REPO if c["dir"] == "." else TREE + c["dir"])]
     return " · ".join(f'<a href="{u}">{label}</a>' for label, u in links)
 
@@ -689,6 +691,46 @@ def build_band():
 </section>'''
 
 
+def devkit_band():
+    """The giong command on the home page, once a release has it: three steps and a fact."""
+    if not any(e[0] == "cli" for e in DOCS):
+        return ""
+    d = C.DEVKIT
+    steps = "".join(
+        f'<article class="nx nx-mini dk-step"><header class="nx-top"><span class="nx-badge">{n + 1}</span>'
+        f'<b class="nx-ver">{html.escape(title)}</b></header>{copy_cmd(f"dk-{n}", cmd)}'
+        f'<p class="nx-line">{ilm(text)}</p></article>'
+        for n, (title, cmd, text) in enumerate(d["steps"]))
+    facts = "".join(f'<li><span>{ilm(t)}</span></li>' for t in d["facts"])
+    return f'''<section class="band" id="devkit">
+  <div class="wrap">
+    {head_block("dev kit", d["h2"], d["lede"], (link("docs/cli"), "Every command"))}
+    <div class="nexts nexts-3">{steps}</div>
+    <ul class="nx-points dk-facts">{facts}</ul>
+  </div>
+</section>'''
+
+
+def devkit_bench():
+    """The benchmarks page's dev kit section, once a release has the giong command."""
+    if not any(e[0] == "cli" for e in DOCS):
+        return ""
+    d = C.DEVKIT_BENCH
+    blocks = []
+    for t in d["tables"]:
+        head = "".join(f"<th>{ilm(h)}</th>" for h in t["head"])
+        rows = "".join("<tr>" + "".join(f"<td>{ilm(v)}</td>" for v in r) + "</tr>" for r in t["rows"])
+        blocks.append(
+            f'<h3>{t["title"]}</h3><p>{ilm(t["note"])}</p>'
+            f'<div class="table-scroll" tabindex="0" role="region" aria-label="{html.escape(t["title"])}">'
+            f'<table class="cmp"><thead><tr>{head}</tr></thead><tbody>{rows}</tbody></table></div>'
+            f'<p class="chart-src">Method and raw data: <a href="{BLOB}{t["src"]}">{t["src"]}</a></p>')
+    return f'''<section class="band" id="devkit"><div class="wrap dk-bench">
+  {head_block("dev kit", d["h2"], d["lede"])}
+  {"".join(blocks)}
+</div></section>'''
+
+
 def next_band():
     """Where the next releases are going: the first milestones that have not shipped."""
     ahead = [m for m in MILESTONES if m["state"] != "done" and m["ver"]][:4]
@@ -761,7 +803,7 @@ def home():
         <a class="btn btn-main" href="{link("docs")}">Get started</a>
         <a class="btn" href="{link("benchmarks")}">See the benchmarks</a>
       </div>
-      {copy_cmd("hero-cmd", "cargo add giong")}
+      {copy_cmd("hero-cmd", C.DEVKIT["hero"] if any(e[0] == "cli" for e in DOCS) else "cargo add giong")}
       <p class="meta"><span>{C.RUNTIME_PLATFORM}</span><span>Rust 1.80+</span><span>MIT or Apache-2.0</span></p>
     </div>
     <figure class="tick" id="tick" data-unit1="syscall this tick" data-unitn="syscalls this tick">
@@ -785,6 +827,8 @@ def home():
 <section class="stats-band" aria-label="giong in numbers">
   <div class="wrap stats">{stats_html}</div>
 </section>
+
+{devkit_band()}
 
 {scoreboard()}
 
@@ -927,11 +971,99 @@ def doc_entries():
         path = "README.md" if c["dir"] == "." else f"{c['dir']}/README.md"
         if released(path) is None or released(release.manifest(c["dir"])) is None:
             continue
+        if c["name"] == "giong-cli" and cli_commands(released(path)):
+            out += cli_entries(path, c)
+            continue
         out.append((c["name"], c["name"], path, c["dir"], layer_group.get(c["layer"], "Tooling"),
                     c.get("lede", c["short"]), c))
     for slug, title, path, group, lede in C.DOC_PAGES:
         if group != "Start" and released(path) is not None:
             out.append((slug, title, path, str(Path(path).parent), group, lede, None))
+    if any(e[0] == "errors" for e in out):
+        out += error_entries()
+    return out
+
+
+CLI_HEADING = re.compile(r"^## (giong ([a-z][a-z0-9-]*)(?: [a-z][a-z0-9 -]*)?)\s*$", re.M)
+
+
+def cli_commands(readme):
+    """[(command, heading)] of every `## giong <command>` section of giong-cli's README."""
+    if not readme:
+        return []
+    found = dict((m.group(2), m.group(1)) for m in CLI_HEADING.finditer(readme))
+    order = [c for c in C.CLI_ORDER if c in found] + [c for c in found if c not in C.CLI_ORDER]
+    return [(c, found[c]) for c in order]
+
+
+def cli_entries(path, crate):
+    """The Dev kit section: /docs/cli/ (the README without its command sections) and
+    /docs/cli/<command>/ for each `## giong <command>` section, so every command has its
+    own page and address while giong-cli's README stays the one source."""
+    out = [("cli", "Dev kit overview", path, crate["dir"], "Dev kit", C.CLI_LEDE, None)]
+    for cmd, heading in cli_commands(released(path)):
+        lede = C.CLI_COMMANDS.get(cmd, "")
+        out.append((f"cli/{cmd}", heading, f"{path}#{md.slug(heading)}", crate["dir"], "Dev kit", lede, None))
+    return out
+
+
+def cli_source(readme, section):
+    """One command's section of giong-cli's README as a page of its own (`### ` become
+    `## `), or with section "" the README without its command sections and with a table
+    linking every command's page."""
+    readme = readme.replace("\r\n", "\n")
+    # In-README links to a command section point at that command's page.
+    readme = re.sub(r"\]\(#(giong-[a-z0-9-]+)\)", r"](README.md#\1)", readme)
+    parts, cur, fence = [], ["", []], None
+    for line in readme.split("\n"):
+        m = re.match(r"^\s*(```+|~~~+)", line)
+        if m:
+            fence = None if fence and m.group(1).startswith(fence) else (fence or m.group(1))
+        if fence is None and not m and line.startswith("## "):
+            parts.append(cur)
+            cur = [line[3:].strip(), []]
+        cur[1].append(line)
+    parts.append(cur)
+    if section:
+        for heading, lines in parts:
+            if heading and md.slug(heading) == section:
+                body = "\n".join(lines[1:])
+                return re.sub(r"^### ", "## ", body, flags=re.M).strip() + "\n"
+        return None
+    commands = {md.slug(h) for _, h in cli_commands(readme)}
+    keep = [lines for heading, lines in parts if md.slug(heading) not in commands and heading != "License"]
+    rows = "".join(f"| [`{h}`](README.md#{md.slug(h)}) | {C.CLI_COMMANDS.get(c, '')} |\n"
+                   for c, h in cli_commands(readme))
+    table = f"## Commands\n\n| Command | What it does |\n|---|---|\n{rows}\n"
+    head, rest = "\n".join(keep[0]), "\n".join("\n".join(x) for x in keep[1:])
+    return f"{head.rstrip()}\n\n{table}{rest}\n"
+
+
+def source(path):
+    """A documentation page's Markdown at the release: a file, or `file#section` for one
+    command of giong-cli's README."""
+    file, _, section = path.partition("#")
+    raw = released(file)
+    if raw is None or file != "giong-cli/README.md" or not cli_commands(raw):
+        return raw
+    return cli_source(raw, section)
+
+
+def error_entries():
+    """A page per error code, /docs/errors/E0001/, from docs/errors/E0001.md at the tag.
+    They are in no sidebar group: the error index links to every one."""
+    out = []
+    index = released("docs/errors/README.md") or ""
+    for code in dict.fromkeys(re.findall(r"\]\((E\d{4})\.md\)", index)):
+        path = f"docs/errors/{code}.md"
+        src = released(path)
+        if src is None:
+            continue
+        h = re.search(r"^#\s+(.+)$", src, re.M)
+        title = h.group(1).strip() if h else f"GIONG-{code}"
+        body = src.replace("\r\n", "\n").split("\n")
+        first = next((ln for ln in body if ln.strip() and not ln.startswith("#")), "")
+        out.append((f"errors/{code}", title, path, "docs/errors", "Errors", first, None))
     return out
 
 
@@ -972,6 +1104,11 @@ def doc_link(url, src_dir):
         path = new
     if path.endswith("/") and path + "README.md" in DOC_BY_PATH:
         path += "README.md"
+    if anchor and f"{path}#{anchor}" in DOC_BY_PATH:
+        return link(doc_page_name(DOC_BY_PATH[f"{path}#{anchor}"][0]))
+    if anchor and path == "giong-cli/README.md":
+        # A command this release's README does not have yet: the README at the tag.
+        return f"{REL_BLOB}{path}#{anchor}"
     if path in DOC_BY_PATH:
         return link(doc_page_name(DOC_BY_PATH[path][0]), anchor)
     return (REL_TREE if path.endswith("/") else REL_BLOB) + path + (f"#{anchor}" if anchor else "")
@@ -1034,6 +1171,8 @@ def md_script(ident, text):
 
 
 def doc_sidebar(current):
+    if current.startswith("errors/"):
+        current = "errors"
     groups = {}
     for e in DOCS:
         groups.setdefault(e[4], []).append(e)
@@ -1067,7 +1206,7 @@ def prompt_for(title, url, body):
 
 def doc_page(entry):
     slug, title, path, src_dir, group, lede, crate = entry
-    raw = released(path)
+    raw = source(path)
     src = clean_md(raw)
     intro, secs = split_sections(src)
     page_url = doc_url(slug)
@@ -1113,10 +1252,23 @@ def doc_page(entry):
     return page, page_md
 
 
+def skill_extra():
+    """{reference name: (path, dir)}: the giong command's README and the guides, when the
+    release has them, so an agent with the skill has the dev kit offline too."""
+    out = {}
+    if any(e[0] == "cli" for e in DOCS):
+        out["giong-cli"] = ("giong-cli/README.md", "giong-cli")
+    for e in DOCS:
+        if e[4] == "Guides":
+            out[e[0].replace("/", "-")] = (e[2], e[3])
+    return out
+
+
 def skill_install():
     s = C.SKILL
-    files = ["SKILL.md", "references/best-practices.md", "references/deployment.md",
-             "references/errors.md"] + [f"references/{e[0]}.md" for e in DOCS if e[6]]
+    files = (["SKILL.md", "references/best-practices.md", "references/deployment.md",
+              "references/errors.md"] + [f"references/{e[0]}.md" for e in DOCS if e[6]]
+             + [f"references/{n}.md" for n in skill_extra()])
     tree = "giong/\n" + "\n".join(f"  {f}" for f in files)
     return f'''<section class="skill">
   <div class="skill-cta">
@@ -1156,6 +1308,10 @@ def skill_zip():
     for e in DOCS:
         if e[6]:
             files[f"giong/references/{e[0]}.md"] = absolute_links(released(e[2]), e[3])
+    for name, (path, d) in skill_extra().items():
+        text = released(path)
+        if text is not None:
+            files[f"giong/references/{name}.md"] = absolute_links(text, d)
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as z:
         for name in sorted(files):
@@ -1204,7 +1360,7 @@ def use_version(minor, tag):
     saved = {k: g[k] for k in _VERSION_STATE}
     g.update(TAG=tag, VERSION=tag[1:], REL_BLOB=f"{REPO}/blob/{tag}/", REL_TREE=f"{REPO}/tree/{tag}/",
              TAG_HERE=True, SKILL_MD=None, DOC_PREFIX=minor)
-    g["DOCS"] = [e for e in doc_entries() if e[0] != "agent-skill"]
+    g["DOCS"] = [e for e in doc_entries() if e[0] != "agent-skill" and e[4] != "Errors"]
     g["DOC_BY_PATH"] = {e[2]: e for e in DOCS if e[2]}
     return saved
 
@@ -1330,11 +1486,11 @@ def docs():
         + "</div></div>" for g in C.DOC_GROUPS if g in groups)
     api = "".join(
         f'<a class="api" href="https://docs.rs/{c["name"]}/{VERSION}"><b>{c["name"]}</b><span>{ilm(c["short"])}</span></a>'
-        for c in CRATES)
+        for c in CRATES if not c.get("binary"))
     errs = "".join(
         f'<details class="errs"{" open" if n == 0 else ""}><summary><b>{html.escape(g["name"])}</b>'
         f'<span>{len(g["rows"])} code{"" if len(g["rows"]) == 1 else "s"}</span></summary><table><tbody>'
-        + "".join(f'<tr><td><a href="{repo_link(r["file"], "docs/errors")}">{r["code"]}</a></td>'
+        + "".join(f'<tr><td><a href="{doc_link(r["file"], "docs/errors")}">{r["code"]}</a></td>'
                   f'<td><code>{html.escape(r["variant"])}</code></td><td>{ilm(r["meaning"])}</td></tr>'
                   for r in g["rows"])
         + "</tbody></table></details>" for n, g in enumerate(ERRORS))
@@ -1352,7 +1508,23 @@ def docs():
     secs = [
         ("requirements", "Requirements", f'<dl class="reqs">{reqs}</dl>',
          "".join(f"- **{a}**: {plain(b)}\n" for a, b in C.REQS)),
-        ("install", "Install",
+    ]
+    if any(e[0] == "cli" for e in DOCS):
+        cli_sh = C.CLI_START
+        steps = "".join(f'<li><a href="{link(doc_page_name("cli/" + c))}"><code>giong {c}</code></a> {ilm(t)}</li>'
+                        for c, t in C.CLI_START_STEPS if any(e[0] == "cli/" + c for e in DOCS))
+        steps_md = "".join(f"- [`giong {c}`]({SITE}{md_file('cli/' + c)}) {plain(t)}\n"
+                           for c, t in C.CLI_START_STEPS if any(e[0] == "cli/" + c for e in DOCS))
+        secs.insert(0,
+            ("quick", "From zero to a running service",
+             f"<p>{ilm(C.CLI_START_LEDE)}</p>"
+             f'<div class="code-copy"><pre class="code" tabindex="0"><code id="cli-start">{shell(cli_sh)}</code></pre>'
+             '<button class="copy" type="button" data-copy="cli-start" data-done="copied">copy</button></div>'
+             f'<ul class="steps">{steps}</ul><p>Every command: <a href="{link(doc_page_name("cli"))}">the dev kit</a>.</p>',
+             f"{plain(C.CLI_START_LEDE)}\n\n```sh\n{cli_sh}\n```\n\n{steps_md}\n"
+             f"Every command: {SITE}{md_file('cli')}\n"))
+    secs += [
+        ("install", "Install the crates",
          "<p>The crates are on crates.io and share one version number. Add the runtime and the "
          "layers you need; <code>giong-http</code> takes <code>--features tls</code> for HTTPS and "
          "<code>--features client</code> for its client.</p>"
@@ -1389,7 +1561,8 @@ def docs():
                    for n, d, c, _ in C.EXAMPLES)),
         ("api", "API reference",
          f'<p>Every public item is documented on docs.rs, with an example where it helps.</p><div class="apis">{api}</div>',
-         "".join(f"- [{c['name']}](https://docs.rs/{c['name']}/{VERSION}): {plain(c['short'])}\n" for c in CRATES)),
+         "".join(f"- [{c['name']}](https://docs.rs/{c['name']}/{VERSION}): {plain(c['short'])}\n"
+                 for c in CRATES if not c.get("binary"))),
         ("errors", "Error codes",
          "<p>Every error giong raises starts with a code, says what went wrong and how to fix it, and "
          f"links to its page. {ERROR_COUNT} codes so far. Match on <code>giong::error::code(&amp;err)</code>, "
@@ -1416,6 +1589,10 @@ def docs():
               if slug in have]
     lede = ("Requirements, a first server, and every page of the documentation: a page for each crate"
             + "".join(", " + g for g in guides) + ". The API reference for each crate is on docs.rs.")
+    if "cli" in have:
+        lede = ("A running service in a few commands, then every page of the documentation: the "
+                "`giong` command, a page for each crate" + "".join(", " + g for g in guides)
+                + ". The API reference for each crate is on docs.rs.")
     sections, scripts, page_parts = [], [], []
     for n, (ident, heading, inner, smd) in enumerate(secs):
         sid = f"md-{n}"
@@ -1524,6 +1701,7 @@ def benchmarks():
   <div class="charts">{charts}</div>
 </div></section>
 {build_band()}
+{devkit_bench()}
 <section class="band" id="caveats"><div class="wrap caveats">
   <h2>What these numbers do not show</h2>
   <ul>{caveats}</ul>
@@ -1827,7 +2005,7 @@ def llms():
         m = re.search(r'^description\s*=\s*"([^"]*)"', pkg, re.M)
         return m.group(1) if m else ""
     api = "".join(f"- [{name} API](https://docs.rs/{name}/{VERSION}): {description(d)}\n"
-                  for name, d in crates)
+                  for name, d in crates if not C.CRATES.get(name, {}).get("binary"))
     examples = "".join(f"- [examples/{name}.rs]({REL_BLOB}examples/{name}.rs): {re.sub(r'[`*]', '', desc)}\n"
                        for name, desc, _, _ in C.EXAMPLES if released(f"examples/{name}.rs") is not None)
     folder, desc, _ = C.SERVICE
@@ -1876,9 +2054,16 @@ def llms():
         guides += (f"- [Agent skill]({SITE}skills/giong.zip): a skill for coding agents (SKILL.md and these "
                    f"docs as references); [SKILL.md]({SITE}skills/giong/SKILL.md)\n")
     pages = "".join(f"- [{e[1]}]({SITE}{md_file(e[0])}): {re.sub(r'[`*]', '', e[5])}\n"
-                    for e in DOCS if e[0] not in ("get-started", "best-practices", "agent-skill", "errors"))
+                    for e in DOCS if e[0] not in ("get-started", "best-practices", "agent-skill", "errors")
+                    and e[4] != "Errors" and not e[0].startswith("cli/"))
     older = ("- Older versions, for code pinned to them: "
              + ", ".join(f"[{m}]({SITE}{md_file('get-started', m)})" for m, _ in OLD) + "\n") if OLD else ""
+    cli = ""
+    if "cli" in have:
+        rows = "".join(f"| {want} | [`{cmd}`]({SITE}{md_file('cli/' + slug)}) |\n"
+                       for want, cmd, slug in C.CLI_TASKS if "cli/" + slug in have)
+        cli = (f"\n## The giong command\n\n{C.CLI_LLMS}\n\n| You want | Run |\n|---|---|\n{rows}\n"
+               f"Every command and its flags: {SITE}{md_file('cli')}\n")
     extra_protocols = ", HTTP/3" if "giong-quic" in names else ""
     grpc = ", gRPC" if "giong-grpc" in names else ""
     return f"""# giong
@@ -1950,11 +2135,12 @@ Facts that are easy to get wrong:
   and in Kubernetes without a CPU limit, set `Builder::workers` from the CPU request.
   examples/rest-api has a Dockerfile and a compose.yaml.
 {pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
-
+{cli}
 ## Docs
 
 {api}- [Get started]({SITE}docs/index.md): requirements, a first server, examples, limits
-{guides}{pages}- [Error codes]({SITE}docs/errors.md): what each `GIONG-E` code means and how to fix it
+{guides}{pages}- [Error codes]({SITE}docs/errors.md): what each `GIONG-E` code means and how to fix it;
+  one code's page is {SITE}docs/errors/E0001.md (any code in place of E0001)
 - [CHANGELOG.md]({REL_BLOB}CHANGELOG.md): what changed in each release
 - [Everything above in one file]({SITE}llms-full.txt): the READMEs, best practices and error pages of {TAG}
 {older}
@@ -1983,6 +2169,13 @@ def absolute_links(text, src_dir):
             if new == path:
                 break
             path = new
+        # A document that is a page of the site: its Markdown there, one hop for an agent.
+        target, _, anchor = path.partition("#")
+        page = DOC_BY_PATH.get(path) or (DOC_BY_PATH.get(target) if not anchor else None)
+        if page is None and target.endswith("/"):
+            page = DOC_BY_PATH.get(target + "README.md") if not anchor else None
+        if page is not None:
+            return f"{m.group(1)}({SITE}{md_file(page[0])})"
         return f"{m.group(1)}({(REL_TREE if path.endswith('/') else REL_BLOB) + path})"
     return re.sub(r"(\]\s?)\(([^)\s]+)\)", fix, text)
 
@@ -1994,13 +2187,14 @@ def llms_full():
     docs += [(f"{d}/README.md", d) for _, d in released_crates() if d != "."]
     docs.insert(1, ("docs/BEST_PRACTICES.md", "docs"))
     docs += [(f"examples/{C.SERVICE[0]}/README.md", f"examples/{C.SERVICE[0]}")]
+    docs += [(e[2], e[3]) for e in DOCS if e[4] == "Guides"]
     docs += [("docs/DEPLOYMENT.md", "docs"), ("docs/errors/README.md", "docs/errors")]
     index = released("docs/errors/README.md") or ""
     docs += [(f"docs/errors/{page}", "docs/errors")
              for page in dict.fromkeys(re.findall(r"\]\((E\d{4}\.md)\)", index))]
     parts = [f"""# giong {VERSION}: the documentation in one file
 
-> The README of every crate and of the example service, the best practices, the deployment notes and every
+> The README of every crate and of the example service, the best practices, the guides, the deployment notes and every
 > error code page of giong {VERSION}, as released in {TAG}. Links point at the same
 > release. The short index is {SITE}llms.txt.
 """]

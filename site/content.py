@@ -145,6 +145,16 @@ CRATES = {
                "A worker stuck in one poll is reported with the line that spawned the task",
                "Loopback or a Unix socket only; `Host` and `Origin` checked; a token required on TCP"],
         fact="about 9 instructions per task poll"),
+    "giong-cli": dict(
+        layer="tooling", tests=391, binary=True,
+        short="The `giong` command: start, run, check, test and ship a service; text for people, JSON for agents.",
+        lede="The `giong` command: a project that passes its tests from the first minute, a dev runner "
+             "that swaps builds without refusing a request, checks and fixes in JSON, and an MCP server.",
+        items=["`giong new`, `giong dev --background`, `giong check --json`, `giong test`",
+               "Restarts on save: 0 failed requests out of 102,061 over 100 restarts under load",
+               "Every finding has a `GIONG-E50xx` code, its place in the source, the cause and the fix",
+               "Loopback only, a token for the dashboard, secrets kept out of recordings, MCP read-only"],
+        fact="0 failed requests over 100 restarts"),
     "giong-compat": dict(
         layer="protocols", tests=42,
         short="Tokio's and futures-io's I/O traits for giong's streams, for h2, tokio-rustls and the like.",
@@ -321,6 +331,54 @@ SCOREBOARD = dict(
 # ---------------------------------------------------------------- home: build
 # bench/build.sh, bench/results/build/cloud-4vcpu/summary.md: the same three-route
 # service on giong-web 1.3.0 and on axum + tokio + tower-http.
+# The home page's dev kit band, shown once a release has the giong command.
+DEVKIT = dict(
+    hero="curl -fsSL https://giong.run/install.sh | sh",
+    h2="From zero to a running service in three commands",
+    lede=("The `giong` command writes a project that builds and passes its tests, runs it on "
+          "localhost with a rebuild on every save, and answers people in text and agents in JSON."),
+    steps=[
+        ("Install", "curl -fsSL https://giong.run/install.sh | sh",
+         "One small binary for Linux, macOS and Windows; or `cargo install giong-cli --locked`."),
+        ("Start a project", "giong new api --db postgres",
+         "A JSON API with tests, migrations, CI, a Dockerfile and the files that teach coding agents."),
+        ("Work on it", "giong dev --background",
+         "Serves on 127.0.0.1 and rebuilds on every save; on Linux and macOS the new build takes "
+         "over without refusing a request."),
+    ],
+    facts=[
+        "`giong dev` restarted a service 100 times under constant load: 0 failed requests out of "
+        "102,061, a save served again in 0.75 s (median; Linux 6.18, 4 vCPU, io_uring; "
+        "[method and raw data](https://github.com/giong-run/Giong/tree/main/bench/results/dev-restarts)).",
+        "A new project's dev profile: clean debug build 12.6 s instead of 15.3 s, `target/` 296 MB "
+        "instead of 640 MB ([method and raw data](https://github.com/giong-run/Giong/tree/main/bench/results/devkit/template-profile)).",
+        "`giong check --json`, `giong mcp` and a page per error code: agents read what went wrong and how to fix it.",
+    ],
+)
+
+# The benchmarks page's dev kit section; every number from the folder in `src`.
+DEVKIT_BENCH = dict(
+    h2="The dev kit, measured",
+    lede="What `giong dev` and a project from `giong new` cost and save, from runs whose raw output is in the repository.",
+    tables=[
+        dict(title="Restarts under load",
+             note=("`giong dev` saved 100 times while 16 clients kept opening new connections; Linux 6.18 "
+                   "VM, 4 vCPU, io_uring. Not measured on epoll."),
+             head=["Requests", "Failed", "Save to serving, median", "p90"],
+             rows=[["102,061", "0", "0.752 s", "0.789 s"]],
+             src="bench/results/dev-restarts/README.md"),
+        dict(title="The dev profile of a new project",
+             note=("`giong new shop --db postgres,redis --tls` against the same project with Cargo's "
+                   "default profile; median of three interleaved rounds. A debugger shows no variable "
+                   "values in dependency frames."),
+             head=["", "Cargo's default", "`giong new` profile", "Change"],
+             rows=[["Clean debug build", "15.33 s", "12.61 s", "-18%"],
+                   ["Target directory", "640 MB", "296 MB", "-54%"],
+                   ["Rebuild after a one-line change", "0.57 s", "0.44 s", "-23%"]],
+             src="bench/results/devkit/template-profile/README.md"),
+    ],
+)
+
 BUILD = dict(
     h2="Light enough to build in seconds",
     lede=("giong's stack is its own crates, with no macros in the runtime or the framework. The "
@@ -739,6 +797,21 @@ DOC_PAGES = [
     ("best-practices", "Best practices", "docs/BEST_PRACTICES.md", "Start",
      "How to build a service on giong that is correct the first time, fast without tuning and "
      "easy to run: the shape of a service, state, blocking, timeouts, databases, deployment, tests."),
+    ("guides/coding-agents", "Build with a coding agent", "docs/guides/coding-agents.md", "Guides",
+     "Set a project up for an agent once, then the loop it follows: one runner, checks in JSON, "
+     "tools over MCP, and the docs as Markdown."),
+    ("guides/safe-defaults", "Safe defaults of the dev kit", "docs/guides/safe-defaults.md", "Guides",
+     "What the `giong` command keeps safe by default: loopback only, a dashboard token, secrets out "
+     "of recordings, read-only agents, development code out of production."),
+    ("guides/database", "Use a database", "docs/guides/database.md", "Guides",
+     "A development database in one command, forward-only migrations, and one pool per worker."),
+    ("guides/testing", "Test a service", "docs/guides/testing.md", "Guides",
+     "Async unit tests, handler tests without a socket, recorded requests replayed, and `giong test` "
+     "on both drivers."),
+    ("guides/ship", "Ship a service", "docs/guides/ship.md", "Guides",
+     "Measure the change, build an image without Docker, and the few settings production needs."),
+    ("guides/from-tokio", "Coming from Tokio", "docs/guides/from-tokio.md", "Guides",
+     "The runtime model, Tokio's names in giong, and the giong crate for each job."),
     ("deployment", "Deployment", "docs/DEPLOYMENT.md", "Operate",
      "io_uring in Docker, Docker Compose and Kubernetes, the locked-memory limit, kernel quirks, "
      "restarting on the same port."),
@@ -751,7 +824,89 @@ DOC_PAGES = [
      "Every `GIONG-E` code: what went wrong and how to fix it."),
 ]
 # Crate pages take their lede from CRATES; their group is their layer.
-DOC_GROUPS = ["Start", "Runtime", "Protocols", "Clients", "Framework", "Tooling", "Operate"]
+DOC_GROUPS = ["Start", "Dev kit", "Guides", "Runtime", "Protocols", "Clients", "Framework", "Tooling", "Operate"]
+
+# The Dev kit section: /docs/cli/ and a page per `## giong <command>` section of
+# giong-cli/README.md (the one source; this file only orders and summarises them).
+CLI_LEDE = ("The `giong` command: start a project, run it with a restart on every save, check it, "
+            "test it and ship it. One small binary; every command answers people in text and "
+            "agents in JSON with `--json`.")
+# Get started's first section once the release has the giong command.
+CLI_START_LEDE = ("The `giong` command writes a project that builds and passes its tests, runs it on "
+                  "localhost with a rebuild on every save, and checks it the way an agent can read. "
+                  "One project, one folder, one runner: no `cargo run`, no container to start by hand.")
+CLI_START = """curl -fsSL https://giong.run/install.sh | sh
+giong new api --db postgres   # a JSON API that passes its tests
+cd api
+giong db up                   # local PostgreSQL, URL in .env
+giong dev --background        # serve 127.0.0.1:8080, rebuild on save
+curl http://127.0.0.1:8080/health
+giong check                   # compiler, clippy, giong's checks
+giong test                    # on io_uring and on epoll
+giong dev stop                # service and database; data kept"""
+CLI_START_STEPS = [
+    ("new", "writes the service, its tests, migrations, `.env.example`, a Dockerfile, CI and the files that teach coding agents."),
+    ("dev", "is the one way to run it while you work; `giong dev status` and `giong dev logs` say how it goes."),
+    ("check", "is what to run before calling a change done; `giong fix` applies what needs no judgement."),
+]
+
+# llms.txt's section on the giong command, and its task table: (you want, run, page).
+CLI_LLMS = """`giong` (`curl -fsSL https://giong.run/install.sh | sh`, or `cargo install giong-cli --locked`)
+starts, runs, checks and ships a giong service. Every command takes `--json` and answers with
+one document whose findings carry a `GIONG-E` code, the place in the source, the cause and the
+fix; exit status 0 (nothing wrong), 1 (an error found) or 2 (the command could not run).
+
+Local development is one runner per project, like `npm run dev`:
+- `giong dev --background` at the start: it builds, starts the service, waits until it serves,
+  prints `http://127.0.0.1:PORT` and returns (or reports the one already running for the project).
+- Edit the code: the runner rebuilds and swaps the service by itself. Test with `curl` on that
+  address.
+- `giong dev status --json` gives `state`, `urls` and the last build's first error
+  (`build.error`); `giong dev logs` the service's output; `giong dev stop` at the end.
+- Never `cargo run`, `cargo build --release`, Docker or a second terminal for the service.
+- Run `giong check --json` before calling a change done."""
+CLI_TASKS = [
+    ("Start a project", "giong new api --template web --db postgres", "new"),
+    ("Teach the project to coding agents", "giong ai init", "ai"),
+    ("Run it while you work", "giong dev --background", "dev"),
+    ("What is wrong with my code?", "giong check --json", "check"),
+    ("Apply the safe fixes", "giong fix", "fix"),
+    ("Run the tests", "giong test", "test"),
+    ("Is my machine right?", "giong doctor", "doctor"),
+    ("A database and migrations", "giong db up, giong db migrate", "db"),
+    ("Which settings, from where", "giong env check", "env"),
+    ("The routes, an OpenAPI document", "giong routes, giong openapi", "routes"),
+    ("Real requests as tests", "giong record save last", "record"),
+    ("See requests, routes and workers", "giong dev --ui", "dashboard"),
+    ("Look inside the running service", "giong top", "top"),
+    ("Measure a change", "giong bench --against main", "bench"),
+    ("Ship an image", "giong image --push <registry>", "image"),
+    ("Free disk", "giong clean", "clean"),
+    ("Give an agent these tools", "giong mcp", "mcp"),
+]
+
+CLI_ORDER = ["new", "ai", "dev", "check", "fix", "test", "doctor", "db", "env", "routes",
+             "record", "dashboard", "top", "bench", "image", "clean", "mcp", "explain"]
+CLI_COMMANDS = {
+    "new": "Start a project from a template (web, gRPC or worker) that builds, lints and passes its tests at once.",
+    "ai": "Teach the project to coding agents: `AGENTS.md`, `CLAUDE.md`, Cursor rules, the skill and `.mcp.json`.",
+    "dev": "Build, run and restart on every save without refusing a request; one runner per project, also in the background.",
+    "check": "Compiler errors, clippy and giong's own checks (blocking calls, host names, borrows across `.await`) in one report.",
+    "fix": "Apply the fixes that need no judgement, whole or not at all.",
+    "test": "Run the tests with `.env`, on io_uring and on epoll, with a time limit.",
+    "doctor": "Is this machine and this project ready: toolchain, kernel, io_uring, limits, ports, disk.",
+    "db": "A development PostgreSQL, MySQL or Redis in a container, and forward-only SQL migrations.",
+    "env": "Where each setting comes from, what is missing, secrets masked.",
+    "routes": "The routes the running service serves, and an OpenAPI 3.1 document made from them.",
+    "record": "Turn real requests into test cases, with secrets kept out of the files, and replay them.",
+    "dashboard": "One page on localhost: build state, live requests, routes, workers, pools and warnings.",
+    "top": "The running service seen from inside: workers, tasks, memory, pools, warnings.",
+    "bench": "Load at a fixed rate without coordinated omission, and compare a change against a branch.",
+    "image": "An OCI image of the service without Docker or a Dockerfile.",
+    "clean": "Free the disk old builds take, keeping what the next build needs.",
+    "mcp": "Every command as a tool for coding agents over MCP, read-only unless allowed.",
+    "explain": "The page of any giong error code, without the network.",
+}
 
 # What "Copy prompt" puts before a page. {version}, {title} and {url} are filled in.
 PROMPT = """I am building a Rust service on giong {version}, a thread-per-core async runtime with its own crates for HTTP, TLS, gRPC, databases and more, and no Tokio underneath. Use {title} as documented below.
