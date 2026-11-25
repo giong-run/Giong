@@ -424,8 +424,16 @@ fn a_change_that_fails_stops_the_old_build_and_says_why() {
     assert!(!answers(port), "something answers after the crash");
 
     // Its port is taken: the finding names who holds it.
+    // The build pauses before it binds: giong dev must not take the holder
+    // answering on the port for the new build having started.
     let holder = TcpListener::bind(("127.0.0.1", port)).unwrap();
-    dir.write("src/main.rs", SERVICE);
+    dir.write(
+        "src/main.rs",
+        &SERVICE.replace(
+            "    let l = ",
+            "    std::thread::sleep(std::time::Duration::from_millis(800));\n    let l = ",
+        ),
+    );
     wait_failed(&dir, port, "start");
     let v = status(&dir, port);
     let failure = &v["data"]["failure"];
