@@ -194,6 +194,12 @@ impl<S: 'static> Middleware<S> for RequireAuth {
 | `Record::new(Sink::Stdout)` | for development: one `exchange` JSON line per answered request with both sides, headers and bodies (up to 64 KiB each, `.max_body(n)`), so that `giong test record` can turn real requests into tests | secret headers (`Authorization`, `Cookie`, `Set-Cookie`, `X-Api-Key`, and any named like a secret, such as `X-Session-Token`) and query parameters, form fields (urlencoded and multipart) and JSON keys named like secrets (`password`, `token`, `api_key`, `card`, ...) written as `[redacted]`, more with `.redact_header(..)` and `.redact_field(..)`, fewer with `.keep_field(..)`; add it only when you want recordings, such as when `GIONG_RECORD` is set; in a release build only with the `dev` feature (otherwise `Record::new` panics with `GIONG-E1213`) |
 | `Trace::new()` (feature `tracing`) | runs each request in a `tracing` span with OpenTelemetry's field names (`http.request.method`, `url.path`, `http.route`, `http.response.status_code`, `client.address`) plus `request_id` and `worker`, ended by one event; a `5xx` at `ERROR` with its code and cause | instead of `Logger`, or beside it |
 
+The optional feature `fast-gzip` selects a worker-local libdeflate compressor for
+level-one gzip bodies at most 16 KiB. The existing pure Rust compressor remains
+the default and handles all other levels and larger bodies, yielding between
+chunks. The optional backend adds a native (C) library build dependency and
+per-worker compressor state. HTTP negotiation and cache semantics are unchanged.
+
 A log line:
 
 ```json
