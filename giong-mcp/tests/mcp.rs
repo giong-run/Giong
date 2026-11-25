@@ -1253,10 +1253,15 @@ fn slow_requests_name_the_route_that_blocks_the_worker() {
             .collect();
         let report = load(addr, "/report", Duration::from_millis(100), stop.clone());
         thread::sleep(Duration::from_millis(100));
+        // The tail from p99.9 up: the holds delay only the few `/fast`
+        // requests in flight when one starts (about 3 per hold, 11 to 15
+        // holds), so they are not always 1% of the ~3,800 requests. When
+        // they were fewer, p99 fell among the 1 ms requests, and the tail
+        // from p99 up was rightly "uniformly this slow".
         let answer = tool(
             mcp,
             "slow_requests",
-            json!({ "duration_ms": 1500, "route": "/fast" }),
+            json!({ "duration_ms": 1500, "route": "/fast", "quantile": 0.999 }),
         );
         stop.store(true, std::sync::atomic::Ordering::Relaxed);
         for c in fast {
