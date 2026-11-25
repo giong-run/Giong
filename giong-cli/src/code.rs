@@ -12,7 +12,8 @@
 //! | E5060-E5064 | C | `bench` |
 //! | E5065-E5069 | D | recording |
 //! | E5070-E5079 | C | `image` |
-//! | E5090-E5099 | | free |
+//! | E5090-E5098 | | `upgrade`, the release checks of `doctor` |
+//! | E5099 | | free |
 //!
 //! Findings may also carry the runtime's own codes (`GIONG-E0001` when io_uring
 //! is blocked, for example): [`Code::runtime`] makes one. Every code here has a
@@ -123,6 +124,15 @@ codes! {
     TEST_TIMEOUT = 5086, "TestTimeout", "the tests took longer than the time limit";
     GIT_INIT_FAILED = 5087, "GitInitFailed", "git init failed in the new project";
     DOTENV_BUILD_SETTING = 5088, "DotenvBuildSetting", ".env sets a cargo or rustc setting";
+    GIONG_OUTDATED = 5090, "GiongOutdated", "a newer giong release is out";
+    GIONG_MIXED = 5091, "GiongMixed", "the project's giong crates are on different releases";
+    CLI_OUTDATED = 5092, "CliOutdated", "this giong command is older than the newest release";
+    UPGRADE_TARGET = 5093, "UpgradeTarget", "the version to move to is not a release giong upgrade can move to";
+    MSRV_BELOW_TARGET = 5094, "MsrvBelowTarget", "the project's rust-version is below what the release needs";
+    PINNED_VERSION = 5095, "PinnedVersion", "a giong dependency is pinned to a version";
+    SELF_UPDATE = 5096, "SelfUpdateFailed", "giong upgrade --self could not replace this command";
+    RELEASE_UNKNOWN = 5097, "ReleaseUnknown", "the newest giong release could not be looked up";
+    MANIFEST_SHAPE = 5098, "ManifestShape", "a giong dependency is written in a form giong upgrade cannot edit";
 }
 
 impl Code {

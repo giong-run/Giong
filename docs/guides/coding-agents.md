@@ -21,7 +21,7 @@ It writes:
 | `.claude/skills/giong/` | Agents that load skills: the Gióng skill of this release |
 | `.mcp.json` | Agents that speak MCP: the `giong` server (`giong mcp`) |
 
-Run it again after upgrading Gióng. In a file you wrote, it replaces only its own marked block; in `.mcp.json` it adds its server and keeps everything else.
+`giong upgrade` runs it again when it moves the project to a new release; run it yourself after moving giong by hand. In a file you wrote, it replaces only its own marked block; in `.mcp.json` it adds its server and keeps everything else.
 
 ## The loop an agent follows
 

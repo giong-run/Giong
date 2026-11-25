@@ -32,6 +32,7 @@ const SCENARIOS: &[&str] = &[
     "mcp",
     "check",
     "dashboard",
+    "upgrade",
 ];
 
 /// How long a command may take outside a project before it is called hung:

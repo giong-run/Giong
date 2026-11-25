@@ -347,3 +347,12 @@ The `giong` command reports `GIONG-E5000` to `GIONG-E5099`. Its findings can als
 | [GIONG-E5086](E5086.md) | `TestTimeout` | the tests took longer than the time limit |
 | [GIONG-E5087](E5087.md) | `GitInitFailed` | git init failed in the new project |
 | [GIONG-E5088](E5088.md) | `DotenvBuildSetting` | .env sets a cargo or rustc setting |
+| [GIONG-E5090](E5090.md) | `GiongOutdated` | a newer giong release is out |
+| [GIONG-E5091](E5091.md) | `GiongMixed` | the project's giong crates are on different releases |
+| [GIONG-E5092](E5092.md) | `CliOutdated` | this giong command is older than the newest release |
+| [GIONG-E5093](E5093.md) | `UpgradeTarget` | the version to move to is not a release giong upgrade can move to |
+| [GIONG-E5094](E5094.md) | `MsrvBelowTarget` | the project's rust-version is below what the release needs |
+| [GIONG-E5095](E5095.md) | `PinnedVersion` | a giong dependency is pinned to a version |
+| [GIONG-E5096](E5096.md) | `SelfUpdateFailed` | giong upgrade --self could not replace this command |
+| [GIONG-E5097](E5097.md) | `ReleaseUnknown` | the newest giong release could not be looked up |
+| [GIONG-E5098](E5098.md) | `ManifestShape` | a giong dependency is written in a form giong upgrade cannot edit |

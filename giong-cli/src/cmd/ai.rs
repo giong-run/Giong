@@ -84,6 +84,7 @@ pub struct Offer {
     pub test: bool,
     pub doctor: bool,
     pub db: bool,
+    pub upgrade: bool,
 }
 
 impl Offer {
@@ -100,6 +101,7 @@ impl Offer {
             test: has("test"),
             doctor: has("doctor"),
             db: has("db"),
+            upgrade: has("upgrade"),
         }
     }
 
@@ -114,6 +116,7 @@ impl Offer {
             test: true,
             doctor: true,
             db: true,
+            upgrade: true,
         }
     }
 }
@@ -163,6 +166,11 @@ fn command_rows(offer: &Offer) -> String {
         offer.db,
         "Start the database, apply migrations",
         "`giong db up`, `giong db migrate`",
+    );
+    row(
+        offer.upgrade,
+        "Move to the newest giong release",
+        "`giong upgrade` (`--dry-run` first; never edit giong versions by hand)",
     );
     rows
 }
@@ -1000,6 +1008,7 @@ mod tests {
             test: false,
             doctor: false,
             db: false,
+            upgrade: false,
         };
         let dir = scratch("offer");
         let out = apply(&dir, GIONG_VERSION, false, &none);
@@ -1013,6 +1022,7 @@ mod tests {
             "giong test",
             "giong doctor",
             "giong db",
+            "giong upgrade",
             "MCP",
         ] {
             assert!(!agents.contains(gone), "{gone} in {agents}");
