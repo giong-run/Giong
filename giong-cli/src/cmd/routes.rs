@@ -142,7 +142,7 @@ pub fn curl(base: &str, r: &Route) -> String {
     let url = format!("{base}{}", sample_path(&r.pattern));
     let mut line = String::from("curl -i");
     if r.method != "GET" {
-        line.push_str(&format!(" -X {}", r.method));
+        line.push_str(&format!(" -X {}", shell_word(&r.method)));
     }
     if matches!(r.method.as_str(), "POST" | "PUT" | "PATCH") {
         if r.stream_limit.is_some() {
@@ -153,6 +153,21 @@ pub fn curl(base: &str, r: &Route) -> String {
     }
     line.push_str(&format!(" '{}'", url.replace('\'', "'\\''")));
     line
+}
+
+/// `s` as one word for a POSIX shell: as it is when it holds only letters,
+/// digits, `-` and `_` (every method people write), else single-quoted. The
+/// method comes from the service, which may be someone else's (`--mcp`), and
+/// HTTP allows `|`, `&`, `$` and a backquote in one.
+fn shell_word(s: &str) -> String {
+    if !s.is_empty()
+        && s.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        s.to_string()
+    } else {
+        format!("'{}'", s.replace('\'', "'\\''"))
+    }
 }
 
 fn run(args: &Args) -> Result<Report, Failure> {
@@ -258,6 +273,19 @@ mod tests {
         assert_eq!(
             curl(b, &route("DELETE", "/it's")),
             "curl -i -X DELETE 'http://127.0.0.1:8080/it'\\''s'"
+        );
+        // A method is a token, and tokens may hold what a shell runs.
+        assert_eq!(
+            curl(b, &route("GET|sh", "/a")),
+            "curl -i -X 'GET|sh' 'http://127.0.0.1:8080/a'"
+        );
+        assert_eq!(
+            curl(b, &route("X'`id`", "/a")),
+            "curl -i -X 'X'\\''`id`' 'http://127.0.0.1:8080/a'"
+        );
+        assert_eq!(
+            curl(b, &route("PURGE", "/a")),
+            "curl -i -X PURGE 'http://127.0.0.1:8080/a'"
         );
     }
 
