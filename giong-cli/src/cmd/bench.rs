@@ -606,7 +606,13 @@ fn against(cwd: &Path, reference: &str) -> Result<(Worktree, PathBuf, String, St
     // One path per repository and commit, so the older build's own files
     // keep their paths and cargo rebuilds only what changed since last time.
     let repo_id = &crate::sha256::hex(top.display().to_string().as_bytes())[..8];
-    let path = std::env::temp_dir().join(format!("giong-bench-{repo_id}-{short}"));
+    // Inside a folder only this user can enter: the build runs what is in it.
+    let path = crate::tmp::mine(&format!("bench-{repo_id}-{short}")).map_err(|e| {
+        fail(
+            format!("a temporary folder for the older commit could not be made: {e}"),
+            "check the temporary folder (TMPDIR) is writable",
+        )
+    })?;
     let _ = std::fs::remove_dir_all(&path);
     let p = path.display().to_string();
     git(&top, &["worktree", "add", "--detach", "--force", &p, &sha]).map_err(|e| {

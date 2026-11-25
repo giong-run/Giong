@@ -205,11 +205,11 @@ fn download(exe: &Path, target: Version, triple: &str) -> Result<(), Download> {
     let name = format!("giong-{target}-{triple}");
     let ext = if cfg!(windows) { "zip" } else { "tar.gz" };
     let base = format!("{}/v{target}", download_base());
-    let work = std::env::temp_dir().join(format!("giong-upgrade-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&work);
-    fs::create_dir_all(&work).map_err(|e| {
+    // A folder no other user can enter: the archive is checked, then unpacked
+    // and the binary copied from it, and nothing may swap them in between.
+    let work = crate::tmp::fresh("giong-upgrade").map_err(|e| {
         Download::Failed(failed(
-            format!("{} could not be made: {e}", work.display()),
+            format!("a temporary folder could not be made: {e}"),
             "check the temporary folder (TMPDIR) is writable",
         ))
     })?;
