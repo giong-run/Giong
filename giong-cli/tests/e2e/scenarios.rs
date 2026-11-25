@@ -436,7 +436,17 @@ fn dev_never_serves_an_old_build() {
     assert_eq!(v["data"]["state"], "failed", "{v:#}");
     assert_eq!(v["data"]["failure"]["code"], "GIONG-E5009", "{v:#}");
     assert!(v["data"]["failure"]["stopped_pid"].is_u64(), "{v:#}");
-    assert!(dev.log().contains("\"serving\":false"), "{}", dev.log());
+    // The event follows the state file (and the output reaches us later).
+    let log_has = |dev: &Dev| dev.log().contains("\"serving\":false");
+    let start = Instant::now();
+    while !log_has(&dev) && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        log_has(&dev),
+        "no build_failed event saying nothing serves:\n{}",
+        dev.log()
+    );
 
     std::fs::write(&main_rs, &good).unwrap();
     dev.wait_until(
