@@ -23,30 +23,71 @@ use std::time::Duration;
 
 use giong::error::{self, Code};
 
+/// Every process this binary starts, and every socket it hands down, is
+/// made under this lock. A process is started with posix_spawn, never fork:
+/// a forked child runs code before its exec, and under TSan on macOS one
+/// such child hung there (a lock TSan held at the fork), holding every
+/// descriptor of the parent, so the pipes of the other tests' children
+/// never closed and three tests waited 90 minutes. Without a hook before
+/// exec, the descriptors to hand down lose close-on-exec in the parent for
+/// as long as the spawn takes, and no other spawn may happen meanwhile; on
+/// macOS a socket also gets close-on-exec only after it is made.
+static SPAWN: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn turn() -> std::sync::MutexGuard<'static, ()> {
+    // A test that failed while holding it leaves it poisoned.
+    SPAWN.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 fn listening_socket() -> (socket2::Socket, SocketAddr) {
+    let _turn = turn();
     let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = l.local_addr().unwrap();
     (socket2::Socket::from(l), addr)
 }
 
-/// Hands `fds` to the child only: they stay close-on-exec here, so a child
-/// that another test starts at the same moment does not inherit them (and
-/// keep the ready socket open after our child is gone).
-fn pass_fds(cmd: &mut Command, fds: Vec<i32>) -> &mut Command {
-    use std::os::unix::process::CommandExt;
-    // SAFETY: between fork and exec the closure calls only fcntl(2), which
-    // is async-signal-safe, and allocates nothing.
+fn socket_pair() -> (UnixStream, UnixStream) {
+    let _turn = turn();
+    UnixStream::pair().unwrap()
+}
+
+fn set_cloexec(fd: i32, on: bool) {
+    // SAFETY: fcntl(2) on a descriptor this test owns.
     unsafe {
-        cmd.pre_exec(move || {
-            for &fd in &fds {
-                let flags = libc::fcntl(fd, libc::F_GETFD);
-                if flags < 0 || libc::fcntl(fd, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-            }
-            Ok(())
-        })
+        let flags = libc::fcntl(fd, libc::F_GETFD);
+        assert!(flags >= 0, "{}", std::io::Error::last_os_error());
+        let flags = if on {
+            flags | libc::FD_CLOEXEC
+        } else {
+            flags & !libc::FD_CLOEXEC
+        };
+        assert!(
+            libc::fcntl(fd, libc::F_SETFD, flags) == 0,
+            "{}",
+            std::io::Error::last_os_error()
+        );
     }
+}
+
+/// Starts `cmd` with `fds` handed down to it and to no other child.
+fn spawn(cmd: &mut Command, fds: &[i32]) -> std::process::Child {
+    let _turn = turn();
+    for &fd in fds {
+        set_cloexec(fd, false);
+    }
+    let child = cmd.spawn();
+    for &fd in fds {
+        set_cloexec(fd, true);
+    }
+    child.unwrap()
+}
+
+/// [`spawn`], then what `Command::output` gives.
+fn output(cmd: &mut Command, fds: &[i32]) -> std::process::Output {
+    cmd.stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    spawn(cmd, fds).wait_with_output().unwrap()
 }
 
 /// The service: two workers bind the inherited address and answer every
@@ -103,7 +144,7 @@ fn restarts_share_the_socket_and_refuse_nothing() {
     // by the next one.
     let mut waiting: Vec<TcpStream> = Vec::new();
     for round in 0..3 {
-        let (mut ours, theirs) = UnixStream::pair().unwrap();
+        let (mut ours, theirs) = socket_pair();
         let mut cmd = Command::new(std::env::current_exe().unwrap());
         cmd.args(["--exact", "dev_child", "--nocapture", "--test-threads=1"])
             .env("GIONG_DEV_TEST_ADDR", addr.to_string())
@@ -112,11 +153,7 @@ fn restarts_share_the_socket_and_refuse_nothing() {
             .env("GIONG_DEV_READY", theirs.as_raw_fd().to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
-        let mut service = Service(
-            pass_fds(&mut cmd, vec![sock.as_raw_fd(), theirs.as_raw_fd()])
-                .spawn()
-                .unwrap(),
-        );
+        let mut service = Service(spawn(&mut cmd, &[sock.as_raw_fd(), theirs.as_raw_fd()]));
         drop(theirs);
         ours.set_read_timeout(Some(Duration::from_secs(60)))
             .unwrap();
@@ -207,7 +244,7 @@ fn only_the_process_giong_dev_started_takes_the_sockets() {
         .env("GIONG_DEV_MALFORMED", "ignored")
         .env("GIONG_DEV_PARENT", "1")
         .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()));
-    let out = pass_fds(&mut cmd, vec![sock.as_raw_fd()]).output().unwrap();
+    let out = output(&mut cmd, &[sock.as_raw_fd()]);
     assert!(
         out.status.success(),
         "{}",
@@ -220,13 +257,12 @@ fn a_malformed_variable_is_a_coded_error() {
     if std::env::var_os("GIONG_DEV_TEST_ADDR").is_some() {
         return;
     }
-    let out = Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "malformed_child", "--nocapture"])
+    let mut cmd = Command::new(std::env::current_exe().unwrap());
+    cmd.args(["--exact", "malformed_child", "--nocapture"])
         .env("GIONG_DEV_MALFORMED", "1")
         .env("GIONG_DEV_PARENT", std::process::id().to_string())
-        .env("GIONG_DEV_LISTEN", "3=localhost:8080")
-        .output()
-        .unwrap();
+        .env("GIONG_DEV_LISTEN", "3=localhost:8080");
+    let out = output(&mut cmd, &[]);
     assert!(
         out.status.success(),
         "{}",
@@ -267,7 +303,7 @@ fn an_address_it_does_not_name_binds_as_usual() {
         .env("GIONG_DEV_OTHER", "1")
         .env("GIONG_DEV_PARENT", std::process::id().to_string())
         .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()));
-    let out = pass_fds(&mut cmd, vec![sock.as_raw_fd()]).output().unwrap();
+    let out = output(&mut cmd, &[sock.as_raw_fd()]);
     assert!(
         out.status.success(),
         "{}",
@@ -304,7 +340,7 @@ fn a_build_without_the_hand_off_refuses_to_run_under_giong_dev() {
         .env("GIONG_DEV_RELEASE", addr.to_string())
         .env("GIONG_DEV_PARENT", std::process::id().to_string())
         .env("GIONG_DEV_LISTEN", format!("{}={addr}", sock.as_raw_fd()));
-    let out = pass_fds(&mut cmd, vec![sock.as_raw_fd()]).output().unwrap();
+    let out = output(&mut cmd, &[sock.as_raw_fd()]);
     assert!(
         out.status.success(),
         "{}",
