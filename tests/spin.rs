@@ -149,3 +149,14 @@ fn a_zero_spin_duration_turns_the_mode_off() {
         })
         .unwrap();
 }
+
+/// `Duration::MAX` reads as "spin while there is no work": it must not
+/// overflow the clock the first time a worker is idle (issue #298).
+#[test]
+fn an_unbounded_spin_duration_does_not_overflow() {
+    spinning(Duration::MAX)
+        .block_on(async {
+            sleep(Duration::from_millis(2)).await;
+        })
+        .unwrap();
+}
