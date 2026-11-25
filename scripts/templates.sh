@@ -46,11 +46,40 @@ export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORK/target}"
 cargo build -q -p giong-cli || exit 1
 GIONG="$CARGO_TARGET_DIR/debug/giong"
 
+# A port for a smoke run: below the range the kernel hands out to outgoing
+# connections (ip_local_port_range, 32768-60999 by default), which the
+# database clients of the same job take, and with nothing listening on it.
+free_port() {
+    local low=32768 port
+    read -r low _ </proc/sys/net/ipv4/ip_local_port_range 2>/dev/null || low=32768
+    [ "$low" -gt 12000 ] || low=32768
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        port=$((10000 + RANDOM % (low - 10000)))
+        if ! (exec 3<>"/dev/tcp/127.0.0.1/$port") 2>/dev/null; then
+            echo "$port"; return 0
+        fi
+    done
+    echo "$port"
+}
+
 # Runs the service's binary, waits until it serves (or, for a worker,
 # runs a job), then sends SIGTERM and expects a clean exit within the grace period.
+# A port taken between the pick and the bind (AddrInUse) gets another try.
 smoke() {
+    local status
+    for _ in 1 2 3; do
+        status=0
+        smoke_once "$@" || status=$?
+        [ "$status" = 2 ] || return "$status"
+        echo "smoke: $1: the port was taken, trying another"
+    done
+    return 1
+}
+
+smoke_once() {
     local name="$1"; shift
-    local port=$((20000 + RANDOM % 20000)) out="$WORK/$name.run" pid deadline
+    local port out="$WORK/$name.run" pid deadline
+    port=$(free_port)
     cargo build -q || return 1
     # shellcheck disable=SC2086
     "$@" env LISTEN="127.0.0.1:$port" WORKERS=2 INTERVAL_SECS=1 GIONG_MCP= \
@@ -67,7 +96,11 @@ smoke() {
             worker) grep -q '"event":"tick"' "$out" ;;
           esac; do
         if ! kill -0 "$pid" 2>/dev/null || [ $SECONDS -ge $deadline ]; then
-            echo "smoke: $name did not start serving:"; cat "$out"; kill "$pid" 2>/dev/null
+            kill "$pid" 2>/dev/null
+            if grep -q 'AddrInUse' "$out"; then
+                return 2
+            fi
+            echo "smoke: $name did not start serving:"; cat "$out"
             return 1
         fi
         sleep 0.2
