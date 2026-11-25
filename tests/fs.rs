@@ -122,6 +122,7 @@ fn open_fds(path: &std::path::Path) -> usize {
 /// process (issue #296). Skipped where no file system at hand takes such a
 /// length.
 #[test]
+#[cfg_attr(miri, ignore = "Miri stops on a too-large allocation")]
 fn reading_a_file_too_large_for_memory_is_an_error() {
     let dir = TempDir::new("huge");
     let mut candidates = vec![dir.path("huge")];
