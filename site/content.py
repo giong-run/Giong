@@ -145,6 +145,16 @@ CRATES = {
                "A worker stuck in one poll is reported with the line that spawned the task",
                "Loopback or a Unix socket only; `Host` and `Origin` checked; a token required on TCP"],
         fact="about 9 instructions per task poll"),
+    "giong-cli": dict(
+        layer="tooling", tests=391, binary=True,
+        short="The `giong` command: start, run, check, test and ship a service; text for people, JSON for agents.",
+        lede="The `giong` command: a project that passes its tests from the first minute, a dev runner "
+             "that swaps builds without refusing a request, checks and fixes in JSON, and an MCP server.",
+        items=["`giong new`, `giong dev --background`, `giong check --json`, `giong test`",
+               "Restarts on save: 0 failed requests out of 102,061 over 100 restarts under load",
+               "Every finding has a `GIONG-E50xx` code, its place in the source, the cause and the fix",
+               "Loopback only, a token for the dashboard, secrets kept out of recordings, MCP read-only"],
+        fact="0 failed requests over 100 restarts"),
     "giong-compat": dict(
         layer="protocols", tests=42,
         short="Tokio's and futures-io's I/O traits for giong's streams, for h2, tokio-rustls and the like.",

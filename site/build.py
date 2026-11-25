@@ -460,8 +460,9 @@ def code_window(samples, ident="code"):
 def crate_links(c, guide=False):
     page = "cli" if c["name"] == "giong-cli" and any(e[0] == "cli" for e in DOCS) else c["name"]
     links = [("guide", link(doc_page_name(page)))] if guide and any(e[0] == page for e in DOCS) else []
-    links += [("docs.rs", f"https://docs.rs/{c['name']}/{VERSION}" if DOC_PREFIX else f"https://docs.rs/{c['name']}"),
-             ("crates.io", f"https://crates.io/crates/{c['name']}"),
+    if not c.get("binary"):      # a command has no API on docs.rs
+        links.append(("docs.rs", f"https://docs.rs/{c['name']}/{VERSION}" if DOC_PREFIX else f"https://docs.rs/{c['name']}"))
+    links += [("crates.io", f"https://crates.io/crates/{c['name']}"),
              ("source", REPO if c["dir"] == "." else TREE + c["dir"])]
     return " · ".join(f'<a href="{u}">{label}</a>' for label, u in links)
 
@@ -1485,7 +1486,7 @@ def docs():
         + "</div></div>" for g in C.DOC_GROUPS if g in groups)
     api = "".join(
         f'<a class="api" href="https://docs.rs/{c["name"]}/{VERSION}"><b>{c["name"]}</b><span>{ilm(c["short"])}</span></a>'
-        for c in CRATES)
+        for c in CRATES if not c.get("binary"))
     errs = "".join(
         f'<details class="errs"{" open" if n == 0 else ""}><summary><b>{html.escape(g["name"])}</b>'
         f'<span>{len(g["rows"])} code{"" if len(g["rows"]) == 1 else "s"}</span></summary><table><tbody>'
@@ -1560,7 +1561,8 @@ def docs():
                    for n, d, c, _ in C.EXAMPLES)),
         ("api", "API reference",
          f'<p>Every public item is documented on docs.rs, with an example where it helps.</p><div class="apis">{api}</div>',
-         "".join(f"- [{c['name']}](https://docs.rs/{c['name']}/{VERSION}): {plain(c['short'])}\n" for c in CRATES)),
+         "".join(f"- [{c['name']}](https://docs.rs/{c['name']}/{VERSION}): {plain(c['short'])}\n"
+                 for c in CRATES if not c.get("binary"))),
         ("errors", "Error codes",
          "<p>Every error giong raises starts with a code, says what went wrong and how to fix it, and "
          f"links to its page. {ERROR_COUNT} codes so far. Match on <code>giong::error::code(&amp;err)</code>, "
@@ -2003,7 +2005,7 @@ def llms():
         m = re.search(r'^description\s*=\s*"([^"]*)"', pkg, re.M)
         return m.group(1) if m else ""
     api = "".join(f"- [{name} API](https://docs.rs/{name}/{VERSION}): {description(d)}\n"
-                  for name, d in crates)
+                  for name, d in crates if not C.CRATES.get(name, {}).get("binary"))
     examples = "".join(f"- [examples/{name}.rs]({REL_BLOB}examples/{name}.rs): {re.sub(r'[`*]', '', desc)}\n"
                        for name, desc, _, _ in C.EXAMPLES if released(f"examples/{name}.rs") is not None)
     folder, desc, _ = C.SERVICE
