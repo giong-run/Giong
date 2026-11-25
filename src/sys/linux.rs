@@ -272,6 +272,63 @@ pub(crate) fn read_dir_batch(
     Ok(n as usize)
 }
 
+/// Whether the directory `dir` is on a filesystem known to answer from local
+/// memory or a local disk. `false` for a network or FUSE filesystem (NFS,
+/// SMB, 9p, Ceph, FUSE...), for one this list does not know, and when
+/// `fstatfs` fails: there a `getdents64` can take a network round trip, or
+/// hang with its server.
+pub(crate) fn on_local_fs(dir: RawFd) -> bool {
+    // SAFETY: all-zero is a valid `statfs`, which the kernel fills in.
+    let mut st: libc::statfs = unsafe { mem::zeroed() };
+    // SAFETY: a valid pointer to a `statfs`.
+    if unsafe { libc::fstatfs(dir, &mut st) } != 0 {
+        return false;
+    }
+    is_local_fs_magic(st.f_type as u64 & 0xFFFF_FFFF)
+}
+
+/// The `statfs.f_type` magic numbers (`linux/magic.h`) of local filesystems.
+pub(crate) fn is_local_fs_magic(magic: u64) -> bool {
+    matches!(
+        magic,
+        0xEF53 // ext2, ext3, ext4
+            | 0x5846_5342 // xfs
+            | 0x9123_683E // btrfs
+            | 0xF2F5_2010 // f2fs
+            | 0xCA45_1A4E // bcachefs
+            | 0x2FC1_2FC1 // zfs
+            | 0x3153_464A // jfs
+            | 0x5265_4973 // reiserfs
+            | 0x3434 // nilfs2
+            | 0x0102_1994 // tmpfs, devtmpfs
+            | 0x8584_58F6 // ramfs
+            | 0x9584_58F6 // hugetlbfs
+            | 0x794C_7630 // overlayfs
+            | 0x7371_7368 // squashfs
+            | 0xE0F5_E1E2 // erofs
+            | 0x9660 // iso9660
+            | 0x1501_3346 // udf
+            | 0x4D44 // vfat, msdos
+            | 0x2011_BAB0 // exfat
+            | 0x7366_746E // ntfs3
+            | 0x5346_544E // ntfs
+            | 0x482B // hfsplus
+            | 0x9FA0 // proc
+            | 0x6265_6572 // sysfs
+            | 0x6367_7270 // cgroup2
+            | 0x0027_E0EB // cgroup
+            | 0x1CD1 // devpts
+            | 0x6462_6720 // debugfs
+            | 0x7472_6163 // tracefs
+            | 0x7363_6673 // securityfs
+            | 0xCAFE_4A11 // bpf
+            | 0x1980_0202 // mqueue
+            | 0x6165_676C // pstore
+            | 0xDE5E_81E4 // efivarfs
+            | 0x6265_6570 // configfs
+    )
+}
+
 /// What [`read_dir_batch`] keeps between calls: nothing on Linux.
 #[derive(Default)]
 pub(crate) struct DirState {

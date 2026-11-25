@@ -900,6 +900,12 @@ impl FileType {
 /// for a whole listing a few percent slower.
 const DIR_BATCH: usize = 8 * 1024;
 
+/// A batch read on the worker that takes this long (a cold disk, a slow
+/// filesystem this list took for local) sends the batches after it to the
+/// blocking lane.
+#[cfg(target_os = "linux")]
+const SLOW_DIR_BATCH: Duration = Duration::from_millis(1);
+
 /// Lists the entries of a directory, without `.` and `..`, in the order the
 /// filesystem keeps them.
 ///
@@ -920,8 +926,14 @@ const DIR_BATCH: usize = 8 * 1024;
 /// hundred names) is read with a direct `getdents64` system call on the
 /// worker thread, and the task yields between batches. On a local
 /// filesystem with the directory cached, a batch takes some tens of
-/// microseconds; on a network filesystem it can hold up the worker for a
-/// round trip.
+/// microseconds.
+///
+/// On Linux, a directory on a network or FUSE filesystem (NFS, SMB, 9p,
+/// Ceph, FUSE, or any filesystem giong does not know as local) is read on
+/// the blocking lane ([`spawn_blocking`](crate::spawn_blocking)) instead,
+/// where a batch that takes a round trip, or hangs with its server, holds up
+/// one blocking thread and not the worker. So is the rest of a directory
+/// once one batch took a millisecond or more on the worker (a cold disk).
 ///
 /// Cancel safe: if the future is dropped, nothing changes and the directory is
 /// closed.
@@ -932,6 +944,12 @@ pub async fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
         .custom_flags(libc::O_DIRECTORY)
         .open(path)
         .await?;
+    #[cfg(target_os = "linux")]
+    let off_worker = if sys::on_local_fs(dir.fd) {
+        None
+    } else {
+        Some(OffWorker::new(dir.fd)?)
+    };
     Ok(ReadDir {
         dir,
         path: Arc::from(path),
@@ -940,7 +958,33 @@ pub async fn read_dir<P: AsRef<Path>>(path: P) -> io::Result<ReadDir> {
         yield_first: false,
         done: false,
         state: sys::DirState::default(),
+        #[cfg(target_os = "linux")]
+        off_worker,
     })
+}
+
+/// A directory whose batches are read on the blocking lane.
+#[cfg(target_os = "linux")]
+struct OffWorker {
+    /// A duplicate of the directory's descriptor, which shares its position:
+    /// a batch still running when the `ReadDir` is dropped reads through it,
+    /// never through a closed (or reused) number.
+    fd: Arc<std::os::fd::OwnedFd>,
+    /// The batch being read: kept across a dropped `next_entry`, so that its
+    /// entries are not lost.
+    pending: Option<crate::lane::BlockingHandle<io::Result<Vec<u8>>>>,
+}
+
+#[cfg(target_os = "linux")]
+impl OffWorker {
+    fn new(fd: RawFd) -> io::Result<Self> {
+        // SAFETY: `fd` is open for the duration of the call.
+        let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(fd) }.try_clone_to_owned()?;
+        Ok(Self {
+            fd: Arc::new(fd),
+            pending: None,
+        })
+    }
 }
 
 /// The entries of a directory; see [`read_dir`].
@@ -957,6 +1001,9 @@ pub struct ReadDir {
     done: bool,
     /// What the system keeps between batches (a directory stream on macOS).
     state: sys::DirState,
+    /// Set when the batches are read on the blocking lane.
+    #[cfg(target_os = "linux")]
+    off_worker: Option<OffWorker>,
 }
 
 impl ReadDir {
@@ -979,8 +1026,41 @@ impl ReadDir {
                 // yielding again, so even a zero timeout makes progress.
                 crate::yield_now().await;
             }
+            #[cfg(target_os = "linux")]
+            if self.off_worker.is_some() {
+                self.read_batch_off_worker().await?;
+                continue;
+            }
             self.read_batch()?;
         }
+    }
+
+    /// Reads the next batch on the blocking lane, and waits for it.
+    #[cfg(target_os = "linux")]
+    async fn read_batch_off_worker(&mut self) -> io::Result<()> {
+        let off = self.off_worker.as_mut().expect("reading off the worker");
+        let pending = off.pending.get_or_insert_with(|| {
+            let fd = off.fd.clone();
+            let mut buf = mem::take(&mut self.buf);
+            crate::spawn_blocking(move || {
+                buf.clear();
+                buf.reserve(DIR_BATCH);
+                let mut state = sys::DirState::default();
+                sys::read_dir_batch(&mut state, fd.as_raw_fd(), &mut buf).map(|_| buf)
+            })
+        });
+        let res = pending.await;
+        off.pending = None;
+        let buf = res.map_err(|e| {
+            io::Error::other(format!(
+                "a batch of entries of {} was not read: {e}",
+                self.path.display()
+            ))
+        })??;
+        self.done = buf.is_empty();
+        self.buf = buf;
+        self.pos = 0;
+        Ok(())
     }
 
     /// Reads the next record of the batch and moves past it. `None` at the
@@ -1008,10 +1088,17 @@ impl ReadDir {
     fn read_batch(&mut self) -> io::Result<()> {
         self.buf.clear();
         self.buf.reserve(DIR_BATCH);
+        #[cfg(target_os = "linux")]
+        let start = std::time::Instant::now();
         let n = sys::read_dir_batch(&mut self.state, self.dir.fd, &mut self.buf)?;
         self.pos = 0;
         self.yield_first = true;
         self.done = n == 0;
+        #[cfg(target_os = "linux")]
+        if !self.done && start.elapsed() >= SLOW_DIR_BATCH {
+            // A failed `dup` only keeps the batches on the worker.
+            self.off_worker = OffWorker::new(self.dir.fd).ok();
+        }
         Ok(())
     }
 }
@@ -1066,5 +1153,82 @@ impl DirEntry {
     /// Cancel safe: it changes nothing.
     pub async fn metadata(&self) -> io::Result<Metadata> {
         symlink_metadata(self.path()).await
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod tests {
+    use super::*;
+    use std::future::Future;
+
+    fn names_in(dir: &Path, off_worker: bool, cancel_every: usize) -> Vec<OsString> {
+        let dir = dir.to_owned();
+        crate::block_on(async move {
+            let mut rd = read_dir(&dir).await.unwrap();
+            if off_worker {
+                rd.off_worker = Some(OffWorker::new(rd.dir.fd).unwrap());
+            }
+            let mut names = Vec::new();
+            let mut polls = 0usize;
+            loop {
+                polls += 1;
+                // Drops some calls after one poll, mid-batch on the blocking
+                // lane: no entry may be lost.
+                if cancel_every != 0 && polls % cancel_every == 0 {
+                    let mut next = std::pin::pin!(rd.next_entry());
+                    struct Noop;
+                    impl std::task::Wake for Noop {
+                        fn wake(self: Arc<Self>) {}
+                    }
+                    let waker = std::task::Waker::from(Arc::new(Noop));
+                    let mut cx = std::task::Context::from_waker(&waker);
+                    if let std::task::Poll::Ready(entry) = next.as_mut().poll(&mut cx) {
+                        match entry.unwrap() {
+                            Some(e) => names.push(e.file_name().to_owned()),
+                            None => break,
+                        }
+                    }
+                    continue;
+                }
+                match rd.next_entry().await.unwrap() {
+                    Some(e) => names.push(e.file_name().to_owned()),
+                    None => break,
+                }
+            }
+            names.sort();
+            names
+        })
+    }
+
+    /// A directory read on the blocking lane lists the same entries as one
+    /// read on the worker, also when calls are dropped while a batch runs.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no fstatfs or getdents64")]
+    fn a_directory_read_off_the_worker_lists_every_entry_once() {
+        let dir = std::env::temp_dir().join(format!("giong-read-dir-off-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir(&dir).unwrap();
+        for i in 0..1500 {
+            std::fs::write(dir.join(format!("entry-with-a-longish-name-{i:05}")), b"").unwrap();
+        }
+        let on = names_in(&dir, false, 0);
+        assert_eq!(on.len(), 1500);
+        assert_eq!(names_in(&dir, true, 0), on);
+        assert_eq!(names_in(&dir, true, 3), on);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn local_and_network_filesystems() {
+        assert!(sys::is_local_fs_magic(0xEF53)); // ext4
+        assert!(sys::is_local_fs_magic(0x0102_1994)); // tmpfs
+        assert!(sys::is_local_fs_magic(0x794C_7630)); // overlayfs
+        assert!(!sys::is_local_fs_magic(0x6969)); // NFS
+        assert!(!sys::is_local_fs_magic(0xFF53_4D42)); // CIFS
+        assert!(!sys::is_local_fs_magic(0xFE53_4D42)); // SMB2
+        assert!(!sys::is_local_fs_magic(0x6573_5546)); // FUSE
+        assert!(!sys::is_local_fs_magic(0x0102_1997)); // 9p
+        assert!(!sys::is_local_fs_magic(0x00C3_6400)); // Ceph
+        assert!(!sys::is_local_fs_magic(0)); // unknown
     }
 }
