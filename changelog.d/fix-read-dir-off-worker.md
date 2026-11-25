@@ -6,4 +6,4 @@
   instead of the worker and every task on it. So is the rest of a directory once one batch
   took a millisecond or more on the worker (a cold disk). Local directories are read as
   before: listing 10,000 entries on tmpfs takes the same time
-  ([#259](https://github.com/giong-run/Giong/issues/259)).
+  ([#413](https://github.com/giong-run/Giong/pull/413), [#259](https://github.com/giong-run/Giong/issues/259)).
