@@ -516,6 +516,22 @@ mod tests {
         sock.local_addr().unwrap()
     }
 
+    /// A free port that no earlier test of this process bound through
+    /// here. Where late joins do not work, the first bind of a port this
+    /// process released skips the check for another holder (see
+    /// [`bind_first`]), and the map remembers the release for good: a port
+    /// the kernel hands out again after an earlier test released it would
+    /// join another holder instead of being refused by it.
+    #[cfg(unix)]
+    fn fresh_port() -> SocketAddr {
+        loop {
+            let addr = free_port();
+            if !ports().contains_key(&(Proto::Udp, addr.port())) {
+                return addr;
+            }
+        }
+    }
+
     fn udp(addr: SocketAddr) -> io::Result<(Socket, Option<Held>)> {
         bind(Proto::Udp, addr, true, || {
             Socket::new(Domain::for_address(addr), Type::DGRAM, Some(Protocol::UDP))
@@ -785,7 +801,7 @@ mod tests {
     fn where_reuse_port_counts_at_the_bind_the_first_socket_checks_with_another() {
         // UDP: refused while another process's socket holds the port, then
         // the first socket and a worker that joins it.
-        let addr = free_port();
+        let addr = fresh_port();
         let other = Socket::new(Domain::IPV4, Type::DGRAM, Some(Protocol::UDP)).unwrap();
         other.set_reuse_port(true).unwrap();
         other.bind(&addr.into()).unwrap();
