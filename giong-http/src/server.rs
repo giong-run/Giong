@@ -92,6 +92,24 @@ fn handed_back() -> Option<Box<RequestTrace>> {
     HANDED_BACK.with(Cell::take)
 }
 
+/// Empties `HANDED_BACK` before a traced handler starts. Every path that
+/// finishes a traced `Caught` takes its trace back in the same poll, so the
+/// slot is empty here; a path that forgot would otherwise give its stale
+/// trace to the next traced request on this worker. A stale trace is
+/// dropped and counted as abandoned. Only this crate's own tests panic on
+/// it: a service's debug build (what `giong dev` runs) must not.
+#[cold]
+fn clear_handed_back() {
+    let stale = handed_back();
+    #[cfg(test)]
+    assert!(
+        stale.is_none(),
+        "giong-http: a finished handler's request trace was not taken back in the poll that \
+         finished it"
+    );
+    drop(stale);
+}
+
 impl<F: Future> Future for Caught<F> {
     type Output = Result<F::Output, ()>;
 
@@ -1924,6 +1942,7 @@ impl<T: Transport> Conn<T> {
         if self.traces == 0 {
             return None;
         }
+        clear_handed_back();
         let mut trace = with_traces(self.traces, |t| t.current.take()).flatten()?;
         trace.started();
         Some(trace)
@@ -2851,6 +2870,24 @@ mod tests {
         assert_eq!(other.stream_body(&req), Some(5));
         let status = giong::block_on(async { shared.call(req).await.status() });
         assert_eq!(status, 204);
+    }
+
+    /// `HANDED_BACK` is empty when a traced handler starts: a trace left
+    /// there by a path that did not take it back is dropped (counted as
+    /// abandoned) rather than adopted by the next request, and this crate's
+    /// tests fail on it (issue #374).
+    #[test]
+    fn a_stale_handed_back_trace_is_not_adopted() {
+        let leftover = giong::block_on(async {
+            giong::handle().set_request_tracing(true);
+            giong::yield_now().await;
+            let trace = RequestTrace::start("test").expect("tracing is on");
+            HANDED_BACK.set(Some(Box::new(trace)));
+            let cleared = catch_unwind(clear_handed_back);
+            giong::handle().set_request_tracing(false);
+            (cleared.is_err(), handed_back().is_none())
+        });
+        assert_eq!(leftover, (true, true));
     }
 
     /// A connection's place in the accept loop's bookkeeping follows the
