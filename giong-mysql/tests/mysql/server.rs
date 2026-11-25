@@ -531,12 +531,26 @@ fn start(bins: Bins, role: Role) -> Server {
     let mariadb = bins.install_db.is_some();
 
     let out = match &bins.install_db {
-        None => mysqld(&bins)
-            .arg("--initialize-insecure")
-            .arg(format!("--datadir={}", data.display()))
-            .arg(format!("--log-error={}", dir.join("init.log").display()))
-            .output()
-            .expect("run mysqld --initialize-insecure"),
+        None => {
+            let mut cmd = mysqld(&bins);
+            cmd.arg("--initialize-insecure")
+                .arg(format!("--datadir={}", data.display()))
+                .arg(format!("--log-error={}", dir.join("init.log").display()));
+            if cfg!(windows) {
+                // `root` is 'root'@'localhost' only, which a login over TCP
+                // does not match with --skip-name-resolve, and Windows has
+                // no Unix socket for it: the same account for 127.0.0.1.
+                let init = dir.join("init.sql");
+                std::fs::write(
+                    &init,
+                    "CREATE USER 'root'@'127.0.0.1' IDENTIFIED BY '';\n\
+                     GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;\n",
+                )
+                .unwrap();
+                cmd.arg(format!("--init-file={}", init.display()));
+            }
+            cmd.output().expect("run mysqld --initialize-insecure")
+        }
         // MariaDB's installer for Windows is a tool of its own, which takes
         // the data directory and sets `root` up without a password.
         Some(install_db) if cfg!(windows) => Command::new(install_db)

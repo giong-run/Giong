@@ -315,6 +315,12 @@ impl Net {
                         if incoming.fin_arrived {
                             r |= RDHUP;
                         }
+                        // As Linux's tcp_poll and unix_poll: a socket whose
+                        // reading side was shut down reads the end of the
+                        // stream, so it is readable, with RDHUP.
+                        if s.shut_rd {
+                            r |= IN | RDHUP;
+                        }
                         if incoming.fin_arrived && outgoing.fin_sent {
                             r |= HUP;
                         }

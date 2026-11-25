@@ -16,8 +16,10 @@ use std::mem::ManuallyDrop;
 use std::net::Shutdown;
 #[cfg(unix)]
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, FromRawFd, IntoRawFd, RawFd};
+#[cfg(target_os = "linux")]
+use std::os::unix::net::SocketAddr;
 #[cfg(unix)]
-use std::os::unix::net::{SocketAddr, UnixStream as StdStream};
+use std::os::unix::net::UnixStream as StdStream;
 use std::path::Path;
 use std::task::{Context, Poll};
 

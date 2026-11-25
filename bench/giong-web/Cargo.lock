@@ -46,6 +46,7 @@ version = "1.5.0"
 dependencies = [
  "giong",
  "libc",
+ "windows-sys",
 ]
 
 [[package]]
