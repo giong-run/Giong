@@ -452,6 +452,9 @@ pub(crate) struct Worker {
     /// waker's `wake` or `drop` runs is inside the borrow); done at the next
     /// turn of the event loop.
     deferred: RefCell<Deferred>,
+    /// Something was pushed to `deferred` since it was last handled: one
+    /// load per turn instead of a borrow and a look at every list.
+    deferred_waiting: Cell<bool>,
     pub(crate) tasks: RefCell<Slab<TaskSlot>>,
     pub(crate) queue: RefCell<VecDeque<usize>>,
     /// Waker states of finished tasks, reused by the next spawns.
@@ -554,6 +557,25 @@ pub(crate) fn with_worker<R>(f: impl FnOnce(&Worker) -> R) -> R {
     }
 }
 
+/// Drops what the driver handed back from a turn (resources of operations
+/// the kernel finished with after their future was dropped). Almost every
+/// turn hands back an empty vector that never allocated: forgetting it
+/// frees nothing, and costs nothing, where dropping it is a call.
+#[inline(always)]
+fn bury(graveyard: Vec<Box<dyn Any>>) {
+    if graveyard.capacity() == 0 {
+        // No allocation, so no element (len <= capacity): nothing to free.
+        mem::forget(graveyard);
+    } else {
+        bury_now(graveyard);
+    }
+}
+
+#[inline(never)]
+fn bury_now(graveyard: Vec<Box<dyn Any>>) {
+    drop(graveyard);
+}
+
 #[cold]
 #[inline(never)]
 fn not_in_runtime() -> ! {
@@ -594,6 +616,7 @@ impl Worker {
             driver_kind: driver.kind(),
             driver: RefCell::new(driver),
             deferred: RefCell::new(Deferred::default()),
+            deferred_waiting: Cell::new(false),
             tasks: RefCell::new(Slab::new()),
             queue: RefCell::new(VecDeque::with_capacity(256)),
             spare_wakers: RefCell::new(Vec::new()),
@@ -793,7 +816,7 @@ impl Worker {
                 }
                 // Just exchange work with the kernel.
                 let graveyard = self.driver.borrow_mut().park(Park::Poll);
-                drop(graveyard);
+                bury(graveyard);
                 self.fire_timers();
                 continue;
             }
@@ -802,7 +825,7 @@ impl Worker {
                 // Hand queued submissions (responses!) to the kernel first, then
                 // watch for new work without giving up the CPU.
                 let graveyard = self.driver.borrow_mut().park(Park::Poll);
-                drop(graveyard);
+                bury(graveyard);
                 self.fire_timers();
                 if !self.queue.borrow().is_empty() || self.spin_for_work(spin) {
                     continue;
@@ -845,7 +868,7 @@ impl Worker {
                 self.shared.counters.woke();
             }
             // Buffers of cancelled operations: dropped outside the driver borrow.
-            drop(graveyard);
+            bury(graveyard);
 
             self.fire_timers();
         }
@@ -945,6 +968,7 @@ impl Worker {
     /// closed behind the driver's back.
     pub(crate) fn defer_close(&self, fd: sys::RawFile) {
         self.deferred.borrow_mut().closes.push(fd);
+        self.deferred_waiting.set(true);
     }
 
     /// [`defer_close`](Self::defer_close) for a socket.
@@ -952,7 +976,10 @@ impl Worker {
         #[cfg(unix)]
         self.defer_close(sock);
         #[cfg(windows)]
-        self.deferred.borrow_mut().sock_closes.push(sock);
+        {
+            self.deferred.borrow_mut().sock_closes.push(sock);
+            self.deferred_waiting.set(true);
+        }
     }
 
     /// Drops the multishot operation `key`, whose owner went away while the
@@ -960,6 +987,7 @@ impl Worker {
     /// deferred closes, since the operation holds a reference to its socket.
     pub(crate) fn defer_drop_multi(&self, key: usize) {
         self.deferred.borrow_mut().multis.push(key);
+        self.deferred_waiting.set(true);
     }
 
     /// Cancels the single-shot operation `key`, whose future was dropped
@@ -976,6 +1004,7 @@ impl Worker {
             .borrow_mut()
             .cancels
             .push((key, data, result_is_fd, finish));
+        self.deferred_waiting.set(true);
     }
 
     /// Where the main future was started.
@@ -1001,7 +1030,20 @@ impl Worker {
         (io, self.timers.borrow().len())
     }
 
+    /// Hands the driver what was given up while it was borrowed. Checked
+    /// on every turn, and almost always empty: the test is inline and the
+    /// work out of line.
+    #[inline]
     fn close_deferred(&self) {
+        if self.deferred_waiting.get() {
+            self.close_deferred_now();
+        }
+    }
+
+    #[inline(never)]
+    fn close_deferred_now(&self) {
+        // Cleared first: what the driver's work below defers again sets it.
+        self.deferred_waiting.set(false);
         if self.deferred.borrow().is_empty() {
             return;
         }
@@ -1119,12 +1161,19 @@ impl Worker {
         now
     }
 
+    /// Wakes the tasks whose timers expired. Called on every turn, usually
+    /// with no timer armed: the test is inline and the work out of line.
+    #[inline]
     fn fire_timers(&self) {
         // Time has passed in the kernel: the next read is a fresh one.
         self.now.set(None);
-        if self.timers.borrow().len() == 0 {
-            return;
+        if self.timers.borrow().len() != 0 {
+            self.fire_timers_now();
         }
+    }
+
+    #[inline(never)]
+    fn fire_timers_now(&self) {
         let expired = self.timers.borrow_mut().expired(self.clock());
         for waker in expired {
             waker.wake();
