@@ -10,6 +10,19 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [1.5.0] - 2026-11-25
 
+The developer kit and runtime 1.5. The new `giong` command (crate `giong-cli`) starts, runs,
+checks and ships a service the way agents and people work: `giong new` writes a project that
+builds and passes its tests from the first minute, `giong dev` rebuilds on every save without
+refusing a request, and `giong check`, `fix`, `test`, `db`, `env`, `top`, `bench`, `image`,
+`record` and `dashboard` cover the rest of the loop. `giong mcp` serves them all as tools to
+coding agents, and every problem comes with a code and a fix. The runtime gains blocking and
+compute lanes, budgets per tenant, child processes and signals, `giong::ipc` message channels
+between processes, and request tracing, which giong-mcp's `slow_requests` tool uses to say why
+a request is slow. In containers, giong raises the soft open-files limit and sizes its workers
+to the CPU limit. Lookups of one name at the same time share one query, and on io_uring a peer
+that keeps sending to a task that stopped reading no longer grows memory without bound. No API
+is removed or changed.
+
 ### Added
 
 - **giong**: blocking and compute lanes (`giong::lane`): `spawn_blocking(f)` runs a closure that
