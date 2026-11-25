@@ -284,9 +284,14 @@ mod tests {
         let port = unsafe { CreateIoCompletionPort(INVALID_HANDLE_VALUE, ptr::null_mut(), 0, 1) };
         assert!(!port.is_null());
         let start = Instant::now();
-        let deadline = start + Duration::from_millis(40);
-        assert_eq!(alarm.set(port, deadline - Instant::now()), Set::Armed);
+        assert_eq!(alarm.set(port, Duration::from_millis(40)), Set::Armed);
         assert_eq!(alarm.arms.get(), 1);
+        // The deadline as the alarm took it. Not one computed here before
+        // the call: `set` reads the clock itself, and a thread preempted
+        // between the two reads (CI's virtual machines) had the alarm armed
+        // later than that deadline by more than SAME_DEADLINE, so asking
+        // for it again rightly armed again.
+        let deadline = alarm.armed.get().expect("armed");
         for _ in 0..10 {
             assert_eq!(alarm.set(port, deadline - Instant::now()), Set::Armed);
         }
