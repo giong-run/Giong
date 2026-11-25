@@ -30,6 +30,7 @@ mod service;
 mod sha256;
 mod state;
 mod template;
+mod tmp;
 mod versions;
 mod watch;
 mod web_client;
