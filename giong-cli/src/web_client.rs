@@ -407,8 +407,12 @@ fn dechunk(mut rest: &[u8], mut out: Option<&mut Vec<u8>>) -> Result<(), String>
     loop {
         let line_end = find(rest, b"\r\n").ok_or("a chunk size line is cut short")?;
         let size_text = String::from_utf8_lossy(&rest[..line_end]);
-        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| format!("a bad chunk size {size_text:?}"))?;
+        let digits = size_text.split(';').next().unwrap_or("").trim();
+        // Hex digits only: from_str_radix alone also takes "+5".
+        let size = Some(digits)
+            .filter(|d| d.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|d| usize::from_str_radix(d, 16).ok())
+            .ok_or_else(|| format!("a bad chunk size {size_text:?}"))?;
         rest = &rest[line_end + 2..];
         if size == 0 {
             // Trailers, then the empty line.
@@ -498,6 +502,9 @@ mod tests {
         let raw =
             b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nfffffffffffffffe\r\nab\r\n";
         assert_eq!(parse(raw, false).unwrap_err(), "a chunk is cut short");
+        // A sign is not a hex digit (usize::from_str_radix takes "+2").
+        let raw = b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n+2\r\nab\r\n0\r\n\r\n";
+        assert!(parse(raw, false).unwrap_err().contains("bad chunk size"));
     }
 
     #[test]

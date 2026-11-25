@@ -554,8 +554,12 @@ fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>, String> {
     loop {
         let line_end = find(rest, b"\r\n").ok_or("a chunk size line is cut short")?;
         let size_text = String::from_utf8_lossy(&rest[..line_end]);
-        let size = usize::from_str_radix(size_text.split(';').next().unwrap_or("").trim(), 16)
-            .map_err(|_| format!("bad chunk size {size_text:?}"))?;
+        let digits = size_text.split(';').next().unwrap_or("").trim();
+        // Hex digits only: from_str_radix alone also takes "+5".
+        let size = Some(digits)
+            .filter(|d| d.bytes().all(|b| b.is_ascii_hexdigit()))
+            .and_then(|d| usize::from_str_radix(d, 16).ok())
+            .ok_or_else(|| format!("bad chunk size {size_text:?}"))?;
         rest = &rest[line_end + 2..];
         if size == 0 {
             return Ok(out);
@@ -696,6 +700,12 @@ mod tests {
             .unwrap_err(),
             "a chunk is cut short"
         );
+        // A sign is not a hex digit (usize::from_str_radix takes "+2").
+        assert!(parse_response(
+            b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n+2\r\nab\r\n0\r\n\r\n"
+        )
+        .unwrap_err()
+        .contains("bad chunk size"));
     }
 
     #[test]
