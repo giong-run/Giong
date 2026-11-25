@@ -1177,6 +1177,7 @@ mod tests {
     /// A directory read on the blocking lane lists the same entries as one
     /// read on the worker, also when calls are dropped while a batch runs.
     #[test]
+    #[cfg_attr(miri, ignore = "Miri has no fstatfs or getdents64")]
     fn a_directory_read_off_the_worker_lists_every_entry_once() {
         let dir = std::env::temp_dir().join(format!("giong-read-dir-off-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
