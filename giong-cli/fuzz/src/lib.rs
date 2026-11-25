@@ -19,3 +19,6 @@ pub mod host;
 pub mod watch;
 #[path = "../../src/lint.rs"]
 pub mod lint;
+pub mod record;
+#[path = "../../src/dashboard/http.rs"]
+pub mod dashboard_http;

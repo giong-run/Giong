@@ -762,9 +762,13 @@ def home():
     announce = ""
     if LATEST:
         name = milestone_name(LATEST["version"])
+        # One line at every width: the version never shrinks, a long release name ends in
+        # an ellipsis (the full text stays in the title), the date drops on small screens.
         label = f'giong {LATEST["version"]}' + (f' “{name}”' if name else "") + " is out"
-        announce = (f'<a class="announce" href="{link("releases", LATEST["id"])}"><b>New</b>'
-                    f'<span>{label}</span><span class="announce-date">{nice_date(LATEST["date"])}</span>'
+        name_html = f'<span class="announce-name">{html.escape(name)}</span>' if name else ""
+        announce = (f'<a class="announce" href="{link("releases", LATEST["id"])}" title="{html.escape(label)}"><b>New</b>'
+                    f'<span class="announce-ver">giong {LATEST["version"]} is out</span>{name_html}'
+                    f'<span class="announce-date">{nice_date(LATEST["date"])}</span>'
                     f'<span class="announce-go" aria-hidden="true">→</span></a>')
     stats = [
         (sys_rows["giong"][2], f"system calls per request on `/json`; raw Tokio makes {sys_rows['tokio'][2]}"),
