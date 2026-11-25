@@ -19,18 +19,20 @@ Named after Thánh Gióng, the child of Vietnamese legend who lay silent for thr
 then rose a giant: giong costs next to nothing while idle and uses every core the moment
 load arrives.
 
-> **Status: 1.4.0.** The API has been frozen since 1.0 ([STABILITY.md](docs/STABILITY.md)),
+> **Status: 1.5.0.** The API has been frozen since 1.0 ([STABILITY.md](docs/STABILITY.md)),
 > and every 1.x release only adds. A whole service runs on giong with no Tokio underneath:
 > TCP, UDP, Unix sockets, files, timers, DNS, multi-core and graceful shutdown in the
 > runtime, and twelve companion crates for HTTP/1.1, HTTP/2 and HTTP/3, TLS, gRPC,
 > Protocol Buffers, QUIC, PostgreSQL, MySQL, Redis, routing and middleware, and an MCP
-> server for agents. One service uses it so far, its author's. See
+> server for agents. The [`giong` command](giong-cli/README.md) starts, runs, checks and
+> ships a service. One service uses giong so far, its author's. See
 > [Platforms](#platforms) and [Limitations](#limitations).
 
 **New in 1.x**, each a minor release that needs no code change to upgrade:
 
 | Release | What it added |
 |---|---|
+| **1.5** | The developer kit: the [`giong` command](giong-cli/README.md) (`new`, `dev`, `check`, `fix`, `test`, `db`, `env`, `top`, `bench`, `image`, `record`, `dashboard`, `mcp`), prebuilt for Linux, macOS and Windows; `giong dev` swaps in each new build with 0 failed requests out of 102,061 over 100 restarts (Linux, io_uring; [raw data](bench/results/dev-restarts/)). In the runtime: blocking and compute lanes, budgets per tenant, child processes and signals, `giong::ipc` between processes on Linux, request tracing (giong-mcp's `slow_requests`), and the open-files limit raised in containers. |
 | **1.4** | Windows: a completion-port (IOCP) driver for the runtime crate: tasks, timers, channels, TCP, UDP, files, DNS and Ctrl+C. The other crates come to Windows in later 1.x releases. |
 | **1.3** | HTTP/3: [`giong-quic`](giong-quic/README.md) (QUIC on giong's UDP sockets) and giong-http's HTTP/3 server and client behind the `unstable-http3` feature; UDP offloads (GSO, GRO, ECN) behind `unstable-udp-offload`. |
 | **1.2** | macOS: a kqueue driver, tested on macOS 15 and 26 on Apple Silicon; a send or connect that meets `ENOBUFS` waits for buffers ([GIONG-E0028](docs/errors/E0028.md)). |
@@ -40,7 +42,10 @@ The full list is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Start here
 
-For people and for AI agents alike, the one path:
+The quickest start is the [`giong` command](giong-cli/README.md): `giong new api --db postgres`
+writes a service that builds and passes its tests, with `AGENTS.md` for your coding agent,
+and `giong dev` runs it on localhost and rebuilds on every save. By hand, for people and for
+AI agents alike, the one path:
 
 1. **Add the crates for the job.** A web service: `cargo add giong giong-web serde --features serde/derive`.
    A bare HTTP server: `cargo add giong giong-http`. The table under
