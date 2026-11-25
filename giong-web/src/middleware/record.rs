@@ -312,7 +312,8 @@ impl Record {
     }
 
     /// A `multipart/form-data` body with the content of each part whose
-    /// field name says secret replaced: as far as parts can be told apart
+    /// field name says secret replaced, and the secrets inside a JSON part
+    /// (by its content type or shape) redacted as in a JSON body: as far as parts can be told apart
     /// when the body is cut short, and to the end for a part that does not
     /// end.
     fn redact_multipart<'a>(&self, s: &'a str, boundary: &str) -> Cow<'a, str> {
@@ -334,12 +335,19 @@ impl Record {
             let content = part + head_len + 4;
             let end = s[content..].find(&next).map(|e| content + e);
             let stop = end.unwrap_or(s.len());
-            if stop > content
-                && part_name(&s[part..part + head_len]).is_some_and(|n| self.secret_field(&n))
-            {
+            let head = &s[part..part + head_len];
+            if stop > content && part_name(head).is_some_and(|n| self.secret_field(&n)) {
                 out.push_str(&s[copied..content]);
                 out.push_str(REDACTED);
                 copied = stop;
+            } else if part_is_json(head, &s[content..stop]) {
+                // A JSON part (metadata sent beside a file) is redacted as
+                // a JSON body is, key by key.
+                if let Cow::Owned(json) = self.redact_json(&s[content..stop]) {
+                    out.push_str(&s[copied..content]);
+                    out.push_str(&json);
+                    copied = stop;
+                }
             }
             match end {
                 Some(e) => at = e + 2,
@@ -554,6 +562,16 @@ fn part_name(head: &str) -> Option<String> {
             percent_decode(v).into_owned()
         })
     })
+}
+
+/// Whether a multipart part holds JSON: its `Content-Type` says so, or its
+/// content starts with `{` or `[`, the rule bodies follow.
+fn part_is_json(head: &str, content: &str) -> bool {
+    head.split("\r\n").any(|line| {
+        line.split_once(':').is_some_and(|(k, v)| {
+            k.trim().eq_ignore_ascii_case("content-type") && v.to_ascii_lowercase().contains("json")
+        })
+    }) || content.trim_start().starts_with(['{', '['])
 }
 
 /// A query or form name with `%XX` and `+` decoded (lossily).
@@ -1025,6 +1043,40 @@ mod tests {
             kept.redact_multipart(body, "XyZ"),
             body.replace("AK-1", "[redacted]")
         );
+    }
+
+    #[test]
+    fn json_parts_of_a_multipart_body_are_redacted_key_by_key() {
+        let rec = Record::new(Sink::Stdout);
+        let part = |head: &str, content: &str| {
+            format!("--b\r\nContent-Disposition: form-data; {head}\r\n\r\n{content}\r\n")
+        };
+        let body = [
+            part(
+                "name=\"meta\"\r\nContent-Type: application/json",
+                r#"{"title":"cat","token":"t1"}"#,
+            ),
+            part("name=\"shape\"", r#" [{"password":"p"}]"#),
+            part("name=\"note\"", r#"say "token":"x""#),
+            part(
+                "name=\"file\"; filename=\"a.json\"\r\nContent-Type: Application/JSON",
+                r#"{"apiKey":"AK"}"#,
+            ),
+            "--b--\r\n".to_string(),
+        ]
+        .concat();
+        assert_eq!(
+            rec.redact_multipart(&body, "b"),
+            body.replace(r#""t1""#, r#""[redacted]""#)
+                .replace(r#""p""#, r#""[redacted]""#)
+                .replace(r#""AK""#, r#""[redacted]""#)
+        );
+        // A JSON part without a secret leaves the body as it was.
+        let plain = part("name=\"meta\"", r#"{"title":"cat"}"#) + "--b--";
+        assert!(matches!(
+            rec.redact_multipart(&plain, "b"),
+            Cow::Borrowed(_)
+        ));
     }
 
     #[test]
