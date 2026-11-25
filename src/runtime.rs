@@ -475,8 +475,11 @@ pub(crate) struct Worker {
     /// The id the next probe gets (see [`Worker::remove_probe`]).
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `ipc` only
     next_probe: Cell<u64>,
-    /// `probes` is not empty: read in the spin loop without borrowing it.
-    has_probes: Cell<bool>,
+    /// What to do before the event loop sleeps, one bit each: probes to
+    /// arm ([`PARK_PROBES`]: `probes` is not empty, read in the spin loop
+    /// without borrowing it), tables to trim ([`PARK_TRIM`]). One flag, so
+    /// that a worker with neither reads one byte.
+    park_work: Cell<u8>,
     /// Writes held back until the end of the turn (see [`Publish`]).
     publishers: RefCell<Vec<Rc<dyn Publish>>>,
     /// `publishers` is not empty.
@@ -571,6 +574,12 @@ fn not_in_runtime() -> ! {
     )
 }
 
+/// A bit of `Worker::park_work`: probes to arm before sleeping.
+const PARK_PROBES: u8 = 1;
+/// A bit of `Worker::park_work`: the task or timer table grew past a few
+/// thousand slots and may be trimmed before sleeping.
+const PARK_TRIM: u8 = 2;
+
 /// Polls after which a busy worker on epoll looks for I/O again.
 const IO_POLL_INTERVAL: usize = 61;
 
@@ -587,7 +596,7 @@ impl Worker {
         shared.counters.set_driver(driver.kind());
         // A worker instance is built once, so the slot is always empty here.
         let _ = shared.driver_choice.set(choice);
-        Ok(Rc::new(Self {
+        let worker = Rc::new(Self {
             index,
             shared,
             rt,
@@ -607,7 +616,7 @@ impl Worker {
             spin: cfg.spin,
             probes: RefCell::new(Vec::new()),
             next_probe: Cell::new(0),
-            has_probes: Cell::new(false),
+            park_work: Cell::new(0),
             publishers: RefCell::new(Vec::new()),
             publish_waiting: Cell::new(false),
             shutdown_waiters: RefCell::new(Slab::new()),
@@ -618,7 +627,15 @@ impl Worker {
             budget: Cell::new(std::ptr::null()),
             io_charges: RefCell::new(Vec::new()),
             tracing: Cell::new(false),
-        }))
+        });
+        // SAFETY: the flag and both tables are fields of the worker, which
+        // stays in its `Rc` until it is dropped, tables and all.
+        unsafe {
+            let flag = &worker.park_work;
+            worker.tasks.borrow_mut().watch_growth(flag, PARK_TRIM);
+            worker.timers.borrow_mut().watch_growth(flag, PARK_TRIM);
+        }
+        Ok(worker)
     }
 
     /// Runs `fut` to completion on this thread, then tears the worker down.
@@ -823,7 +840,7 @@ impl Worker {
             // Announce that we are going to sleep, then re-check for injected
             // work (see `WorkerShared::inject`) and balanced jobs (see
             // `RuntimeShared::push_job`): `prepare_park` ends with the fence.
-            let mode = if (self.has_probes.get() && self.fire_probes(true))
+            let mode = if (self.park_work.get() != 0 && self.before_park())
                 || self.shared.bell.prepare_park()
                 || self.rt.jobs_len.any()
             {
@@ -851,6 +868,41 @@ impl Worker {
         }
     }
 
+    /// Keeps [`PARK_PROBES`] in `park_work` in step with the probes left.
+    fn note_probes(&self, left: usize) {
+        let work = self.park_work.get() & !PARK_PROBES;
+        self.park_work
+            .set(if left == 0 { work } else { work | PARK_PROBES });
+    }
+
+    /// The work of `park_work` before the event loop sleeps: tables to
+    /// trim, then probes to arm. `true` if a probe woke a task.
+    #[inline(never)]
+    fn before_park(&self) -> bool {
+        let work = self.park_work.get();
+        if work & PARK_TRIM != 0 {
+            self.trim_tables();
+        }
+        work & PARK_PROBES != 0 && self.fire_probes(true)
+    }
+
+    /// Gives back the task table, run queue and timer table a burst of
+    /// tasks or timers grew, once most of it is vacant (see [`Slab::trim`]).
+    /// The queue is empty here: the event loop only sleeps with nothing to
+    /// run. Clears [`PARK_TRIM`] once neither table is big any more.
+    fn trim_tables(&self) {
+        let mut tasks = self.tasks.borrow_mut();
+        if tasks.trim_due() && tasks.trim() {
+            self.queue.borrow_mut().shrink_to(tasks.len());
+        }
+        let armed = tasks.trim_armed();
+        drop(tasks);
+        let armed = self.timers.borrow_mut().trim() || armed;
+        if !armed {
+            self.park_work.set(self.park_work.get() & !PARK_TRIM);
+        }
+    }
+
     /// Whether this worker busy-polls before blocking (`spin_before_park`):
     /// only then are [`SpinProbe`]s watched.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))] // used by `ipc` only
@@ -865,7 +917,7 @@ impl Worker {
         let id = self.next_probe.get();
         self.next_probe.set(id.wrapping_add(1));
         self.probes.borrow_mut().push((id, probe, waker));
-        self.has_probes.set(true);
+        self.park_work.set(self.park_work.get() | PARK_PROBES);
         id
     }
 
@@ -876,7 +928,7 @@ impl Worker {
         let mut probes = self.probes.borrow_mut();
         if let Some(i) = probes.iter().position(|(p, _, _)| *p == id) {
             let removed = probes.swap_remove(i);
-            self.has_probes.set(!probes.is_empty());
+            self.note_probes(probes.len());
             drop(probes);
             // The probe and waker are dropped outside the borrow.
             drop(removed);
@@ -930,7 +982,7 @@ impl Worker {
                     i += 1;
                 }
             }
-            self.has_probes.set(!probes.is_empty());
+            self.note_probes(probes.len());
         }
         let any = !fired.is_empty();
         for waker in fired {
@@ -1053,7 +1105,7 @@ impl Worker {
                 if self.shared.bell.peek()
                     || self.rt.jobs_len.any()
                     || self.driver.borrow_mut().has_completions()
-                    || (self.has_probes.get() && self.fire_probes(false))
+                    || (self.park_work.get() & PARK_PROBES != 0 && self.fire_probes(false))
                 {
                     return true;
                 }
@@ -2569,6 +2621,61 @@ mod tests {
 
     /// Every kind of deferred work keeps `close_deferred` from skipping the
     /// turn: on Windows a socket alone was ignored, and stayed open (#289).
+    /// A burst of tasks and timers leaves neither table behind once it is
+    /// over (#292): the worker gives them back before it sleeps.
+    #[test]
+    #[cfg_attr(
+        miri,
+        ignore = "50,000 tasks, minutes long under Miri; slab tests cover the trim"
+    )]
+    fn a_burst_of_tasks_and_timers_gives_its_tables_back() {
+        use std::time::Duration;
+        super::Builder::new()
+            .workers(1)
+            .build()
+            .unwrap()
+            .run(|_| async {
+                let tables = || {
+                    super::with_worker(|w| {
+                        (
+                            w.tasks.borrow().slots(),
+                            w.queue.borrow().capacity(),
+                            w.timers.borrow().slots(),
+                        )
+                    })
+                };
+                let burst = 50_000;
+                let handles: Vec<_> = (0..burst)
+                    .map(|_| {
+                        crate::spawn(async {
+                            crate::time::sleep(Duration::from_millis(20)).await;
+                        })
+                    })
+                    .collect();
+                // Every task runs once and sets its timer.
+                crate::executor::yield_now().await;
+                let (tasks, queue, timers) = tables();
+                assert!(tasks >= burst, "{tasks}");
+                assert!(queue >= burst, "{queue}");
+                assert!(timers >= burst, "{timers}");
+                for handle in handles {
+                    handle.await.unwrap();
+                }
+                // Each try that leaves a table big (a live timer near its
+                // end) waits twice as long for the next: a few sleeps.
+                let mut left = tables();
+                for _ in 0..64 {
+                    crate::time::sleep(Duration::from_micros(100)).await;
+                    left = tables();
+                    if left.0 < 64 && left.1 < 64 && left.2 < 64 {
+                        break;
+                    }
+                }
+                assert!(left.0 < 64 && left.1 < 64 && left.2 < 64, "{left:?}");
+            })
+            .unwrap();
+    }
+
     #[test]
     fn a_deferred_close_of_any_kind_is_work() {
         assert!(Deferred::default().is_empty());
