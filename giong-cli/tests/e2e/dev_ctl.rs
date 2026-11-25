@@ -436,6 +436,15 @@ fn a_change_that_fails_stops_the_old_build_and_says_why() {
             "the fix does not name this process: {v:#}"
         );
     }
+    // Naming who holds the port reads the list of runners: the runner
+    // finds itself there and keeps its entry, so --all still lists it (and
+    // nothing changes in the folder it watches, here, where GIONG_HOME is).
+    let all = dev(&dir, &["status", "--all"], port).run().report("dev");
+    assert_eq!(
+        all["data"]["projects"].as_array().map(Vec::len),
+        Some(1),
+        "the runner left the list of runners: {all:#}"
+    );
     drop(holder);
     // Any save starts it again.
     dir.write("src/main.rs", &format!("{SERVICE}\n// saved again\n"));

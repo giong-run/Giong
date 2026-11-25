@@ -95,7 +95,17 @@ pub fn registered() -> Vec<PathBuf> {
         let root = PathBuf::from(root);
         // The pid must still be the runner of that project (pids are reused).
         let state = read_state(&root).unwrap_or(Value::Null);
-        if state["pid"].as_u64() != Some(pid) || !is_runner(Some(pid), &state["pid_started"]) {
+        // A runner asking (to name who holds a port) finds itself, which
+        // `is_runner` never matches (nothing signals itself): its own entry
+        // stays, when that project's dev.json names this very process.
+        let own = u64::from(std::process::id());
+        let me = pid == own
+            && state["pid"].as_u64() == Some(own)
+            && state["pid_started"].as_str().is_some()
+            && state["pid_started"].as_str() == super::dev::started(own).as_deref();
+        if !me
+            && (state["pid"].as_u64() != Some(pid) || !is_runner(Some(pid), &state["pid_started"]))
+        {
             let _ = fs::remove_file(&path);
             continue;
         }
