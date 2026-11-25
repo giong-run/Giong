@@ -876,6 +876,12 @@ impl ComputeCharge {
     pub(crate) fn weight(&self) -> u32 {
         self.0.weight.load(Ordering::Relaxed) as u32
     }
+
+    /// The budget, for the compute lane to tell when its class is gone.
+    pub(crate) fn owner(&self) -> std::sync::Weak<dyn Send + Sync> {
+        let weak: std::sync::Weak<Inner> = Arc::downgrade(&self.0);
+        weak
+    }
 }
 
 impl Drop for ComputeCharge {
