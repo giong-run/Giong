@@ -560,7 +560,8 @@ fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>, String> {
         if size == 0 {
             return Ok(out);
         }
-        if rest.len() < size + 2 {
+        // A size near usize::MAX is just a chunk that never arrives.
+        if rest.len() < size.saturating_add(2) {
             return Err("a chunk is cut short".into());
         }
         out.extend_from_slice(&rest[..size]);
@@ -686,6 +687,14 @@ mod tests {
         assert!(
             parse_response(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nab")
                 .is_err()
+        );
+        // A size that overflows when the CRLF is added: an error, not a panic.
+        assert_eq!(
+            parse_response(
+                b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\nffffffffffffffff\r\nab\r\n"
+            )
+            .unwrap_err(),
+            "a chunk is cut short"
         );
     }
 
