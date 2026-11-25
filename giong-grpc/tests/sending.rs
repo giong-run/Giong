@@ -209,15 +209,24 @@ fn a_client_that_does_not_read_holds_the_handler_back() {
             .unwrap();
         assert!(responses.message().await.unwrap().is_some());
         // Nothing more is read: the handler stops once the windows and the
-        // buffers on the way are full.
-        sleep(Duration::from_millis(300)).await;
-        let sent = sender.sent.get();
+        // buffers on the way are full. How long filling them takes depends on
+        // the machine (under TSan it was still going after 300 ms), so wait
+        // until the count stops moving, then check where it stopped.
+        let mut sent = sender.sent.get();
+        for _ in 0..300 {
+            sleep(Duration::from_millis(100)).await;
+            let now = sender.sent.get();
+            if now == sent {
+                break;
+            }
+            sent = now;
+        }
         assert!(
             sent < 4096,
             "{sent} messages of 1 KiB sent to a client that reads none"
         );
-        sleep(Duration::from_millis(100)).await;
-        assert_eq!(sender.sent.get(), sent);
+        sleep(Duration::from_millis(300)).await;
+        assert_eq!(sender.sent.get(), sent, "the handler kept sending");
         // The client gives up: the handler, waiting to send, is dropped.
         drop(responses);
         for _ in 0..1000 {
