@@ -225,6 +225,9 @@ struct Service {
     pid: u32,
     mcp: PathBuf,
     tail: Arc<Mutex<VecDeque<String>>>,
+    /// The threads copying its output ([`Dev::tee`]): they end when its
+    /// output closes, so a report waits for them to have its last lines.
+    readers: Vec<std::thread::JoinHandle<()>>,
     /// giong dev's end of the ready channel: `\n` comes for each bind of a
     /// handed-down socket, `s` asks to stop accepting, `d` answers it.
     #[cfg(unix)]
@@ -953,6 +956,7 @@ impl Dev {
             child,
             mcp: if mcp_on { mcp } else { PathBuf::new() },
             tail: Arc::new(Mutex::new(VecDeque::new())),
+            readers: Vec::new(),
             #[cfg(unix)]
             ready: None,
             #[cfg(unix)]
@@ -1138,7 +1142,7 @@ impl Dev {
             let log = Arc::clone(&self.log);
             let tail = Arc::clone(&service.tail);
             let echo = !self.json;
-            std::thread::spawn(move || {
+            let reader = std::thread::spawn(move || {
                 let mut reader = BufReader::new(stream);
                 let mut line = Vec::new();
                 loop {
@@ -1168,6 +1172,7 @@ impl Dev {
                     }
                 }
             });
+            service.readers.push(reader);
         }
     }
 
@@ -1240,8 +1245,6 @@ impl Dev {
                 );
                 return;
             }
-            // Give the output threads a moment to take the last lines.
-            std::thread::sleep(Duration::from_millis(50));
             let finding = self.exited_finding(service, status);
             self.say(
                 "exited",
@@ -1251,7 +1254,6 @@ impl Dev {
             self.report.push(finding);
             return;
         }
-        std::thread::sleep(Duration::from_millis(50));
         let finding = if status.is_some_and(|s| s.success()) {
             // Not an error of the session's report, but nothing serves.
             exited_by_itself(service)
@@ -1591,7 +1593,14 @@ fn watch_limit() -> Finding {
     .fix("move large data out of the project, or into a directory named target or node_modules")
 }
 
+/// The last lines of a service that ended: once its output threads have
+/// read everything (half a second at most: a program it started may hold
+/// its output open).
 fn tail_text(service: &Service) -> String {
+    let until = Instant::now() + Duration::from_millis(500);
+    while service.readers.iter().any(|r| !r.is_finished()) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     service
         .tail
         .lock()
