@@ -9,10 +9,11 @@
 //!   "engine": "docker", "started_by": "giong db up", "started_at": 1764000000000}]}
 //! ```
 
-use std::fs;
 use std::path::{Path, PathBuf};
 
 use serde_json::{json, Value};
+
+use crate::state;
 
 /// One thing giong started for the project.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -54,7 +55,7 @@ fn path(root: &Path) -> PathBuf {
 
 /// The entries, oldest first; none when the file is missing or unreadable.
 pub fn list(root: &Path) -> Vec<Entry> {
-    let Ok(text) = fs::read_to_string(path(root)) else {
+    let Ok(text) = state::read_to_string(&path(root)) else {
         return Vec::new();
     };
     let Ok(doc) = serde_json::from_str::<Value>(&text) else {
@@ -77,7 +78,6 @@ pub fn list(root: &Path) -> Vec<Entry> {
 }
 
 /// Records `entry`, replacing one of the same kind and name.
-#[allow(dead_code)] // called by `giong db up`
 pub fn add(root: &Path, entry: Entry) -> std::io::Result<()> {
     let mut all = list(root);
     all.retain(|e| !(e.kind == entry.kind && e.name == entry.name));
@@ -104,17 +104,15 @@ pub fn to_json(e: &Entry) -> Value {
 
 /// Written aside, then renamed: a reader never sees half a file.
 fn save(root: &Path, all: &[Entry]) -> std::io::Result<()> {
-    let dir = root.join(".giong");
-    fs::create_dir_all(&dir)?;
+    state::ensure(root)?;
     let doc = json!({"processes": all.iter().map(to_json).collect::<Vec<_>>()});
-    let tmp = dir.join(format!("processes.json.{}", std::process::id()));
-    fs::write(&tmp, format!("{doc:#}\n"))?;
-    fs::rename(&tmp, path(root))
+    state::replace(&path(root), format!("{doc:#}\n").as_bytes())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     #[test]
     fn entries_are_added_replaced_and_removed() {

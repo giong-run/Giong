@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 giong = { path = "../.." }
+giong-mcp = { path = "../../giong-mcp" }
 giong-postgres = { path = "../../giong-postgres" }
 giong-redis = { path = "../../giong-redis" }
 giong-tls = { path = "../../giong-tls" }
@@ -24,7 +25,6 @@ rcgen = "0.13"
 # this crate (see `markdown` in src/lib.rs): the crates and the Tokio-ecosystem
 # crates they show.
 giong-compat = { path = "../../giong-compat", features = ["tls"] }
-giong-mcp = { path = "../../giong-mcp" }
 giong-mysql = { path = "../../giong-mysql" }
 http-body-util = "0.1"
 hyper = { version = "1.6", features = ["http1", "http2", "client", "server"] }

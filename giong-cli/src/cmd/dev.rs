@@ -45,6 +45,7 @@ use crate::code::Code;
 use crate::dotenv;
 use crate::project::Project;
 use crate::report::{Failure, Finding, Report, Severity};
+use crate::state;
 use crate::watch::{self, Change, Snapshot};
 
 pub const COMMAND: Command = Command {
@@ -52,7 +53,7 @@ pub const COMMAND: Command = Command {
     summary: "build and run the service, and restart it on every save without refusing a request",
     usage: "giong dev [--background] [--bin NAME] [--release] [--listen ADDR[,ADDR]] [--lan] \
             [--workers N] [--prod-like] [--once] [--grace S] [--ready-timeout S] \
-            [-- service arguments]\n\
+            [--ui] [--ui-port N] [-- service arguments]\n\
             giong dev status [--all]\n\
             giong dev logs [--lines N]\n\
             giong dev stop [--all]\n\n\
@@ -68,7 +69,8 @@ pub const COMMAND: Command = Command {
             gets the variables of .env, WORKERS=2 (unless set, or --prod-like), RUST_BACKTRACE=1 \
             and a giong-mcp socket. --once builds, runs the service until it exits, and stops. \
             The listening addresses come from --listen or LISTEN (environment, then .env); \
-            0.0.0.0 or [::] is served on loopback (127.0.0.1, ::1) unless --lan is given.",
+            0.0.0.0 or [::] is served on loopback (127.0.0.1, ::1) unless --lan is given. \
+            --ui also serves the dashboard (giong dashboard) on 127.0.0.1:7700 or a port after it.",
     flags: &[
         Flag {
             name: "bin",
@@ -131,6 +133,16 @@ pub const COMMAND: Command = Command {
             name: "ready-timeout",
             kind: Kind::Value,
             help: "seconds a new build has to start accepting (default 30)",
+        },
+        Flag {
+            name: "ui",
+            kind: Kind::Switch,
+            help: "also serve the dashboard, a local page showing the service (giong dashboard)",
+        },
+        Flag {
+            name: "ui-port",
+            kind: Kind::Value,
+            help: "the dashboard's port, or the first of ten to try (default 7700; implies --ui)",
         },
     ],
     max_words: 1,
@@ -231,6 +243,8 @@ struct Dev {
     grace: Duration,
     #[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
     ready_timeout: Duration,
+    /// The dashboard's port, with --ui or --ui-port.
+    ui: Option<u16>,
     listen: Vec<SocketAddr>,
     /// The addresses the service is told to listen on (`LISTEN`), after
     /// [`loopback_unless_lan`]; empty: the service's own choice.
@@ -272,15 +286,18 @@ fn secs(args: &Args, name: &str, default: u64) -> Result<Duration, Failure> {
 
 impl Dev {
     fn new(project: Project, args: &Args) -> Result<Dev, Failure> {
-        let state_dir = project.root.join(".giong");
-        refuse_if_running(&state_dir)?;
-        fs::create_dir_all(&state_dir).map_err(|e| {
+        let state_dir = state::ensure(&project.root).map_err(|e| {
             Failure::new(
                 Code::USAGE,
-                format!("{} cannot be created: {e}", state_dir.display()),
-                "check that the project directory is writable",
+                format!(
+                    "{} cannot be used: {e}",
+                    state::dir(&project.root).display()
+                ),
+                "check that the project directory is writable and that .giong is a folder of \
+                 its own, not a link",
             )
         })?;
+        refuse_if_running(&state_dir)?;
         let (package, bin) = pick_binary(&project, args.value("bin"))?;
         let workers = match args.number::<u32>("workers")? {
             Some(0) => {
@@ -298,11 +315,12 @@ impl Dev {
         let listen = listen_addresses(args.value("listen"), &env_file)?;
         let (listen, network) = loopback_unless_lan(listen, args.has("lan"));
         let log_path = state_dir.join("dev.log");
-        let log = File::create(&log_path).map_err(|e| {
+        let log = state::create(&log_path).map_err(|e| {
             Failure::new(
                 Code::USAGE,
                 format!("{} cannot be written: {e}", log_path.display()),
-                "check that the project directory is writable",
+                "check that the project directory is writable and that .giong/dev.log is not a \
+                 link",
             )
         })?;
         let mut dev = Dev {
@@ -316,6 +334,10 @@ impl Dev {
             once: args.has("once"),
             grace: secs(args, "grace", 30)?,
             ready_timeout: secs(args, "ready-timeout", 30)?,
+            ui: match args.number::<u16>("ui-port")? {
+                Some(port) => Some(port),
+                None => args.has("ui").then_some(crate::dashboard::PORT),
+            },
             listen: Vec::new(),
             addresses: listen.clone(),
             #[cfg(unix)]
@@ -409,6 +431,9 @@ impl Dev {
                 json!({}),
             );
         }
+        if let Some(port) = self.ui {
+            self.start_dashboard(port);
+        }
         let changed_at = Instant::now();
         self.rebuild(changed_at);
         if self.once {
@@ -497,8 +522,8 @@ impl Dev {
 
     /// `giong dev stop` asked this runner to stop (`.giong/stop`).
     fn stop_asked(&self) -> bool {
-        let request = self.project.root.join(".giong").join("stop");
-        if !request.exists() {
+        let request = state::dir(&self.project.root).join("stop");
+        if !state::exists(&request) {
             return false;
         }
         let _ = fs::remove_file(&request);
@@ -558,14 +583,25 @@ impl Dev {
         if self.release {
             cargo_args.push("--release".into());
         }
-        // A release build has giong's socket hand-off only with its `dev`
-        // feature: on for giong dev's own builds (debug builds always have
-        // it, so --prod-like adds it too only for the same build either way).
-        #[cfg(unix)]
-        if (self.release || self.prod_like) && giong_takes_sockets(&self.project) {
-            for f in dev_features(&self.project.metadata, &self.package) {
-                cargo_args.push("--features".into());
-                cargo_args.push(f);
+        // A release build has giong's socket hand-off, and giong-web's
+        // Record, only with their `dev` features: on for giong dev's own
+        // builds (debug builds always have them, so --prod-like adds them
+        // too only for the same build either way).
+        if self.release || self.prod_like {
+            #[cfg(unix)]
+            let sockets = giong_takes_sockets(&self.project);
+            #[cfg(not(unix))]
+            let sockets = false;
+            for (crate_name, feature) in dev_features(&self.project.metadata, &self.package) {
+                let wanted = if crate_name == "giong" {
+                    sockets
+                } else {
+                    has_dev_feature(&self.project, crate_name)
+                };
+                if wanted {
+                    cargo_args.push("--features".into());
+                    cargo_args.push(feature);
+                }
             }
         }
         let outcome = match build::run(&self.project.root, "build", &cargo_args) {
@@ -1139,7 +1175,7 @@ impl Dev {
 
     /// `.giong/dev.json`, replaced in one step (written aside, then renamed).
     fn write_state(&self) {
-        let dir = self.project.root.join(".giong");
+        let dir = state::dir(&self.project.root);
         let current = self.current.as_ref();
         let doc = json!({
             "pid": std::process::id(),
@@ -1159,9 +1195,43 @@ impl Dev {
             "restarts": self.restarts,
             "build": self.build_json(),
         });
-        let tmp = dir.join(format!("dev.json.{}", std::process::id()));
-        if fs::write(&tmp, format!("{doc:#}\n")).is_ok() {
-            let _ = fs::rename(&tmp, dir.join("dev.json"));
+        let _ = state::replace(&dir.join("dev.json"), format!("{doc:#}\n").as_bytes());
+    }
+
+    /// Serves the dashboard on a thread of its own. Ports in use are a
+    /// warning: the service runs without the page.
+    fn start_dashboard(&mut self, port: u16) {
+        match crate::dashboard::spawn(self.project.root.clone(), port) {
+            Ok(url) => {
+                self.say(
+                    "dashboard",
+                    format!("dashboard on {url}"),
+                    json!({ "url": url }),
+                );
+            }
+            Err(e) => {
+                let last = port.saturating_add(9);
+                let (code, what, fix) = if e.kind() == std::io::ErrorKind::AddrInUse {
+                    (
+                        Code::DASHBOARD_PORT_IN_USE,
+                        format!("ports {port}-{last} are in use: running without the dashboard"),
+                        "give another port with --ui-port, or stop what holds them",
+                    )
+                } else {
+                    (
+                        Code::DASHBOARD_FAILED,
+                        format!("the dashboard cannot listen on 127.0.0.1:{port}: {e}"),
+                        "give another port with --ui-port, or run giong dashboard on its own",
+                    )
+                };
+                self.say(
+                    "warning",
+                    format!("{code}: {what}"),
+                    json!({ "code": code.to_string() }),
+                );
+                self.report
+                    .push(Finding::new(code, Severity::Warning, what).fix(fix));
+            }
         }
     }
 
@@ -1313,19 +1383,29 @@ pub(crate) fn started(pid: u64) -> Option<String> {
         let stat = fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
         // Fields after the command name, which may hold spaces and ')'.
         let rest = &stat[stat.rfind(')')? + 1..];
-        // starttime is field 22; `rest` starts at field 3.
-        rest.split_whitespace().nth(19).map(String::from)
+        let mut fields = rest.split_whitespace();
+        // state is field 3: a zombie (a runner that ended where nobody
+        // reaps, as under docker without --init) does not run.
+        if fields.next()? == "Z" {
+            return None;
+        }
+        // starttime is field 22.
+        fields.nth(18).map(String::from)
     }
     #[cfg(all(unix, not(target_os = "linux")))]
     {
         let out = Process::new("ps")
-            .args(["-o", "lstart=", "-p", &pid.to_string()])
+            // Separate -o options: after `=` the rest of an argument is the
+            // column header, so `stat=,lstart=` would print stat alone.
+            .args(["-o", "stat=", "-o", "lstart=", "-p", &pid.to_string()])
             .stdin(Stdio::null())
             .stderr(Stdio::null())
             .output()
             .ok()?;
         let text = String::from_utf8_lossy(&out.stdout).trim().to_string();
-        (out.status.success() && !text.is_empty()).then_some(text)
+        // A zombie does not run.
+        let (stat, start) = text.split_once(char::is_whitespace)?;
+        (out.status.success() && !stat.starts_with('Z')).then(|| start.trim().to_string())
     }
     #[cfg(not(unix))]
     {
@@ -1421,7 +1501,11 @@ fn parent(pid: u64) -> Option<u64> {
             .ok()?;
         String::from_utf8_lossy(&out.stdout).trim().parse().ok()
     }
-    #[cfg(not(unix))]
+    #[cfg(windows)]
+    {
+        crate::winproc::parent(pid)
+    }
+    #[cfg(not(any(unix, windows)))]
     {
         let _ = pid;
         None
@@ -1430,7 +1514,7 @@ fn parent(pid: u64) -> Option<u64> {
 
 /// Refuses to start when another giong dev serves the project.
 fn refuse_if_running(state_dir: &Path) -> Result<(), Failure> {
-    let Ok(text) = fs::read_to_string(state_dir.join("dev.json")) else {
+    let Ok(text) = state::read_to_string(&state_dir.join("dev.json")) else {
         return Ok(());
     };
     let Ok(v) = serde_json::from_str::<Value>(&text) else {
@@ -1670,11 +1754,11 @@ fn listen_on(addr: SocketAddr) -> Result<socket2::Socket, Failure> {
 }
 
 /// The `dev` features to turn on for `package`'s build: `giong/dev` when it
-/// depends on giong itself (by its own name or a rename). A package that
-/// reaches giong only through another crate gets that crate's feature from
-/// it (giong-web's `dev` turns on giong's).
-#[cfg(unix)]
-fn dev_features(metadata: &Value, package: &str) -> Vec<String> {
+/// depends on giong itself, `giong-web/dev` (recording with `Record`) when
+/// it depends on giong-web, each by its own name or a rename. A package
+/// that reaches giong only through giong-web gets giong's from it
+/// (giong-web's `dev` turns on giong's).
+fn dev_features(metadata: &Value, package: &str) -> Vec<(&'static str, String)> {
     let Some(p) = metadata["packages"]
         .as_array()
         .into_iter()
@@ -1683,14 +1767,33 @@ fn dev_features(metadata: &Value, package: &str) -> Vec<String> {
     else {
         return Vec::new();
     };
-    p["dependencies"]
+    let deps = p["dependencies"]
         .as_array()
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    ["giong", "giong-web"]
         .into_iter()
-        .flatten()
-        .filter(|d| d["name"] == "giong" && d["kind"].is_null())
-        .map(|d| d["rename"].as_str().unwrap_or("giong").to_string() + "/dev")
-        .take(1)
+        .filter_map(|crate_name| {
+            deps.iter()
+                .find(|d| d["name"] == crate_name && d["kind"].is_null())
+                .map(|d| {
+                    let name = d["rename"].as_str().unwrap_or(crate_name);
+                    (crate_name, format!("{name}/dev"))
+                })
+        })
         .collect()
+}
+
+/// Whether the project's `crate_name` has the `dev` feature: 1.5 and newer,
+/// or from a path (a checkout of the repository). No lock file yet: assume
+/// a current one.
+fn has_dev_feature(project: &Project, crate_name: &str) -> bool {
+    let Ok(lock) = fs::read_to_string(project.root.join("Cargo.lock")) else {
+        return true;
+    };
+    lock_version(&lock, crate_name).map_or(true, |(v, from_path)| {
+        from_path || v >= crate::host::Version(1, 5, 0)
+    })
 }
 
 /// Whether the project's giong takes sockets from giong dev (1.5 and newer,
@@ -1711,6 +1814,11 @@ fn giong_takes_sockets(project: &Project) -> bool {
 /// `source`).
 #[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
 fn lock_giong_version(lock: &str) -> Option<(crate::host::Version, bool)> {
+    lock_version(lock, "giong")
+}
+
+/// A crate's version in a Cargo.lock, and whether it comes from a path.
+fn lock_version(lock: &str, crate_name: &str) -> Option<(crate::host::Version, bool)> {
     for block in lock.split("[[package]]") {
         let mut name = None;
         let mut version = None;
@@ -1725,7 +1833,7 @@ fn lock_giong_version(lock: &str) -> Option<(crate::host::Version, bool)> {
                 source = true;
             }
         }
-        if name == Some("giong") {
+        if name == Some(crate_name) {
             return version.map(|v| (v, !source));
         }
     }
@@ -1761,7 +1869,6 @@ mod tests {
         let _ = fs::remove_dir_all(&base);
     }
 
-    #[cfg(unix)]
     #[test]
     fn a_release_build_turns_on_giongs_dev_feature() {
         let meta = json!({"packages": [
@@ -1772,10 +1879,23 @@ mod tests {
             ]},
             {"name": "renamed", "dependencies": [{"name": "giong", "rename": "rt", "kind": null}]},
             {"name": "web-only", "dependencies": [{"name": "giong-web", "rename": null, "kind": null}]},
+            {"name": "both", "dependencies": [
+                {"name": "giong-web", "rename": "web", "kind": null},
+                {"name": "giong", "rename": null, "kind": null},
+            ]},
+            {"name": "web-dev-only", "dependencies": [{"name": "giong-web", "rename": null, "kind": "dev"}]},
         ]});
-        assert_eq!(dev_features(&meta, "svc"), ["giong/dev"]);
-        assert_eq!(dev_features(&meta, "renamed"), ["rt/dev"]);
-        assert!(dev_features(&meta, "web-only").is_empty());
+        let features = |p: &str| {
+            dev_features(&meta, p)
+                .into_iter()
+                .map(|(c, f)| format!("{c}: {f}"))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(features("svc"), ["giong: giong/dev"]);
+        assert_eq!(features("renamed"), ["giong: rt/dev"]);
+        assert_eq!(features("web-only"), ["giong-web: giong-web/dev"]);
+        assert_eq!(features("both"), ["giong: giong/dev", "giong-web: web/dev"]);
+        assert!(features("web-dev-only").is_empty());
         assert!(dev_features(&meta, "nope").is_empty());
     }
 
@@ -1837,5 +1957,12 @@ mod tests {
         let path = "[[package]]\nname = \"giong\"\nversion = \"1.3.0\"\ndependencies = []\n";
         assert_eq!(lock_giong_version(path), Some((Version(1, 3, 0), true)));
         assert_eq!(lock_giong_version("[[package]]\nname = \"a\"\n"), None);
+        let both = "[[package]]\nname = \"giong\"\nversion = \"1.5.0\"\nsource = \"registry+x\"\n\n\
+                    [[package]]\nname = \"giong-web\"\nversion = \"1.4.0\"\nsource = \"registry+x\"\n";
+        assert_eq!(
+            lock_version(both, "giong-web"),
+            Some((Version(1, 4, 0), false))
+        );
+        assert_eq!(lock_version(both, "giong"), Some((Version(1, 5, 0), false)));
     }
 }

@@ -20,14 +20,17 @@ pub(crate) const MAX_ANSWER: usize = 4 * 1024 * 1024;
 
 const INSTRUCTIONS: &str = "\
 This server looks inside a running service built on giong, a thread-per-core async runtime \
-for Rust. The tools only read, except that `profile` makes every worker time its polls while it \
-measures. Each worker is one thread with its own tasks; a task never moves between workers. \
+for Rust. The tools only read, except that `profile` and `slow_requests` make every worker time \
+its polls (and follow its requests) while they measure. Each worker is one thread with its own tasks; a task never moves between workers. \
 Tasks are named by the source line that spawned them.\n\
 Start with `overview`. A worker reported as blocked has been inside one poll of one task for \
 that long: the task blocks the thread (a blocking call, a long computation, a loop with no \
 .await), and the location says which task. `tasks` shows what is alive (a count that keeps \
 growing at one location is a leak), `sources` shows connection pools, and `profile` measures \
-where the workers spend their time over a short window.";
+where the workers spend their time over a short window. When requests are slow, ask \
+`slow_requests`: per route, where the time of the slowest requests went (pool waits, queries, \
+other services, the handler's code, a worker blocked by another task), with a verdict, its \
+evidence and a confidence. Its suggestions are proposals: check them before changing anything.";
 
 pub(crate) fn error_response(id: Value, code: i64, message: &str) -> Value {
     json!({ "jsonrpc": "2.0", "id": id, "error": { "code": code, "message": message } })

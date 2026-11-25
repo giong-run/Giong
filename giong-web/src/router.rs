@@ -389,6 +389,8 @@ impl<S: 'static> Router<S> {
         for (i, def) in self.routes.into_iter().enumerate() {
             let stream = def.stream.or(self.stream);
             streams |= stream.is_some();
+            let traced_as =
+                giong::observe::Route::new(&format!("{} {}", def.method.as_str(), def.pattern));
             // Duplicates were refused when the routes were added.
             let _ = table.insert(&def.pattern, def.method.clone(), i);
             let chain: Box<Chain<S>> = top.iter().cloned().chain(def.middleware).collect();
@@ -402,6 +404,7 @@ impl<S: 'static> Router<S> {
                 def.added_at,
             ));
             routes.push(Route {
+                traced_as,
                 info: Rc::new(RouteInfo {
                     pattern: def.pattern.to_string().into(),
                     names: def.pattern.names().into(),
@@ -471,6 +474,10 @@ struct Route<S> {
     handler: BoxHandler<S>,
     /// The body limit when the body is read as a stream.
     stream: Option<u64>,
+    /// The route's method and pattern, such as `GET /users/{id}`, which
+    /// names its requests while requests are traced (see
+    /// `giong::observe::set_route`).
+    traced_as: giong::observe::Route,
 }
 
 /// A finished [`Router`]: give it to [`Server::serve`](crate::Server::serve),
@@ -527,6 +534,7 @@ impl<S: 'static> App<S> {
         let (route, chain, endpoint) = match self.table.lookup(&method, path, &mut caps) {
             Lookup::Found(i) => {
                 let route = &self.routes[i];
+                giong::observe::set_route(&route.traced_as);
                 (
                     Some(route),
                     &*route.chain,

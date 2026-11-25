@@ -7,7 +7,10 @@
 //!   each message on its own; the Unix socket gets 32 messages per write
 //!   (2 KiB), as a program would batch them.
 //!
-//!   bench-ipc-giong <ipc|unix> <ping|stream> <count> <cpu-a> <cpu-b>
+//! `ipc` receives with `recv`, which copies each message out of the ring;
+//! `ipc-in-place` with `recv_in_place`, which reads it where it lies.
+//!
+//!   bench-ipc-giong <ipc|ipc-in-place|unix> <ping|stream> <count> <cpu-a> <cpu-b>
 //!
 //! GIONG_SPIN_US sets `spin_before_park` on both workers.
 use std::process::Command;
@@ -60,13 +63,26 @@ fn usage(who: i32) -> f64 {
     total
 }
 
+/// The next message: copied out of the ring (`ipc`), or read where it lies
+/// (`ipc-in-place`).
+async fn next(rx: &mut ipc::Receiver, in_place: bool) -> Option<ipc::Message<'_>> {
+    if in_place {
+        // SAFETY: the peer is this benchmark's other process, which sends
+        // with giong's `Sender` and never writes a message it has sent.
+        unsafe { rx.recv_in_place() }.await.unwrap()
+    } else {
+        rx.recv().await.unwrap()
+    }
+}
+
 /// The child: connects and answers (ping) or drains (stream).
 async fn child(transport: &str, mode: &str, count: u64, path: &str) {
     match transport {
-        "ipc" => {
+        "ipc" | "ipc-in-place" => {
+            let in_place = transport == "ipc-in-place";
             let (mut tx, mut rx) = ipc::connect(path, 1 << 20).await.unwrap();
             let mut got = 0u64;
-            while let Some(m) = rx.recv().await.unwrap() {
+            while let Some(m) = next(&mut rx, in_place).await {
                 if mode == "ping" {
                     let mut buf = [0u8; MSG];
                     buf.copy_from_slice(&m);
@@ -124,7 +140,8 @@ async fn parent(
     };
     let msg = [7u8; MSG];
     match transport {
-        "ipc" => {
+        "ipc" | "ipc-in-place" => {
+            let in_place = transport == "ipc-in-place";
             let l = ipc::IpcListener::bind(path, 1 << 20).unwrap();
             let mut proc = spawn();
             let (mut tx, mut rx) = l.accept().await.unwrap();
@@ -132,13 +149,13 @@ async fn parent(
             if mode == "ping" {
                 for _ in 0..count {
                     tx.send(&msg).await.unwrap();
-                    drop(rx.recv().await.unwrap().unwrap());
+                    drop(next(&mut rx, in_place).await.unwrap());
                 }
             } else {
                 for _ in 0..count {
                     tx.send(&msg).await.unwrap();
                 }
-                drop(rx.recv().await.unwrap().unwrap());
+                drop(next(&mut rx, in_place).await.unwrap());
             }
             let r = (t0.elapsed().as_secs_f64(), cpu_us() - c0);
             drop(tx);

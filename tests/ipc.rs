@@ -44,14 +44,76 @@ fn msg_for(i: u32, max: usize) -> Vec<u8> {
         .collect()
 }
 
+/// The descriptors a listener receives in a handshake (the memfd and the
+/// eventfds) are close-on-exec, like every other descriptor here, so a
+/// program this process starts does not inherit them.
+#[test]
+fn an_accepted_channel_s_descriptors_are_close_on_exec() {
+    let path = SockPath::new();
+    giong::block_on(async {
+        let listener = IpcListener::bind(&path.0, 1 << 16).unwrap();
+        let server = giong::spawn(async move { listener.accept().await.unwrap() });
+        let client = ipc::connect(&path.0, 4096).await.unwrap();
+        let channel = server.await.unwrap();
+        // Only memfds and eventfds: other tests of this binary run at the
+        // same time, and what the standard library or the C library opens
+        // for them is not this test's business. Every memfd and eventfd
+        // the tests create themselves is close-on-exec.
+        let mut seen = 0;
+        for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+            let entry = entry.unwrap();
+            let Ok(target) = std::fs::read_link(entry.path()) else {
+                continue;
+            };
+            let target = target.to_string_lossy();
+            if !target.starts_with("/memfd:") && target != "anon_inode:[eventfd]" {
+                continue;
+            }
+            let fd: RawFd = entry.file_name().to_str().unwrap().parse().unwrap();
+            // SAFETY: only reads the flags of a descriptor number.
+            let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            // Another test may have closed it since.
+            if flags >= 0 {
+                seen += 1;
+                assert_ne!(
+                    flags & libc::FD_CLOEXEC,
+                    0,
+                    "descriptor {fd} ({target}) is inherited by exec"
+                );
+            }
+        }
+        // Both ends of the channel are in this process.
+        assert!(seen >= 2, "found {seen} memfds and eventfds");
+        drop((client, channel));
+    });
+}
+
 #[test]
 fn messages_of_every_size_arrive_in_order_both_ways() {
+    every_size_both_ways(false);
+}
+
+#[test]
+fn messages_of_every_size_read_in_place_arrive_in_order_both_ways() {
+    every_size_both_ways(true);
+}
+
+/// The listener echoes what it reads, with `recv_in_place` when `in_place`.
+fn every_size_both_ways(in_place: bool) {
     let path = SockPath::new();
     giong::block_on(async {
         let listener = IpcListener::bind(&path.0, 1 << 16).unwrap();
         let server = giong::spawn(async move {
             let (mut tx, mut rx) = listener.accept().await.unwrap();
-            while let Some(m) = rx.recv().await.unwrap() {
+            loop {
+                let m = if in_place {
+                    // SAFETY: the peer is this test, sending with giong's
+                    // `Sender`, which never writes a message it has sent.
+                    unsafe { rx.recv_in_place() }.await.unwrap()
+                } else {
+                    rx.recv().await.unwrap()
+                };
+                let Some(m) = m else { break };
                 let copy = m.to_vec();
                 drop(m);
                 tx.send(&copy).await.unwrap();
@@ -517,4 +579,175 @@ fn a_peer_that_closes_its_socket_mid_channel_is_gone_after_its_messages() {
             .unwrap_err();
         assert_eq!(code(&err), Some(Code::IpcPeerGone), "{err}");
     });
+}
+
+#[test]
+fn a_client_that_sends_no_handshake_does_not_hold_up_the_next() {
+    let path = SockPath::new();
+    giong::block_on(async {
+        let listener = IpcListener::bind(&path.0, 4096).unwrap();
+        let server = giong::spawn(async move {
+            let (_tx, mut rx) = listener.accept().await.unwrap();
+            let got = rx.recv().await.unwrap().unwrap().to_vec();
+            (listener, got)
+        });
+        // Connected and silent, and staying so.
+        let silent: Vec<_> = (0..3)
+            .map(|_| StdUnixStream::connect(&path.0).unwrap())
+            .collect();
+        let (mut tx, _rx) = timeout(Duration::from_secs(2), ipc::connect(&path.0, 4096))
+            .await
+            .expect("a silent client held up the handshake of the next")
+            .unwrap();
+        tx.send(b"through").await.unwrap();
+        let (listener, got) = server.await.unwrap();
+        assert_eq!(got, b"through");
+        // The silent clients are given up on, with the handshake code, and
+        // their connections closed.
+        let started = std::time::Instant::now();
+        let err = listener.accept().await.unwrap_err();
+        assert_eq!(code(&err), Some(Code::IpcHandshake), "{err}");
+        assert!(started.elapsed() < Duration::from_secs(10));
+        // Read without blocking the worker, which closes them.
+        for mut s in silent {
+            s.set_nonblocking(true).unwrap();
+            let mut b = [0u8; 1];
+            let closed = async {
+                loop {
+                    match std::io::Read::read(&mut s, &mut b) {
+                        Ok(n) => return n,
+                        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                            sleep(Duration::from_millis(10)).await
+                        }
+                        Err(e) => panic!("{e}"),
+                    }
+                }
+            };
+            assert_eq!(timeout(Duration::from_secs(10), closed).await.unwrap(), 0);
+        }
+    });
+}
+
+#[test]
+fn dropping_the_listener_ends_the_handshakes_under_way() {
+    let path = SockPath::new();
+    giong::block_on(async {
+        let listener = IpcListener::bind(&path.0, 4096).unwrap();
+        let mut silent = StdUnixStream::connect(&path.0).unwrap();
+        // The handshake starts, and goes on after the accept is given up.
+        assert!(timeout(Duration::from_millis(100), listener.accept())
+            .await
+            .is_err());
+        drop(listener);
+        silent.set_nonblocking(true).unwrap();
+        let mut b = [0u8; 1];
+        let closed = async {
+            loop {
+                match std::io::Read::read(&mut silent, &mut b) {
+                    Ok(n) => return n,
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                        sleep(Duration::from_millis(10)).await
+                    }
+                    Err(e) => panic!("{e}"),
+                }
+            }
+        };
+        // Well before the 5 seconds a silent client is given.
+        assert_eq!(timeout(Duration::from_secs(2), closed).await.unwrap(), 0);
+    });
+}
+
+// ------------------------------------------------- descriptors and exec
+
+/// The child half of the close-on-exec test: accepts one channel, then
+/// fails if a descriptor it opened would be inherited by an exec'd program.
+/// In a process of its own, so that no other test's descriptors are in the
+/// list.
+#[test]
+#[ignore = "run by a_new_channel_leaks_no_descriptor_into_exec in a child process"]
+fn child_lists_inheritable_descriptors() {
+    let Ok(path) = std::env::var("GIONG_IPC_CLOEXEC_PATH") else {
+        return;
+    };
+    // Descriptors this process was started with (a CI runner hands some
+    // down) are not the channel's: only the ones opened since count.
+    let before = inheritable_descriptors();
+    giong::block_on(async move {
+        let listener = IpcListener::bind(&path, 4096).unwrap();
+        let client = giong::spawn(async move { ipc::connect(&path, 4096).await });
+        let accepted = listener.accept().await.unwrap();
+        let connected = client.await.unwrap().unwrap();
+        let open: Vec<RawFd> = inheritable_descriptors()
+            .into_iter()
+            .filter(|fd| !before.contains(fd))
+            .collect();
+        drop((accepted, connected));
+        assert!(open.is_empty(), "inherited by exec: {open:?}");
+    });
+}
+
+/// The descriptors past stdio that an exec'd program would inherit.
+fn inheritable_descriptors() -> Vec<RawFd> {
+    let mut open = Vec::new();
+    for entry in std::fs::read_dir("/proc/self/fd").unwrap() {
+        let fd: RawFd = entry
+            .unwrap()
+            .file_name()
+            .to_str()
+            .unwrap()
+            .parse()
+            .unwrap();
+        // SAFETY: F_GETFD only reads the flags; a closed descriptor (the
+        // directory's own) returns -1.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+        if fd > 2 && flags >= 0 && flags & libc::FD_CLOEXEC == 0 {
+            open.push(fd);
+        }
+    }
+    open
+}
+
+/// `true` if io_uring works here (it is blocked in a container, for
+/// instance). Where CI says it must work (`GIONG_TEST_EXPECT_DRIVER=io_uring`),
+/// not working is a failure instead of a reason to test epoll only.
+fn io_uring_available() -> bool {
+    let res = giong::Builder::new()
+        .driver(giong::DriverKind::IoUring)
+        .block_on(async {});
+    if let Err(e) = &res {
+        assert_ne!(
+            std::env::var("GIONG_TEST_EXPECT_DRIVER").as_deref(),
+            Ok("io_uring"),
+            "io_uring must work here, but: {e}"
+        );
+    }
+    res.is_ok()
+}
+
+#[test]
+fn a_new_channel_leaks_no_descriptor_into_exec() {
+    for driver in ["io_uring", "epoll"] {
+        if driver == "io_uring" && !io_uring_available() {
+            continue;
+        }
+        let path = SockPath::new();
+        let out = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "child_lists_inheritable_descriptors",
+                "--ignored",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("GIONG_IPC_CLOEXEC_PATH", &path.0)
+            .env("GIONG_DRIVER", driver)
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "{driver}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
 }

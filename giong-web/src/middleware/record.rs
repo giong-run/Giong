@@ -101,6 +101,9 @@ const KEY_KINDS: [&str; 5] = ["api", "private", "secret", "access", "signing"];
 ///   (`api_key`, `privateKey`; `key` alone is not a secret).
 ///
 /// A JSON value is replaced whole, objects included: `"card":"[redacted]"`.
+/// A form or JSON body that is not valid UTF-8 is read with each bad byte as
+/// U+FFFD; when it holds a secret, the record keeps that redacted text
+/// instead of the raw bytes.
 /// [`redact_field`](Self::redact_field) adds a name and
 /// [`keep_field`](Self::keep_field) keeps one. Other text is written as it
 /// is: do not record traffic with real personal data.
@@ -269,14 +272,15 @@ impl Record {
     /// says form, JSON keys when it says JSON or the body looks like JSON.
     fn redact_body<'a>(&self, body: &'a [u8], content_type: Option<&[u8]>) -> Cow<'a, [u8]> {
         let ct = content_type.map(|c| String::from_utf8_lossy(c).to_ascii_lowercase());
-        let Ok(text) = std::str::from_utf8(body) else {
-            return Cow::Borrowed(body);
-        };
+        // A body that is not UTF-8 is scanned through a lossy view: when it
+        // holds a secret, the record keeps the redacted text (invalid bytes
+        // become U+FFFD) rather than the raw bytes as base64, secret included.
+        let text = String::from_utf8_lossy(body);
         let ct = ct.as_deref().unwrap_or("");
         let redacted = if ct.contains("x-www-form-urlencoded") {
-            self.redact_pairs(text)
+            self.redact_pairs(&text)
         } else if ct.contains("json") || text.trim_start().starts_with(['{', '[']) {
-            self.redact_json(text)
+            self.redact_json(&text)
         } else {
             return Cow::Borrowed(body);
         };
@@ -779,6 +783,23 @@ mod tests {
         );
         let binary = [0xffu8, b'{', b'"'];
         assert!(matches!(rec.redact_body(&binary, None), Cow::Borrowed(_)));
+        // Not UTF-8, but JSON with a secret: redacted through a lossy view,
+        // never kept as raw bytes.
+        let mut bad = br#"{"name":"x"#.to_vec();
+        bad.push(0xff);
+        bad.extend_from_slice(br#"","token":"t"}"#);
+        assert_eq!(
+            &*rec.redact_body(&bad, Some(b"application/json")),
+            "{\"name\":\"x\u{fffd}\",\"token\":\"[redacted]\"}".as_bytes()
+        );
+        let form = b"a=\xff&password=p";
+        assert_eq!(
+            &*rec.redact_body(form, Some(b"application/x-www-form-urlencoded")),
+            "a=\u{fffd}&password=[redacted]".as_bytes()
+        );
+        // Without a secret the bytes are kept as they were.
+        let plain = [b'{', 0xff, b'}'];
+        assert!(matches!(rec.redact_body(&plain, None), Cow::Borrowed(_)));
     }
 
     #[test]

@@ -576,33 +576,51 @@ fn a_connection_goes_back_closed_while_a_cancel_from_its_lease_is_on_its_way() {
     run(|s| async move {
         let pool = Pool::new(s.local(), 1);
         let pid = |row: giong_postgres::Row| row.get::<i32>(0).unwrap();
-        let conn = pool.get().await.unwrap();
-        let first = pid(conn
-            .query_one("SELECT pg_backend_pid()", &[])
-            .await
-            .unwrap());
-        let token = conn.cancel_token();
-        // The cancel passes the check and starts connecting...
-        let mut cancel = std::pin::pin!(token.cancel());
-        std::future::poll_fn(|cx| {
-            assert!(std::future::Future::poll(cancel.as_mut(), cx).is_pending());
-            std::task::Poll::Ready(())
-        })
-        .await;
-        // ...and the connection goes back before the request arrives: the
-        // next task must not get that connection.
-        drop(conn);
-        let next = pool.get().await.unwrap();
-        let second = pid(next
-            .query_one("SELECT pg_backend_pid()", &[])
-            .await
-            .unwrap());
-        assert_ne!(
-            second, first,
-            "a connection a cancel request is on its way to"
-        );
-        cancel.await.unwrap();
-        next.query("SELECT pg_sleep(0.2)", &[]).await.unwrap();
+        // The cancel must still be on its way when the connection goes back.
+        // Its first poll connects, sends the request and reads until the
+        // server closes; on a readiness driver a loopback connect and send
+        // can finish at once, and the server can read and close before this
+        // process looks (#389, under tsan). Then the cancel is over before the
+        // lease ends, the connection may rightly be lent again, and the try
+        // proves nothing: it runs again, the connection back in the pool.
+        for attempt in 1.. {
+            let conn = pool.get().await.unwrap();
+            let first = pid(conn
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap());
+            let token = conn.cancel_token();
+            // The cancel passes the check and starts connecting...
+            let mut cancel = std::pin::pin!(token.cancel());
+            let polled = std::future::poll_fn(|cx| {
+                std::task::Poll::Ready(std::future::Future::poll(cancel.as_mut(), cx))
+            })
+            .await;
+            if let std::task::Poll::Ready(sent) = polled {
+                sent.unwrap();
+                drop(conn);
+                assert!(
+                    attempt < 50,
+                    "every cancel finished in its first poll, so none was on its way"
+                );
+                continue;
+            }
+            // ...and the connection goes back before the request arrives: the
+            // next task must not get that connection.
+            drop(conn);
+            let next = pool.get().await.unwrap();
+            let second = pid(next
+                .query_one("SELECT pg_backend_pid()", &[])
+                .await
+                .unwrap());
+            assert_ne!(
+                second, first,
+                "a connection a cancel request is on its way to"
+            );
+            cancel.await.unwrap();
+            next.query("SELECT pg_sleep(0.2)", &[]).await.unwrap();
+            break;
+        }
     });
 }
 

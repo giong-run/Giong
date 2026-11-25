@@ -729,7 +729,8 @@ impl Iocp {
                         None,
                     ))
                 }
-                Io::RecvMsg { fd, msg } => match self.recv_msg_for(fd) {
+                // `flags` is 0 here: only descriptor passing on Linux sets any.
+                Io::RecvMsg { fd, msg, flags: _ } => match self.recv_msg_for(fd) {
                     Err(code) => Err(code),
                     Ok(recv_msg) => wsa(recv_msg(fd, msg, &mut transferred, ov, None)),
                 },

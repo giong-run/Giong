@@ -58,6 +58,14 @@ mod windows {
 
     /// Runs `round` once to open what a process opens once, then
     /// [`ROUNDS`] times, and checks that the handle count comes back.
+    ///
+    /// One Event more is looked at again rather than failed at once: the
+    /// system opened one in a merge queue run (#391), in a round that opens
+    /// no Event of giong's, and 2,400 rounds of four owners on each of
+    /// windows-2022 and windows-2025 left none, so it is opened lazily and
+    /// rarely, and kept. A handle each round leaves would show as
+    /// [`ROUNDS`] of them; so the round runs [`ROUNDS`] times more, and the
+    /// count must not grow again.
     fn check(what: &str, mut round: impl FnMut()) {
         round();
         let before = settled(usize::MAX);
@@ -67,10 +75,29 @@ mod windows {
         }
         let after = settled(before);
         eprintln!("{what}: {before} handles before {ROUNDS} rounds, {after} after");
+        if after <= before {
+            return;
+        }
+        let new = new_handles(&types_before);
+        let one_event = after == before + 1 && new.len() == 1 && new[0].1 == "Event";
         assert!(
-            after <= before,
+            one_event,
             "{what}: {after} handles open after {ROUNDS} rounds, {before} before; new: {}",
-            new_types(&types_before)
+            listed(&new)
+        );
+        for _ in 0..ROUNDS {
+            round();
+        }
+        let again = settled(after);
+        eprintln!(
+            "{what}: one Event more ({}), then {again} handles after {ROUNDS} more rounds",
+            listed(&new)
+        );
+        assert!(
+            again <= after,
+            "{what}: {again} handles open after {} rounds, {before} before; new: {}",
+            2 * ROUNDS,
+            listed(&new_handles(&types_before))
         );
     }
 
@@ -157,13 +184,17 @@ mod windows {
         types
     }
 
-    fn new_types(before: &BTreeMap<usize, String>) -> String {
-        let new: Vec<String> = handle_types()
+    /// The handles open now that were not in `before`, with their types.
+    fn new_handles(before: &BTreeMap<usize, String>) -> Vec<(usize, String)> {
+        handle_types()
             .into_iter()
             .filter(|(h, t)| before.get(h) != Some(t))
-            .map(|(h, t)| format!("{h:#x} {t}"))
-            .collect();
-        format!("[{}]", new.join(", "))
+            .collect()
+    }
+
+    fn listed(handles: &[(usize, String)]) -> String {
+        let all: Vec<String> = handles.iter().map(|(h, t)| format!("{h:#x} {t}")).collect();
+        format!("[{}]", all.join(", "))
     }
 
     fn on_two_workers<F, Fut>(f: F)

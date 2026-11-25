@@ -97,7 +97,6 @@ fn run(args: &Args) -> Result<Report, Failure> {
 /// cargo check's findings and giong's own, with their edits, printing
 /// nothing: what `giong fix` applies (it runs clippy itself).
 /// `cargo_args` go to cargo (`--features x`).
-#[allow(dead_code)] // called by giong fix (#217)
 pub fn findings(project: &Project, cargo_args: &[String]) -> Result<Vec<Finding>, Failure> {
     let (cargo, _) = cargo_findings(project, "check", cargo_args)?;
     let source = source_findings(project);
@@ -186,7 +185,7 @@ fn clippy_installed(dir: &Path) -> bool {
 
 /// The last build of a `giong dev` that runs in this project.
 fn dev_build(root: &Path) -> Option<Value> {
-    let text = std::fs::read_to_string(root.join(".giong").join("dev.json")).ok()?;
+    let text = crate::state::read_to_string(&crate::state::dir(root).join("dev.json")).ok()?;
     let v: Value = serde_json::from_str(&text).ok()?;
     Some(json!({"build": v["build"], "service_pid": v["service_pid"], "listen": v["listen"]}))
 }

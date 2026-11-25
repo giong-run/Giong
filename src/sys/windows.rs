@@ -1102,6 +1102,15 @@ pub(crate) fn hosts_path() -> std::path::PathBuf {
     std::path::Path::new(&root).join("System32\\drivers\\etc\\hosts")
 }
 
+/// Lowers the calling thread's CPU priority (compute lane threads) to below
+/// normal, so the scheduler serves the workers first. Windows has no nice
+/// value; a failure leaves the thread at its old priority, which is safe.
+pub(crate) fn lower_thread_priority(_nice: i32) {
+    use windows_sys::Win32::System::Threading::{SetThreadPriority, THREAD_PRIORITY_BELOW_NORMAL};
+    // SAFETY: plain call about the calling thread, through its pseudo-handle.
+    unsafe { SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL) };
+}
+
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};

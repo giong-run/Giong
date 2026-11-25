@@ -442,11 +442,16 @@ What matters at run time:
 | Area | API |
 |---|---|
 | Starting | `giong::block_on(fut)` for one thread; `Builder::new().workers(n).build()?.run(\|i\| async { .. })` for one worker per core |
-| Configuration | `.workers(n)`, `.driver(DriverKind)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.precise_timers(bool)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)`; `giong::driver_kind()` |
+| Configuration | `.workers(n)`, `.driver(DriverKind)`, `.pin_cores(bool)`, `.spin_before_park(duration)`, `.precise_timers(bool)`, `.ring_entries(n)`, `.recv_buffers(count, size)`, `.shutdown_on_signals(bool)`, `.shutdown_grace(duration)`, `.max_blocking_threads(n)`, `.compute_threads(n)`, `.compute_backlog(n)`; `giong::driver_kind()` |
 | Tasks | `spawn(fut) -> JoinHandle<T>`, `handle.abort()`, `yield_now()`; futures need not be `Send` |
+| Blocking and CPU work | `spawn_blocking(f)` (blocking calls: `std::fs`, C libraries; up to 128 threads), `spawn_compute(f)` (CPU-heavy work on one thread per CPU, below the workers' priority), `try_spawn_compute(f)` (sheds with `GIONG-E0014` when the lane is behind); all `-> BlockingHandle<T>`; `Handle::spawn_blocking` / `spawn_compute` from any thread, `Handle::lane_stats()` |
+| Tenants | `budget::Budget::new(name, Limits::new().tasks(n).memory(bytes).io(n).compute(n))`; `budget.spawn(fut).await`, `budget.reserve(bytes).await`, `budget.spawn_compute(f).await`, `budget.enter(fut)`; `try_spawn` / `try_reserve` / `try_spawn_compute` refuse with `GIONG-E0080`; `budget::current()`, `budget.stats()`. Spawns and compute closures inside a budgeted task are charged to it; an I/O slot is held until the kernel completes the operation, even when its future was dropped; the compute lane serves budgets fairly by compute time and weight |
 | TCP | `TcpListener::bind` / `bind_balanced` (busy workers hand new connections to idle ones) / `accept`, on an IP address (a host name is refused: `lookup_host` first), shared by the workers of one process and refused to any other; `TcpStream::connect` (host names resolved without blocking, Happy Eyeballs) / `recv` / `read` / `write` / `write_all` / `write_all_vectored` / `shutdown` / `set_nodelay` |
 | Names | `net::lookup_host("host:port")`; `net::Resolver` (`/etc/hosts`, then DNS over UDP and TCP, search list, cache) |
-| Unix sockets | `UnixListener::bind` / `accept`; `UnixStream::connect` / `pair`, with the same read and write methods as `TcpStream` |
+| Unix sockets | `UnixListener::bind` / `bind_addr` (abstract names too) / `accept`; `UnixStream::connect` / `pair`, with the same read and write methods as `TcpStream`, and `peer_cred`; `UnixDatagram::bind` / `unbound` / `pair` / `send_to` / `recv_from`; passing open descriptors to another process with `send_with_fds` / `recv_with_fds` on either (copies taken for the send, received ones never leaked when a future is dropped) |
+| Socket activation | `net::activated_sockets()`: the sockets systemd passes (`LISTEN_FDS`), by name; `.tcp_listener()` (and `unix_listener`, `udp_socket`, `unix_datagram`) on each worker |
+| Processes | `process::Command` (the standard library's builder) `.spawn()` / `.status()` / `.output()`; `Child::wait` / `try_wait` / `wait_with_output` / `signal` / `kill`, watched through a pidfd on the ring (no thread, no `SIGCHLD` handler); piped stdio as `PipeReader` / `PipeWriter`; `process::pipe()`; this process's own `process::stdin()` / `stdout()` / `stderr()` |
+| Signals | `signal::listen(SignalKind::HANGUP)` and `.recv().await`, for any signal a program may handle; works alongside `shutdown_on_signals` |
 | UDP | `UdpSocket::bind` / `connect` (IP addresses); `recv_from` / `recv` (multishot, pool buffer); `read_from` / `read` (your buffer); `send_to` / `send`; `set_broadcast`; with the `unstable-udp-offload` feature, GSO (`send_segments_to`), GRO (`set_gro`), ECN and the local address of a datagram |
 | Files | `fs::File::open` / `create` / `options`; `read_at` / `write_at` / `write_all_at` / `sync_all` / `sync_data` / `allocate` / `metadata` / `len` / `close`; `fs::read`, `write`, `metadata`, `rename`, `remove_file`, `create_dir`, `remove_dir`, `read_dir` |
 | Time | `time::sleep`, `sleep_until`, `timeout(duration, fut)` |
@@ -553,7 +558,7 @@ to poll. A crate of step 4 opens its own sockets (`connect(url)`), sleeps or spa
 
 ## Coming from Tokio
 
-giong has no macros and no `spawn_blocking`, and a worker's state is never shared with
+giong has no macros, and a worker's state is never shared with
 another thread, so some everyday Tokio code is written another way. Every row was run on
 giong 0.7.0.
 
@@ -563,12 +568,15 @@ giong 0.7.0.
 | `tokio::spawn(fut)` | `giong::spawn(fut)`: the task stays on the worker that spawned it, so the future need not be `Send`. From another thread or for another worker: `Handle::spawn_on`, `Handle::spawn_balanced` |
 | `JoinHandle`, `abort()` | the same: `handle.await` is `Err` for a task that panicked or was aborted |
 | `tokio::join!`, `tokio::select!` | `futures::join!` and `futures::select!` from the `futures` crate, which need no runtime |
-| `spawn_blocking(f).await` | nothing built in yet: `std::thread::spawn`, and a `giong::sync::oneshot` channel to await the result. A worker that blocks holds up every connection it owns |
+| `spawn_blocking(f).await` | `giong::spawn_blocking(f).await` for calls that wait, and `giong::spawn_compute(f).await` for work that keeps a CPU busy: compute threads run below the workers' priority, so network work keeps its latency. A worker that blocks holds up every connection it owns |
 | `Arc<Mutex<T>>` shared by handlers | state per worker in an `Rc<RefCell<T>>`, built inside `run(\|_\| async { .. })` and not borrowed across an `.await`. What every worker must see goes through atomics or a channel |
 | `tokio::sync::{Semaphore, Notify, watch, broadcast, Mutex}` | `giong::sync` has `mpsc` (unbounded and bounded) and `oneshot`. Tokio's `sync` module needs no Tokio runtime and works on giong as it is: `tokio = { version = "1", default-features = false, features = ["sync"] }` |
 | `tokio::time::{sleep, sleep_until, timeout}` | `giong::time::{sleep, sleep_until, timeout}` |
 | `tokio::time::interval` | a loop around `sleep_until(next)` |
 | `tokio::signal::ctrl_c()` | `Builder::shutdown_on_signals(true)`, then `giong::shutdown_signal().await`, or `giong::until_shutdown(fut)` around a wait |
+| `tokio::signal::unix::signal(SignalKind::hangup())` | `giong::signal::listen(SignalKind::HANGUP)?`, then `.recv().await` |
+| `tokio::process::Command` | `giong::process::Command`: the same builder, `spawn`, `status().await`, `output().await`; a child's pipes are `PipeReader` / `PipeWriter`, read and written with owned buffers |
+| `tokio::io::{stdin, stdout}` | `giong::process::{stdin, stdout}` |
 | `stream.read(&mut buf)`, `stream.write_all(&buf)` | `stream.recv().await?` lends a buffer from the worker's pool; a write takes its buffer by value and hands it back: `let (result, buf) = stream.write_all(buf).await;` |
 | tonic and prost | `giong-grpc` with `giong-grpc-build` in `build.rs` (no `protoc`), messages as `giong-proto` views |
 | quinn, h3 | `giong-quic`; giong-http's `unstable-http3` feature for HTTP/3 |
@@ -690,10 +698,14 @@ below; the other crates and the example API describe theirs in their READMEs.
 | `tests/time.rs` (8), `src/time.rs` (4) | sleep, timeout, ordering, 5,000 timers; the timing wheel against a reference model over 87 random operation sequences with timers from 1 ms to 30 days |
 | `tests/net.rs` (30) | echo, 8 MB each way without a wrong byte, EOF, 6 MB in turns of `recv` and receives straight into the reader's buffer without a byte out of place, 500 and 1,300 connections, plain `std` clients; writes from 16 KiB − 1 to 1 MiB + 3, plain and vectored, intact with and without zero-copy send; a bulk transfer to a reader that keeps up is not copied; `send_file` of 9 MB and of ranges, past a file's end and to a closed peer; **a non-blocking socket under io_uring never reports `WouldBlock`** (it did on Linux 6.0 and 6.1); binding a busy address fails (Linux 6.0.16 to 6.0.19 report success and leave the socket unbound), and so does a port another process shares through `SO_REUSEPORT`, while a dropped listener's port binds again at once; a host name is refused with what to write instead |
 | `tests/unix.rs` (8) | echo over a socket file, 4 MB each way over `pair()`, bind and connect errors, 300 connections, `std` interop |
+| `tests/unix_fds.rs` (12) | Unix datagrams keep their boundaries and senders, abstract names, peer credentials; a pipe and a TCP listener passed to another socket keep working, 253 descriptors in one message, mistakes refused with `GIONG-E0017`; **a dropped receive never leaks a descriptor**, and a dropped send keeps its own copies |
+| `tests/process.rs` (15), `tests/signal.rs` (8), `tests/activation.rs` (3) | output and exit codes, 1 MiB through `cat` both ways at once, kill and signals through the pidfd, **a dropped wait loses nothing and a dropped child is reaped**, pipes, the process's own stdin and stdout (also from a regular file); every listener sees a signal, deliveries coalesce, `SIGCHLD`, a `SIGTERM` listener together with `shutdown_on_signals`; sockets inherited as systemd passes them |
 | `tests/udp.rs` (25) | IPv4 and IPv6, connected sockets, **a cancelled `recv_from` loses no datagram**, many tasks receiving on one socket each woken for a datagram of its own, a receiver that gave up not taking the next datagram, a task that only sends letting the others run, a burst of 64 datagrams complete and in order, truncation, 2,000 datagrams echoed through one buffer, a pool of 4 buffers not starved by one socket, three workers on one port, 1,000 sockets on port 0 each with a port of its own, sockets closed on drop, a buffer with no room refused without losing the datagram, a port held by another process refused while sockets of one process share it, a host name refused by `bind` and `connect` |
 | `tests/fs.rs` (25) | files intact up to 8 MB, positional reads and writes, open options like `std`, metadata, rename and remove, 200 tasks sharing one file, descriptors closed exactly once, an operation cancelled in flight, a file closed only after the blocking thread using it is done (epoll), one stuck operation not holding up the others, offsets above `i64::MAX` and open options that cannot work refused with their codes, a pipe on standard input left blocking |
 | `tests/cancel.rs` (17) | **a buffer stays alive until the kernel confirms the cancellation**; 4 buffers for 32 connections; a stalled connection cannot starve another; a dropped `send_file` leaves nothing behind; **a dropped open closes the descriptor it produced**; a stream or operation dropped by code the driver runs is still closed and cancelled; connections accepted for a listener that outlives its runtime are closed; teardown with everything in flight |
 | `tests/multi.rs` (16) | several workers, cross-thread wake-ups, 30,000 channel messages, `SO_REUSEPORT`, SIGTERM (also after worker 0 returned), work sent to a stopped runtime cancelled, a panicking worker |
+| `tests/lane.rs` (11) | handles are `Send`; blocking and compute closures run on their own threads (compute at nice +10) and give their value; **a sleeping blocking closure does not stall its worker's timers**; a panic reaches the handle, not the worker; `abort` stops a closure that has not started; `try_spawn_compute` sheds with GIONG-E0014 at the backlog limit; the blocking lane never exceeds its thread limit; closures not started when the runtime stops, or sent after, are cancelled |
+| `tests/budget.rs` (15) | budgets are `Send`; `try_spawn`, `try_reserve`, `try_spawn_compute` refuse with GIONG-E0080 at their limits and a reservation larger than the budget with GIONG-E0081; waiting calls are served in order and **a large reservation is not overtaken by smaller ones**; dropped waiting calls leave the queue and granted ones give back what they were handed; tasks and compute closures spawned inside a budget are charged to it; **a cancelled read keeps its I/O slot until the kernel has completed its cancellation** (io_uring); **a light tenant's compute job waits for at most a couple of a heavy tenant's jobs**, and weights share the lane |
 | `tests/shutdown.rs` (10) | **graceful shutdown**: remaining tasks finish within the grace period and are dropped when it expires; requests in progress are answered, idle connections close at once |
 | `tests/spin.rs` (6) | the busy-poll mode behaves like the default: I/O, timers, cross-thread wake-ups, shutdown |
 | `tests/driver.rs` (9), `tests/blocked.rs` (4) | choosing a driver in code or with `GIONG_DRIVER`; **with io_uring blocked by a seccomp filter, a runtime starts on epoll by itself**, and fails with GIONG-E0001 when io_uring was asked for; with the locked-memory limit used up, the same with GIONG-E0010; the optional io_uring features found are the kernel's; a task whose I/O never waits still lets the others run; a socket that gets the number of one whose connect failed is still woken |
@@ -854,6 +866,10 @@ younger than both, and one service runs on it so far.
   `std::future` do. For PostgreSQL, use [`giong-postgres`](giong-postgres/README.md); for
   MySQL, [`giong-mysql`](giong-mysql/README.md); for Redis,
   [`giong-redis`](giong-redis/README.md); for HTTP requests, `giong-http`'s client.
+- **Budgets charge what they can see.** A `giong::budget::Budget` counts reserved memory and
+  task futures, not every allocation of the tenant's code; it does not charge time on the
+  workers (heavy work belongs on the compute lane, which it shares fairly), work spawned on
+  another worker, the blocking lane, or `giong-http`'s per-worker request byte budget.
 - **Started tasks do not migrate.** Balancing happens where work starts: jobs queued with
   `Handle::spawn_balanced` go to the first idle worker, and listeners bound with
   `TcpListener::bind_balanced` hand new connections to less busy workers. A connection

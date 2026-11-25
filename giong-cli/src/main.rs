@@ -8,21 +8,38 @@ mod args;
 mod build;
 mod cmd;
 mod code;
+mod dashboard;
 mod dotenv;
+mod hist;
 mod host;
 mod lint;
+#[cfg(windows)]
+mod noinherit;
 #[rustfmt::skip] // generated (see src/pages.rs)
 mod pages;
+mod loadgen;
 mod procs;
 mod project;
+mod record;
 mod report;
+mod scaffold;
+mod service;
+mod sha256;
+mod state;
+mod template;
 mod watch;
+mod web_client;
+#[cfg(windows)]
+mod winproc;
 
 use std::process::ExitCode;
 
 use crate::report::fail;
 
 fn main() -> ExitCode {
+    // Nothing giong starts may hold the caller's pipe open (#378, #382).
+    #[cfg(windows)]
+    noinherit::keep_std_handles();
     let mut argv = Vec::new();
     for (i, a) in std::env::args_os().skip(1).enumerate() {
         match a.into_string() {

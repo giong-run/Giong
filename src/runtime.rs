@@ -10,7 +10,7 @@ use std::mem;
 use std::panic;
 use std::pin::{pin, Pin};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::task::{Context, Poll, Waker};
 use std::thread;
@@ -22,6 +22,7 @@ use crate::driver::Io;
 use crate::driver::{ChosenBy, Driver, DriverChoice, DriverKind, Park};
 use crate::error::Code;
 use crate::executor::{RemoteJoinHandle, TaskSlot, TaskWaker, MAIN_TASK};
+use crate::lane::{BlockingHandle, LaneConfig, LaneStats, Lanes};
 use crate::notify::{Doorbell, JobCount};
 use crate::observe::{self, Counters, Location, Pulse, WorkerState};
 #[cfg(unix)]
@@ -159,12 +160,23 @@ pub(crate) struct RuntimeShared {
     jobs: Mutex<Jobs>,
     /// How many jobs wait in `jobs`, readable without the lock.
     jobs_len: JobCount,
-    /// Workers time every task poll (see [`Handle::set_profiling`]).
-    profiling: AtomicBool,
+    /// What workers measure: [`PROFILING`] (see [`Handle::set_profiling`])
+    /// and [`TRACING`] (see [`Handle::set_request_tracing`]), one load per
+    /// batch of tasks for both.
+    measuring: AtomicU8,
+    /// The blocking and compute lanes ([`crate::lane`]).
+    pub(crate) lanes: Lanes,
 }
 
+/// In [`RuntimeShared::measuring`]: workers time every task poll for
+/// [`observe::take_profile`].
+pub(crate) const PROFILING: u8 = 1;
+/// In [`RuntimeShared::measuring`]: workers trace requests for
+/// [`observe::take_requests`], and time every task poll to find long ones.
+pub(crate) const TRACING: u8 = 2;
+
 impl RuntimeShared {
-    fn new(workers: usize) -> io::Result<Arc<Self>> {
+    fn new(workers: usize, lanes: LaneConfig) -> io::Result<Arc<Self>> {
         let workers = (0..workers)
             .map(|_| WorkerShared::new())
             .collect::<io::Result<Vec<_>>>()?;
@@ -177,7 +189,8 @@ impl RuntimeShared {
                 stopped: false,
             }),
             jobs_len: JobCount::new(),
-            profiling: AtomicBool::new(false),
+            measuring: AtomicU8::new(0),
+            lanes: Lanes::new(lanes),
         }))
     }
 
@@ -221,9 +234,22 @@ impl RuntimeShared {
         self.workers.len()
     }
 
-    /// `true` while workers should time task polls.
+    /// `true` while workers should time task polls for the profile.
     pub(crate) fn profiling(&self) -> bool {
-        self.profiling.load(Ordering::Relaxed)
+        self.measuring() & PROFILING != 0
+    }
+
+    /// What workers measure: [`PROFILING`] and [`TRACING`] bits.
+    pub(crate) fn measuring(&self) -> u8 {
+        self.measuring.load(Ordering::Relaxed)
+    }
+
+    fn set_measuring(&self, what: u8, on: bool) {
+        if on {
+            self.measuring.fetch_or(what, Ordering::Relaxed);
+        } else {
+            self.measuring.fetch_and(!what, Ordering::Relaxed);
+        }
     }
 
     /// How busy worker `i` looks; see [`least_loaded`](Self::least_loaded).
@@ -336,6 +362,7 @@ impl RuntimeShared {
         // Outside the lock: dropping a job cancels its handle, which wakes
         // whoever awaits it.
         drop(stranded);
+        self.lanes.stop();
     }
 
     fn shutdown(&self) {
@@ -464,6 +491,12 @@ pub(crate) struct Worker {
     main_location: Cell<Location>,
     /// Registered sources and the profile being gathered.
     pub(crate) observe: observe::Local,
+    /// The budget of the task being polled, or null (see [`crate::budget`]).
+    pub(crate) budget: Cell<*const crate::budget::Inner>,
+    /// The budget I/O slots of operations in flight, by driver key.
+    pub(crate) io_charges: RefCell<Vec<Option<crate::budget::IoCharge>>>,
+    /// Request tracing is on for this thread (see `observe::requests`).
+    pub(crate) tracing: Cell<bool>,
 }
 
 /// Something a spinning worker can watch for work that arrives without a
@@ -582,6 +615,9 @@ impl Worker {
             draining: Cell::new(false),
             main_location: Cell::new(panic::Location::caller()),
             observe: observe::Local::default(),
+            budget: Cell::new(std::ptr::null()),
+            io_charges: RefCell::new(Vec::new()),
+            tracing: Cell::new(false),
         }))
     }
 
@@ -984,6 +1020,12 @@ impl Worker {
         for sock in deferred.sock_closes {
             driver.close_sock(sock);
         }
+        // What the cancellations freed (a budget's I/O slot may be among
+        // it, and wake a task): dropped outside the driver, before the
+        // worker sleeps.
+        let graveyard = driver.take_graveyard();
+        drop(driver);
+        drop(graveyard);
     }
 
     /// Publishes how busy this worker is (see [`Load`]): two relaxed stores
@@ -1148,6 +1190,12 @@ pub struct Builder {
     signals: bool,
     spin: Option<Duration>,
     shutdown_grace: Duration,
+    max_blocking_threads: usize,
+    /// `None`: the CPU budget (see [`Builder::compute_threads`]).
+    compute_threads: Option<usize>,
+    /// `None`: four per compute thread.
+    compute_backlog: Option<usize>,
+    open_files: bool,
     precise_timers: bool,
     /// Makes this worker panic before it reports that it started. A field
     /// of the builder, not a static, so that the runtimes of other tests
@@ -1178,6 +1226,10 @@ impl Builder {
             signals: false,
             spin: None,
             shutdown_grace: Duration::ZERO,
+            max_blocking_threads: crate::lane::DEFAULT_MAX_BLOCKING,
+            compute_threads: None,
+            compute_backlog: None,
+            open_files: true,
             precise_timers: false,
             #[cfg(test)]
             panic_on_start: None,
@@ -1325,6 +1377,25 @@ impl Builder {
         self
     }
 
+    /// On Linux, raise the process's soft limit on open files
+    /// (`RLIMIT_NOFILE`, `ulimit -n`) to its hard limit when the runtime is
+    /// built (default: `true`). Every connection is a file descriptor, and the soft limit is
+    /// often far below what the system allows: containerd, and so most
+    /// Kubernetes nodes, starts containers at 1,024 soft and 524,288 hard,
+    /// which would stop a server near a thousand connections. Go programs
+    /// raise it the same way.
+    ///
+    /// It is raised once per process, by the first runtime built with this
+    /// on, and never lowered; a limit the program set itself before that is
+    /// raised too. Pass `false` to keep the soft limit as it is, for example
+    /// for a program that starts children which use `select(2)`, whose
+    /// descriptors must stay below 1,024 (children inherit the limit). A hard
+    /// limit of `unlimited` is read as `fs.nr_open`, the most Linux allows.
+    pub fn raise_open_files_limit(mut self, enable: bool) -> Self {
+        self.open_files = enable;
+        self
+    }
+
     /// Graceful shutdown: once a worker's main future has completed, keep
     /// running that worker's remaining tasks for up to `grace`, so they can
     /// finish what they are doing. Tasks still alive after that are dropped.
@@ -1363,6 +1434,58 @@ impl Builder {
         self
     }
 
+    /// The most threads of the blocking lane ([`spawn_blocking`](crate::spawn_blocking))
+    /// at once (default: 128, at least 1).
+    ///
+    /// Threads start only when every thread is busy and end after 10 seconds
+    /// idle, so a quiet process has none. A closure that finds every thread
+    /// busy waits for one. Raise the limit for many slow blocking calls at
+    /// once (each thread reserves a 2 MiB stack, touched only as used); lower
+    /// it to bound what a hung dependency, such as an NFS mount, can tie up.
+    pub fn max_blocking_threads(mut self, n: usize) -> Self {
+        self.max_blocking_threads = n.max(1);
+        self
+    }
+
+    /// The most threads of the compute lane ([`spawn_compute`](crate::spawn_compute))
+    /// at once (at least 1).
+    ///
+    /// Defaults to the CPU budget of the process, the same number
+    /// [`workers`](Self::workers) defaults to: its CPUs, or its cgroup CPU
+    /// quota when that is lower. More threads than CPUs only add switching.
+    /// Compute threads run at a lower priority than the workers (nice +10),
+    /// so they use the CPU time the workers leave; see the
+    /// [lane docs](crate::lane) for what that means under a CPU quota.
+    pub fn compute_threads(mut self, n: usize) -> Self {
+        self.compute_threads = Some(n.max(1));
+        self
+    }
+
+    /// How many closures may wait for a compute thread before
+    /// [`try_spawn_compute`](crate::try_spawn_compute) refuses new ones with
+    /// `GIONG-E0014` (default: four per compute thread). Does not limit
+    /// [`spawn_compute`](crate::spawn_compute), which always queues.
+    ///
+    /// Zero refuses whenever every compute thread is busy.
+    pub fn compute_backlog(mut self, n: usize) -> Self {
+        self.compute_backlog = Some(n);
+        self
+    }
+
+    /// The lane settings, with the defaults filled in.
+    fn lane_config(&self) -> LaneConfig {
+        let compute_threads = self
+            .compute_threads
+            .unwrap_or_else(|| default_workers(allowed_cpus().len(), parallelism()));
+        LaneConfig {
+            max_blocking: self.max_blocking_threads,
+            compute_threads,
+            compute_backlog: self
+                .compute_backlog
+                .unwrap_or(compute_threads * crate::lane::BACKLOG_PER_THREAD),
+        }
+    }
+
     /// The settings each worker starts from. Reads `GIONG_DRIVER` when no
     /// driver was named.
     fn config(&self) -> io::Result<Config> {
@@ -1391,10 +1514,13 @@ impl Builder {
     /// Creates the runtime. Nothing runs until [`Runtime::run`] is called.
     pub fn build(self) -> io::Result<Runtime> {
         let cfg = self.config()?;
+        if self.open_files {
+            raise_open_files_limit();
+        }
         let workers = self
             .workers
             .unwrap_or_else(|| default_workers(allowed_cpus().len(), parallelism()));
-        let shared = RuntimeShared::new(workers)?;
+        let shared = RuntimeShared::new(workers, self.lane_config())?;
         Ok(Runtime {
             builder: self,
             cfg,
@@ -1408,7 +1534,10 @@ impl Builder {
     pub fn block_on<F: Future>(self, fut: F) -> io::Result<F::Output> {
         let location = panic::Location::caller();
         let cfg = self.config()?;
-        let rt = RuntimeShared::new(1)?;
+        if self.open_files {
+            raise_open_files_limit();
+        }
+        let rt = RuntimeShared::new(1, self.lane_config())?;
         // Work sent through a `Handle` after the runtime is gone is cancelled
         // rather than left waiting, on every exit path.
         let _stop = Stop(rt.clone());
@@ -1641,6 +1770,46 @@ impl Runtime {
     }
 }
 
+/// Raises the soft `RLIMIT_NOFILE` to the hard one, once per process (see
+/// [`Builder::raise_open_files_limit`]). Failure changes nothing: the
+/// process keeps the limit it had.
+#[cfg(all(target_os = "linux", not(miri)))]
+fn raise_open_files_limit() {
+    static ONCE: std::sync::Once = std::sync::Once::new();
+    ONCE.call_once(|| {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` fills the struct it is given, which is of its type.
+        if unsafe { libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) } != 0 {
+            return;
+        }
+        let mut max = lim.rlim_max;
+        if max == libc::RLIM_INFINITY {
+            // Linux refuses more than `fs.nr_open` descriptors per process.
+            match std::fs::read_to_string("/proc/sys/fs/nr_open")
+                .ok()
+                .and_then(|n| n.trim().parse().ok())
+            {
+                Some(nr_open) => max = nr_open,
+                None => return,
+            }
+        }
+        if lim.rlim_cur >= max {
+            return;
+        }
+        lim.rlim_cur = max;
+        // SAFETY: `setrlimit` reads the struct it is given, which is of its type.
+        unsafe { libc::setrlimit(libc::RLIMIT_NOFILE, &lim) };
+    });
+}
+
+/// Other systems keep their limit: their hard limits and caps differ from
+/// Linux's, and each port decides for itself. Miri has no `getrlimit`.
+#[cfg(any(not(target_os = "linux"), miri))]
+fn raise_open_files_limit() {}
+
 /// Whether a worker thread could not be started because the process may not
 /// have more threads: the kernel says only `EAGAIN` ("Resource temporarily
 /// unavailable"), which is what a container's PID limit and `RLIMIT_NPROC`
@@ -1750,6 +1919,46 @@ impl Handle {
     /// `true` once a shutdown has been requested.
     pub fn is_shutdown(&self) -> bool {
         self.rt.shutdown.load(Ordering::SeqCst)
+    }
+
+    /// [`spawn_blocking`](crate::spawn_blocking) on this runtime's blocking
+    /// lane, from any thread, including threads outside the runtime.
+    pub fn spawn_blocking<F, T>(&self, f: F) -> BlockingHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.rt.lanes.spawn_blocking(f)
+    }
+
+    /// [`spawn_compute`](crate::spawn_compute) on this runtime's compute
+    /// lane, from any thread, including threads outside the runtime.
+    pub fn spawn_compute<F, T>(&self, f: F) -> BlockingHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.rt.lanes.spawn_compute(f)
+    }
+
+    /// [`try_spawn_compute`](crate::try_spawn_compute) on this runtime's
+    /// compute lane, from any thread.
+    ///
+    /// # Errors
+    ///
+    /// `GIONG-E0014` when the compute lane's backlog is full.
+    pub fn try_spawn_compute<F, T>(&self, f: F) -> io::Result<BlockingHandle<T>>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        self.rt.lanes.try_spawn_compute(f)
+    }
+
+    /// Threads, busy threads and queued closures of the blocking and compute
+    /// lanes, right now.
+    pub fn lane_stats(&self) -> LaneStats {
+        self.rt.lanes.stats()
     }
 
     /// Starts a task on the given worker and returns a handle to its result.
@@ -1976,13 +2185,39 @@ impl Handle {
     /// spawned; [`observe::take_profile`] collects the result on a worker.
     /// Workers notice the change at their next batch of tasks.
     pub fn set_profiling(&self, on: bool) {
-        self.rt.profiling.store(on, Ordering::Relaxed);
+        self.rt.set_measuring(PROFILING, on);
     }
 
     /// `true` while task polls are being timed (see
     /// [`set_profiling`](Self::set_profiling)).
     pub fn is_profiling(&self) -> bool {
         self.rt.profiling()
+    }
+
+    /// Turns request tracing on or off on every worker: see
+    /// [`observe`](crate::observe#why-a-request-is-slow). While it is on,
+    /// the protocol crates (`giong-http`) follow each request through its
+    /// phases, the database clients time their waits, and every worker times
+    /// each task poll to find the long ones; [`observe::take_requests`]
+    /// collects the result on a worker. Turned off, it costs one read of a
+    /// thread-local per request. Workers notice the change at their next
+    /// batch of tasks; requests already in flight then are not traced.
+    ///
+    /// ```
+    /// let rt = giong::Builder::new().workers(1).build()?;
+    /// let handle = rt.handle();
+    /// handle.set_request_tracing(true);
+    /// assert!(handle.is_request_tracing());
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn set_request_tracing(&self, on: bool) {
+        self.rt.set_measuring(TRACING, on);
+    }
+
+    /// `true` while requests are traced (see
+    /// [`set_request_tracing`](Self::set_request_tracing)).
+    pub fn is_request_tracing(&self) -> bool {
+        self.rt.measuring() & TRACING != 0
     }
 
     /// The caller's worker index, if it runs on a worker of this runtime.

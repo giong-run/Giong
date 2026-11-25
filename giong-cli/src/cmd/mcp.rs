@@ -582,7 +582,7 @@ fn dev_status(dir: Option<PathBuf>) -> Value {
         .or_else(|| std::env::current_dir().ok())
         .unwrap_or_default();
     let root = crate::project::find_manifest_dir(&dir).unwrap_or(dir);
-    let doc = match std::fs::read_to_string(root.join(".giong").join("dev.json"))
+    let doc = match crate::state::read_to_string(&crate::state::dir(&root).join("dev.json"))
         .ok()
         .and_then(|t| serde_json::from_str::<Value>(&t).ok())
     {
@@ -628,6 +628,8 @@ mod tests {
             names.contains(&"doctor") && names.contains(&"check") && names.contains(&"dev_status")
         );
         assert!(names.contains(&"dev") && !names.contains(&"mcp"));
+        assert!(!names.contains(&"dashboard"), "it serves until stopped");
+        assert!(names.contains(&"record") && names.contains(&"openapi"));
         let clean = &list["result"]["tools"]
             .as_array()
             .unwrap()

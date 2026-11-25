@@ -2,7 +2,9 @@
 //! routing, path and query parameters and serde JSON.
 //!
 //! MIDDLEWARE=1 adds request ids, gzip and a timeout, as bench/axum does
-//! with tower-http's equivalents.
+//! with tower-http's equivalents. TRACE=1 turns request tracing on
+//! (`Handle::set_request_tracing`), to measure what it costs
+//! (bench/request-tracing.sh).
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -66,11 +68,14 @@ async fn compute(req: Req) -> Result<Response, Error> {
 
 fn main() -> std::io::Result<()> {
     let middleware = std::env::var_os("MIDDLEWARE").is_some();
-    giong::Builder::new()
+    let rt = giong::Builder::new()
         .shutdown_on_signals(true)
         .shutdown_grace(Duration::from_secs(5))
-        .build()?
-        .run(move |_| async move {
+        .build()?;
+    if std::env::var_os("TRACE").is_some() {
+        rt.handle().set_request_tracing(true);
+    }
+    rt.run(move |_| async move {
             let mut router = Router::new()
                 .get("/json", hello)
                 .get("/users", users)

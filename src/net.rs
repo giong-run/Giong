@@ -16,9 +16,13 @@
 //! behave the same way, with a non-blocking system call made when the socket
 //! is ready (see [`DriverKind`](crate::DriverKind)).
 
+#[cfg(target_os = "linux")]
+mod activation;
 mod addr;
 mod balance;
 pub(crate) mod dns;
+#[cfg(target_os = "linux")]
+mod fds;
 // giong dev's socket hand-off: in debug builds, or with the `dev` feature.
 // Elsewhere a stub that refuses to run under giong dev.
 #[cfg(all(unix, any(debug_assertions, feature = "dev")))]
@@ -34,12 +38,18 @@ pub(crate) mod udp;
 #[cfg(unix)]
 mod unix;
 
+#[cfg(target_os = "linux")]
+pub use activation::{activated_sockets, ActivatedSocket};
 pub use addr::{lookup_host, ToSocketAddrs};
 pub use dns::{Resolver, ResolverConfig};
+#[cfg(target_os = "linux")]
+pub use fds::{PeerCred, MAX_FDS};
 pub(crate) use sendq::SendQueue;
 pub use udp::{Datagram, UdpSocket};
 #[cfg(feature = "unstable-udp-offload")]
 pub use udp::{SendOptions, GRO_RECV_BUFFER};
+#[cfg(target_os = "linux")]
+pub use unix::UnixDatagram;
 #[cfg(unix)]
 pub use unix::{UnixListener, UnixStream};
 
@@ -715,17 +725,12 @@ impl StreamSocket {
                         return Poll::Ready(Ok(buf));
                     }
                     MultiPoll::NeedArm => {
-                        if !wait_for_pool(&mut driver, cx, false) {
+                        let once = self.bulk.get() > 0;
+                        if !wait_for_pool(&mut driver, cx, once) {
                             return Poll::Pending;
                         }
                         let fd = self.sock.as_raw_fd();
-                        driver.arm_multi(
-                            key,
-                            MultiIo::Recv {
-                                fd,
-                                once: self.bulk.get() > 0,
-                            },
-                        );
+                        driver.arm_multi(key, MultiIo::Recv { fd, once });
                     }
                     MultiPoll::Pending => {
                         if driver.kind() == crate::DriverKind::IoUring && self.end_was_missed() {
@@ -1345,16 +1350,18 @@ impl Drop for StreamSocket {
     }
 }
 
-/// Makes sure the kernel has a pool buffer to receive into before a multishot
-/// receive (of datagrams, or of a stream) is armed. Returns `false` if the
-/// caller has to wait for one (its waker is registered with the pool).
-pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>, datagram: bool) -> bool {
-    if !driver.ensure_recv_buffer(datagram) {
+/// Makes sure the kernel has a pool buffer to receive into before a receive
+/// is armed: `whole` for one that takes whole buffers (of datagrams, or of a
+/// stream one buffer at a time), else a multishot stream receive. Returns
+/// `false` if the caller has to wait for one (its waker is registered with
+/// the pool).
+pub(crate) fn wait_for_pool(driver: &mut Driver, cx: &mut Context<'_>, whole: bool) -> bool {
+    if !driver.ensure_recv_buffer(whole) {
         // The pool is exhausted. Reclaim buffers that hold unread data of
         // other sockets ...
         driver.evacuate();
     }
-    if !driver.ensure_recv_buffer(datagram) {
+    if !driver.ensure_recv_buffer(whole) {
         // ... and if user code holds all the rest, wait for one to come back
         // instead of spinning on ENOBUFS.
         driver.pool().wait(cx.waker());
@@ -1373,6 +1380,11 @@ pub struct TcpListener {
     /// The listener's hold on its port, for one that [`bind`](Self::bind)
     /// made (see `share`).
     held: Option<share::Held>,
+    /// Set once the descriptor has been lent out ([`AsFd`](std::os::fd::AsFd),
+    /// [`AsRawFd`]): it may have been duplicated or passed to another
+    /// process, so dropping the listener must only close this descriptor,
+    /// never shut the socket down for every copy.
+    lent: Cell<bool>,
     /// The listener's share of an address that several workers listen on
     /// (see `spread`). After `inner`: the socket is closed first.
     #[cfg(windows)]
@@ -1456,6 +1468,7 @@ impl TcpListener {
                 // Not counted as this process's hold on the port: dropping a
                 // duplicate must not stop the shared socket listening.
                 held: None,
+                lent: Cell::new(false),
             });
         }
         let bind = || -> io::Result<Self> {
@@ -1469,6 +1482,7 @@ impl TcpListener {
                 inner: ListenSocket::new(sock),
                 balance: None,
                 held,
+                lent: Cell::new(false),
                 #[cfg(windows)]
                 spread: None,
             };
@@ -1494,6 +1508,7 @@ impl TcpListener {
                 inner: ListenSocket::new(sock),
                 balance: None,
                 held: None,
+                lent: Cell::new(false),
                 spread: None,
             });
             listener.spread = member;
@@ -1559,6 +1574,7 @@ impl TcpListener {
             inner: ListenSocket::new(sock),
             balance: None,
             held: None,
+            lent: Cell::new(false),
             #[cfg(windows)]
             spread: None,
         }
@@ -1602,7 +1618,11 @@ impl Drop for TcpListener {
     fn drop(&mut self) {
         // Before the socket is closed, which happens when `inner` is dropped.
         if let Some(held) = self.held.take() {
-            held.release(self.inner.socket());
+            if self.lent.get() {
+                held.release_lent();
+            } else {
+                held.release(self.inner.socket());
+            }
         }
         // A connection this listener's own accept took goes to the others
         // that share the address, with those still waiting for it.
@@ -1619,22 +1639,38 @@ impl Drop for TcpListener {
 
 #[cfg(unix)]
 impl AsRawFd for TcpListener {
+    /// The descriptor. Once it has been taken, dropping the listener only
+    /// closes it, so that copies made of it (with `dup`, or passed to another
+    /// process with [`UnixStream::send_with_fds`]) keep listening.
     fn as_raw_fd(&self) -> RawFd {
+        self.lent.set(true);
         self.inner.socket().as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for TcpListener {
+    /// The descriptor, with the same effect on drop as
+    /// [`as_raw_fd`](AsRawFd::as_raw_fd).
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        self.lent.set(true);
+        std::os::fd::AsFd::as_fd(self.inner.socket())
     }
 }
 
 #[cfg(windows)]
 impl std::os::windows::io::AsRawSocket for TcpListener {
     fn as_raw_socket(&self) -> std::os::windows::io::RawSocket {
+        self.lent.set(true);
         std::os::windows::io::AsRawSocket::as_raw_socket(self.inner.socket())
     }
 }
 
 impl std::fmt::Debug for TcpListener {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Not `self.as_raw_fd()`, which would mark the descriptor lent.
         f.debug_struct("TcpListener")
-            .field("fd", &self.as_raw_fd())
+            .field("fd", &self.inner.socket().as_raw_fd())
             .finish()
     }
 }
@@ -1931,6 +1967,13 @@ impl TcpStream {
 impl AsRawFd for TcpStream {
     fn as_raw_fd(&self) -> RawFd {
         self.inner.socket().as_raw_fd()
+    }
+}
+
+#[cfg(unix)]
+impl std::os::fd::AsFd for TcpStream {
+    fn as_fd(&self) -> std::os::fd::BorrowedFd<'_> {
+        std::os::fd::AsFd::as_fd(self.inner.socket())
     }
 }
 

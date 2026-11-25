@@ -85,10 +85,25 @@ pub(crate) fn overview() -> Value {
                 }),
                 &["pid", "uptime_s", "rss_bytes", "threads", "open_fds", "fd_limit"],
             ),
+            "limits": object(
+                json!({
+                    "cpus": or_null(int()),
+                    "cpu_quota": or_null(num()),
+                    "memory_bytes": or_null(int()),
+                    "pids_max": or_null(int()),
+                    "pids_current": or_null(int()),
+                    "open_files": or_null(int()),
+                    "open_files_hard": or_null(int()),
+                }),
+                &["cpus", "cpu_quota", "memory_bytes", "pids_max", "pids_current", "open_files",
+                  "open_files_hard"],
+            ),
             "runtime": object(
-                json!({ "workers": int(), "shutting_down": { "type": "boolean" },
+                json!({ "workers": int(),
+                        "workers_from": { "type": "string", "enum": ["cpus", "cpu_quota", "set"] },
+                        "shutting_down": { "type": "boolean" },
                         "profiling": { "type": "boolean" } }),
-                &["workers", "shutting_down", "profiling"],
+                &["workers", "workers_from", "shutting_down", "profiling"],
             ),
             "workers": array(object(
                 json!({
@@ -107,7 +122,14 @@ pub(crate) fn overview() -> Value {
             )),
             "warnings": array(text()),
         }),
-        &["giong_mcp", "process", "runtime", "workers", "warnings"],
+        &[
+            "giong_mcp",
+            "process",
+            "limits",
+            "runtime",
+            "workers",
+            "warnings",
+        ],
     )
 }
 
@@ -284,5 +306,175 @@ pub(crate) fn profile() -> Value {
             "note": text(),
         }),
         &["duration_ms", "total", "workers", "note"],
+    )
+}
+
+pub(crate) fn slow_requests() -> Value {
+    let breakdown = object(
+        json!({
+            "requests": int(),
+            "total_ms": num(),
+            "read_ms": num(),
+            "poll_ms": num(),
+            "pool_ms": num(),
+            "query_ms": num(),
+            "upstream_ms": num(),
+            "other_ms": num(),
+            "write_ms": num(),
+            "blocked_ms": num(),
+        }),
+        &[
+            "requests",
+            "total_ms",
+            "read_ms",
+            "poll_ms",
+            "pool_ms",
+            "query_ms",
+            "upstream_ms",
+            "other_ms",
+            "write_ms",
+            "blocked_ms",
+        ],
+    );
+    let wait = object(
+        json!({ "total_ms": num(), "count": int(), "longest_ms": num(), "what": or_null(text()) }),
+        &["total_ms", "count", "longest_ms", "what"],
+    );
+    let record = object(
+        json!({
+            "worker": int(),
+            "protocol": text(),
+            "status": int(),
+            "ago_ms": num(),
+            "total_ms": num(),
+            "read_ms": num(),
+            "poll_ms": num(),
+            "polls": int(),
+            "longest_poll_ms": num(),
+            "pool": wait.clone(),
+            "query": wait.clone(),
+            "upstream": wait,
+            "other_ms": num(),
+            "write_ms": num(),
+            "blocked_ms": num(),
+            "blocked_by": or_null(object(
+                json!({ "location": text(), "route": or_null(text()), "held_ms": num() }),
+                &["location", "route", "held_ms"],
+            )),
+        }),
+        &[
+            "worker",
+            "protocol",
+            "status",
+            "ago_ms",
+            "total_ms",
+            "read_ms",
+            "poll_ms",
+            "polls",
+            "longest_poll_ms",
+            "pool",
+            "query",
+            "upstream",
+            "other_ms",
+            "write_ms",
+            "blocked_ms",
+            "blocked_by",
+        ],
+    );
+    let cause = json!({ "type": "string", "enum": [
+        "pool_wait", "slow_queries", "slow_upstream", "handler_cpu", "worker_blocked",
+        "worker_saturated", "slow_request_arrival", "slow_response_write", "unattributed_wait",
+        "not_slow",
+    ] });
+    let verdict = object(
+        json!({
+            "cause": cause,
+            "phase": text(),
+            "confidence": { "type": "string", "enum": ["high", "medium", "low"] },
+            "share_of_tail": num(),
+            "share_of_excess": or_null(num()),
+            "blocked_share": num(),
+            "evidence": array(text()),
+            "suggestion": text(),
+        }),
+        &[
+            "cause",
+            "phase",
+            "confidence",
+            "share_of_tail",
+            "share_of_excess",
+            "blocked_share",
+            "evidence",
+            "suggestion",
+        ],
+    );
+    let route = object(
+        json!({
+            "route": text(),
+            "requests": int(),
+            "per_second": num(),
+            "abandoned": int(),
+            "p50_ms": num(),
+            "p90_ms": num(),
+            "p99_ms": num(),
+            "max_ms": num(),
+            "tail": breakdown.clone(),
+            "faster_half": breakdown,
+            "verdict": verdict,
+            "slowest": array(record),
+        }),
+        &[
+            "route",
+            "requests",
+            "per_second",
+            "abandoned",
+            "p50_ms",
+            "p90_ms",
+            "p99_ms",
+            "max_ms",
+            "tail",
+            "faster_half",
+            "verdict",
+            "slowest",
+        ],
+    );
+    object(
+        json!({
+            "duration_ms": num(),
+            "quantile": num(),
+            "summary": text(),
+            "requests": int(),
+            "routes": array(route),
+            "routes_not_shown": int(),
+            "workers": array(object(json!({ "worker": int(), "busy": num() }), &["worker", "busy"])),
+            "long_polls": array(object(
+                json!({
+                    "location": text(),
+                    "polls": int(),
+                    "total_ms": num(),
+                    "max_ms": num(),
+                    "giong_http_connection": { "type": "boolean" },
+                }),
+                &["location", "polls", "total_ms", "max_ms", "giong_http_connection"],
+            )),
+            "pools": array(object(json!({ "kind": text(), "name": text(), "worker": int() }), &["kind", "name", "worker"])),
+            "unanswered": array(object(json!({ "worker": int(), "error": text() }), &["worker", "error"])),
+            "phases": { "type": "object" },
+            "note": text(),
+        }),
+        &[
+            "duration_ms",
+            "quantile",
+            "summary",
+            "requests",
+            "routes",
+            "routes_not_shown",
+            "workers",
+            "long_polls",
+            "pools",
+            "unanswered",
+            "phases",
+            "note",
+        ],
     )
 }

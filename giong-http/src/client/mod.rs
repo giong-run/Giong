@@ -2499,6 +2499,7 @@ impl RequestBuilder {
         if let Some(e) = self.error {
             return Err(e);
         }
+        let _wait = giong::observe::wait(giong::observe::Wait::Upstream, "http");
         let url = self.url?;
         let client = self.client;
         let timeout = self.timeout.unwrap_or(client.shared.config.timeout);
@@ -2537,6 +2538,8 @@ impl RequestBuilder {
         if let Some(e) = self.error {
             return Err(e);
         }
+        // Up to the head; the body is read later, piece by piece.
+        let _wait = giong::observe::wait(giong::observe::Wait::Upstream, "http");
         let url = self.url?;
         let client = self.client;
         let timeout = self.timeout.unwrap_or(client.shared.config.timeout);

@@ -22,12 +22,26 @@ doc = false
 # it builds on every platform (Windows too), so it uses the standard library and
 # one JSON crate, with no macros.
 [dependencies]
-serde_json = "1"
+# preserve_order: giong ai init adds its servers to .mcp.json without reordering
+# the keys a person wrote.
+serde_json = { version = "1", features = ["preserve_order"] }
 
 # giong dev hands its listening sockets to the service: socket2 makes them
 # inheritable for the spawn only, without `unsafe` here.
 [target.'cfg(unix)'.dependencies]
 socket2 = { version = "0.6", features = ["all"] }
+# O_NOFOLLOW for giong's own files in .giong (src/state.rs); socket2 uses it too.
+libc = "0.2"
 
 [lints.rust]
-unsafe_code = "forbid"
+# Two Windows-only modules (src/noinherit.rs, src/winproc.rs) need system
+# calls std does not offer; everything else stays free of `unsafe`.
+unsafe_code = "deny"
+
+# The end-to-end tests run a real service (giong-web routes, giong-mcp) and
+# drive the `giong` binary against it. Unix only: giong-web does not build on
+# Windows. `dev` keeps giong-web's Record in the release test builds CI runs.
+[target.'cfg(unix)'.dev-dependencies]
+giong = { path = "..", version = "1.4.2" }
+giong-web = { path = "../giong-web", version = "1.4.2", features = ["dev"] }
+giong-mcp = { path = "../giong-mcp", version = "1.4.2", features = ["web"] }

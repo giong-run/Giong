@@ -94,6 +94,17 @@ pub struct Finding {
     pub edits: Vec<Edit>,
 }
 
+/// A finding's file in one form on every system: `/` between components, as
+/// agents and the JSON schema expect (Windows tools also accept it). Only on
+/// Windows, where `\` separates; elsewhere a `\` is part of a name.
+fn portable(file: String) -> String {
+    if cfg!(windows) && file.contains('\\') {
+        file.replace('\\', "/")
+    } else {
+        file
+    }
+}
+
 impl Finding {
     pub fn new(code: Code, severity: Severity, title: impl Into<String>) -> Finding {
         Finding {
@@ -120,7 +131,7 @@ impl Finding {
 
     pub fn at(mut self, file: impl Into<String>, line: u32, column: u32) -> Finding {
         self.place = Some(Place {
-            file: file.into(),
+            file: portable(file.into()),
             line,
             column,
         });
@@ -128,7 +139,10 @@ impl Finding {
     }
 
     /// Marks the finding as fixable by `giong fix` with these edits.
-    pub fn edits(mut self, edits: Vec<Edit>) -> Finding {
+    pub fn edits(mut self, mut edits: Vec<Edit>) -> Finding {
+        for e in &mut edits {
+            e.file = portable(std::mem::take(&mut e.file));
+        }
         self.fixable = !edits.is_empty();
         self.edits = edits;
         self
@@ -375,6 +389,25 @@ mod tests {
         let t = r.to_text();
         assert!(t.starts_with("Cargo.toml:3:1: error GIONG-E5003: Rust 1.70 is too old"));
         assert!(t.contains("  Fix: rustup update stable"));
+    }
+
+    #[test]
+    fn a_file_reads_the_same_on_every_system() {
+        let f = Finding::new(Code::USAGE, Severity::Error, "t")
+            .at("src\\main.rs", 1, 1)
+            .edits(vec![Edit {
+                file: "src\\main.rs".into(),
+                start: 0,
+                end: 0,
+                replacement: String::new(),
+            }]);
+        let want = if cfg!(windows) {
+            "src/main.rs"
+        } else {
+            "src\\main.rs"
+        };
+        assert_eq!(f.to_json()["file"], want);
+        assert_eq!(f.to_json()["edits"][0]["file"], want);
     }
 
     #[test]

@@ -32,9 +32,9 @@ API reference is on docs.rs (`https://docs.rs/<crate>`); the index for models is
    immutable data, atomics, `giong::sync::{mpsc, oneshot}`, or Tokio's `sync` module
    (`tokio = { version = "1", default-features = false, features = ["sync"] }`).
 4. **Never block a worker.** No `std::fs`, `std::net`, `std::thread::sleep` or long loops
-   on it. Use `giong::fs`, `giong::net`, `giong::time`. There is no `spawn_blocking`: run
-   blocking or heavy work on `std::thread::spawn` and await a `giong::sync::oneshot`. Call
-   `giong::yield_now().await` in long loops.
+   on it. Use `giong::fs`, `giong::net`, `giong::time`. Blocking calls go to
+   `giong::spawn_blocking(f).await`, CPU-heavy work to `giong::spawn_compute(f).await`
+   (threads below the workers' priority). Call `giong::yield_now().await` in long loops.
 5. **`bind` takes IP addresses**: `TcpListener::bind("0.0.0.0:8080")`, never
    `"localhost:8080"` (`GIONG-E0100`). Every worker binds the same port. `TcpStream::connect`
    resolves names itself; `giong::net::lookup_host` resolves them without blocking.
@@ -93,7 +93,7 @@ running": replace it, or run it on a Tokio runtime in a thread of its own behind
 | `#[tokio::main]` | `giong::Builder::new().build()?.run(\|_\| async { .. })` or `giong::block_on` |
 | `tokio::spawn` | `giong::spawn` (stays on the worker; no `Send`); `Handle::spawn_on` / `spawn_balanced` for other workers |
 | `tokio::join!`, `select!` | `futures::join!`, `futures::select!` |
-| `spawn_blocking` | `std::thread::spawn` + `giong::sync::oneshot` |
+| `spawn_blocking` | `giong::spawn_blocking` for blocking calls, `giong::spawn_compute` for CPU-heavy work |
 | `Arc<Mutex<T>>` in handlers | `Rc<RefCell<T>>` per worker, or a channel |
 | `tokio::time::interval` | a loop around `giong::time::sleep_until(next)` |
 | `tokio::signal::ctrl_c()` | `Builder::shutdown_on_signals(true)` + `giong::shutdown_signal().await` |
@@ -131,7 +131,50 @@ fn main() -> std::io::Result<()> {
 }
 ```
 
-`cargo add giong giong-web serde --features serde/derive`, then `cargo run --release`.
+`cargo add giong giong-web serde --features serde/derive`, then `giong dev --background`
+(see Local development below; `cargo run` without the giong command).
+
+## The giong command
+
+`cargo install giong-cli` installs `giong`: one command per job, the same on every
+project. Every command takes `--json` and reports each problem with a `GIONG-E50xx` code,
+the cause and the fix.
+
+| You want | Run |
+|---|---|
+| Start a project | `giong new api --template web --db postgres` (templates `web`, `grpc`, `worker`; `--db postgres`, `mysql`, `redis`, comma-separated; `--tls`) |
+| Teach this project to your agent | `giong ai init` (`giong new` does it) |
+| Work on it | `giong dev --background`, once (see Local development) |
+| Is my machine right? | `giong doctor` |
+| What is wrong with my code? | `giong check --json`, then `giong fix` |
+| What does this error mean? | `giong explain GIONG-E0102` |
+| Run the tests | `giong test` (on io_uring, then on epoll; reads `.env`) |
+| A database | `giong db up`, `giong db migrate` |
+
+`giong new` writes a project that builds and passes its tests: the service, an end to end
+test, migrations, `.env.example`, a Dockerfile, a CI workflow and fast dev builds. Extend it
+rather than starting from an empty `main.rs`. `giong fix` applies only fixes that need no
+judgement (the compiler's, clippy's, and `giong check`'s own); what is left needs a decision.
+
+## Local development
+
+One project folder, one runner, on this machine, like `npm run dev`:
+
+1. At the start, run `giong dev --background`. It builds, starts the service, waits until
+   it serves, prints its address (`http://127.0.0.1:PORT`) and returns; if one already runs
+   for this project, it reports that one. A failed build says why (`GIONG-E5009`) and keeps
+   watching: fix the code.
+2. Edit the code. `giong dev` rebuilds and swaps the service by itself, without refusing a
+   connection.
+3. Try it with `curl` on the printed address.
+4. `giong dev status --json` says whether it is building, serving or failed (`state`), its
+   `urls` and the last build's first error (`build.error`); `giong dev logs --lines 100` shows
+   the service's output and requests.
+5. `giong dev stop` when you are done. `--all` on `status` and `stop` covers every project
+   on this machine.
+
+Do not run the service with `cargo run`, `cargo build --release`, Docker or a second
+terminal. One `giong dev` per project.
 
 ## Testing
 
@@ -170,4 +213,4 @@ Log `giong::driver_choice()` at start-up to see which driver each worker got and
 1. Nothing blocks a worker. 2. Every wait has a deadline. 3. No `RefCell` borrow across an
 `.await`. 4. Pools, clients and routers are per worker. 5. Errors matched by code. 6.
 Transactions on `pool.get()`. 7. No Tokio-runtime crate on a worker. 8. Tests pass with
-`GIONG_DRIVER=epoll` too.
+`GIONG_DRIVER=epoll` too. 9. `giong check --json` reports nothing new.
