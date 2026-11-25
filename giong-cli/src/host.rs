@@ -84,6 +84,14 @@ pub fn run(cmd: &mut Command) -> Result<String, ToolError> {
     run_within(cmd, TOOL_TIMEOUT)
 }
 
+/// Runs `cmd` with its output captured, stopped after `timeout`. Unlike
+/// [`run`], a timeout here is not remembered: it is about the network the
+/// tool used (cargo asking a registry), not about the tool itself, whose
+/// other uses must still run.
+pub fn run_once_within(cmd: &mut Command, timeout: Duration) -> Result<String, ToolError> {
+    run_tool(cmd, timeout, false)
+}
+
 /// Stops a tool that ran out of time, with what it started: on Windows a
 /// `.cmd` wrapper's children outlive the wrapper (#382). On Unix the tool's
 /// children keep only its own pipes, which giong no longer reads.
@@ -106,8 +114,12 @@ fn kill_tree(child: &mut std::process::Child) {
 }
 
 fn run_within(cmd: &mut Command, timeout: Duration) -> Result<String, ToolError> {
+    run_tool(cmd, timeout, true)
+}
+
+fn run_tool(cmd: &mut Command, timeout: Duration, remember: bool) -> Result<String, ToolError> {
     let program = cmd.get_program().to_os_string();
-    if timed_out_before(&program) {
+    if remember && timed_out_before(&program) {
         return Err(ToolError::TimedOut);
     }
     let mut child = cmd
@@ -137,8 +149,10 @@ fn run_within(cmd: &mut Command, timeout: Duration) -> Result<String, ToolError>
             _ => {
                 kill_tree(&mut child);
                 let _ = child.wait();
-                if let Ok(mut t) = TIMED_OUT.lock() {
-                    t.push(program);
+                if remember {
+                    if let Ok(mut t) = TIMED_OUT.lock() {
+                        t.push(program);
+                    }
                 }
                 return Err(ToolError::TimedOut);
             }

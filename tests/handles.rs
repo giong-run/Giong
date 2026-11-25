@@ -66,6 +66,18 @@ mod windows {
     /// rarely, and kept. A handle each round leaves would show as
     /// [`ROUNDS`] of them; so the round runs [`ROUNDS`] times more, and the
     /// count must not grow again.
+    ///
+    /// Where it comes from (found with the kernel's handle tracing, in 11 of
+    /// 96 runs of this test eight at a time, Windows 10 22H2): the Winsock
+    /// provider, `mswsock.dll`, guards its start-up state with a counter and
+    /// one process-wide Event, which it creates only when a thread has to
+    /// wait on that counter while another thread holds it, and closes only
+    /// when the provider is cleaned up (`WSACleanup`, which the standard
+    /// library never calls). Every one of those Events was created in
+    /// `WSASocketW`, by `Socket::try_clone` in the binds of a shared address,
+    /// where both workers make sockets at the same moment, on a thread that
+    /// had ended by the time it was counted. A normal run never reaches that
+    /// code. So it is one handle per process, not a leak of giong's.
     fn check(what: &str, mut round: impl FnMut()) {
         round();
         let before = settled(usize::MAX);

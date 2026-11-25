@@ -351,6 +351,51 @@ Calls that return the kernel's `ENOBUFS` as it is, with no code, as on Linux:
 
 [All error codes](README.md)
 "#),
+    (60, r#"# GIONG-E0060: a file is already at the Unix socket path
+
+Raised by `UnixListener::bind` on Windows. In code: `giong::error::Code::UnixSocketInUse`. The error kind is `AddrInUse`, and Winsock's `WSAEADDRINUSE` is the `source()`.
+
+## What happened
+
+A Unix domain socket that listens is a file at its path. When the listener closes, the file stays, on Windows as on Unix, and a second bind to the same path fails while it is there. giong does not remove the file for you: another server may still be listening on it, and taking its path would leave that server unreachable.
+
+## How to fix it
+
+- If no server listens on the path any more (an earlier run of the same program, say), remove the file with `std::fs::remove_file` and bind again. A service usually does this at start-up, after making sure no other copy of itself runs.
+- Otherwise pick another path, or stop the server that holds it.
+
+[All error codes](README.md)
+"#),
+    (61, r#"# GIONG-E0061: Unix socket path too long
+
+Raised by `UnixListener::bind` and `UnixStream::connect` on Windows. In code: `giong::error::Code::UnixPathTooLong`. The error kind is `InvalidInput`.
+
+## What happened
+
+Winsock keeps the path of a Unix domain socket in a fixed field of 108 bytes, in UTF-8 and ending with a NUL, so a path may be at most 107 bytes long. Characters outside ASCII take two to four bytes each. The path is not shortened for you, since a shorter path names another socket.
+
+## How to fix it
+
+- Use a shorter path: a relative one (it is resolved against the current directory), or a directory near the root of the drive, such as `C:\run\app.sock`.
+- `UnixStream::pair` binds a short-lived socket in the temporary directory (`std::env::temp_dir()`); if that directory's path is very long, point the `TMP` environment variable at a shorter one.
+
+[All error codes](README.md)
+"#),
+    (62, r#"# GIONG-E0062: no Unix domain sockets on this Windows
+
+Raised by `UnixListener::bind`, `UnixStream::connect` and `UnixStream::pair` on Windows. In code: `giong::error::Code::UnixSocketsUnavailable`. The error kind is `Unsupported`, and Winsock's error (`WSAEAFNOSUPPORT` or similar) is in the message.
+
+## What happened
+
+Windows has had Unix domain stream sockets (`AF_UNIX`) since Windows 10 version 1803 and Windows Server 2019. On an older system, or one where the `afunix` driver is turned off, creating such a socket fails.
+
+## How to fix it
+
+- Run on Windows 10 version 1803 or later, or Windows Server 2019 or later, and check that `sc query afunix` shows the driver running.
+- Otherwise talk over TCP on a loopback address (`127.0.0.1`) instead.
+
+[All error codes](README.md)
+"#),
     (80, r#"# GIONG-E0080: the budget is at its limit
 
 Raised by `Budget::try_spawn`, `Budget::try_reserve` and `Budget::try_spawn_compute` in `giong::budget`, and by `giong::try_spawn_compute` inside a task of a budget. In code: `giong::error::Code::BudgetFull`. Its `io::ErrorKind` is `WouldBlock`.
@@ -738,6 +783,23 @@ These are the combinations the standard library's `std::fs::OpenOptions` refuses
 - To read: `OpenOptions::new().read(true)`.
 - To create or replace a file: `OpenOptions::new().write(true).create(true).truncate(true)` (what `File::create` does).
 - To add to the end of a file, creating it if needed: `OpenOptions::new().append(true).create(true)`. To empty it first, open it with `.write(true).truncate(true)` and write in order instead of appending.
+
+[All error codes](README.md)
+"#),
+    (204, r#"# GIONG-E0204: file too large to read into memory
+
+Raised by `giong::fs::read`. In code: `giong::error::Code::FileTooLarge`. Kind: `OutOfMemory`.
+
+## What happened
+
+`fs::read` reads a whole file into one `Vec<u8>`, sized from the file's length. The allocator could not give that much memory, so nothing was read and nothing is kept. The process goes on: without this check, Rust aborts the whole process when an allocation fails.
+
+The length can be far more than the file holds: a sparse file (a disk image, a database file, a core dump) reports the size it was given, not the blocks it uses. A path that a client chooses (an upload directory, a static file handler) can point at such a file.
+
+## How to fix it
+
+- Read the file in pieces with `File::read_at`, or stream it (`giong_http::FileBody` sends a file without loading it).
+- Check `File::len` (or `fs::metadata(path).await?.len()`) first, and refuse files above a limit you choose.
 
 [All error codes](README.md)
 "#),
@@ -2733,7 +2795,7 @@ cargo could not be started, or it failed before it could build: Cargo.toml has a
 "#),
     (5003, r#"# GIONG-E5003: the Rust compiler is too old
 
-Raised by the `giong` command (giong-cli): `giong doctor`. In JSON output: `"code": "GIONG-E5003"`.
+Raised by the `giong` command (giong-cli): `giong doctor` and `giong upgrade`. In JSON output: `"code": "GIONG-E5003"`.
 
 ## What happened
 
@@ -2743,6 +2805,7 @@ The Rust compiler on the `PATH` is older than the minimum the giong crates need 
 
 - `rustup update stable`, then check with `rustc --version`.
 - If the project pins an older toolchain in `rust-toolchain.toml`, raise it.
+- From `giong upgrade`: the release it was moving to needs a newer Rust than this one. Nothing was changed; update Rust and run `giong upgrade` again, or stay on the release you have.
 
 [All error codes](README.md)
 "#),
@@ -2824,11 +2887,11 @@ A `RefCell` borrow (`borrow()` or `borrow_mut()`) is kept in a variable while th
 "#),
     (5009, r#"# GIONG-E5009: the code does not compile
 
-Raised by the `giong` command (giong-cli): `giong check` and `giong dev`. In JSON output: `"code": "GIONG-E5009"`.
+Raised by the `giong` command (giong-cli): `giong check`, `giong dev` and `giong upgrade`. In JSON output: `"code": "GIONG-E5009"`.
 
 ## What happened
 
-The compiler reported an error. `giong dev` keeps the last build that worked running until the code compiles again.
+The compiler reported an error. `giong dev` stops the build that was running, so that no request is answered by code older than the files, and builds again on the next save; `giong dev status` shows the first errors in `failure`.
 
 ## How to fix it
 
@@ -2910,11 +2973,12 @@ Raised by the `giong` command (giong-cli): `giong doctor` and `giong dev`. In JS
 
 ## What happened
 
-Another process listens on the port the service is configured to use, so the service cannot bind it.
+Another process listens on the port the service is configured to use, so the service cannot bind it: when `giong dev` binds it for the service, or when the service, started by `giong dev`, stops at start-up because its own bind failed. In the second case `giong dev` stopped the build that ran before it too, and starts again on the next save.
 
 ## How to fix it
 
-- Stop the other process, or use another port. `giong dev` names the process that listens there when the system says (Linux, macOS); otherwise `ss -ltnp` on Linux or `lsof -i :PORT` on macOS shows which one.
+- Stop the other process, or use another port. `giong dev` names the process that listens there when the system says (Linux, macOS, Windows); otherwise `ss -ltnp` on Linux, `lsof -i :PORT` on macOS or `netstat -ano` on Windows shows which one.
+- When the process is `giong dev` itself, it holds the port for the service and hands the socket down: the service must bind exactly `LISTEN` with `giong::net::TcpListener` (giong 1.5 or later, which giong-web's `serve` uses), not `std::net::TcpListener` or another runtime's listener.
 - When it is a `giong dev` of another project, the message names the project: `giong dev stop` there, or `giong dev stop --all` stops every `giong dev` on this machine. `giong dev status --all` lists them.
 
 [All error codes](README.md)
@@ -2955,11 +3019,12 @@ Raised by the `giong` command (giong-cli): `giong dev`. In JSON output: `"code":
 
 ## What happened
 
-The service `giong dev` started exited by itself (it panicked, returned an error from `main`, or was killed). The finding carries its exit status and the last lines it printed.
+The service `giong dev` started exited by itself (it panicked, returned an error from `main`, or was killed), at start-up or later. The finding carries its exit status and the last lines it printed. When it was a new build that stopped before it served, `giong dev` stopped the build that ran before it too: nothing older than the files answers. `giong dev status` shows the same finding in `failure` until a build serves again; `giong dev` does not restart a service that stopped on its own until the next save.
 
 ## How to fix it
 
 - Read the last lines of its output in the finding: a panic message names the file and line.
+- `giong dev logs` prints more of its output.
 - Fix the code and save: `giong dev` builds and starts it again.
 
 [All error codes](README.md)
@@ -2970,7 +3035,7 @@ Raised by the `giong` command (giong-cli): `giong dev`. In JSON output: `"code":
 
 ## What happened
 
-The new build of the service did not accept connections within the time `giong dev` waits for it (30 seconds by default). The previous build keeps serving.
+The new build of the service did not accept connections within the time `giong dev` waits for it (30 seconds by default). `giong dev` stopped it, and the previous build too, so that nothing older than the files answers; the next save builds and starts again.
 
 ## How to fix it
 
@@ -3121,7 +3186,7 @@ The template, a store in `--db`, or the combination asked for is not one `giong 
 "#),
     (5033, r#"# GIONG-E5033: a file of the project could not be written
 
-Raised by the `giong` command (giong-cli): `giong new` and `giong ai init`. In JSON output: `"code": "GIONG-E5033"`.
+Raised by the `giong` command (giong-cli): `giong new`, `giong ai init` and `giong upgrade`. In JSON output: `"code": "GIONG-E5033"`.
 
 ## What happened
 
@@ -3209,13 +3274,13 @@ The project depends on a giong `major.minor` other than the one this `giong` com
 ## How to fix it
 
 - Install the command that matches the project: `cargo install giong-cli --version ~1.4` for a project on giong 1.4, then run `giong ai init` again.
-- Or move the project to the command's version: change the giong versions in `Cargo.toml`, then `cargo update`.
+- Or move the project to the command's version: `giong upgrade --to <the command's version>` (`giong upgrade` moves both to the newest release).
 
 [All error codes](README.md)
 "#),
     (5039, r#"# GIONG-E5039: the project does not depend on giong
 
-Raised by the `giong` command (giong-cli): `giong ai init`. In JSON output: `"code": "GIONG-E5039"`.
+Raised by the `giong` command (giong-cli): `giong ai init` and `giong upgrade`. In JSON output: `"code": "GIONG-E5039"`.
 
 ## What happened
 
@@ -3223,6 +3288,7 @@ No package of the workspace has `giong` in its `[dependencies]`, so the rules wr
 
 ## How to fix it
 
+- From `giong upgrade`: the project takes no giong crate from crates.io. A giong checkout (`path = ...`) or a git dependency is updated where it comes from (`git pull`).
 - `cargo add giong` (and the giong crates you need), or start from a template with `giong new`.
 - If this is not a giong project, delete the giong block from `AGENTS.md` and `CLAUDE.md` and the files `.cursor/rules/giong.mdc` and `.claude/skills/giong/`.
 
@@ -3958,6 +4024,150 @@ Raised by the `giong` command (giong-cli): `giong test`. In JSON output: `"code"
 
 - Put build settings where cargo reads them for every command: `.cargo/config.toml` (`[build] rustflags = [...]`, `[build] target-dir = "..."`), or the shell.
 - Delete the variable from `.env`.
+
+[All error codes](README.md)
+"#),
+    (5090, r#"# GIONG-E5090: a newer giong release is out
+
+Raised by the `giong` command (giong-cli): `giong doctor`. In JSON output: `"code": "GIONG-E5090"`.
+
+## What happened
+
+The project's `Cargo.lock` holds giong crates older than the newest giong release on crates.io. `giong doctor` asks crates.io (through `cargo info giong`, with your cargo configuration) at most once a day and keeps the answer in `~/.giong/cache/releases.json`; `--offline` and `CARGO_NET_OFFLINE=true` skip the question.
+
+Releases within 1.x only add (docs/STABILITY.md), so moving up keeps code that built building. Each release lists its fixes in the CHANGELOG.
+
+## How to fix it
+
+- `giong upgrade --dry-run` shows the edits, `giong upgrade` makes them: every giong version in every `Cargo.toml`, `cargo update`, `cargo check`, and back as it was if a step fails.
+- To stay on a release on purpose, pin it (`giong = "=1.4.2"`): the warning stays, as a reminder.
+
+[All error codes](README.md)
+"#),
+    (5091, r#"# GIONG-E5091: the project's giong crates are on different releases
+
+Raised by the `giong` command (giong-cli): `giong doctor` and `giong upgrade`. In JSON output: `"code": "GIONG-E5091"`.
+
+## What happened
+
+The giong crates are released together, with one version, and meant to be used at one version. This project's `Cargo.lock` has them at different versions (for example `giong 1.5.0` with `giong-web 1.4.2`), or has one of them twice because another dependency asks for an older one. Each crate works with a newer runtime, but the newer crates' fixes and the agent files `giong ai init` writes assume one release.
+
+From `giong upgrade`: after `cargo update`, a giong crate stayed on another version. The files were put back as they were.
+
+## How to fix it
+
+- `giong upgrade` moves every giong crate to one release.
+- When a crate is in the lock twice, `cargo tree -i giong-web@1.4.2` (with the crate and version reported) shows which dependency holds the old one: update that dependency.
+
+[All error codes](README.md)
+"#),
+    (5092, r#"# GIONG-E5092: this giong command is older than the newest release
+
+Raised by the `giong` command (giong-cli): `giong doctor` and `giong upgrade`. In JSON output: `"code": "GIONG-E5092"`.
+
+## What happened
+
+The `giong` command is older than the newest giong release. The command writes templates, agent files and checks for its own release, so an older one does not know what the newer crates offer.
+
+From `giong upgrade`: the command updated itself, and the one started afterwards still reports the old version (another `giong` comes first on the `PATH`).
+
+## How to fix it
+
+- `giong upgrade --self` updates it the way it was installed.
+- If it repeats, `which giong` (Windows: `where giong`) shows which binary runs: remove the old one or put the right folder first on the `PATH`.
+
+[All error codes](README.md)
+"#),
+    (5093, r#"# GIONG-E5093: the version to move to is not a release giong upgrade can move to
+
+Raised by the `giong` command (giong-cli): `giong upgrade`. In JSON output: `"code": "GIONG-E5093"`.
+
+## What happened
+
+`--to` named something giong upgrade does not move to: not a version, a release of another major version, or one older than the project's. Releases within a major version only add, so moving forward within 1.x keeps the code building; moving back or across a major version is not that kind of change.
+
+## How to fix it
+
+- Give a 1.x release at least as new as the project's: `giong upgrade --to 1.5.0`.
+- To go back to an older release, restore `Cargo.toml` and `Cargo.lock` from version control.
+
+[All error codes](README.md)
+"#),
+    (5094, r#"# GIONG-E5094: the project's rust-version is below what the release needs
+
+Raised by the `giong` command (giong-cli): `giong upgrade`. In JSON output: `"code": "GIONG-E5094"`.
+
+## What happened
+
+A package of the project promises to build on an older Rust (`rust-version` in its `Cargo.toml`) than the release it was moving to needs. giong does not raise a project's promise by itself: the people who use the package may rely on it. Nothing was changed: the files were put back as they were.
+
+## How to fix it
+
+- If the package can drop the older Rust, raise its `rust-version` to the version reported, then `giong upgrade` again.
+- Otherwise stay on the release you have.
+
+[All error codes](README.md)
+"#),
+    (5095, r#"# GIONG-E5095: a giong dependency is pinned to a version
+
+Raised by the `giong` command (giong-cli): `giong upgrade`. In JSON output: `"code": "GIONG-E5095"`.
+
+## What happened
+
+A giong requirement names an exact version or a range (`=1.4.2`, `>=1.4, <1.5`) that does not allow the release to move to. A pin is a decision, so giong upgrade does not undo it. Nothing was changed.
+
+## How to fix it
+
+- Change the requirement to the release (`giong = "1.5.0"`) or remove the pin, then `giong upgrade` again.
+- To keep the pin, move the rest with `giong upgrade --to` a release the pin allows.
+
+[All error codes](README.md)
+"#),
+    (5096, r#"# GIONG-E5096: giong upgrade --self could not replace this command
+
+Raised by the `giong` command (giong-cli): `giong upgrade`. In JSON output: `"code": "GIONG-E5096"`.
+
+## What happened
+
+`giong upgrade --self` (or `giong upgrade`, which updates the command before a project that moves past it) replaces the command the way it was installed: from the install script's folder (`~/.giong/bin` or `$GIONG_INSTALL`) with the release's archive, checked against its SHA-256; from `cargo install` with `cargo install giong-cli --locked --version <v>`. A command anywhere else (a package manager, a copy) is not replaced, since giong cannot know what that would break. Or a step failed: the download, the checksum, unpacking, or writing the folder.
+
+## How to fix it
+
+- Update it the way it was installed: `curl -fsSL https://giong.run/install.sh | GIONG_VERSION=<v> sh` (Windows: `install.ps1` with `$env:GIONG_VERSION`), or `cargo install giong-cli --locked --version <v>`.
+- For a project, `giong upgrade --to <this command's version>` moves it without updating the command.
+- Behind a mirror of the release downloads, set `GIONG_DOWNLOAD_URL`, as for the install script.
+
+[All error codes](README.md)
+"#),
+    (5097, r#"# GIONG-E5097: the newest giong release could not be looked up
+
+Raised by the `giong` command (giong-cli): `giong upgrade`. In JSON output: `"code": "GIONG-E5097"`.
+
+## What happened
+
+giong upgrade asks crates.io for the newest giong release through `cargo info giong`, which uses your cargo configuration (proxies, credentials). The question failed: no network, `CARGO_NET_OFFLINE=true`, a cargo older than Rust 1.82 (which has no `cargo info`), or a registry mirror that cargo info cannot read.
+
+## How to fix it
+
+- `giong upgrade --offline` moves the project to this command's own release, with cargo offline (the crates must be in cargo's cache).
+- `giong upgrade --to 1.5.0` names the release.
+- `GIONG_LATEST=1.5.0` tells `giong doctor` and `giong upgrade` which release is the newest, for a mirror or a company that approves releases.
+- `rustup update stable` brings a cargo with `cargo info`.
+
+[All error codes](README.md)
+"#),
+    (5098, r#"# GIONG-E5098: a giong dependency is written in a form giong upgrade cannot edit
+
+Raised by the `giong` command (giong-cli): `giong upgrade`. In JSON output: `"code": "GIONG-E5098"`.
+
+## What happened
+
+giong upgrade edits only the version of each giong dependency and leaves every other byte of `Cargo.toml` as it is. It reads dependencies written on one line (`giong = "1.4"`, `giong = { version = "1.4", ... }`), as dotted keys (`giong.version = "1.4"`) and as tables of their own (`[dependencies.giong]`). After editing, it asks cargo for every requirement again; one that still does not allow the new release was written in a form it did not read, or the edited file no longer parses. Nothing was changed: the files were put back as they were.
+
+## How to fix it
+
+- Change the version of the dependency reported by hand, or write it in one of the forms above, then `giong upgrade` again.
+- `giong upgrade --dry-run` lists every edit it would make.
 
 [All error codes](README.md)
 "#),

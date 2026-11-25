@@ -1,5 +1,11 @@
 {{#file-if sql}}
 //! `/users`: create, read, update, delete and export users.
+{{#if sqlite}}
+//!
+//! The SQL runs in closures on giong's blocking lane (see `db.rs`): what a
+//! closure needs from the request is copied into it, and it gives back owned
+//! values.
+{{/if}}
 {{#if redis}}
 //!
 //! Reads go through the Redis cache (cache-aside); writes go to the database
@@ -15,6 +21,9 @@ use giong_postgres::Row;
 use giong_mysql::Row;
 {{/if}}
 use giong_web::{json, Body, Error, Req, Response, Router};
+{{#if sqlite}}
+use rusqlite::{params, Connection, OptionalExtension};
+{{/if}}
 use serde::{Deserialize, Serialize};
 
 use crate::State;
@@ -64,11 +73,56 @@ const UPDATE: &str = "UPDATE users SET name = ?, email = ? WHERE id = ?";
 const EXISTS: &str = "SELECT 1 FROM users WHERE id = ?";
 const DELETE: &str = "DELETE FROM users WHERE id = ?";
 {{/if}}
+{{#if sqlite}}
+/// The columns a user is read with; `created_at` is RFC 3339 text already.
+macro_rules! columns {
+    () => {
+        "id, name, email, created_at"
+    };
+}
+
+const SELECT_ONE: &str = concat!("SELECT ", columns!(), " FROM users WHERE id = ?1");
+const SELECT_PAGE: &str = concat!(
+    "SELECT ",
+    columns!(),
+    " FROM users WHERE id > ?1 ORDER BY id LIMIT ?2"
+);
+const INSERT: &str = concat!(
+    "INSERT INTO users (name, email) VALUES (?1, ?2) RETURNING ",
+    columns!()
+);
+const UPDATE: &str = concat!(
+    "UPDATE users SET name = ?2, email = ?3 WHERE id = ?1 RETURNING ",
+    columns!()
+);
+const DELETE: &str = "DELETE FROM users WHERE id = ?1";
+{{/if}}
 
 /// The largest page `GET /users` gives, and the default.
 const MAX_PAGE: u32 = 1000;
 const DEFAULT_PAGE: u32 = 50;
 
+{{#if sqlite}}
+/// Owned, since it comes back from the blocking lane.
+#[derive(Serialize)]
+struct User {
+    id: i64,
+    name: String,
+    email: String,
+    created_at: String,
+}
+
+impl User {
+    fn from_row(row: &rusqlite::Row) -> rusqlite::Result<Self> {
+        Ok(Self {
+            id: row.get(0)?,
+            name: row.get(1)?,
+            email: row.get(2)?,
+            created_at: row.get(3)?,
+        })
+    }
+}
+{{#else}}
 #[derive(Serialize)]
 struct User<'a> {
     id: i64,
@@ -87,6 +141,7 @@ impl<'a> User<'a> {
         })
     }
 }
+{{/if}}
 
 /// The body of `POST /users` and `PUT /users/{id}`.
 #[derive(Deserialize)]
@@ -128,8 +183,13 @@ struct Page {
 }
 
 #[derive(Serialize)]
+{{#if sqlite}}
+struct PageBody {
+    users: Vec<User>,
+{{#else}}
 struct PageBody<'a> {
     users: Vec<User<'a>>,
+{{/if}}
     /// The `after` of the next page; `null` on the last one.
     next_after: Option<i64>,
 }
@@ -150,6 +210,12 @@ fn conflict_or(err: giong_postgres::Error, email: &str) -> Error {
 fn conflict_or(err: giong_mysql::Error, email: &str) -> Error {
     if err.server_code() == Some(1062) {
 {{/if}}
+{{#if sqlite}}
+/// A user already taken: SQLite's unique constraint, as a `409`.
+fn conflict_or(err: rusqlite::Error, email: &str) -> Error {
+    let unique = Some(rusqlite::ffi::SQLITE_CONSTRAINT_UNIQUE);
+    if err.sqlite_error().map(|e| e.extended_code) == unique {
+{{/if}}
         Error::conflict(
             "email_taken",
             format!("a user with the email {email:?} exists already"),
@@ -162,6 +228,15 @@ fn conflict_or(err: giong_mysql::Error, email: &str) -> Error {
 fn not_found(id: i64) -> Error {
     Error::not_found("user_not_found", format!("no user has the id {id}"))
 }
+{{#if sqlite}}
+
+/// The users after `after`, by id: on the blocking lane.
+fn page(c: &Connection, after: i64, limit: u32) -> rusqlite::Result<Vec<User>> {
+    let mut stmt = c.prepare_cached(SELECT_PAGE)?;
+    let users = stmt.query_map(params![after, limit], User::from_row)?;
+    users.collect()
+}
+{{/if}}
 
 /// The routes, mounted at `/users`.
 pub fn routes() -> Router<State> {
@@ -185,6 +260,13 @@ async fn list_users(req: Req<State>) -> Result<Response, Error> {
         ));
     }
     let after = page.after.unwrap_or(0);
+{{#if sqlite}}
+    let users = req
+        .state()
+        .db
+        .read(move |c| Ok(self::page(c, after, limit)?))
+        .await?;
+{{#else}}
     let rows = req
         .state()
         .db
@@ -194,6 +276,7 @@ async fn list_users(req: Req<State>) -> Result<Response, Error> {
         .iter()
         .map(User::from_row)
         .collect::<Result<Vec<_>, _>>()?;
+{{/if}}
     let next_after = (users.len() == limit as usize)
         .then(|| users.last().map(|u| u.id))
         .flatten();
@@ -225,7 +308,19 @@ async fn create_user(req: Req<State>) -> Result<Response, Error> {
         .await?
         .ok_or_else(|| not_found(id))?;
 {{/if}}
+{{#if sqlite}}
+    let (name, email) = (name.to_string(), email.to_string());
+    let user = req
+        .state()
+        .db
+        .write(move |c| {
+            c.query_row(INSERT, params![name, email], User::from_row)
+                .map_err(|e| conflict_or(e, &email))
+        })
+        .await?;
+{{#else}}
     let user = User::from_row(&row)?;
+{{/if}}
     let location = format!("/users/{}", user.id);
     Ok(json(201, &user)?.header("Location", &location))
 }
@@ -241,12 +336,21 @@ async fn get_user(req: Req<State>) -> Result<Response, Error> {
     if let Ok(Some(cached)) = state.cache.get::<Option<Vec<u8>>>(&key).await {
         return Ok(Response::json(cached).header("X-Cache", "hit"));
     }
+{{#if sqlite}}
+    let user = state
+        .db
+        .read(move |c| Ok(c.query_row(SELECT_ONE, [id], User::from_row).optional()?))
+        .await?
+        .ok_or_else(|| not_found(id))?;
+    let body = serde_json::to_vec(&user)?;
+{{#else}}
     let row = state
         .db
         .query_opt(SELECT_ONE, &[&id])
         .await?
         .ok_or_else(|| not_found(id))?;
     let body = serde_json::to_vec(&User::from_row(&row)?)?;
+{{/if}}
     // Not worth failing the request for: the next read tries again.
     let _ = state.cache.set_ex(&key, &body, state.cache_ttl).await;
     Ok(Response::json(body).header("X-Cache", "miss"))
@@ -254,6 +358,15 @@ async fn get_user(req: Req<State>) -> Result<Response, Error> {
 {{#else}}
 async fn get_user(req: Req<State>) -> Result<Response, Error> {
     let id: i64 = req.param("id")?;
+{{#if sqlite}}
+    let user = req
+        .state()
+        .db
+        .read(move |c| Ok(c.query_row(SELECT_ONE, [id], User::from_row).optional()?))
+        .await?
+        .ok_or_else(|| not_found(id))?;
+    json(200, &user)
+{{#else}}
     let row = req
         .state()
         .db
@@ -261,6 +374,7 @@ async fn get_user(req: Req<State>) -> Result<Response, Error> {
         .await?
         .ok_or_else(|| not_found(id))?;
     json(200, &User::from_row(&row)?)
+{{/if}}
 }
 {{/if}}
 
@@ -295,21 +409,47 @@ async fn update_user(req: Req<State>) -> Result<Response, Error> {
         .await?
         .ok_or_else(|| not_found(id))?;
 {{/if}}
+{{#if sqlite}}
+    let (name, email) = (name.to_string(), email.to_string());
+    let user = state
+        .db
+        .write(move |c| {
+            c.query_row(UPDATE, params![id, name, email], User::from_row)
+                .optional()
+                .map_err(|e| conflict_or(e, &email))
+        })
+        .await?
+        .ok_or_else(|| not_found(id))?;
+{{/if}}
 {{#if redis}}
     // After the write, so a read in between caches at most the old row
     // until `cache_ttl` runs out. Failing here would leave the old row
     // cached: report it.
     state.cache.del(cache_key(id)).await?;
 {{/if}}
+{{#if sqlite}}
+    json(200, &user)
+{{#else}}
     json(200, &User::from_row(&row)?)
+{{/if}}
 }
 
 async fn delete_user(req: Req<State>) -> Result<Response, Error> {
     let id: i64 = req.param("id")?;
     let state = req.state();
+{{#if sqlite}}
+    let deleted = state
+        .db
+        .write(move |c| Ok(c.execute(DELETE, [id])?))
+        .await?;
+    if deleted == 0 {
+        return Err(not_found(id));
+    }
+{{#else}}
     if state.db.execute(DELETE, &[&id]).await? == 0 {
         return Err(not_found(id));
     }
+{{/if}}
 {{#if redis}}
     state.cache.del(cache_key(id)).await?;
 {{/if}}
@@ -325,6 +465,29 @@ async fn export_users(req: Req<State>) -> Result<Response, Error> {
     drop(giong::spawn(async move {
         let mut after = 0i64;
         loop {
+{{#if sqlite}}
+            let read = state.db.read(move |c| Ok(page(c, after, MAX_PAGE)?));
+            let users = match read.await {
+                Ok(users) => users,
+                // The status is gone already: cut the body short, so the
+                // client sees that it is incomplete.
+                Err(_) => return tx.abort(),
+            };
+            let mut lines = Vec::with_capacity(users.len() * 96);
+            for user in &users {
+                after = user.id;
+                if serde_json::to_writer(&mut lines, user).is_err() {
+                    return tx.abort();
+                }
+                lines.push(b'\n');
+            }
+            if tx.send(lines).await.is_err() {
+                return; // The client went away.
+            }
+            if users.len() < MAX_PAGE as usize {
+                return;
+            }
+{{#else}}
             let limit = i64::from(MAX_PAGE);
             let rows = match state.db.query(SELECT_PAGE, &[&after, &limit]).await {
                 Ok(rows) => rows,
@@ -349,6 +512,7 @@ async fn export_users(req: Req<State>) -> Result<Response, Error> {
             if rows.len() < MAX_PAGE as usize {
                 return;
             }
+{{/if}}
         }
     }));
     Ok(Response::new(200)

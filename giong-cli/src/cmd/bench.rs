@@ -606,7 +606,26 @@ fn against(cwd: &Path, reference: &str) -> Result<(Worktree, PathBuf, String, St
     // One path per repository and commit, so the older build's own files
     // keep their paths and cargo rebuilds only what changed since last time.
     let repo_id = &crate::sha256::hex(top.display().to_string().as_bytes())[..8];
-    let path = std::env::temp_dir().join(format!("giong-bench-{repo_id}-{short}"));
+    // Under ~/.giong, never the temporary directory: cargo reads
+    // `.cargo/config.toml` from every folder above the one it builds in, and
+    // any user can make /tmp/.cargo/config.toml (its rustc-wrapper would run
+    // as this user).
+    let path = crate::versions::giong_home()
+        .map(|home| home.join("bench").join(format!("{repo_id}-{short}")))
+        .ok_or_else(|| {
+            fail(
+                "there is no home folder to build the older commit in".to_string(),
+                "set GIONG_HOME to a folder of your own",
+            )
+        })?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            fail(
+                format!("{} could not be made: {e}", parent.display()),
+                "check that you may write to it, or set GIONG_HOME to a folder of your own",
+            )
+        })?;
+    }
     let _ = std::fs::remove_dir_all(&path);
     let p = path.display().to_string();
     git(&top, &["worktree", "add", "--detach", "--force", &p, &sha]).map_err(|e| {

@@ -506,12 +506,16 @@ impl Pool {
     /// [`ErrorKind::PoolTimeout`]. A task that opens a new connection waits
     /// for it up to [`Config::connect_timeout`] instead.
     ///
+    /// A wait longer than a century (`Duration::MAX`) counts as a
+    /// century: no limit.
+    ///
     /// # Panics
     ///
     /// Panics if other clones of this pool exist; set it right after
     /// [`new`](Self::new).
     pub fn wait_timeout(mut self, timeout: Duration) -> Self {
-        self.settings("wait timeout").wait_timeout = timeout;
+        self.settings("wait timeout").wait_timeout =
+            timeout.min(Duration::from_secs(100 * 365 * 24 * 3600));
         self
     }
 
@@ -1470,6 +1474,23 @@ impl std::fmt::Debug for PooledClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `Duration::MAX` reads as "no limit" and must not overflow the clock
+    /// when a task starts waiting (issue #298). Nothing listens on port 1,
+    /// so the task fails to connect instead.
+    #[test]
+    fn an_unbounded_wait_timeout_does_not_overflow() {
+        let pool = Pool::new(
+            Config::new()
+                .host("127.0.0.1")
+                .port(1)
+                .connect_timeout(Duration::from_secs(2)),
+            1,
+        )
+        .wait_timeout(Duration::MAX);
+        let got = giong::block_on(async move { pool.get().await.map(drop) });
+        assert!(got.is_err());
+    }
 
     fn refused(sql: &str) -> bool {
         refuse_on_shared(sql, false).is_err()

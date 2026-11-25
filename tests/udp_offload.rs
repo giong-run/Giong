@@ -4,6 +4,7 @@
 #![cfg(feature = "unstable-udp-offload")]
 
 use std::io::ErrorKind;
+#[cfg(unix)]
 use std::os::fd::AsRawFd;
 use std::time::Duration;
 
@@ -19,17 +20,51 @@ const GRO_BUFFER: usize = giong::net::GRO_RECV_BUFFER;
 const READINESS: DriverKind = DriverKind::Epoll;
 #[cfg(target_os = "macos")]
 const READINESS: DriverKind = DriverKind::Kqueue;
+/// Windows has one driver, the completion port: both turns run on it.
+#[cfg(windows)]
+const READINESS: DriverKind = DriverKind::Iocp;
 
-/// Turns GRO on or off; `false` where the system has none (macOS), which
-/// refuses it with `ENOPROTOOPT`.
+/// The errors a system without an option gives: `ENOPROTOOPT` on macOS;
+/// on Windows versions without it `WSAENOPROTOOPT`, or `WSAEINVAL` for an
+/// option number they do not know.
+#[cfg(target_os = "macos")]
+const NO_OPTION: &[i32] = &[libc::ENOPROTOOPT];
+#[cfg(windows)]
+const NO_OPTION: &[i32] = &[10042, 10022];
+#[cfg(target_os = "linux")]
+const NO_OPTION: &[i32] = &[];
+
+/// A segmented send without GSO: `EOPNOTSUPP` (Winsock's `WSAEOPNOTSUPP`).
+#[cfg(target_os = "macos")]
+const NOT_SUPPORTED: i32 = libc::EOPNOTSUPP;
+#[cfg(windows)]
+const NOT_SUPPORTED: i32 = 10045;
+
+/// Turns GRO on or off; `false` where the system has none (macOS, Windows
+/// before 11), which refuses it.
 fn gro(s: &UdpSocket, on: bool) -> bool {
     match s.set_gro(on) {
         Ok(()) => true,
         Err(e) if cfg!(not(target_os = "linux")) => {
-            assert_eq!(e.raw_os_error(), Some(libc::ENOPROTOOPT), "{e}");
+            let code = e.raw_os_error().unwrap_or(0);
+            assert!(NO_OPTION.contains(&code), "{e}");
             false
         }
         Err(e) => panic!("set_gro({on}): {e}"),
+    }
+}
+
+/// Turns ECN reports on; `false` on a Windows without them (before 11 and
+/// Server 2022), which refuses the option. Every other system has them.
+fn ecn(s: &UdpSocket) -> bool {
+    match s.set_recv_ecn(true) {
+        Ok(()) => true,
+        Err(e) if cfg!(windows) => {
+            let code = e.raw_os_error().unwrap_or(0);
+            assert!(NO_OPTION.contains(&code), "{e}");
+            false
+        }
+        Err(e) => panic!("set_recv_ecn: {e}"),
     }
 }
 
@@ -38,6 +73,10 @@ fn gro(s: &UdpSocket, on: bool) -> bool {
 #[cfg(target_os = "linux")]
 const LOOPBACKS: &[u8] = &[1, 2, 77];
 #[cfg(target_os = "macos")]
+const LOOPBACKS: &[u8] = &[1];
+/// Windows receives on all of 127.0.0.0/8, but sends only from 127.0.0.1,
+/// the one loopback address its interface has.
+#[cfg(windows)]
 const LOOPBACKS: &[u8] = &[1];
 
 /// `true` if io_uring works here (it is blocked, for instance, under
@@ -162,8 +201,8 @@ fn a_short_last_segment_is_kept() {
     }
 }
 
-/// Without GSO (macOS), a send of several segments is refused and sends
-/// nothing; one of a single segment goes as a datagram.
+/// Without GSO (macOS, Windows before 11), a send of several segments is
+/// refused and sends nothing; one of a single segment goes as a datagram.
 #[test]
 #[cfg(not(target_os = "linux"))]
 fn a_segmented_send_is_refused_without_gso() {
@@ -171,11 +210,18 @@ fn a_segmented_send_is_refused_without_gso() {
         async {
             let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
             let tx = UdpSocket::bind("127.0.0.1:0").unwrap();
+            // macOS has none; a Windows that has it is tested above.
+            #[cfg(windows)]
+            if tx.gso_supported() {
+                eprintln!("this Windows has GSO; skipped");
+                return;
+            }
+            #[cfg(target_os = "macos")]
             assert!(!tx.gso_supported());
             let to = rx.local_addr().unwrap();
             let (res, _) = tx.send_segments_to(vec![7u8; 2500], to, 1000, 0).await;
             let err = res.expect_err("segmented without GSO");
-            assert_eq!(err.raw_os_error(), Some(libc::EOPNOTSUPP), "{err}");
+            assert_eq!(err.raw_os_error(), Some(NOT_SUPPORTED), "{err}");
             let (res, _) = tx.send_segments_to(vec![8u8; 900], to, 1000, 0).await;
             assert_eq!(res.unwrap(), 900);
             let (dg, _) = timeout(Duration::from_secs(5), rx.recv_from())
@@ -204,11 +250,20 @@ fn ecn_bits_travel_with_the_datagram() {
                         eprintln!("{host} not available; skipped");
                         return;
                     };
-                    rx.set_recv_ecn(true).unwrap();
+                    if !ecn(&rx) {
+                        eprintln!("no ECN on this Windows; skipped");
+                        return;
+                    }
                     let tx = UdpSocket::bind(host).unwrap();
                     let to = rx.local_addr().unwrap();
                     for ecn in [0u8, 1, 2, 3] {
                         let (res, _) = tx.send_segments_to(vec![ecn; 100], to, 0, ecn).await;
+                        // Windows lets no sender mark a datagram CE (3), the
+                        // mark of a router that met congestion.
+                        if cfg!(windows) && ecn == 3 {
+                            assert_eq!(res.unwrap_err().kind(), ErrorKind::InvalidInput);
+                            continue;
+                        }
                         assert_eq!(res.unwrap(), 100);
                         let (dg, _) = timeout(Duration::from_secs(5), rx.recv_from())
                             .await
@@ -238,7 +293,7 @@ fn offload_options_are_refused_when_they_would_lose_datagrams() {
                 "{e}"
             );
             assert_eq!(e.kind(), ErrorKind::InvalidInput);
-            s.set_recv_ecn(true).unwrap();
+            ecn(&s);
         })
         .unwrap();
     run(
@@ -272,7 +327,7 @@ fn a_reply_leaves_from_the_address_the_request_came_to() {
                 async move {
                     let server = UdpSocket::bind("0.0.0.0:0").unwrap();
                     server.set_recv_local_addr(true).unwrap();
-                    server.set_recv_ecn(true).unwrap();
+                    ecn(&server);
                     if !self::gro(&server, gro) {
                         eprintln!("no GRO here; skipped");
                         return;
@@ -371,7 +426,10 @@ fn ecn_reaches_an_ipv4_peer_of_a_dual_stack_socket() {
                     return;
                 };
                 let receiver = UdpSocket::bind("127.0.0.1:0").unwrap();
-                receiver.set_recv_ecn(true).unwrap();
+                if !ecn(&receiver) {
+                    eprintln!("no ECN on this Windows; skipped");
+                    return;
+                }
                 let port = receiver.local_addr().unwrap().port();
                 let to = std::net::SocketAddr::from((
                     std::net::Ipv4Addr::LOCALHOST.to_ipv6_mapped(),
@@ -507,4 +565,71 @@ fn buffer_sizes_and_dont_fragment() {
         },
         DriverKind::IoUring,
     );
+}
+
+/// A port the workers of one runtime share: on Windows one socket, whose
+/// datagrams a thread of giong's hands out to the workers' sockets. The
+/// local address each datagram was sent to comes with it, whichever
+/// socket it reaches and whichever way (the socket's own receive, the
+/// thread, or the first socket passing on a datagram it took).
+#[test]
+fn datagrams_of_a_shared_port_keep_their_control_messages() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    const WORKERS: usize = 3;
+    // A port below the ephemeral range, free now.
+    let port = (20_000u16..30_000)
+        .map(|p| p.wrapping_add((std::process::id() % 9_000) as u16))
+        .find(|&p| std::net::UdpSocket::bind(("0.0.0.0", p)).is_ok())
+        .expect("a free port");
+    let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
+    let bound = Arc::new(AtomicUsize::new(0));
+    let rt = Builder::new()
+        .workers(WORKERS)
+        .recv_buffers(64, GRO_BUFFER)
+        .build()
+        .unwrap();
+    let handle = rt.handle();
+    let b = bound.clone();
+    let server = std::thread::spawn(move || {
+        rt.run(move |_| {
+            let b = b.clone();
+            async move {
+                let socket = UdpSocket::bind(addr).unwrap();
+                socket.set_recv_local_addr(true).unwrap();
+                let index = b.fetch_add(1, Ordering::SeqCst);
+                while let Some(Ok((dg, from))) = giong::until_shutdown(socket.recv_from()).await {
+                    let local = dg.local_ip() == Some(std::net::IpAddr::from([127, 0, 0, 1]));
+                    let reply = vec![index as u8, u8::from(local)];
+                    socket.send_to(reply, from).await.0.unwrap();
+                }
+            }
+        })
+        .unwrap();
+    });
+    while bound.load(Ordering::SeqCst) < WORKERS {
+        std::thread::sleep(Duration::from_millis(1));
+    }
+    let mut reached = std::collections::HashSet::new();
+    for i in 0..30 {
+        let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .unwrap();
+        for _ in 0..3 {
+            client.send_to(b"where", ("127.0.0.1", port)).unwrap();
+            let mut buf = [0u8; 4];
+            let (n, _) = client.recv_from(&mut buf).unwrap();
+            assert_eq!(n, 2);
+            assert_eq!(
+                buf[1], 1,
+                "sender {i}: no local address on socket {}",
+                buf[0]
+            );
+            reached.insert(buf[0]);
+        }
+    }
+    assert!(reached.len() > 1, "every sender reached one socket");
+    handle.shutdown();
+    server.join().unwrap();
 }

@@ -1,0 +1,19 @@
+[package]
+name = "app"
+version = "0.1.0"
+
+[dependencies]
+giong = "1.4.2" # the runtime
+giong-web = { version = "1.4", features = ["tracing", "dev"] }
+rt = { package = 'giong-http', version = '~1.4', default-features = false }
+giong-mcp.version = "1.4.0"
+giong-tls = { path = "../giong-tls", version = "1.4" }
+
+[dev-dependencies.giong-postgres]
+version = "^1.4.2"
+
+[target.'cfg(unix)'.dependencies]
+giong-redis = { workspace = true }
+
+[workspace.dependencies]
+giong-redis = "=1.4.2"

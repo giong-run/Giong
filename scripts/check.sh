@@ -107,10 +107,13 @@ run_tsan() {
         --skip a_second_signal_ends_a_process_whose_shutdown_hangs)
     # `--cfg giong_tsan` makes giong close sockets with close(2) instead of
     # IORING_OP_CLOSE, which TSan cannot see (see Driver::close_fd).
+    # allocator_may_return_null: TSan's malloc aborts the process on a request
+    # over 1 TiB instead of failing it as the system allocator does, and the
+    # fs test of #296 asks for 2^60 bytes through try_reserve.
     for round in $(seq 1 "$ROUNDS"); do
         echo "== ThreadSanitizer: round $round/$ROUNDS"
         RUSTFLAGS="-Zsanitizer=thread --cfg giong_tsan" \
-        TSAN_OPTIONS="halt_on_error=1" \
+        TSAN_OPTIONS="halt_on_error=1 allocator_may_return_null=1" \
         CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/tsan" \
             cargo +nightly test -Zbuild-std --target "$target" --tests --quiet --workspace --all-features \
             -- "${skip[@]}"

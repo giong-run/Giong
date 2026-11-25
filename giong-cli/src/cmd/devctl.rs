@@ -95,7 +95,17 @@ pub fn registered() -> Vec<PathBuf> {
         let root = PathBuf::from(root);
         // The pid must still be the runner of that project (pids are reused).
         let state = read_state(&root).unwrap_or(Value::Null);
-        if state["pid"].as_u64() != Some(pid) || !is_runner(Some(pid), &state["pid_started"]) {
+        // A runner asking (to name who holds a port) finds itself, which
+        // `is_runner` never matches (nothing signals itself): its own entry
+        // stays, when that project's dev.json names this very process.
+        let own = u64::from(std::process::id());
+        let me = pid == own
+            && state["pid"].as_u64() == Some(own)
+            && state["pid_started"].as_str().is_some()
+            && state["pid_started"].as_str() == super::dev::started(own).as_deref();
+        if !me
+            && (state["pid"].as_u64() != Some(pid) || !is_runner(Some(pid), &state["pid_started"]))
+        {
             let _ = fs::remove_file(&path);
             continue;
         }
@@ -161,13 +171,35 @@ pub fn project_status(root: &Path) -> (Value, Vec<Finding>) {
         "stopped"
     } else if build_state == "building" {
         "building"
+    } else if state["starting"] == true {
+        "starting"
     } else if service_pid.is_some() {
         "serving"
     } else {
         "failed"
     };
+    let failure = if running {
+        state["failure"].clone()
+    } else {
+        Value::Null
+    };
     let mut findings = Vec::new();
-    if running && build_state == "failed" {
+    // Why nothing serves, as the runner recorded it (a runner older than this
+    // field leaves it out): the code, the cause, the last lines and the fix.
+    if word == "failed" && failure.is_object() {
+        let mut f = finding_from_json(&failure).unwrap_or_else(|| {
+            Finding::new(
+                Code::SERVICE_EXITED,
+                Severity::Error,
+                "giong dev runs, but nothing serves",
+            )
+        });
+        f.severity = Severity::Error;
+        if f.fix.is_empty() {
+            f.fix = "fix the cause and save: giong dev builds and starts it again".into();
+        }
+        findings.push(f);
+    } else if running && build_state == "failed" {
         findings.push(
             Finding::new(Code::BUILD_FAILED, Severity::Error, "the last build failed")
                 .detail(build["error"].as_str().unwrap_or("").to_string())
@@ -213,6 +245,7 @@ pub fn project_status(root: &Path) -> (Value, Vec<Finding>) {
         "urls": if running { json!(urls) } else { json!([]) },
         "addresses": if running { json!(addresses) } else { json!([]) },
         "build": build,
+        "failure": failure,
         "restarts": if running { state["restarts"].clone() } else { Value::Null },
         "log": log.is_file().then(|| log.display().to_string()),
         "runner_log": (background && runner_log.is_file()).then(|| runner_log.display().to_string()),
@@ -278,7 +311,24 @@ fn status_lines(p: &Value) -> Vec<String> {
                 format!("is building; the previous build serves {at}")
             }
             Some("building") => "is building".to_string(),
-            _ => "runs, but nothing serves".to_string(),
+            Some("starting") if p["service_pid"].is_u64() => {
+                format!("is starting the new build; the previous build serves {at}")
+            }
+            Some("starting") => "is starting the service".to_string(),
+            _ => match p["failure"]["stage"].as_str() {
+                Some("build") => {
+                    "runs, but nothing serves: the last build failed (the build before it was \
+                     stopped, so no old code answers)"
+                        .to_string()
+                }
+                Some("start") => {
+                    "runs, but nothing serves: the new build stopped before it served (the \
+                     build before it was stopped, so no old code answers)"
+                        .to_string()
+                }
+                Some(_) => "runs, but nothing serves: the service stopped".to_string(),
+                None => "runs, but nothing serves".to_string(),
+            },
         };
         out.push(format!(
             "giong dev {how} (pid {}{}, {} restarts) in {root}",
@@ -826,8 +876,7 @@ fn detach(cmd: &mut Process) {
 }
 
 /// The process that listens on `port`, when this machine says: its pid and
-/// command line.
-#[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
+/// command line (Windows: its image name).
 pub fn port_owner(port: u16) -> Option<(u32, String)> {
     #[cfg(target_os = "linux")]
     {
@@ -852,11 +901,61 @@ pub fn port_owner(port: u16) -> Option<(u32, String)> {
             .to_string();
         Some((pid, name))
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(windows)]
+    {
+        let out = Process::new("netstat")
+            .args(["-ano", "-p", "TCP"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok()?;
+        let pid = netstat_listener(&String::from_utf8_lossy(&out.stdout), port)?;
+        let out = Process::new("tasklist")
+            .args(["/FI", &format!("PID eq {pid}"), "/FO", "CSV", "/NH"])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .ok();
+        let name = out
+            .and_then(|o| {
+                let text = String::from_utf8_lossy(&o.stdout).into_owned();
+                // "giong.exe","1234","Console","1","10,000 K"
+                let first = text
+                    .lines()
+                    .next()?
+                    .split("\",\"")
+                    .next()?
+                    .trim_matches('"')
+                    .to_string();
+                (!first.is_empty() && !first.starts_with("INFO:")).then_some(first)
+            })
+            .unwrap_or_default();
+        Some((pid, name))
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos", windows)))]
     {
         let _ = port;
         None
     }
+}
+
+/// The pid that listens on `port` in the output of `netstat -ano -p TCP`
+/// (Windows): `  TCP    127.0.0.1:8080    0.0.0.0:0    LISTENING    1234`.
+/// The state column is translated on a localized system, so a listener is
+/// told by its remote address, which only a listener has as port 0.
+#[cfg_attr(not(windows), allow(dead_code))] // tested everywhere
+fn netstat_listener(text: &str, port: u16) -> Option<u32> {
+    text.lines().find_map(|line| {
+        let cols: Vec<&str> = line.split_whitespace().collect();
+        if cols.len() != 5 || !cols[0].eq_ignore_ascii_case("TCP") {
+            return None;
+        }
+        let local_port = cols[1].rsplit_once(':')?.1.parse::<u16>().ok()?;
+        let remote_port = cols[2].rsplit_once(':')?.1;
+        (local_port == port && remote_port == "0")
+            .then(|| cols[4].parse().ok())
+            .flatten()
+    })
 }
 
 #[cfg(target_os = "linux")]
@@ -916,7 +1015,6 @@ fn linux_port_owner(port: u16) -> Option<(u32, String)> {
 
 /// What to say about the process that holds `port`: who it is and how to
 /// stop it, naming the project when a `giong dev` started it.
-#[cfg_attr(not(unix), allow(dead_code))] // the shared-socket path is Unix only
 pub fn port_owner_fix(port: u16) -> Option<String> {
     let (pid, command) = port_owner(port)?;
     let shown = if command.is_empty() {
@@ -936,8 +1034,13 @@ pub fn port_owner_fix(port: u16) -> Option<String> {
             ));
         }
     }
+    let kill = if cfg!(windows) {
+        format!("taskkill /PID {pid} /F")
+    } else {
+        format!("kill {pid}")
+    };
     Some(format!(
-        "{shown} listens there: stop it (kill {pid}), or set another LISTEN in .env"
+        "{shown} listens there: stop it ({kill}), or set another LISTEN in .env"
     ))
 }
 
@@ -1103,10 +1206,25 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn netstat_names_the_listener_of_a_port() {
+        let text = "\r\nActive Connections\r\n\r\n  Proto  Local Address          Foreign Address        State           PID\r\n\
+                    \x20 TCP    127.0.0.1:8080         127.0.0.1:50000        ESTABLISHED     77\r\n\
+                    \x20 TCP    0.0.0.0:135            0.0.0.0:0              LISTENING       900\r\n\
+                    \x20 TCP    127.0.0.1:8080         0.0.0.0:0              ABHÖREN         4242\r\n\
+                    \x20 TCP    [::1]:9000             [::]:0                 LISTENING       31\r\n";
+        assert_eq!(netstat_listener(text, 8080), Some(4242));
+        assert_eq!(netstat_listener(text, 9000), Some(31));
+        assert_eq!(netstat_listener(text, 135), Some(900));
+        assert_eq!(netstat_listener(text, 50000), None);
+        assert_eq!(netstat_listener(text, 1), None);
+    }
+
+    #[test]
     fn the_owner_of_a_port_is_found() {
         let l = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
         let port = l.local_addr().unwrap().port();
-        if !Path::new("/proc/net/tcp").exists() {
+        // Linux with /proc, and Windows (netstat); macOS needs lsof.
+        if !cfg!(windows) && !Path::new("/proc/net/tcp").exists() {
             return;
         }
         let (pid, _) = port_owner(port).expect("this process listens");

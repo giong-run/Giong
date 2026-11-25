@@ -74,6 +74,7 @@ dependencies = [
  "giong-tls",
  "libc",
  "miniz_oxide",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -85,6 +86,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

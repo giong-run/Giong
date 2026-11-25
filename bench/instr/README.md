@@ -44,31 +44,31 @@ instructions per request.
 
 | case | one operation | io_uring | epoll |
 |---|---|---:|---:|
-| `spawn` | spawn a task that returns at once and await it | 1,342 | 1,097 |
-| `yield` | `yield_now`: one trip through the run queue | 479 | 357 |
+| `spawn` | spawn a task that returns at once and await it | 1,100 | 996 |
+| `yield` | `yield_now`: one trip through the run queue | 358 | 306 |
 | `oneshot` | a oneshot channel: create, send, receive | 278 | 278 |
-| `channel` | a round trip between two tasks over two bounded channels | 1,686 | 1,442 |
+| `channel` | a round trip between two tasks over two bounded channels | 1,444 | 1,342 |
 | `timeout` | a timeout around a future that is ready at once | 98 | 98 |
-| `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,328 | 4,283 |
-| `udp-echo` | a 64-byte datagram to an echo task and back | 3,826 | 4,584 |
-| `file-read` | read 4 KiB at an offset of an open file (page cache) | 191 | 242 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 8,401 | 9,264 |
-| `http1-client` | giong-http client and server, HTTP/1.1 | 21,861 | 22,894 |
-| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 29,926 | 30,826 |
-| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 241,110 | 242,171 |
-| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 33,966 | 34,984 |
-| `web` | a giong-web router with a path parameter, raw client | 11,385 | 12,254 |
-| `redis-get` | giong-redis `GET` against a fake server | 8,068 | 8,639 |
-| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 9,960 | 10,575 |
-| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,409 | 14,024 |
+| `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,464 | 4,403 |
+| `udp-echo` | a 64-byte datagram to an echo task and back | 3,962 | 4,704 |
+| `file-read` | read 4 KiB at an offset of an open file (page cache) | 191 | 243 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 8,587 | 9,428 |
+| `http1-client` | giong-http client and server, HTTP/1.1 | 22,041 | 23,064 |
+| `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 29,918 | 30,939 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 241,007 | 242,026 |
+| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 34,146 | 35,148 |
+| `web` | a giong-web router with a path parameter, raw client | 11,565 | 12,412 |
+| `redis-get` | giong-redis `GET` against a fake server | 8,044 | 8,741 |
+| `postgres-query` | giong-postgres query, one parameter, one row, fake server | 9,854 | 10,595 |
+| `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,317 | 14,058 |
 
-A worker that goes to sleep reads the clock twice, so that `Handle::pulse` can say how long
-it was idle. Those readings went through `Instant` (a subtraction from an epoch, then a
-`Duration` turned back into nanoseconds), about 70 instructions each; they now read
-`CLOCK_MONOTONIC` directly. Every case in which the worker sleeps once per operation moved
-by about 284 instructions: `tcp-echo` 3,612 to 3,328 on io_uring (−7.9%) and 4,567 to 4,283
-on epoll (−6.2%), `udp-echo` −6.9% and −5.8%, `http1` −3.3% and −3.0%, the database cases
-−2% to −3.4%.
+Each turn of a worker's event loop called helpers out of line that almost always find
+nothing to do: the deferred-close list, the timers, the io_uring completion queue, and the
+drop of the empty vector of finished resources the driver hands back. Their tests are now
+inline and their work out of line ([#288](https://github.com/giong-run/Giong/issues/288)):
+`yield` 481 to 358 on io_uring (−25.6%) and 359 to 306 on epoll (−14.6%), `spawn` −18.3%
+and −9.5%, `channel` −14.6% and −7.3%, `tcp-echo` −4.1% and −3.6%, the database cases −2%
+to −3.9%.
 
 The io_uring driver's state changed shape with
 [#322](https://github.com/giong-run/Giong/issues/322) (a bound on received data waiting on the

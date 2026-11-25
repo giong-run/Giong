@@ -16,14 +16,18 @@ use crate::scaffold::{self, Options, Template};
 pub const COMMAND: Command = Command {
     name: "new",
     summary: "start a project: an HTTP API, a gRPC service or a worker",
-    usage: "giong new <path> [--template web|grpc|worker] [--db postgres,mysql,redis] [--tls]\n\n\
+    usage:
+        "giong new <path> [--template web|grpc|worker] [--db sqlite|postgres|mysql|none[,redis]] \
+            [--tls]\n\n\
             Writes a project that builds and passes its tests: Cargo.toml with fast dev \
             builds, the service (one worker per core, graceful shutdown, giong-mcp), an end to \
             end test, .env.example, a Dockerfile, a GitHub Actions workflow, and the files \
             coding agents read (giong ai init). The directory must not exist or be empty; its \
             last part is the package name unless --name gives one.\n\n\
-            web: routes and JSON on giong-web; with --db a users API (postgres or mysql; with \
-            redis as a cache too), or counters in redis. grpc: a service from a .proto, no \
+            web: routes and JSON on giong-web, and a users API on SQLite (a file in the \
+            project: nothing to install or start); --db postgres or mysql puts it on that \
+            server instead, redis adds a cache (--db redis alone: counters in redis), --db none \
+            leaves the store out. grpc: a service from a .proto, no \
             protoc needed. worker: jobs from a postgres or mysql table or a redis list, or a \
             job on a timer.",
     flags: &[
@@ -35,7 +39,8 @@ pub const COMMAND: Command = Command {
         Flag {
             name: "db",
             kind: Kind::Value,
-            help: "the stores, separated by commas: postgres or mysql, and redis",
+            help: "the stores, separated by commas: sqlite (web's default), postgres or mysql, \
+                   and redis; none for no store",
         },
         Flag {
             name: "tls",
@@ -103,7 +108,10 @@ fn options(args: &Args) -> Result<(PathBuf, Options), Failure> {
         })?,
     };
     let mut o = Options::new(&name, template);
-    o.dbs = scaffold::parse_dbs(args.value("db").unwrap_or(""))?;
+    o.dbs = match args.value("db") {
+        Some(list) => scaffold::parse_dbs(list)?,
+        None => scaffold::default_dbs(template),
+    };
     o.tls = args.has("tls");
     if let Some(path) = args.value("giong-path") {
         let checkout = fs::canonicalize(path)
@@ -367,7 +375,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
     let cd = format!("cd {}", dir.display());
     let mut next = vec![cd];
     let offer = ai::Offer::here();
-    if !o.dbs.is_empty() && offer.db {
+    if o.dbs.iter().any(|d| d.has_server()) && offer.db {
         next.push("giong db up".into());
     }
     next.push(
@@ -412,6 +420,7 @@ fn db_list(o: &Options) -> String {
         .map(|d| match d {
             scaffold::Db::Postgres => "PostgreSQL",
             scaffold::Db::Mysql => "MySQL",
+            scaffold::Db::Sqlite => "SQLite",
             scaffold::Db::Redis => "Redis",
         })
         .collect();
@@ -445,6 +454,16 @@ mod tests {
         assert!(o.tls);
         let (_, o) = options(&parse("new . --name svc --template worker")).unwrap();
         assert_eq!((o.name.as_str(), o.template), ("svc", Template::Worker));
+        assert_eq!(o.dbs, []);
+        // web keeps its users in SQLite unless --db says otherwise.
+        let (_, o) = options(&parse("new api")).unwrap();
+        assert_eq!(o.dbs, [scaffold::Db::Sqlite]);
+        let (_, o) = options(&parse("new api --db none")).unwrap();
+        assert_eq!(o.dbs, []);
+        let (_, o) = options(&parse("new api --db sqlite,redis")).unwrap();
+        assert_eq!(o.dbs, [scaffold::Db::Sqlite, scaffold::Db::Redis]);
+        let (_, o) = options(&parse("new api --template grpc")).unwrap();
+        assert_eq!(o.dbs, []);
 
         let code = |line: &str| options(&parse(line)).unwrap_err().code;
         assert_eq!(code("new"), Code::USAGE);
@@ -458,6 +477,11 @@ mod tests {
         assert_eq!(code("new x --template rocket"), Code::BAD_TEMPLATE_CHOICE);
         assert_eq!(code("new x --db mongo"), Code::BAD_TEMPLATE_CHOICE);
         assert_eq!(code("new x --db postgres,mysql"), Code::BAD_TEMPLATE_CHOICE);
+        assert_eq!(code("new x --db sqlite,mysql"), Code::BAD_TEMPLATE_CHOICE);
+        assert_eq!(
+            code("new x --template worker --db sqlite"),
+            Code::BAD_TEMPLATE_CHOICE
+        );
         assert_eq!(
             code("new x --template grpc --db redis"),
             Code::BAD_TEMPLATE_CHOICE
@@ -488,14 +512,15 @@ mod tests {
         assert!(r.ok());
         assert!(dir.join("Cargo.toml").is_file());
         assert!(dir.join(".github/workflows/ci.yml").is_file());
-        assert!(dir.join("src/hello.rs").is_file());
+        assert!(dir.join("src/db.rs").is_file());
+        assert!(dir.join("src/users.rs").is_file());
         let files = r.data_value("files").unwrap().as_array().unwrap().len();
-        assert_eq!(
-            files,
-            scaffold::render(&Options::new(&project_name(&dir).unwrap(), Template::Web))
-                .unwrap()
-                .len()
-        );
+        let mut o = Options::new(&project_name(&dir).unwrap(), Template::Web);
+        o.dbs = vec![scaffold::Db::Sqlite];
+        assert_eq!(files, scaffold::render(&o).unwrap().len());
+        // Nothing to start: the next steps go straight to giong dev.
+        let next = r.data_value("next").unwrap().as_array().unwrap().clone();
+        assert!(!next.iter().any(|s| s == "giong db up"), "{next:?}");
 
         let again = run(&parse(&format!("new {} --no-git", dir.display()))).unwrap_err();
         assert_eq!(again.code, Code::TARGET_NOT_EMPTY);

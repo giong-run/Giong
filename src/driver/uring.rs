@@ -1666,7 +1666,18 @@ impl Uring {
     }
 
     /// Dispatches every completion currently in the completion queue.
+    /// Handles every completion waiting. Called on every turn, and on a
+    /// busy worker usually with none: that test is inline, the work out of
+    /// line.
+    #[inline]
     fn reap(&mut self) {
+        if !self.ring.completion().is_empty() {
+            self.reap_now();
+        }
+    }
+
+    #[inline(never)]
+    fn reap_now(&mut self) {
         let mut batch = mem::take(&mut self.cqes);
         loop {
             batch.clear();

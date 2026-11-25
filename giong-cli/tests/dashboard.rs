@@ -549,18 +549,19 @@ fn giong_dev_runs_without_the_dashboard_when_its_ports_are_taken() {
     if !have_cargo() {
         return;
     }
-    // Ten free ports in a row, held while giong dev starts.
-    let held = (0..50)
-        .find_map(|_| {
-            let first = std::net::TcpListener::bind("127.0.0.1:0").ok()?;
-            let base = first.local_addr().ok()?.port();
-            if base > u16::MAX - 10 {
-                return None;
-            }
-            let mut all = vec![first];
-            for p in base + 1..base + 10 {
-                all.push(std::net::TcpListener::bind(("127.0.0.1", p)).ok()?);
-            }
+    // Ten free ports in a row, held while giong dev starts. Looked for
+    // below the ports the system hands out to connections (from 32768 on
+    // Linux, 49152 on macOS and Windows): among those, the connections of
+    // the tests running alongside left no ten in a row free on a busy
+    // machine. Where to start depends on the process, so that two runs at
+    // once look in different places.
+    let start = std::process::id() as usize % 1200;
+    let held = (0..1200)
+        .find_map(|i| {
+            let base = 20_000 + ((start + i) % 1200) as u16 * 10;
+            let all = (base..base + 10)
+                .map(|p| std::net::TcpListener::bind(("127.0.0.1", p)).ok())
+                .collect::<Option<Vec<_>>>()?;
             Some((base, all))
         })
         .expect("ten free ports in a row");

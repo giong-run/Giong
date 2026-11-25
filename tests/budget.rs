@@ -220,6 +220,35 @@ fn raising_a_limit_lets_waiting_calls_through() {
     });
 }
 
+/// A limit lowered below a reservation that waits fails that reservation
+/// with `GIONG-E0081`, as it would have failed when asked, instead of
+/// leaving it at the head of the queue, where it could never be granted and
+/// every reservation behind it would wait for ever.
+#[test]
+fn lowering_the_memory_limit_below_a_waiting_reservation_fails_it_with_e0081() {
+    giong::block_on(async {
+        let b = Budget::new("t", Limits::new().memory(1000));
+        let held = b.try_reserve(800).unwrap();
+        let mut big = Box::pin(b.reserve(600));
+        assert!(poll_once(&mut big).is_none());
+        let mut small = Box::pin(b.reserve(10));
+        assert!(poll_once(&mut small).is_none());
+        assert_eq!(b.stats().memory.waiting, 2);
+
+        b.set_limits(Limits::new().memory(500));
+        let err = big.await.unwrap_err();
+        assert_eq!(error::code(&err), Some(Code::BudgetTooSmall));
+        assert_eq!(b.stats().memory.waiting, 1);
+        // The small one waits only for the 800 bytes held, under the new
+        // limit.
+        drop(held);
+        let small = small.await.unwrap();
+        assert_eq!(small.bytes(), 10);
+        assert_eq!(b.stats().memory.used, 10);
+        assert_eq!(b.stats().memory.waiting, 0);
+    });
+}
+
 /// A connected pair; nothing is ever written to the second.
 async fn pair() -> (TcpStream, std::net::TcpStream) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();

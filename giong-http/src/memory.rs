@@ -21,11 +21,19 @@
 //! macOS has no cgroups: what is left there is what the machine has, its
 //! free and inactive pages (the kernel's `host_statistics64`), the figure
 //! `vm_stat` prints and monitoring tools call "available".
+//!
+//! Windows has no cgroups either. What is left there is the smaller of the
+//! machine's available physical memory and, when the process runs in a job
+//! object with a memory limit (a Windows container, a service manager that
+//! caps memory), that limit minus what the process or the job has committed.
 
 use std::cell::RefCell;
 use std::fs::{self, File};
 use std::io;
+#[cfg(unix)]
 use std::os::unix::fs::FileExt;
+#[cfg(windows)]
+use std::os::windows::fs::FileExt;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
@@ -126,6 +134,8 @@ pub(crate) fn auto_reserve() -> u64 {
                 .and_then(|text| field(&text, "MemTotal:").map(|kib| kib * 1024)),
             #[cfg(target_os = "macos")]
             None => mac::total(),
+            #[cfg(windows)]
+            None => win::total(),
         };
         total.map_or(MIN_RESERVE, reserve_for)
     })
@@ -255,6 +265,11 @@ impl Watch {
         mac::available()
     }
 
+    #[cfg(windows)]
+    fn machine_free(&mut self) -> Option<u64> {
+        win::available()
+    }
+
     #[cfg(target_os = "linux")]
     fn machine_free(&mut self) -> Option<u64> {
         let text = read_all(self.meminfo.as_ref()?, &mut self.buf).ok()?;
@@ -334,6 +349,107 @@ mod mac {
     }
 }
 
+/// The machine's memory on Windows, and the limit of the job object the
+/// process may run in.
+#[cfg(windows)]
+mod win {
+    use std::mem::{size_of, zeroed};
+    use std::ptr::{addr_of_mut, null_mut};
+
+    use windows_sys::Win32::System::JobObjects::{
+        JobObjectExtendedLimitInformation, QueryInformationJobObject,
+        JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JOB_OBJECT_LIMIT_JOB_MEMORY,
+        JOB_OBJECT_LIMIT_PROCESS_MEMORY,
+    };
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS, PROCESS_MEMORY_COUNTERS_EX,
+    };
+    use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+
+    /// The physical memory installed, and what of it is available now.
+    fn machine() -> Option<(u64, u64)> {
+        // SAFETY: all-zero is a valid value of this plain structure.
+        let mut status: MEMORYSTATUSEX = unsafe { zeroed() };
+        status.dwLength = size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: a structure of the size its first field gives.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) };
+        (ok != 0 && status.ullTotalPhys > 0).then_some((status.ullTotalPhys, status.ullAvailPhys))
+    }
+
+    /// The memory limit of the job object the process runs in: the
+    /// smaller of its limit per process and its limit for the whole job.
+    /// `None` outside a job or in one without a memory limit.
+    fn job_limit() -> Option<u64> {
+        // SAFETY: all-zero is a valid value of this plain structure.
+        let mut info: JOBOBJECT_EXTENDED_LIMIT_INFORMATION = unsafe { zeroed() };
+        // SAFETY: a null job handle asks about the job of the calling
+        // process; the structure is of the size given. Outside a job the
+        // call succeeds with no limit flags.
+        let ok = unsafe {
+            QueryInformationJobObject(
+                null_mut(),
+                JobObjectExtendedLimitInformation,
+                addr_of_mut!(info).cast(),
+                size_of::<JOBOBJECT_EXTENDED_LIMIT_INFORMATION>() as u32,
+                null_mut(),
+            )
+        };
+        if ok == 0 {
+            return None;
+        }
+        let flags = info.BasicLimitInformation.LimitFlags;
+        let process = (flags & JOB_OBJECT_LIMIT_PROCESS_MEMORY != 0)
+            .then_some(info.ProcessMemoryLimit as u64);
+        let job = (flags & JOB_OBJECT_LIMIT_JOB_MEMORY != 0).then_some(info.JobMemoryLimit as u64);
+        match (process, job) {
+            (Some(p), Some(j)) => Some(p.min(j)),
+            (p, j) => p.or(j),
+        }
+    }
+
+    /// The memory the process has committed (its private bytes).
+    fn committed() -> Option<u64> {
+        // SAFETY: all-zero is a valid value of this plain structure.
+        let mut counters: PROCESS_MEMORY_COUNTERS_EX = unsafe { zeroed() };
+        let size = size_of::<PROCESS_MEMORY_COUNTERS_EX>() as u32;
+        // SAFETY: the pseudo handle of this process, and a structure of the
+        // size given, which extends the one the call is declared with.
+        let ok = unsafe {
+            K32GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                addr_of_mut!(counters).cast::<PROCESS_MEMORY_COUNTERS>(),
+                size,
+            )
+        };
+        (ok != 0).then_some(counters.PrivateUsage as u64)
+    }
+
+    /// The memory the process may use at most: the job's limit, or the
+    /// machine's memory.
+    pub(super) fn total() -> Option<u64> {
+        let machine = machine().map(|(total, _)| total);
+        match (job_limit(), machine) {
+            (Some(limit), Some(total)) => Some(limit.min(total)),
+            (Some(limit), None) => Some(limit),
+            (None, total) => total,
+        }
+    }
+
+    /// The memory left to the process: what the machine has available, and
+    /// under a job's limit what the limit leaves. A limit on the whole job
+    /// is compared with this process's commit, which is all of the job's
+    /// for a service alone in its container.
+    pub(super) fn available() -> Option<u64> {
+        let machine = machine().map(|(_, available)| available);
+        let job = job_limit().and_then(|limit| Some(limit.saturating_sub(committed()?)));
+        match (machine, job) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
 /// The whole of a small file kept open (a cgroup or `/proc` file, which
 /// is generated on each read from offset 0).
 fn read_all<'a>(file: &File, buf: &'a mut Vec<u8>) -> io::Result<&'a [u8]> {
@@ -345,7 +461,11 @@ fn read_all<'a>(file: &File, buf: &'a mut Vec<u8>) -> io::Result<&'a [u8]> {
         let at = buf.len();
         let cap = buf.capacity();
         buf.resize(cap, 0);
-        match file.read_at(&mut buf[at..], at as u64) {
+        #[cfg(unix)]
+        let read = file.read_at(&mut buf[at..], at as u64);
+        #[cfg(windows)]
+        let read = file.seek_read(&mut buf[at..], at as u64);
+        match read {
             Ok(0) => {
                 buf.truncate(at);
                 return Ok(buf);
@@ -376,7 +496,7 @@ fn reclaimable(stat: &str, v2: bool) -> u64 {
 }
 
 /// A `/proc/meminfo` field, in KiB.
-#[cfg_attr(target_os = "macos", allow(dead_code))]
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn field(meminfo: &str, name: &str) -> Option<u64> {
     let line = meminfo.lines().find_map(|line| line.strip_prefix(name))?;
     line.trim().trim_end_matches("kB").trim().parse().ok()

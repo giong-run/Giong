@@ -48,12 +48,14 @@ pub const COMMAND: Command = Command {
             claude mcp add giong -- giong mcp (giong ai init writes .mcp.json for you).\n\n\
             The tools only read unless --allow-writes is given; then they may also change the \
             project (dev --background and stop, clean, fix, env init, db up/migrate/new, record \
-            save, bench, image). db reset, db down --volumes, clean --all, env get and --reveal are never tools.",
+            save, bench, image, upgrade). db reset, db down --volumes, clean --all, env get, --reveal \
+            and upgrade --self are never tools.",
     flags: &[Flag {
         name: "allow-writes",
         kind: Kind::Switch,
         help: "let the tools change the project too (dev --background and stop, clean, fix, env \
-               init, db up/migrate/new, record save, bench, image); never db reset, db down --volumes, clean --all or secrets",
+               init, db up/migrate/new, record save, bench, image, upgrade); never db reset, db \
+               down --volumes, clean --all, upgrade --self or secrets",
     }],
     max_words: 0,
     run,
@@ -89,6 +91,9 @@ pub struct Policy {
     /// The access of one use, from its words and the flags it sets.
     pub access: fn(words: &[&str], flags: &[&str]) -> Access,
 }
+
+/// Set in the environment of every command run as a tool.
+pub const TOOL_ENV: &str = "GIONG_MCP_TOOL";
 
 /// The commands that are tools. `dashboard` never returns, `help`
 /// and `version` say nothing an agent needs, `new` and `ai` write a whole
@@ -220,6 +225,25 @@ pub const POLICIES: &[Policy] = &[
         },
     },
     Policy {
+        name: "upgrade",
+        reads: "--dry-run says what moving the project to the newest giong release would change",
+        writes: "moves the project's giong crates to a release (Cargo.toml, Cargo.lock, agent \
+                 files), put back as they were if cargo check fails",
+        never: "--self, or a release newer than the giong command (that replaces the command \
+                itself: a person runs it)",
+        destructive: false,
+        idempotent: true,
+        access: |_, flags| {
+            if flags.contains(&"self") {
+                Access::Never
+            } else if flags.contains(&"dry-run") {
+                Access::Read
+            } else {
+                Access::Write
+            }
+        },
+    },
+    Policy {
         name: "image",
         reads: "",
         writes: "builds a container image (--load into the local engine)",
@@ -332,8 +356,8 @@ pub fn handle(msg: &Value, writes: bool) -> Option<Value> {
                         document: findings carry a GIONG-E code, a fix and, when giong fix can apply \
                         it, edits. Pass `dir` to run in a project other than the current directory. \
                         Writes are allowed (dev --background and dev stop, clean, fix, env init, \
-                        db up/migrate/new, record save, bench, image); db reset, db down, clean \
-                        --all and secrets are not tools: ask the person to run them. To run the \
+                        db up/migrate/new, record save, bench, image, upgrade); db reset, db \
+                        down, clean --all, upgrade --self and secrets are not tools: ask the person to run them. To run the \
                         service: dev with background once (it serves on localhost and rebuilds on \
                         every save), then dev status and dev logs; dev stop when done. Not cargo \
                         run, a release build or a container."
@@ -553,6 +577,9 @@ pub fn call(name: &str, args: &Value, writes: bool) -> Result<Value, String> {
     let exe = std::env::current_exe().map_err(|e| format!("giong cannot find itself: {e}"))?;
     let mut cmd = Process::new(exe);
     cmd.args(&argv)
+        // What a tool must not do although its policy allows the command
+        // (giong upgrade replacing the giong command itself) checks this.
+        .env(TOOL_ENV, "1")
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
@@ -717,6 +744,10 @@ mod tests {
         assert_eq!(access("record", &["save"], &[]), Access::Write);
         assert_eq!(access("record", &["drop"], &[]), Access::Never);
         assert_eq!(access("image", &[], &["push"]), Access::Never);
+        assert_eq!(access("upgrade", &[], &["self"]), Access::Never);
+        assert_eq!(access("upgrade", &[], &["self", "dry-run"]), Access::Never);
+        assert_eq!(access("upgrade", &[], &["dry-run"]), Access::Read);
+        assert_eq!(access("upgrade", &[], &["to"]), Access::Write);
         assert_eq!(access("openapi", &[], &["out"]), Access::Write);
         assert_eq!(access("bench", &[], &["rate"]), Access::Write);
         assert_eq!(access("dev", &[], &[]), Access::Never);

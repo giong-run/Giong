@@ -48,6 +48,7 @@ fn giong(cwd: &Path, args: &[&str]) -> (i32, Value) {
     cmd.args(args)
         .arg("--json")
         .current_dir(cwd)
+        .env("GIONG_HOME", home_of(cwd))
         .env_remove("WORKERS");
     for k in OUTER_BUILD {
         cmd.env_remove(k);
@@ -61,6 +62,11 @@ fn giong(cwd: &Path, args: &[&str]) -> (i32, Value) {
         )
     });
     (out.status.code().unwrap_or(-1), v)
+}
+
+/// The `GIONG_HOME` of a run in `cwd`: next to it, not in the user's.
+fn home_of(cwd: &Path) -> PathBuf {
+    PathBuf::from(format!("{}.home", cwd.display()))
 }
 
 /// An HTTP/1.1 keep-alive server: `/fail` answers 500, anything else 200
@@ -108,6 +114,19 @@ fn finding<'a>(v: &'a Value, code: &str) -> &'a Value {
         .iter()
         .find(|f| f["code"] == code)
         .unwrap_or_else(|| panic!("no {code} in {v}"))
+}
+
+/// A port nothing listens on. A port the system handed out and took back
+/// is no good: the other tests here run alongside and bind port 0, so one of
+/// their servers can get it and answer the probe. This one is below the
+/// system's ephemeral ports (from 32768 on Linux, 49152 on macOS and
+/// Windows), which binding port 0 never gives.
+fn closed_port() -> u16 {
+    let pid = std::process::id() as usize;
+    (0..2000)
+        .map(|i| 20_000 + ((pid + i * 7) % 12_000) as u16)
+        .find(|&p| TcpListener::bind(("127.0.0.1", p)).is_ok())
+        .expect("a free port from 20000 to 31999")
 }
 
 fn scratch(tag: &str) -> PathBuf {
@@ -229,11 +248,7 @@ fn failures_are_reported_and_refusals_are_coded() {
     assert_eq!(r["statuses"]["500"], r["statuses"]["200"]);
 
     // Nothing listens: the probe finds no answer.
-    let closed = TcpListener::bind("127.0.0.1:0")
-        .unwrap()
-        .local_addr()
-        .unwrap()
-        .port();
+    let closed = closed_port();
     let (code, v) = giong(&dir, &["bench", &format!("http://127.0.0.1:{closed}/")]);
     assert_eq!(code, 2, "{v}");
     assert_eq!(v["error"]["code"], "GIONG-E5060");
@@ -440,6 +455,11 @@ fn a_project_is_built_started_and_compared_with_a_commit() {
         .output()
         .unwrap();
     assert_eq!(String::from_utf8_lossy(&list.stdout).lines().count(), 1);
+    // It was made under GIONG_HOME, never below the temporary directory,
+    // where any user can put a .cargo/config.toml that the build would read.
+    let worktrees = home_of(&dir).join("bench");
+    assert!(worktrees.is_dir(), "{}", worktrees.display());
+    assert_eq!(std::fs::read_dir(&worktrees).unwrap().count(), 0);
 
     // The same code twice: no regression, and the report says it is noise.
     git(&dir, &["checkout", "-q", "--", "src/main.rs"]);
@@ -510,4 +530,5 @@ fn a_service_that_exits_is_reported_with_its_log() {
         "{v}"
     );
     let _ = std::fs::remove_dir_all(&dir);
+    let _ = std::fs::remove_dir_all(home_of(&dir));
 }

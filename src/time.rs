@@ -291,6 +291,28 @@ impl Timers {
         None
     }
 
+    /// Gives back the timer table a burst of timers left behind, once it
+    /// is mostly vacant (see [`Slab::trim`]): for the event loop, before
+    /// it sleeps.
+    /// Returns whether the table may need it again (see
+    /// [`Slab::trim_armed`]).
+    pub(crate) fn trim(&mut self) -> bool {
+        if self.entries.trim_due() {
+            self.entries.trim();
+        }
+        self.entries.trim_armed()
+    }
+
+    /// See [`Slab::watch_growth`].
+    ///
+    /// # Safety
+    ///
+    /// As for [`Slab::watch_growth`].
+    pub(crate) unsafe fn watch_growth(&mut self, flag: &std::cell::Cell<u8>, bit: u8) {
+        // SAFETY: passed on from the caller.
+        unsafe { self.entries.watch_growth(flag, bit) };
+    }
+
     /// When the event loop must wake up next for timers: at the earliest
     /// deadline itself, not at the start of its millisecond, unless timers
     /// fired less than a tick ago (see `quiet_until`).
@@ -387,6 +409,12 @@ impl Timers {
 
     pub(crate) fn len(&self) -> usize {
         self.entries.len()
+    }
+
+    /// The timer table's length in slots, occupied or not.
+    #[cfg(test)]
+    pub(crate) fn slots(&self) -> usize {
+        self.entries.slots()
     }
 }
 

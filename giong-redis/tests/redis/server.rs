@@ -92,7 +92,7 @@ impl Server {
 
 fn find_bin() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("GIONG_REDIS_BIN") {
-        let bin = PathBuf::from(dir).join("redis-server");
+        let bin = PathBuf::from(dir).join(exe("redis-server"));
         return bin.exists().then_some(bin);
     }
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
@@ -100,18 +100,38 @@ fn find_bin() -> Option<PathBuf> {
         .unwrap_or_default();
     std::iter::once(PathBuf::from("/usr/bin"))
         .chain(path_dirs)
-        .map(|d| d.join("redis-server"))
+        .map(|d| d.join(exe("redis-server")))
         .find(|p| p.exists())
+}
+
+/// Kills the process `pid` this binary started and waits for it to go.
+#[cfg(unix)]
+fn kill(pid: i32) {
+    // SAFETY: plain system calls on a child process we started.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+}
+
+#[cfg(windows)]
+fn kill(pid: i32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// `name` with the system's suffix for programs (`.exe` on Windows).
+fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
 extern "C" fn stop_server() {
     let pid = PID.load(Ordering::SeqCst);
     if pid > 0 {
-        // SAFETY: plain system calls on a child process we started.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
-        }
+        kill(pid);
     }
     if let Some(dir) = DIR.get() {
         let _ = std::fs::remove_dir_all(dir);
@@ -121,40 +141,18 @@ extern "C" fn stop_server() {
 /// A port on 127.0.0.1 that refuses connections for as long as the
 /// returned socket lives: it is bound there and not listening, so nothing
 /// else can take the port and answer in the meantime.
-pub fn closed_port() -> (std::os::fd::OwnedFd, u16) {
-    use std::os::fd::FromRawFd;
-    // SAFETY: socket, bind and getsockname on a socket this function owns,
-    // with a sockaddr_in of the size given.
-    unsafe {
-        // (Close-on-exec matters only where a server is started while the
-        // socket lives; macOS has no flag for it at creation.)
-        #[cfg(target_os = "linux")]
-        let kind = libc::SOCK_STREAM | libc::SOCK_CLOEXEC;
-        #[cfg(target_os = "macos")]
-        let kind = libc::SOCK_STREAM;
-        let fd = libc::socket(libc::AF_INET, kind, 0);
-        assert!(fd >= 0, "socket: {}", std::io::Error::last_os_error());
-        let fd = std::os::fd::OwnedFd::from_raw_fd(fd);
-        let mut addr: libc::sockaddr_in = std::mem::zeroed();
-        addr.sin_family = libc::AF_INET as libc::sa_family_t;
-        addr.sin_addr.s_addr = u32::from(std::net::Ipv4Addr::LOCALHOST).to_be();
-        let mut len = std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t;
-        use std::os::fd::AsRawFd;
-        let raw = fd.as_raw_fd();
-        assert_eq!(
-            libc::bind(raw, std::ptr::addr_of!(addr).cast(), len),
-            0,
-            "bind: {}",
-            std::io::Error::last_os_error()
-        );
-        assert_eq!(
-            libc::getsockname(raw, std::ptr::addr_of_mut!(addr).cast(), &mut len),
-            0,
-            "getsockname: {}",
-            std::io::Error::last_os_error()
-        );
-        (fd, u16::from_be(addr.sin_port))
-    }
+pub fn closed_port() -> (socket2::Socket, u16) {
+    use socket2::{Domain, Socket, Type};
+    let sock = Socket::new(Domain::IPV4, Type::STREAM, None).expect("socket");
+    sock.bind(&std::net::SocketAddr::from(([127, 0, 0, 1], 0)).into())
+        .expect("bind");
+    let port = sock
+        .local_addr()
+        .expect("getsockname")
+        .as_socket()
+        .expect("an IPv4 address")
+        .port();
+    (sock, port)
 }
 
 /// A port for the server that nothing listens on now, below the kernel's

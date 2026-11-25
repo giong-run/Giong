@@ -234,9 +234,12 @@ pub fn tar(entries: &[Entry], mtime: u64) -> Result<Vec<u8>, String> {
         } else {
             // Split at a '/' so the prefix is at most 155 bytes and the rest
             // at most 100.
-            // (Not at the '/' that ends a directory's name.)
-            let cut = name[..(name.len() - 1).min(156)]
-                .rfind('/')
+            // (Not at the '/' that ends a directory's name.) Looked for
+            // among the bytes: a byte count can fall inside a character of
+            // a name that is not ASCII, and a '/' byte never does.
+            let cut = name.as_bytes()[..(name.len() - 1).min(156)]
+                .iter()
+                .rposition(|&b| b == b'/')
                 .filter(|&i| name.len() - i - 1 <= 100)
                 .ok_or_else(|| format!("a path longer than a tar header holds: {name}"))?;
             (&name[..cut], &name[cut + 1..])
@@ -450,11 +453,24 @@ fn collect(root: &Path, rel: &str, out: &mut Vec<Entry>) -> Result<(), Failure> 
         .collect::<Vec<_>>()
         .join("/");
     if meta.is_dir() {
-        let mut names: Vec<_> = std::fs::read_dir(&full)
-            .map_err(|e| bad(format!("{rel}: {e}")))?
-            .filter_map(Result::ok)
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .collect();
+        let mut names = Vec::new();
+        for e in std::fs::read_dir(&full).map_err(|e| bad(format!("{rel}: {e}")))? {
+            let name = e.map_err(|e| bad(format!("{rel}: {e}")))?.file_name();
+            // Written as UTF-8 in the image: a name that is not would be
+            // renamed there (with U+FFFD), and the service would not find
+            // its file.
+            let name = name.into_string().map_err(|name| {
+                Failure::new(
+                    Code::IMAGE_ADD,
+                    format!(
+                        "{rel}/{} has a name that is not UTF-8",
+                        name.to_string_lossy()
+                    ),
+                    "rename the file to a UTF-8 name, or leave its folder out of --add",
+                )
+            })?;
+            names.push(name);
+        }
         names.sort();
         out.push(Entry::dir(&format!("app/{clean}"), 0o755, 0));
         for n in names {
@@ -1310,6 +1326,43 @@ mod tests {
         assert_eq!(get("home/nonroot/").2, NONROOT);
         assert_eq!(get("etc/ssl/certs/ca.crt").4.len(), 600);
         assert!(tar(&[Entry::file(&"x".repeat(300), 0o644, vec![])], 0).is_err());
+    }
+
+    /// Names that are not ASCII, in a path past a tar header's 100 bytes:
+    /// the split looked for a '/' in a string cut at a byte count, which
+    /// panicked when the count fell inside a character.
+    #[test]
+    fn long_paths_with_names_that_are_not_ascii() {
+        // Byte 156 inside a character (each of these takes three bytes).
+        let deep = format!("app/static/{}/xx{}.txt", "ả".repeat(20), "ấ".repeat(31));
+        assert!(!deep.is_char_boundary(156));
+        // The last byte inside one, past 100 bytes.
+        let tail = format!("app/static/{}/x{}", "ả".repeat(15), "ấ".repeat(33));
+        assert!(!tail.is_char_boundary(tail.len() - 1));
+        let entries = [
+            Entry::file(&deep, 0o644, b"a".to_vec()),
+            Entry::file(&tail, 0o644, b"b".to_vec()),
+        ];
+        let back = untar(&tar(&entries, 0).unwrap());
+        let get = |n: &str| back.iter().find(|x| x.0 == n).map(|x| x.4.clone());
+        assert_eq!(get(&deep), Some(b"a".to_vec()));
+        assert_eq!(get(&tail), Some(b"b".to_vec()));
+    }
+
+    /// A name that is not UTF-8 would be renamed in the image: refused.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn names_that_are_not_utf8_are_refused() {
+        use std::os::unix::ffi::OsStrExt;
+        let root = std::env::temp_dir().join(format!("giongimagenames-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("static")).unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"caf\xe9.txt");
+        std::fs::write(root.join("static").join(name), "x").unwrap();
+        let e = collect(&root, "static", &mut Vec::new()).unwrap_err();
+        assert_eq!(e.code, Code::IMAGE_ADD);
+        assert!(e.what.contains("not UTF-8"), "{}", e.what);
+        let _ = std::fs::remove_dir_all(&root);
     }
 
     #[test]

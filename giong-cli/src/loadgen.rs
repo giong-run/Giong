@@ -520,6 +520,8 @@ impl Conn {
             let size = std::str::from_utf8(&line)
                 .ok()
                 .map(|l| l.split(';').next().unwrap_or("").trim())
+                // Hex digits only: from_str_radix alone also takes "+5".
+                .filter(|h| h.bytes().all(|b| b.is_ascii_hexdigit()))
                 .and_then(|h| usize::from_str_radix(h, 16).ok())
                 .ok_or(Fail::Http("a chunk size that is not hex"))?;
             if size == 0 {
@@ -718,6 +720,21 @@ mod tests {
         );
         assert_eq!(o.error_statuses(), o.statuses[&404]);
         assert_eq!(o.connects, 4, "keep-alive reuses connections");
+    }
+
+    #[test]
+    fn a_chunk_size_with_a_sign_is_not_hex() {
+        // u64::from_str_radix alone takes "+3".
+        let addr = serve(
+            vec![b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n+3\r\nabc\r\n0\r\n\r\n"],
+            None,
+        );
+        let mut p = plan(addr, Some(50.0));
+        p.duration = Duration::from_millis(100);
+        let o = run(&p);
+        assert_eq!(o.answered(), 0, "{o:?}");
+        let e = o.first_error.unwrap();
+        assert!(e.contains("not hex"), "{e}");
     }
 
     #[test]

@@ -306,6 +306,155 @@ fn background_with_a_broken_build_returns_the_error() {
     );
 }
 
+/// `giong dev status --json` of the project: its data and findings.
+fn status(dir: &TempDir, port: u16) -> serde_json::Value {
+    dev(dir, &["status"], port).run().report("dev")
+}
+
+/// Waits until the state is `failed` with a failure of `stage`, and says
+/// what the status was when it never is.
+fn wait_failed(dir: &TempDir, port: u16, stage: &str) {
+    let start = Instant::now();
+    loop {
+        let v = status(dir, port);
+        if v["data"]["state"] == "failed" && v["data"]["failure"]["stage"] == stage {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(240),
+            "timed out waiting for a failure at {stage}; the last status: {v:#}\nthe runner's log:\n{}",
+            std::fs::read_to_string(dir.join(".giong/runner.log")).unwrap_or_default()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// K's rule for development: a change that breaks the service shows the
+/// error, it does not leave an old build answering. Each way a change can
+/// fail (it does not compile, it stops at start-up, it stops later, its port
+/// is taken) stops what served, says why in `giong dev status` with a code,
+/// the cause and the fix, and the next save serves again.
+#[test]
+fn a_change_that_fails_stops_the_old_build_and_says_why() {
+    if !has_command("dev") || !toolchain("a_change_that_fails_stops_the_old_build_and_says_why") {
+        return;
+    }
+    let dir = project("devctl-fail");
+    let _stop = StopOnDrop(&dir);
+    let port = free_port();
+    // The address tells giong dev which port is the service's, to name who
+    // holds it (this std-only service binds it itself).
+    let listen = format!("127.0.0.1:{port}");
+    let out = dev(&dir, &["--background", "--listen", &listen], port).run();
+    out.expect_code(0);
+    wait_for("the service to answer", Duration::from_secs(240), || {
+        answers(port)
+    });
+
+    // It does not compile: the old build stops.
+    dir.write("src/main.rs", "fn main() { let x: u32 = \"no\"; }\n");
+    wait_failed(&dir, port, "build");
+    assert!(!answers(port), "an old build answers after a failed build");
+    let v = status(&dir, port);
+    let failure = &v["data"]["failure"];
+    assert_eq!(failure["code"], "GIONG-E5009", "{v:#}");
+    assert!(
+        failure["detail"].as_str().unwrap_or("").contains("main.rs"),
+        "{v:#}"
+    );
+    assert!(failure["stopped_pid"].is_u64(), "{v:#}");
+    assert_eq!(v["findings"][0]["code"], "GIONG-E5009", "{v:#}");
+    assert!(v["data"]["service_pid"].is_null(), "{v:#}");
+
+    // Back to working code: it serves without anything else to do.
+    dir.write("src/main.rs", SERVICE);
+    wait_for("the fixed build to serve", Duration::from_secs(240), || {
+        status(&dir, port)["data"]["state"] == "serving"
+    });
+    assert!(answers(port));
+    let v = status(&dir, port);
+    assert_eq!(v["data"]["state"], "serving", "{v:#}");
+    assert!(v["data"]["failure"].is_null(), "{v:#}");
+
+    // It compiles but stops at start-up.
+    dir.write(
+        "src/main.rs",
+        "fn main() { panic!(\"e2e boot failure\"); }\n",
+    );
+    wait_failed(&dir, port, "start");
+    assert!(!answers(port), "an old build answers after a failed start");
+    let v = status(&dir, port);
+    let failure = &v["data"]["failure"];
+    assert_eq!(failure["code"], "GIONG-E5017", "{v:#}");
+    assert!(
+        failure["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("e2e boot failure"),
+        "the service's last lines are missing: {v:#}"
+    );
+    assert!(
+        failure["fix"].as_str().is_some_and(|f| !f.is_empty()),
+        "{v:#}"
+    );
+    assert_eq!(v["findings"][0]["code"], "GIONG-E5017", "{v:#}");
+
+    // It starts, then stops by itself.
+    dir.write(
+        "src/main.rs",
+        &SERVICE.replace(
+            "println!(\"dev-ctl service listening on {port}\");",
+            "println!(\"dev-ctl service listening on {port}\");\n    \
+             std::thread::spawn(|| { std::thread::sleep(std::time::Duration::from_millis(1500)); \
+             panic!(\"e2e late crash\"); });",
+        ).replace("fn main() {", "fn main() {\n    std::panic::set_hook(Box::new(|i| { eprintln!(\"{i}\"); std::process::exit(101); }));"),
+    );
+    wait_failed(&dir, port, "exited");
+    let v = status(&dir, port);
+    assert!(
+        v["data"]["failure"]["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("e2e late crash"),
+        "{v:#}"
+    );
+    assert!(!answers(port), "something answers after the crash");
+
+    // Its port is taken: the finding names who holds it.
+    let holder = TcpListener::bind(("127.0.0.1", port)).unwrap();
+    dir.write("src/main.rs", SERVICE);
+    wait_failed(&dir, port, "start");
+    let v = status(&dir, port);
+    let failure = &v["data"]["failure"];
+    assert_eq!(failure["code"], "GIONG-E5014", "{v:#}");
+    if cfg!(any(target_os = "linux", windows)) {
+        assert!(
+            failure["fix"]
+                .as_str()
+                .unwrap_or("")
+                .contains(&std::process::id().to_string()),
+            "the fix does not name this process: {v:#}"
+        );
+    }
+    // Naming who holds the port reads the list of runners: the runner
+    // finds itself there and keeps its entry, so --all still lists it (and
+    // nothing changes in the folder it watches, here, where GIONG_HOME is).
+    let all = dev(&dir, &["status", "--all"], port).run().report("dev");
+    assert_eq!(
+        all["data"]["projects"].as_array().map(Vec::len),
+        Some(1),
+        "the runner left the list of runners: {all:#}"
+    );
+    drop(holder);
+    // Any save starts it again.
+    dir.write("src/main.rs", &format!("{SERVICE}\n// saved again\n"));
+    wait_for(
+        "the service to answer again",
+        Duration::from_secs(240),
+        || answers(port),
+    );
+}
+
 /// A runner killed with SIGKILL (or a reboot) leaves `.giong/dev.json`
 /// behind. Its pid can belong to any other process of this user later; giong
 /// must not report it as giong dev, refuse to start because of it, or signal

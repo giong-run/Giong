@@ -14,7 +14,10 @@ Made with `giong new` from giong {{giong_version}}.
 ## Work on it
 
 ```sh
-{{#if db}}
+{{#if servers & sqlite}}
+giong db up              # starts Redis in Docker and writes its URL into .env
+{{/if}}
+{{#if servers & !sqlite}}
 giong db up              # starts the database in Docker and writes its URL into .env
 {{/if}}
 {{#if dev_background}}
@@ -36,7 +39,8 @@ One `giong dev` per project, started once: edit the code and it swaps in the new
 {{#if worker}}
 by itself.
 {{#else}}
-without refusing a connection. Try the service on the address it prints.
+without refusing a connection. Try the service on the address it prints. A change that
+does not compile or start stops it, so nothing old answers: `giong dev status` says why.
 {{/if}}
 {{/if}}
 
@@ -56,6 +60,9 @@ Without the `giong` command, plain cargo works too: `cargo run`, `cargo test`
 {{/if}}
 {{#if web & sql}}
 | `src/users.rs` | `/users` |
+{{/if}}
+{{#if sqlite}}
+| `src/db.rs` | the SQLite database: queries on the blocking lane, one writer, several readers |
 {{/if}}
 {{#if web & redis & !sql}}
 | `src/counters.rs` | `/counters` |
@@ -87,6 +94,19 @@ Without `LISTEN` the service listens on `127.0.0.1` only; the Dockerfile sets
 `LISTEN=0.0.0.0:{{default_port}}`, and a deployment without Docker sets it too.
 {{/if}}
 
+{{#if sqlite}}
+## The database
+
+SQLite, compiled into the service: the database is the file `data/{{crate}}.db`,
+made at the first start, so there is nothing to install or start. `giong db migrate`
+applies the files of `migrations/` (it needs the `sqlite3` shell), and `giong db
+reset --yes` empties the file. The tests use a file of their own each.
+
+One process owns the file: run one copy of the service per database file (its
+workers share it). For several machines, `giong new --db postgres` writes the same
+service on PostgreSQL.
+
+{{/if}}
 ## Deploy
 
 ```sh

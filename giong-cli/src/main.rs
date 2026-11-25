@@ -13,6 +13,8 @@ mod dotenv;
 mod hist;
 mod host;
 mod lint;
+mod lockfile;
+mod manifest;
 #[cfg(windows)]
 mod noinherit;
 #[rustfmt::skip] // generated (see src/pages.rs)
@@ -23,10 +25,13 @@ mod project;
 mod record;
 mod report;
 mod scaffold;
+mod selfupdate;
 mod service;
 mod sha256;
 mod state;
 mod template;
+mod tmp;
+mod versions;
 mod watch;
 mod web_client;
 #[cfg(windows)]

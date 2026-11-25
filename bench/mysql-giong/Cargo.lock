@@ -78,6 +78,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

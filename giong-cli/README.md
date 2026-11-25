@@ -11,11 +11,12 @@ cargo install giong-cli --locked                            # anywhere Rust runs
 The install scripts download the prebuilt binary of the latest release from GitHub, check its SHA-256 and put it in `~/.giong/bin` (`%USERPROFILE%\.giong\bin` on Windows) without asking for root; where no binary is published they build it with cargo. `GIONG_VERSION=1.5.0` picks a version, `GIONG_INSTALL=/path` another folder, `GIONG_DOWNLOAD_URL` a mirror of the release downloads. Then:
 
 ```sh
-giong new api --db postgres   # a service that builds and passes its tests now
+giong new api    # a users API on SQLite that builds and passes its tests now, nothing to install
 giong doctor     # is this machine (and project) ready?
 giong dev --background  # build, run on localhost and rebuild on every save; returns once it serves
 giong dev status        # what runs, where, and how the last build went (logs, stop: the same way)
 giong check      # compiler errors, clippy and giong's own checks in one report
+giong upgrade    # move the project (and this command) to the newest giong release
 ```
 
 ## One shape for every command
@@ -42,31 +43,33 @@ giong dev logs [--lines N]
 giong dev stop [--all]
 ```
 
-Builds the service and runs it. On every save it builds again, starts the new build next to the old one, and swaps it in once it accepts connections: measured 0 failed requests out of 102,061 over 100 restarts under constant load ([method and raw output](../bench/results/dev-restarts/)). A build that fails, or one that stops at start-up, leaves the running build serving and prints the compiler's errors. A change to `.env` alone restarts without building.
+Builds the service and runs it. On every save it builds again, starts the new build next to the old one, and swaps it in once it accepts connections: measured 0 failed requests out of 102,061 over 100 restarts under constant load ([method and raw output](../bench/results/dev-restarts/)). It never serves code older than the files: a change that does not compile, or that compiles and then stops before it serves (a panic at start-up, a port it cannot bind, no bind within `--ready-timeout`), stops the running build too and closes the port, so a request is refused at once rather than answered by the old code or left waiting. The terminal shows the compiler's errors or the service's last lines with a coded error and its fix, `giong dev status` says `failed` with the same (`failure` in its JSON), and the dashboard shows it at the top; the next save builds and starts again. A service that stops by itself later is reported the same way and waits for a save, so a crash at start-up does not loop. A change to `.env` alone restarts without building.
 
 How the swap works: `giong dev` binds the service's listening sockets itself and hands them down (`GIONG_DEV_LISTEN`). `giong::net::TcpListener::bind` on the same address takes the socket it was given instead of binding a new one, so the old and the new build accept on one socket and the kernel queues connections between them rather than refusing them. Once the new build accepts, the old one is told to stop accepting, finishes the connections it already took, and gets `SIGTERM` (`--grace` seconds, 30 by default, before `SIGKILL`). The runtime takes a socket only from the `giong dev` that started it; anywhere else `bind` binds as usual. The hand-off is compiled into debug builds, and into release builds only with giong's `dev` feature, which `giong dev --release` and `--prod-like` turn on for their own builds; a release build without it, started by `giong dev`, refuses to bind with a coded error.
 
 The listening addresses come from `--listen`, else `LISTEN` in the environment, else `LISTEN` in `.env`. `0.0.0.0` or `[::]` (every network interface, as a container in production wants) is served on loopback, `127.0.0.1` or `::1` with the same port, with a warning (`GIONG-E5024`); the service gets `LISTEN` set to the address `giong dev` listens on. `--lan` keeps the address, to reach the service from another device. Without one, with a giong older than 1.5, or on Windows, `giong dev` stops the old build before starting the new one: restarts still work, with a moment where the port is closed.
 
-One project has one `giong dev`, and it is the way to run the service while developing: not `cargo run`, `cargo build --release`, a container or a second terminal. `--background` starts it detached from the terminal (its own process group: Ctrl-C or the end of an agent's shell does not stop it), waits until the first build serves, prints its address and returns; a build that fails comes back as findings, and the runner stays to build again on the next save. Started again while one runs, it reports that one. `giong dev status` says what runs (address, process ids, the last build and its first error, the containers giong started for the project), `--all` for every project on this machine (`~/.giong/run`); `giong dev logs` prints the service's last lines; `giong dev stop` asks the runner to stop (it stops its service gracefully), signals it only if it does not, and stops what giong started for the project besides (`.giong/processes.json`: a database container from `giong db up`, its data kept). When the port is taken, the error names the process that holds it, and the project when it is another `giong dev`.
+One project has one `giong dev`, and it is the way to run the service while developing: not `cargo run`, `cargo build --release`, a container or a second terminal. `--background` starts it detached from the terminal (its own process group: Ctrl-C or the end of an agent's shell does not stop it), waits until the first build serves, prints its address and returns; a build that fails comes back as findings, and the runner stays to build again on the next save. Started again while one runs, it reports that one. `giong dev status` says what runs (`state`: `building`, `starting`, `serving` or `failed`; address, process ids, the last build, why nothing serves when nothing does, the containers giong started for the project), `--all` for every project on this machine (`~/.giong/run`); `giong dev logs` prints the service's last lines; `giong dev stop` asks the runner to stop (it stops its service gracefully), signals it only if it does not, and stops what giong started for the project besides (`.giong/processes.json`: a database container from `giong db up`, its data kept). When the port is taken, when `giong dev` binds it or when the service does, the error names the process that holds it (Linux, macOS, Windows), and the project when it is another `giong dev`.
 
 The service gets the variables of `.env` (those not already set), `WORKERS=2` so a laptop stays usable (`--workers N` sets another number, `--prod-like` leaves it to the service: every core), `RUST_BACKTRACE=1`, and `GIONG_MCP` set to a Unix socket so [giong-mcp](https://github.com/giong-run/Giong/tree/main/giong-mcp) can answer. Its output goes to the terminal and to `.giong/dev.log`; `.giong/dev.json` holds the state of the session (process ids, addresses, the last build and its errors) for other tools, and `--json` prints one event per line. `--once` builds, runs the service until it exits, and stops. `--ui` also serves the [dashboard](#giong-dashboard) on `http://127.0.0.1:7700` (or the first free port of the nine after it; `--ui-port N` picks another start); when all ten are taken the service runs without it and a `GIONG-E5053` warning says so.
 
 ## giong new
 
 ```sh
-giong new <dir> [--template web|grpc|worker] [--db postgres,mysql,redis] [--tls] [--name NAME] [--no-git] [--no-ai] [--dry-run]
+giong new <dir> [--template web|grpc|worker] [--db sqlite|postgres|mysql|none[,redis]] [--tls] [--name NAME] [--no-git] [--no-ai] [--dry-run]
 ```
 
 Writes a project that builds, passes `clippy -D warnings` and passes its tests from the first minute, then runs `git init` and `giong ai init` in it. Every project has one worker per core with graceful shutdown on `SIGTERM`, giong-mcp (off until `GIONG_MCP` is set), an end to end test, `.env.example`, a Dockerfile, a GitHub Actions workflow with the database services it needs, and a dev profile that builds faster: on a PostgreSQL, Redis and TLS service a clean debug build takes 12.6 s instead of 15.3 s and the target directory 296 MB instead of 640 MB (Rust 1.100, [method](https://github.com/giong-run/Giong/tree/main/bench/results/devkit/template-profile)).
 
 | Template | What it is |
 |---|---|
-| `web` (default) | A JSON API on giong-web with `/health` (and `/ready` when it has a database): a users API on PostgreSQL or MySQL (with Redis as a cache when both are chosen), counters on Redis, or a hello service without a database. Migrations in `migrations/`. |
+| `web` (default) | A JSON API on giong-web with `/health` (and `/ready` when it has a database): a users API on SQLite by default, or on PostgreSQL or MySQL with `--db` (with Redis as a cache when `redis` is added), counters on Redis (`--db redis`), or a hello service without a database (`--db none`). Migrations in `migrations/`. |
 | `grpc` | A gRPC service from `proto/service.proto` with health and reflection, built by giong-grpc-build (no `protoc` to install). |
 | `worker` | A job runner: jobs claimed from a table with `FOR UPDATE SKIP LOCKED` (PostgreSQL) or in a transaction (MySQL), from a Redis list, or on a timer, with retries and backoff. |
 
-`--tls` serves HTTPS or gRPC over TLS when `TLS_CERT` and `TLS_KEY` are set. `postgres` and `mysql` exclude each other, `grpc` takes no database and `worker` one, without `--tls`: anything else is refused with `GIONG-E5032` and the choices that work. The directory must be new or empty (`GIONG-E5031`); a write that fails takes back everything it made. Every combination is built, linted, tested on io_uring and on epoll against real databases, started and stopped with `SIGTERM` on every pull request.
+SQLite needs nothing installed or started: the database is the file `data/<name>.db`, made at the first start, compiled in through rusqlite (feature `bundled`). Its calls block, so the project's `src/db.rs` runs each one on giong's blocking lane (`giong::spawn_blocking`), with one write connection and a few read connections in WAL mode shared by every worker; the tests use a file of their own each, and the CI workflow starts no service. One copy of the service owns a file; for several machines start from `--db postgres`.
+
+`--tls` serves HTTPS or gRPC over TLS when `TLS_CERT` and `TLS_KEY` are set. `sqlite`, `postgres` and `mysql` exclude each other, `grpc` takes no database and `worker` one, without `--tls`: anything else is refused with `GIONG-E5032` and the choices that work. The directory must be new or empty (`GIONG-E5031`); a write that fails takes back everything it made. Every combination is built, linted, tested on io_uring and on epoll against real databases, started and stopped with `SIGTERM` on every pull request.
 
 ## giong ai init
 
@@ -111,10 +114,23 @@ Applies the fixes that need no judgement: the compiler's and clippy's machine-ap
 ## giong doctor
 
 ```sh
-giong doctor [--machine]
+giong doctor [--machine] [--offline]
 ```
 
 Checks the Rust toolchain and the linker, the kernel and whether io_uring is allowed, the locked-memory and open-files limits, and a container's seccomp profile; inside a project also the crates that need the Tokio runtime, a dev profile that writes full debug information (slow builds), `.env` against `.env.example`, the port the service uses, and the disk its builds take. Every problem comes with its code and its fix.
+
+In a project that takes giong crates from crates.io, it also reads `Cargo.lock`: giong crates on different releases (`GIONG-E5091`), a newer giong release out (`GIONG-E5090`) and this command older than it (`GIONG-E5092`). The newest release comes from `cargo info giong`, with your cargo configuration, at most once a day (`~/.giong/cache/releases.json`); `--offline` or `CARGO_NET_OFFLINE=true` skips the question, and `GIONG_LATEST=1.5.0` answers it (a mirror, or a company that approves releases).
+
+## giong upgrade
+
+```sh
+giong upgrade [--to 1.5.0] [--dry-run] [--offline]
+giong upgrade --self [--to 1.5.0] [--dry-run]
+```
+
+Moves every giong crate of the project to the newest release (or `--to`). The giong crates are released together with one version, and a 1.x release only adds, so this is one step: the version of each giong dependency in every `Cargo.toml` of the workspace, written as you wrote it (`"1.4"` becomes `"1.5"`, `"~1.4.2"` becomes `"~1.5.0"`; comments, features and every other byte stay), `cargo update` of the giong crates to exactly that release, the release's `rust-version` against rustc and the project's own `rust-version`, and `cargo check`. If a step fails, every file is put back as it was (`.giong/upgrade/` holds the originals while it runs). Then the agent files `giong ai init` wrote are refreshed for the new release. It never moves back, across a major version, or past a pinned requirement (`=1.4.2`: `GIONG-E5095`); path and git dependencies are left to you. `--dry-run` lists the edits; `--offline` moves to this command's own release with cargo offline.
+
+This command writes templates and agent files for its own release, so a release newer than the command updates the command first, then the new command moves the project. `giong upgrade --self` updates only the command, the way it was installed: from the install script's folder with the release archive (checked against its SHA-256, `GIONG_DOWNLOAD_URL` honoured), or with `cargo install giong-cli --locked --version x.y.z`. A command installed another way is left alone, with the command to use (`GIONG-E5096`). In `giong mcp`, `upgrade --dry-run` reads and `upgrade` writes; neither ever replaces the command.
 
 ## giong clean
 
@@ -130,7 +146,7 @@ Frees the disk old builds use and keeps what the next build needs: removes what 
 claude mcp add giong -- giong mcp
 ```
 
-Serves every command as a tool to coding agents over the Model Context Protocol on standard input and output, each answering with the command's JSON document. `dev` is a tool for `status` and `logs` (read-only) and, with `--allow-writes`, `--background` and `stop`; `dev_status` reads `.giong/dev.json` as it is.
+Serves every command as a tool to coding agents over the Model Context Protocol on standard input and output, each answering with the command's JSON document. `upgrade` is a tool with `--dry-run` (read-only) and, with `--allow-writes`, without it; `--self` never is. `dev` is a tool for `status` and `logs` (read-only) and, with `--allow-writes`, `--background` and `stop`; `dev_status` reads `.giong/dev.json` as it is.
 
 ## giong routes and giong openapi
 
@@ -182,13 +198,15 @@ It reads what the service already gives, its output and its giong-mcp, so the se
 ## giong db
 
 ```sh
-giong db up            # a development PostgreSQL, MySQL or Redis in Docker or Podman
+giong db up            # a development PostgreSQL, MySQL or Redis in Docker or Podman (SQLite: nothing to start)
 giong db new add_users # migrations/0002_add_users.sql
 giong db migrate       # apply what is new; giong db status shows what is applied
 giong db down          # stop it; --volumes also deletes the data
 ```
 
 Starts the databases the project depends on in containers, with a random password, a free port and a volume, and writes `DATABASE_URL` or `REDIS_URL` into `.env` (owner-only, git-ignored). Each checkout gets its own container, named after the package, the engine and a short hash of the project's path (`giong-shop-postgres-3fa2c1`), so two copies of a project never share a database. The container is recorded in `.giong/processes.json`: `giong dev status` lists it and `giong dev stop` stops it, keeping its data. Migrations are forward-only SQL files `migrations/NNNN_name.sql`; each PostgreSQL file runs in one transaction (unless its first line is `-- giong:no-transaction`), each applied file is recorded with its SHA-256 checksum, a changed applied file is refused and a failing one names its line. With a `DATABASE_URL` of your own, `migrate` and `status` work on that database. `giong db reset --yes` empties a database `giong db up` started.
+
+SQLite (a project that depends on rusqlite) has no server: `giong db up` only writes `DATABASE_URL=sqlite:data/<name>.db` into `.env` when it names no SQLite file yet, and without it `migrate` and `status` use the file the service opens by default. They run through the `sqlite3` shell (apt install sqlite3, brew install sqlite; macOS has it), each file in one transaction. `giong db reset --yes` drops every table of the file when the file is inside the project, and keeps the file, so a running service carries on with the emptied one.
 
 ## giong env
 

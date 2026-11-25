@@ -114,7 +114,9 @@ jobs:
     env:
       GIONG_TEST_EXPECT_DRIVER: kqueue
       RUSTFLAGS: -Zsanitizer=thread --cfg giong_tsan
-      TSAN_OPTIONS: halt_on_error=1
+      # allocator_may_return_null: a malloc over TSan's 1 TiB limit fails as
+      # it does without TSan, instead of aborting (the fs test of #296).
+      TSAN_OPTIONS: halt_on_error=1 allocator_may_return_null=1
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

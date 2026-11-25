@@ -12,6 +12,11 @@
 //!
 //! [`server`] is the one most tests use. [`odd`] starts a second one, set up
 //! the way some production servers are and the defaults are not.
+//!
+//! MySQL and MariaDB on Windows listen on named pipes instead of Unix
+//! sockets, which giong-mysql does not speak: there `root` and the other
+//! "socket" logins go over TCP to 127.0.0.1, and the tests about the Unix
+//! socket itself are Unix only.
 
 #[cfg(target_os = "linux")]
 #[cfg(target_os = "linux")]
@@ -149,12 +154,32 @@ pub fn odd(main: &Server) -> (&'static Server, MutexGuard<'static, ()>) {
 }
 
 impl Server {
-    /// `root` over the Unix socket (no password).
+    /// `root` over the Unix socket (no password); over TCP on Windows.
     pub fn local(&self) -> Config {
-        Config::new()
-            .host(self.socket.to_str().unwrap())
-            .user("root")
-            .database(DATABASE)
+        self.local_host().user("root").database(DATABASE)
+    }
+
+    /// The server's Unix socket, or on Windows 127.0.0.1 and its port.
+    pub fn local_host(&self) -> Config {
+        if cfg!(windows) {
+            Config::new().host("127.0.0.1").port(self.port)
+        } else {
+            Config::new().host(self.socket.to_str().unwrap())
+        }
+    }
+
+    /// The `mysql` client's arguments for logging in as `root`: over the
+    /// Unix socket, or on Windows over TCP.
+    fn root_client(&self) -> Command {
+        let mut cmd = Command::new(&self.bins.mysql);
+        cmd.args(["--no-defaults", "-uroot", "-N", "-B"]);
+        if cfg!(windows) {
+            cmd.args(["--protocol=TCP", "-h127.0.0.1"])
+                .arg(format!("-P{}", self.port));
+        } else {
+            cmd.arg("-S").arg(&self.socket);
+        }
+        cmd
     }
 
     /// A user over TCP to 127.0.0.1, without TLS.
@@ -167,10 +192,9 @@ impl Server {
             .database(DATABASE)
     }
 
-    /// A user over the Unix socket.
+    /// A user over the Unix socket; over TCP on Windows.
     pub fn socket(&self, (user, password): (&str, &str)) -> Config {
-        Config::new()
-            .host(self.socket.to_str().unwrap())
+        self.local_host()
             .user(user)
             .password(password)
             .database(DATABASE)
@@ -192,9 +216,8 @@ impl Server {
     /// Runs SQL as root with the `mysql` client and returns what it prints,
     /// tab-separated.
     pub fn sql(&self, sql: &str) -> String {
-        let out = Command::new(&self.bins.mysql)
-            .args(["--no-defaults", "-uroot", "-N", "-B", "-S"])
-            .arg(&self.socket)
+        let out = self
+            .root_client()
             .args(["-e", sql])
             .output()
             .expect("run mysql");
@@ -208,9 +231,7 @@ impl Server {
 
     /// Like [`sql`](Self::sql), but returns whether it worked.
     fn try_sql(&self, sql: &str) -> bool {
-        Command::new(&self.bins.mysql)
-            .args(["--no-defaults", "-uroot", "-N", "-B", "-S"])
-            .arg(&self.socket)
+        self.root_client()
             .args(["-e", sql])
             .stderr(Stdio::null())
             .stdout(Stdio::null())
@@ -246,7 +267,7 @@ fn find_bins() -> Option<Bins> {
     let path_dirs: Vec<PathBuf> = std::env::var_os("PATH")
         .map(|p| std::env::split_paths(&p).collect())
         .unwrap_or_default();
-    let names = ["mysqld", "mariadbd"];
+    let names = [exe("mysqld"), exe("mariadbd")];
     let mysqld = match std::env::var_os("GIONG_MYSQL_BIN") {
         Some(dir) => names
             .iter()
@@ -254,7 +275,7 @@ fn find_bins() -> Option<Bins> {
             .find(|p| p.exists())?,
         None => std::iter::once(PathBuf::from("/usr/sbin"))
             .chain(path_dirs.iter().cloned())
-            .flat_map(|d| names.map(|n| d.join(n)))
+            .flat_map(|d| names.iter().map(move |n| d.join(n)))
             .find(|p| p.exists())?,
     };
     let here = mysqld.parent()?.to_owned();
@@ -270,7 +291,7 @@ fn find_bins() -> Option<Bins> {
         .collect();
     let find = |names: &[&str]| {
         near.iter()
-            .flat_map(|d| names.iter().map(move |n| d.join(n)))
+            .flat_map(|d| names.iter().map(move |n| d.join(exe(n))))
             .find(|p| p.exists())
     };
     let mysql = find(&["mysql", "mariadb"])?;
@@ -302,9 +323,40 @@ fn version_number(version: &str) -> (u32, u32) {
     (numbers.next().unwrap_or(0), numbers.next().unwrap_or(0))
 }
 
+#[cfg(unix)]
 fn is_root() -> bool {
     // SAFETY: geteuid has no preconditions.
     unsafe { libc::geteuid() == 0 }
+}
+
+/// Windows: the server runs as the tests' user.
+#[cfg(windows)]
+fn is_root() -> bool {
+    false
+}
+
+/// Kills the process `pid` this binary started and waits for it to go.
+#[cfg(unix)]
+fn kill(pid: i32) {
+    // SAFETY: plain system calls on a child process we started.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+}
+
+#[cfg(windows)]
+fn kill(pid: i32) {
+    let _ = std::process::Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
+}
+
+/// `name` with the system's suffix for programs (`.exe` on Windows).
+fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
 }
 
 extern "C" fn stop_servers() {
@@ -313,11 +365,7 @@ extern "C" fn stop_servers() {
     };
     for (pid, dir) in started.iter() {
         if *pid > 0 {
-            // SAFETY: plain system calls on a child process we started.
-            unsafe {
-                libc::kill(*pid, libc::SIGKILL);
-                libc::waitpid(*pid, std::ptr::null_mut(), 0);
-            }
+            kill(*pid);
         }
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -397,16 +445,16 @@ const START_ATTEMPTS: usize = 5;
 /// gives what it logged from `log_from` on.
 fn wait_until_ready(server: &Server, gone: &AtomicBool, log_from: usize) -> Result<(), String> {
     let started = Instant::now();
-    while !server.socket.exists() || !server.try_sql("SELECT 1") {
+    // Windows has no socket file: the server is ready when it answers.
+    while !(cfg!(windows) || server.socket.exists()) || !server.try_sql("SELECT 1") {
         if gone.load(Ordering::Acquire) {
             return Err(server.log().get(log_from..).unwrap_or_default().to_owned());
         }
         if started.elapsed() > Duration::from_secs(60) {
             // Say which side failed: the server, or the client that sets it
             // up (which cannot run when a shared library is missing, say).
-            let client = Command::new(&server.bins.mysql)
-                .args(["--no-defaults", "-uroot", "-N", "-B", "-S"])
-                .arg(&server.socket)
+            let client = server
+                .root_client()
                 .args(["-e", "SELECT 1"])
                 .output()
                 .map(|out| String::from_utf8_lossy(&out.stderr).into_owned())
@@ -483,12 +531,32 @@ fn start(bins: Bins, role: Role) -> Server {
     let mariadb = bins.install_db.is_some();
 
     let out = match &bins.install_db {
-        None => mysqld(&bins)
-            .arg("--initialize-insecure")
+        None => {
+            let mut cmd = mysqld(&bins);
+            cmd.arg("--initialize-insecure")
+                .arg(format!("--datadir={}", data.display()))
+                .arg(format!("--log-error={}", dir.join("init.log").display()));
+            if cfg!(windows) {
+                // `root` is 'root'@'localhost' only, which a login over TCP
+                // does not match with --skip-name-resolve, and Windows has
+                // no Unix socket for it: the same account for 127.0.0.1.
+                let init = dir.join("init.sql");
+                std::fs::write(
+                    &init,
+                    "CREATE USER 'root'@'127.0.0.1' IDENTIFIED BY '';\n\
+                     GRANT ALL PRIVILEGES ON *.* TO 'root'@'127.0.0.1' WITH GRANT OPTION;\n",
+                )
+                .unwrap();
+                cmd.arg(format!("--init-file={}", init.display()));
+            }
+            cmd.output().expect("run mysqld --initialize-insecure")
+        }
+        // MariaDB's installer for Windows is a tool of its own, which takes
+        // the data directory and sets `root` up without a password.
+        Some(install_db) if cfg!(windows) => Command::new(install_db)
             .arg(format!("--datadir={}", data.display()))
-            .arg(format!("--log-error={}", dir.join("init.log").display()))
             .output()
-            .expect("run mysqld --initialize-insecure"),
+            .expect("run mariadb-install-db"),
         Some(install_db) => {
             let mut cmd = Command::new(install_db);
             cmd.arg("--no-defaults");

@@ -29,3 +29,4 @@ mod mcp;
 mod new_ai;
 mod record;
 mod scenarios;
+mod upgrade;

@@ -93,6 +93,7 @@ fn not_connected_is_closed(res: io::Result<()>) -> io::Result<()> {
 /// buffered before: the kernel copies straight from the caller's slices, as
 /// Tokio's streams do, instead of `Compat` copying them into its buffer
 /// first and the kernel copying them again.
+#[cfg(unix)]
 fn send_now(fd: std::os::fd::RawFd, bufs: &[IoSlice<'_>]) -> Option<io::Result<usize>> {
     // SAFETY: zeroed is a valid `msghdr` (no address, no control data).
     let mut msg: libc::msghdr = unsafe { std::mem::zeroed() };
@@ -119,6 +120,72 @@ fn send_now(fd: std::os::fd::RawFd, bufs: &[IoSlice<'_>]) -> Option<io::Result<u
         io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => None,
         _ => Some(Err(e)),
     }
+}
+
+/// One `WSASend` that does not wait (giong's streams are non-blocking from
+/// the start on Windows), for the same reason as on Unix. Without an
+/// `OVERLAPPED` it is a plain call: nothing reaches the completion port.
+#[cfg(windows)]
+fn send_now(
+    socket: std::os::windows::io::RawSocket,
+    bufs: &[IoSlice<'_>],
+) -> Option<io::Result<usize>> {
+    use windows_sys::Win32::Networking::WinSock::{WSAGetLastError, WSASend, WSABUF};
+    // The most slices one call is given, as on Unix.
+    const MAX_SLICES: usize = 1024;
+    // The most bytes one call hands Winsock, as giong's driver does: Winsock
+    // takes the whole of a send whenever its buffer is not yet full, so a
+    // larger one would put all of it in the kernel for a peer that may
+    // never read it.
+    const MAX_BYTES: u32 = 1 << 20;
+    let mut room = MAX_BYTES;
+    let mut cut: Vec<WSABUF> = Vec::new();
+    for b in bufs.iter().take(MAX_SLICES) {
+        if room == 0 {
+            break;
+        }
+        let len = (b.len().min(u32::MAX as usize) as u32).min(room);
+        room -= len;
+        cut.push(WSABUF {
+            len,
+            buf: b.as_ptr().cast_mut(),
+        });
+    }
+    let mut sent = 0u32;
+    // SAFETY: the pieces point at the caller's slices, which outlive the
+    // call; `WSASend` only reads them. No overlapped structure or routine
+    // is passed.
+    let rc = unsafe {
+        WSASend(
+            socket as usize,
+            cut.as_ptr(),
+            cut.len() as u32,
+            &mut sent,
+            0,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if rc == 0 {
+        return Some(Ok(sent as usize));
+    }
+    // SAFETY: reads the calling thread's last Winsock error.
+    let e = io::Error::from_raw_os_error(unsafe { WSAGetLastError() });
+    match e.kind() {
+        io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted => None,
+        _ => Some(Err(e)),
+    }
+}
+
+/// The socket of a giong stream, as [`send_now`] takes it.
+#[cfg(unix)]
+fn raw<T: std::os::fd::AsRawFd>(stream: &T) -> std::os::fd::RawFd {
+    stream.as_raw_fd()
+}
+
+#[cfg(windows)]
+fn raw<T: std::os::windows::io::AsRawSocket>(stream: &T) -> std::os::windows::io::RawSocket {
+    stream.as_raw_socket()
 }
 
 macro_rules! socket_transport {
@@ -148,7 +215,7 @@ macro_rules! socket_transport {
             }
 
             fn send_now(&self, bufs: &[IoSlice<'_>]) -> Option<io::Result<usize>> {
-                send_now(std::os::fd::AsRawFd::as_raw_fd(self), bufs)
+                send_now(raw(self), bufs)
             }
 
             fn no_delay(&self) {

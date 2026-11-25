@@ -1,6 +1,6 @@
 # Use a database
 
-A local database for development in one command, forward-only migrations, and the pool pattern every giong service uses. PostgreSQL is shown; MySQL and Redis work the same way.
+A local database for development in one command, forward-only migrations, and the pool pattern every giong service uses. PostgreSQL is shown; MySQL and Redis work the same way. A project from `giong new` starts on [SQLite](#sqlite), which needs nothing installed or started.
 
 ## Start one for development
 
@@ -53,6 +53,24 @@ The [giong-postgres](../../giong-postgres/README.md), [giong-mysql](../../giong-
 ## Test against the real database
 
 `giong test` reads `.env`, so the tests see the `DATABASE_URL` that `giong db up` wrote. A project from `giong new --db postgres` already has an end to end test that does this, and a CI workflow that starts the same database as a service.
+
+## SQLite
+
+`giong new api` keeps its users in SQLite: the file `data/api.db`, made at the first start, with SQLite compiled in by rusqlite (feature `bundled`). Nothing to install, nothing to start, and `giong db migrate`, `status` and `reset --yes` work on the file (through the `sqlite3` shell).
+
+SQLite is a C library that does its reads and writes in the calling thread, so a query on a worker holds up every connection of that worker. The project's `src/db.rs` runs every query on giong's blocking lane instead:
+
+```rust
+let user = state
+    .db
+    .read(move |c| Ok(c.query_row(SELECT_ONE, [id], User::from_row).optional()?))
+    .await?;
+```
+
+- `db.read(..)` runs the closure with one of a few read connections, `db.write(..)` with the one write connection, both on `giong::spawn_blocking` threads. The closure gets what it needs moved in and gives back owned values.
+- The file is in WAL mode: reads run side by side and while a write runs. SQLite runs one write at a time whatever the number of connections, so writes queue for the write connection instead of failing with `database is locked`; `c.transaction()` inside `write` makes several statements one change.
+- One `Db` is shared by every worker (it is the one thing a giong service shares, since SQLite allows one writer per file). One copy of the service owns the file: for several copies or machines, `giong new --db postgres` writes the same service on PostgreSQL.
+- The tests open a file of their own each in the temporary directory, so they always run and never share rows.
 
 ## Not with sqlx or tokio-postgres
 

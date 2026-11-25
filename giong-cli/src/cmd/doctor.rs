@@ -4,7 +4,8 @@
 //! version, a linker, the kernel and io_uring, the locked-memory and
 //! open-files limits, a container's seccomp profile; and in a project, crates
 //! that need Tokio, the dev profile, `.env` against `.env.example`, a port that
-//! is taken, and the disk the builds use.
+//! is taken, the disk the builds use, and the giong release the project is on
+//! against the newest one ([`giong_versions`]).
 
 use std::net::TcpListener;
 use std::path::Path;
@@ -18,6 +19,7 @@ use crate::dotenv;
 use crate::host::{self, Version};
 use crate::project::Project;
 use crate::report::{Edit, Failure, Finding, Report, Severity};
+use crate::versions;
 
 pub const COMMAND: Command = Command {
     name: "doctor",
@@ -26,13 +28,21 @@ pub const COMMAND: Command = Command {
             Checks the Rust toolchain, the linker, the kernel and io_uring, the locked-memory and \
             open-files limits and a container's seccomp profile; inside a project also crates that \
             need Tokio, the dev profile, .env against .env.example, the port the service uses and \
-            the disk its builds take. Every problem comes with its code and its fix. Exit status 1 \
-            when one is an error.",
-    flags: &[Flag {
-        name: "machine",
-        kind: Kind::Switch,
-        help: "check only the machine, not the project in this directory",
-    }],
+            the disk its builds take, and whether its giong crates are on one release and on the \
+            newest one (asked of crates.io through cargo, at most once a day; --offline skips it). \
+            Every problem comes with its code and its fix. Exit status 1 when one is an error.",
+    flags: &[
+        Flag {
+            name: "machine",
+            kind: Kind::Switch,
+            help: "check only the machine, not the project in this directory",
+        },
+        Flag {
+            name: "offline",
+            kind: Kind::Switch,
+            help: "do not ask crates.io for the newest giong release",
+        },
+    ],
     max_words: 0,
     run,
 };
@@ -73,7 +83,10 @@ fn run(args: &Args) -> Result<Report, Failure> {
     machine(&mut r);
     if !args.has("machine") {
         match Project::here() {
-            Ok(project) => project_checks(&project, &mut r),
+            Ok(project) => {
+                project_checks(&project, &mut r);
+                giong_versions(&project, args.has("offline"), &mut r);
+            }
             // Outside a project there is nothing to check; a project cargo
             // cannot read is the first thing to fix.
             Err(f) if f.code == Code::NOT_A_PROJECT => r.data("project", json!(null)),
@@ -414,6 +427,127 @@ fn project_checks(p: &Project, r: &mut Report) {
     }
 }
 
+/// The giong crates in Cargo.lock: on one release (GIONG-E5091), on the
+/// newest one (GIONG-E5090), and this command against the newest
+/// (GIONG-E5092). Asks crates.io only for a project that locks giong crates
+/// from a registry, at most once a day, and never with `--offline`.
+fn giong_versions(p: &Project, offline: bool, r: &mut Report) {
+    let Ok(text) = std::fs::read_to_string(p.root.join("Cargo.lock")) else {
+        return;
+    };
+    let lock = versions::parse_lock(&text);
+    let giong = versions::giong_from_registry(&lock);
+    if giong.is_empty() {
+        return;
+    }
+    let mut locked = serde_json::Map::new();
+    for c in &giong {
+        locked.insert(c.name.clone(), json!(c.version.to_string()));
+    }
+    let newest_locked = giong.iter().map(|c| c.version).max().expect("not empty");
+    let oldest = giong.iter().min_by_key(|c| c.version).expect("not empty");
+    if oldest.version != newest_locked {
+        let list: Vec<String> = giong
+            .iter()
+            .map(|c| format!("{} {}", c.name, c.version))
+            .collect();
+        let twice: Vec<&str> = giong
+            .iter()
+            .filter(|c| giong.iter().filter(|o| o.name == c.name).count() > 1)
+            .map(|c| c.name.as_str())
+            .collect();
+        let mut detail = format!(
+            "The giong crates are released together and meant to be used at one version; this \
+             lock has {}.",
+            list.join(", ")
+        );
+        if let Some(name) = twice.first() {
+            detail.push_str(&format!(
+                " {name} is there twice: another crate asks for the old one (cargo tree -i \
+                 {name}@{} shows which).",
+                oldest.version
+            ));
+        }
+        r.push(
+            Finding::new(
+                Code::GIONG_MIXED,
+                Severity::Warning,
+                format!(
+                    "the project's giong crates are on different releases ({} to {newest_locked})",
+                    oldest.version
+                ),
+            )
+            .detail(detail)
+            .fix(
+                "giong upgrade moves every giong crate to one release (giong upgrade --dry-run \
+                 shows the edits first)",
+            )
+            .at("Cargo.lock", oldest.line, 1),
+        );
+    }
+    let latest = if offline {
+        Err("--offline".to_string())
+    } else {
+        versions::latest(true)
+    };
+    let cli = versions::cli();
+    match &latest {
+        Ok(l) => {
+            if oldest.version < l.version {
+                r.push(
+                    Finding::new(
+                        Code::GIONG_OUTDATED,
+                        Severity::Warning,
+                        format!(
+                            "the project is on giong {}; giong {} is out",
+                            oldest.version, l.version
+                        ),
+                    )
+                    .detail(format!(
+                        "Releases within 1.x only add (docs/STABILITY.md), so moving up keeps the \
+                         code building; each one brings the fixes listed in its CHANGELOG ({}).",
+                        changelog_url(l.version)
+                    ))
+                    .fix("giong upgrade (giong upgrade --dry-run shows the edits first)")
+                    .at("Cargo.lock", oldest.line, 1),
+                );
+            }
+            if cli < l.version {
+                r.push(
+                    Finding::new(
+                        Code::CLI_OUTDATED,
+                        Severity::Warning,
+                        format!("this giong command is {cli}; giong {} is out", l.version),
+                    )
+                    .detail(
+                        "The command writes agent files, templates and checks for its own \
+                         release; an older one does not know what the newer crates offer.",
+                    )
+                    .fix("giong upgrade --self"),
+                );
+            }
+        }
+        Err(why) => r.line(format!(
+            "The newest giong release was not looked up ({why})."
+        )),
+    }
+    r.data(
+        "giong",
+        json!({
+            "locked": locked,
+            "cli": cli.to_string(),
+            "latest": latest.as_ref().ok().map(|l| l.version.to_string()),
+            "latest_from": latest.as_ref().ok().map(|l| l.from),
+            "latest_unknown": latest.as_ref().err(),
+        }),
+    );
+}
+
+/// The CHANGELOG of a release, on GitHub.
+pub fn changelog_url(v: Version) -> String {
+    format!("https://github.com/giong-run/Giong/blob/v{v}/CHANGELOG.md")
+}
+
 /// Tokio without runtime features (its traits and `sync`, as giong-compat
 /// uses) runs anywhere; every other crate in the list needs the runtime.
 pub fn needs_tokio_runtime(name: &str, features: &[String]) -> bool {
@@ -597,11 +731,38 @@ fn debug_set_elsewhere(root: &Path) -> bool {
     })
 }
 
+/// A `.env`-style file of the project, never read through a link: a cloned
+/// repository can commit `.env.example -> ~/.aws/credentials`, and the keys
+/// of what it names would reach the report. `None` when it does not exist,
+/// or is a link (said once in the report).
+fn env_file(
+    root: &Path,
+    name: &str,
+    r: &mut Report,
+) -> Option<(Vec<dotenv::Var>, Vec<dotenv::BadLine>)> {
+    match crate::state::read_to_string(&root.join(name)) {
+        Ok(text) => Some(dotenv::parse(&text)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => {
+            r.push(
+                Finding::new(
+                    Code::ENV_MISSING,
+                    Severity::Warning,
+                    format!("{name} is not read"),
+                )
+                .detail(e.to_string())
+                .fix(format!("make {name} a plain file in the project")),
+            );
+            None
+        }
+    }
+}
+
 fn env_checks(root: &Path, r: &mut Report) {
-    let Some((example, _)) = dotenv::read(&root.join(".env.example")) else {
+    let Some((example, _)) = env_file(root, ".env.example", r) else {
         return;
     };
-    let (local, bad) = dotenv::read(&root.join(".env")).unwrap_or_default();
+    let (local, bad) = env_file(root, ".env", r).unwrap_or_default();
     for b in bad {
         r.push(
             Finding::new(
@@ -850,6 +1011,39 @@ mod tests {
         assert_eq!(find_line(m, "rt"), (6, 1));
         assert_eq!(find_line(m, "tokio"), (1, 1));
         assert_eq!(find_line(m, "sqlx"), (7, 1));
+    }
+
+    /// A linked `.env.example` or `.env` is not read (it could name a file
+    /// outside the project), and the report says so.
+    #[cfg(unix)]
+    #[test]
+    fn env_files_are_never_read_through_a_link() {
+        let d = std::env::temp_dir().join(format!("giong-cli-doctor-env-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(d.join("p")).unwrap();
+        std::fs::write(d.join("secret"), "aws_secret_access_key=abc\n").unwrap();
+        std::os::unix::fs::symlink(d.join("secret"), d.join("p/.env.example")).unwrap();
+        let mut r = Report::new("doctor");
+        env_checks(&d.join("p"), &mut r);
+        let titles: Vec<&str> = r.findings().iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(titles, [".env.example is not read"]);
+
+        // A plain .env.example, a linked .env: its keys count as unset.
+        std::fs::remove_file(d.join("p/.env.example")).unwrap();
+        std::fs::write(d.join("p/.env.example"), "KEY_ONLY_IN_EXAMPLE=\n").unwrap();
+        std::fs::write(d.join("secret"), "KEY_ONLY_IN_EXAMPLE=1\n").unwrap();
+        std::os::unix::fs::symlink(d.join("secret"), d.join("p/.env")).unwrap();
+        let mut r = Report::new("doctor");
+        env_checks(&d.join("p"), &mut r);
+        let titles: Vec<&str> = r.findings().iter().map(|f| f.title.as_str()).collect();
+        assert_eq!(
+            titles,
+            [
+                ".env is not read",
+                "KEY_ONLY_IN_EXAMPLE is in .env.example but not set"
+            ]
+        );
+        std::fs::remove_dir_all(&d).unwrap();
     }
 
     #[test]

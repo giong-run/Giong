@@ -1,8 +1,9 @@
 name: Windows runtime
 
-# giong itself on real Windows: the completion port driver in the runtime,
-# with the parts of the test suite that are ported so far. A draft, and a pull
-# request that changes none of the code built here, skip the tests (job `plan`,
+# giong and every crate of the workspace on real Windows: the completion port
+# driver in the runtime (job `runtime`, its suites many times over) and the
+# other crates' suites (job `crates`). A draft, and a pull request that
+# changes none of the code built here, skip the tests (job `plan`,
 # scripts/ci-scope.py --relevant). Outside pull requests (the merge queue, a
 # push to main, a dispatch of CI) ci.yml calls this workflow, so that its
 # `all-checks` holds a merge back when a job here fails.
@@ -23,12 +24,13 @@ env:
   CARGO_TERM_COLOR: always
   # CI's stable compiler (see ci.yml).
   RUST_STABLE: "1.100.0"
-  # The suites that build for Windows today.
+  # The runtime's suites that run many times over in job `runtime`.
   SUITES: >-
     --lib --test executor --test channels --test time --test shutdown
     --test observe --test spin --test net --test udp --test cancel
     --test multi --test balance --test dns --test fs --test soak
     --test driver --test wake --test error_docs --test cancel_docs
+    --test unix
 
 jobs:
   plan:
@@ -48,6 +50,8 @@ jobs:
           if [ "$EVENT" = pull_request ]; then git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files.txt"; else : > "$RUNNER_TEMP/files.txt"; fi
           python3 scripts/ci-scope.py --event "$EVENT" $DRAFT --explain \
             --relevant src/ tests/ Cargo.toml Cargo.lock scripts/ci-scope.py .github/workflows/windows-runtime.yml \
+              giong-compat/ giong-grpc/ giong-grpc-build/ giong-http/ giong-mcp/ giong-mysql/ \
+              giong-postgres/ giong-proto/ giong-quic/ giong-redis/ giong-tls/ giong-web/ \
             < "$RUNNER_TEMP/files.txt" | tee -a "$GITHUB_OUTPUT"
 
   runtime:
@@ -88,23 +92,64 @@ jobs:
           done
           echo "30 runs passed" >> "$GITHUB_STEP_SUMMARY"
 
+  # Every crate, every feature: clippy, then each crate's suites once in
+  # debug (the runtime's are job `runtime`'s), and the UDP offloads for QUIC.
+  # The database crates start their own servers where the runner has them
+  # and skip, saying so, where it does not.
+  crates:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: clippy
+      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      # The runners' images carry PostgreSQL (`PGBIN`): its tests must run
+      # there. MySQL and Redis are not on them; their tests were run against
+      # MariaDB 11.4 and Redis for Windows 8.10 by hand, and skip here.
+      - run: |
+          if [ -n "${PGBIN:-}" ]; then export GIONG_PG_REQUIRED=1; fi
+          cargo test --workspace --all-features --locked --no-fail-fast --exclude giong
+      - run: >
+          cargo test -p giong --features unstable-udp-offload --locked --no-fail-fast
+          --test udp_offload --test udp --test unix
+
+  # The minimum Rust versions, checked by scripts/msrv.sh as on Linux.
   # Not `msrv`: a job of that name would also count as main's required
   # `msrv` check (ci.yml's), so a cancelled run here would block a merge.
   windows-msrv:
     needs: plan
     if: needs.plan.outputs.heavy == 'true'
     runs-on: windows-2025
-    timeout-minutes: 15
+    timeout-minutes: 20
+    defaults:
+      run:
+        shell: bash
     steps:
       - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
-      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
-        with:
-          toolchain: "1.80"
-      - run: cargo check -p giong --locked
+      # The versions and what each checks live in scripts/msrv.sh, as for
+      # the Linux job `msrv`, so that an MSRV change moves both.
+      - name: "net: install the toolchains scripts/msrv.sh names"
+        run: |
+          for v in $(scripts/msrv.sh versions); do
+              scripts/ci-net.sh retry -n 4 -t 600 -- rustup toolchain install "$v" --profile minimal --no-self-update
+          done
+      - run: scripts/msrv.sh
 
   # Every job above passed, or `plan` chose to skip them. One name to require.
   windows-checks:
-    needs: [plan, runtime, windows-msrv]
+    needs: [plan, runtime, crates, windows-msrv]
     if: always()
     runs-on: ubuntu-24.04
     steps:

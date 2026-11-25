@@ -14,6 +14,14 @@
 //! A REST API on giong: users kept in MySQL, with nothing from the Tokio
 //! ecosystem.
 {{/if}}
+{{#if sqlite & redis}}
+//! A REST API on giong: users kept in SQLite, read through a Redis cache,
+//! with nothing from the Tokio ecosystem.
+{{/if}}
+{{#if sqlite & !redis}}
+//! A REST API on giong: users kept in SQLite, a file in the project, with
+//! nothing from the Tokio ecosystem.
+{{/if}}
 {{#if redis & !sql}}
 //! An HTTP service on giong: counters kept in Redis, with nothing from the
 //! Tokio ecosystem.
@@ -65,6 +73,9 @@ use std::time::Duration;
 use giong_web::middleware::{Compression, Logger, RequestId, Timeout};
 use giong_web::{App, Error, Req, Response, Router, Sink};
 
+{{#if sqlite}}
+pub mod db;
+{{/if}}
 {{#if sql}}
 mod users;
 {{/if}}
@@ -82,6 +93,10 @@ pub struct State {
 {{/if}}
 {{#if mysql}}
     pub db: giong_mysql::Pool,
+{{/if}}
+{{#if sqlite}}
+    /// Shared by every worker: SQLite runs on the blocking lane.
+    pub db: db::Db,
 {{/if}}
 {{#if redis & sql}}
     pub cache: giong_redis::Pool,
@@ -110,7 +125,14 @@ async fn health(_req: Req<State>) -> Result<Response, Error> {
 /// `503` (with the cause in the log) when either store does not answer.
 async fn ready(req: Req<State>) -> Result<Response, Error> {
     let state = req.state();
+{{#if sqlite}}
+    state
+        .db
+        .read(|c| Ok(c.query_row("SELECT 1", [], |_| Ok(()))?))
+        .await?;
+{{#else}}
     state.db.query_one("SELECT 1", &[]).await?;
+{{/if}}
     state.cache.ping().await?;
     Ok(Response::text("ready"))
 }
@@ -119,7 +141,14 @@ async fn ready(req: Req<State>) -> Result<Response, Error> {
 {{#if sql & !redis}}
 /// `503` (with the cause in the log) when the database does not answer.
 async fn ready(req: Req<State>) -> Result<Response, Error> {
+{{#if sqlite}}
+    req.state()
+        .db
+        .read(|c| Ok(c.query_row("SELECT 1", [], |_| Ok(()))?))
+        .await?;
+{{#else}}
     req.state().db.query_one("SELECT 1", &[]).await?;
+{{/if}}
     Ok(Response::text("ready"))
 }
 
