@@ -7,7 +7,17 @@
 //! the kernel's queue of connections outlives every build. The new build
 //! starts while the old one still serves; when it says it accepts (a byte on
 //! `GIONG_DEV_READY`), the old one gets `SIGTERM` and finishes what it was
-//! doing within `--grace`. A build that fails leaves the old one serving.
+//! doing within `--grace`.
+//!
+//! giong dev never serves code older than the files: a build that fails, or
+//! a new build that stops before it serves (a panic at start-up, a port it
+//! cannot bind, no bind within `--ready-timeout`), stops the old build too
+//! and closes the port, so a client is refused at once instead of being
+//! answered by old code (or left waiting in a queue nobody takes from). The
+//! cause goes to the terminal, the `--json` events and `failure` in
+//! `.giong/dev.json`, which `giong dev status` and the dashboard show; the
+//! next save builds and starts again. A service that stops by itself later
+//! is reported the same way and is not restarted until a save.
 //!
 //! The addresses come from `--listen`, or `LISTEN` in the environment or in
 //! `.env`. Without one, or on a giong older than 1.5, or on Windows, the old
@@ -64,8 +74,11 @@ pub const COMMAND: Command = Command {
             logs prints the service's last lines, and stop stops it and what giong started for \
             the project (a database container, its data kept).\n\n\
             Builds the service and runs it; on every save it builds again and swaps the new build \
-            in once it accepts connections, so no request is refused. A failed build leaves the \
-            running one serving. A change to .env alone restarts without building. The service \
+            in once it accepts connections, so no request is refused. It never serves code older \
+            than the files: a build that fails, or a new build that stops before it serves, stops \
+            the running one too and closes the port, and giong dev status and the dashboard say \
+            why; the next save builds and starts again. A change to .env alone restarts without \
+            building. The service \
             gets the variables of .env, WORKERS=2 (unless set, or --prod-like), RUST_BACKTRACE=1 \
             and a giong-mcp socket. --once builds, runs the service until it exits, and stops. \
             The listening addresses come from --listen or LISTEN (environment, then .env); \
@@ -212,6 +225,9 @@ struct Service {
     pid: u32,
     mcp: PathBuf,
     tail: Arc<Mutex<VecDeque<String>>>,
+    /// The threads copying its output ([`Dev::tee`]): they end when its
+    /// output closes, so a report waits for them to have its last lines.
+    readers: Vec<std::thread::JoinHandle<()>>,
     /// giong dev's end of the ready channel: `\n` comes for each bind of a
     /// handed-down socket, `s` asks to stop accepting, `d` answers it.
     #[cfg(unix)]
@@ -222,6 +238,27 @@ struct Service {
     /// When it started ([`started`]): with the pid, names this process in
     /// `dev.json` even after the pid is reused.
     started: Option<String>,
+}
+
+/// Why nothing serves: the last change did not build or start, or the
+/// service stopped by itself. Cleared when a build serves again.
+struct Failed {
+    /// `build`, `start` or `exited`.
+    stage: &'static str,
+    finding: Finding,
+    at: u64,
+    /// The build that served until then, stopped because of it.
+    stopped: Option<u32>,
+}
+
+impl Failed {
+    fn to_json(&self) -> Value {
+        let mut v = self.finding.to_json();
+        v["stage"] = json!(self.stage);
+        v["at"] = json!(self.at);
+        v["stopped_pid"] = json!(self.stopped);
+        v
+    }
 }
 
 /// An old build finishing its requests.
@@ -265,6 +302,10 @@ struct Dev {
     starts: u64,
     started_at: u64,
     build: BuildState,
+    /// Why nothing serves, when nothing does because of a failure.
+    failure: Option<Failed>,
+    /// A build is being started (until it serves or fails).
+    starting: bool,
     report: Report,
     /// `--background` started this runner (its events go to
     /// `.giong/runner.log`, and it has a process group of its own).
@@ -352,6 +393,8 @@ impl Dev {
             served: false,
             started_at: unix_ms(),
             build: BuildState::default(),
+            failure: None,
+            starting: false,
             report: Report::new("dev"),
             background: std::env::var_os(devctl::BACKGROUND_VAR).is_some_and(|v| v == "1"),
             project,
@@ -513,8 +556,11 @@ impl Dev {
                 json!({"files": changed.iter().map(|p| p.display().to_string()).collect::<Vec<_>>()}),
             );
             match watch::classify(&changed) {
-                Some(Change::Env) => self.restart(changed_at),
-                Some(Change::Code) => self.rebuild(changed_at),
+                // Without a binary of the code as it is (the last build
+                // failed), a change to .env builds: the binary before the
+                // failure is old code.
+                Some(Change::Env) if self.exe.is_some() => self.restart(changed_at),
+                Some(Change::Env | Change::Code) => self.rebuild(changed_at),
                 None => {}
             }
         }
@@ -564,9 +610,12 @@ impl Dev {
         Ok(std::mem::replace(&mut self.report, Report::new("dev")))
     }
 
-    /// Builds; on failure the diagnostics are shown and the old build keeps
-    /// serving.
+    /// Builds; on failure the diagnostics are shown and the build that
+    /// served is stopped ([`Dev::fail`]).
     fn build_once(&mut self, changed_at: Instant) -> bool {
+        // A failure before this change no longer says why nothing serves:
+        // this build will (or it serves).
+        self.failure = None;
         self.build = BuildState {
             state: "building",
             started_at: unix_ms(),
@@ -610,14 +659,11 @@ impl Dev {
                 self.build.state = "failed";
                 self.build.error = Some(f.what.clone());
                 self.build.finished_at = Some(unix_ms());
-                self.write_state();
+                self.exe = None;
                 let finding = Finding::new(f.code, Severity::Error, f.what).fix(f.fix);
-                self.say(
-                    "build_failed",
-                    finding.title.clone(),
-                    json!({"findings": [finding.to_json()]}),
-                );
-                self.report.push(finding);
+                self.report.push(finding.clone());
+                let fields = json!({"findings": [finding.to_json()]});
+                self.fail("build_failed", "build", finding, fields, None);
                 return false;
             }
         };
@@ -645,25 +691,15 @@ impl Dev {
         if !outcome.ok {
             self.build.state = "failed";
             self.build.error = outcome.findings.first().map(|f| f.title.clone());
-            self.write_state();
-            let running = if self.current.is_some() {
-                "; the running build keeps serving"
-            } else {
-                ""
-            };
-            self.say(
-                "build_failed",
-                format!(
-                    "build failed ({errors} {}){running}",
-                    if errors == 1 { "error" } else { "errors" }
-                ),
-                json!({"findings": outcome.findings.iter().map(Finding::to_json).collect::<Vec<_>>()}),
-            );
+            self.exe = None;
+            let fields = json!({"findings": outcome.findings.iter().map(Finding::to_json).collect::<Vec<_>>()});
+            let finding = build_failure(&outcome.findings, errors);
             if self.once {
                 for f in outcome.findings {
                     self.report.push(f);
                 }
             }
+            self.fail("build_failed", "build", finding, fields, None);
             return false;
         }
         let exe = outcome
@@ -673,14 +709,14 @@ impl Dev {
             .or_else(|| outcome.executables.first())
             .map(|(p, _)| p.clone());
         let Some(exe) = exe else {
+            let what = format!("cargo built no binary named {}", self.bin);
             self.build.state = "failed";
-            self.build.error = Some(format!("cargo built no binary named {}", self.bin));
-            self.write_state();
-            self.say(
-                "build_failed",
-                format!("cargo built no binary named {}", self.bin),
-                json!({}),
-            );
+            self.build.error = Some(what.clone());
+            self.exe = None;
+            let finding = Finding::new(Code::BUILD_FAILED, Severity::Error, what)
+                .fix("check the [[bin]] targets of Cargo.toml, or name one with --bin");
+            let fields = json!({"findings": [finding.to_json()]});
+            self.fail("build_failed", "build", finding, fields, None);
             return false;
         };
         self.exe = Some(exe);
@@ -712,12 +748,34 @@ impl Dev {
             return;
         };
         let shared = self.shares_sockets();
+        let mut stopped_first = None;
         if !shared {
             if let Some(old) = self.current.take() {
+                stopped_first = Some(old.pid);
                 self.stop_now(old);
             }
         }
-        match self.start(&exe, shared) {
+        // The sockets were closed when nothing could serve: bound again.
+        #[cfg(unix)]
+        if shared && self.listeners.is_empty() {
+            let bound: Result<Vec<_>, Failure> =
+                self.listen.iter().map(|a| listen_on(*a)).collect();
+            match bound {
+                Ok(listeners) => self.listeners = listeners,
+                Err(f) => {
+                    let finding = Finding::new(f.code, Severity::Error, f.what).fix(f.fix);
+                    self.report.push(finding.clone());
+                    let fields = json!({"finding": finding.to_json()});
+                    self.fail("start_failed", "start", finding, fields, None);
+                    return;
+                }
+            }
+        }
+        self.starting = true;
+        self.write_state();
+        let started = self.start(&exe, shared);
+        self.starting = false;
+        match started {
             Ok(service) => {
                 let pid = service.pid;
                 if let Some(old) = self.current.replace(service) {
@@ -727,6 +785,7 @@ impl Dev {
                     self.restarts += 1;
                 }
                 self.served = true;
+                self.failure = None;
                 self.write_state();
                 let took = changed_at.elapsed();
                 let addrs: Vec<String> = self.listen.iter().map(|a| a.to_string()).collect();
@@ -745,26 +804,85 @@ impl Dev {
                 );
             }
             Err(finding) => {
-                let running = if self.current.is_some() {
-                    "; the running build keeps serving"
-                } else {
-                    ""
-                };
-                self.say(
-                    "start_failed",
-                    format!("{}{running}", finding.title),
-                    json!({"finding": finding.to_json()}),
-                );
-                self.report.push(finding);
-                self.write_state();
+                self.report.push(finding.clone());
+                let fields = json!({"finding": finding.to_json()});
+                self.fail("start_failed", "start", finding, fields, stopped_first);
             }
         }
+    }
+
+    /// The change did not serve, or the service stopped: the build that
+    /// served is stopped too and the port closes (giong dev never serves code
+    /// older than the files), and the cause goes to the terminal, the event
+    /// and `.giong/dev.json` for `giong dev status` and the dashboard. The
+    /// next save builds and starts again.
+    fn fail(
+        &mut self,
+        event: &str,
+        stage: &'static str,
+        finding: Finding,
+        mut fields: Value,
+        stopped_before: Option<u32>,
+    ) {
+        let stopped = self.stop_serving().or(stopped_before);
+        let failed = Failed {
+            stage,
+            finding,
+            at: unix_ms(),
+            stopped,
+        };
+        fields["serving"] = json!(false);
+        fields["stopped_pid"] = json!(stopped);
+        fields["failure"] = failed.to_json();
+        let until = match stage {
+            "build" => "until the code compiles",
+            "start" => "until a save builds one that starts",
+            _ => "until a save starts it again",
+        };
+        let message = format!(
+            "{}: {}; {}nothing serves {until}",
+            failed.finding.code,
+            failed.finding.title,
+            match stopped {
+                Some(pid) => format!("the previous build (pid {pid}) was stopped too: "),
+                None => String::new(),
+            },
+        );
+        let fix = failed.finding.fix.clone();
+        self.failure = Some(failed);
+        self.write_state();
+        self.say(event, message, fields);
+        if !self.json && !fix.is_empty() {
+            let _ = writeln!(std::io::stderr().lock(), "giong dev:   fix: {fix}");
+        }
+    }
+
+    /// Stops the build that serves and the old ones still finishing their
+    /// requests, and closes the listening sockets (bound again at the next
+    /// start), so that a client is refused at once instead of waiting in a
+    /// queue that nobody takes from. Gives the pid of the build that served.
+    fn stop_serving(&mut self) -> Option<u32> {
+        let stopped = self.current.take().map(|old| {
+            let pid = old.pid;
+            self.stop_now(old);
+            pid
+        });
+        // Old builds hold a copy of the listening socket until they exit.
+        for mut r in self.retiring.drain(..) {
+            let _ = r.child.kill();
+            let _ = r.child.wait();
+        }
+        #[cfg(unix)]
+        self.listeners.clear();
+        stopped
     }
 
     fn shares_sockets(&self) -> bool {
         #[cfg(unix)]
         {
-            !self.listeners.is_empty()
+            // Set only when the sockets were bound ([`Dev::bind`]); they
+            // may be closed for now ([`Dev::stop_serving`]).
+            !self.listen.is_empty()
         }
         #[cfg(not(unix))]
         {
@@ -777,7 +895,20 @@ impl Dev {
         self.starts += 1;
         let mcp = mcp_socket(&state_dir, self.starts);
         let _ = fs::remove_file(&mcp);
-        let mut cmd = Process::new(exe);
+        let program = runnable(exe, self.starts)?;
+        let mut cmd = Process::new(&program);
+        // The copy runs from another folder: the DLLs next to cargo's file
+        // (and in deps/, as cargo run finds them) are found through PATH.
+        #[cfg(windows)]
+        if let Some(dir) = exe.parent() {
+            let mut paths = vec![dir.to_path_buf(), dir.join("deps")];
+            paths.extend(std::env::split_paths(
+                &std::env::var_os("PATH").unwrap_or_default(),
+            ));
+            if let Ok(path) = std::env::join_paths(paths) {
+                cmd.env("PATH", path);
+            }
+        }
         cmd.args(&self.service_args)
             .env_remove(devctl::BACKGROUND_VAR)
             .current_dir(&self.project.root)
@@ -837,6 +968,7 @@ impl Dev {
             child,
             mcp: if mcp_on { mcp } else { PathBuf::new() },
             tail: Arc::new(Mutex::new(VecDeque::new())),
+            readers: Vec::new(),
             #[cfg(unix)]
             ready: None,
             #[cfg(unix)]
@@ -1022,7 +1154,7 @@ impl Dev {
             let log = Arc::clone(&self.log);
             let tail = Arc::clone(&service.tail);
             let echo = !self.json;
-            std::thread::spawn(move || {
+            let reader = std::thread::spawn(move || {
                 let mut reader = BufReader::new(stream);
                 let mut line = Vec::new();
                 loop {
@@ -1052,6 +1184,7 @@ impl Dev {
                     }
                 }
             });
+            service.readers.push(reader);
         }
     }
 
@@ -1110,38 +1243,39 @@ impl Dev {
         if let Some(status) = exited {
             let service = self.current.take().expect("checked");
             self.service_ended(&service, Some(status));
-            self.write_state();
         }
     }
 
     fn service_ended(&mut self, service: &Service, status: Option<ExitStatus>) {
         let _ = fs::remove_file(&service.mcp);
-        if status.is_some_and(|s| s.success()) {
-            let then = if self.once {
-                ""
-            } else {
-                "; save a file to start it again"
-            };
+        if self.once {
+            if status.is_some_and(|s| s.success()) {
+                self.say(
+                    "exited",
+                    "the service exited (status 0)".into(),
+                    json!({"pid": service.pid, "code": 0}),
+                );
+                return;
+            }
+            let finding = self.exited_finding(service, status);
             self.say(
                 "exited",
-                format!("the service exited (status 0){then}"),
-                json!({"pid": service.pid, "code": 0}),
+                finding.title.clone(),
+                json!({"pid": service.pid, "code": status.and_then(|s| s.code()), "finding": finding.to_json()}),
             );
+            self.report.push(finding);
             return;
         }
-        // Give the output threads a moment to take the last lines.
-        std::thread::sleep(Duration::from_millis(50));
-        let finding = self.exited_finding(service, status);
-        self.say(
-            "exited",
-            if self.once {
-                finding.title.clone()
-            } else {
-                format!("{}; fix it and save to start it again", finding.title)
-            },
-            json!({"pid": service.pid, "code": status.and_then(|s| s.code()), "finding": finding.to_json()}),
-        );
-        self.report.push(finding);
+        let finding = if status.is_some_and(|s| s.success()) {
+            // Not an error of the session's report, but nothing serves.
+            exited_by_itself(service)
+        } else {
+            let f = self.exited_finding(service, status);
+            self.report.push(f.clone());
+            f
+        };
+        let fields = json!({"pid": service.pid, "code": status.and_then(|s| s.code()), "finding": finding.to_json()});
+        self.fail("exited", "exited", finding, fields, None);
     }
 
     fn exited_finding(&self, service: &Service, status: Option<ExitStatus>) -> Finding {
@@ -1149,14 +1283,49 @@ impl Dev {
             Some(s) => describe_status(s),
             None => "for an unknown reason".to_string(),
         };
+        let tail = tail_text(service);
+        if says_port_in_use(&tail) {
+            let port = self.addresses.first().map(|a| a.port());
+            let ours = port
+                .and_then(devctl::port_owner)
+                .is_some_and(|(pid, _)| pid == std::process::id());
+            let owner = if ours {
+                // The socket giong dev hands down: the service bound the
+                // address another way.
+                Some(format!(
+                    "giong dev holds {} for the service and hands the socket down: bind exactly \
+                     LISTEN with giong::net::TcpListener (giong 1.5 or later, or giong-web's \
+                     serve), not std::net or another runtime's listener",
+                    self.addresses
+                        .iter()
+                        .map(|a| a.to_string())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                ))
+            } else {
+                port.and_then(devctl::port_owner_fix)
+            };
+            return Finding::new(
+                Code::PORT_IN_USE,
+                Severity::Error,
+                format!("the service stopped {how}: its port is in use"),
+            )
+            .detail(tail)
+            .fix(owner.unwrap_or_else(|| {
+                "another program listens on the service's port (a service started by hand?): \
+                 stop it, or set another LISTEN in .env, then save"
+                    .to_string()
+            }));
+        }
         Finding::new(
             Code::SERVICE_EXITED,
             Severity::Error,
             format!("the service stopped {how}"),
         )
-        .detail(tail_text(service))
+        .detail(tail)
         .fix(format!(
-            "read its last lines above (all of them are in {}); a panic names the file and line",
+            "read its last lines (giong dev logs; all of them are in {}): a panic names the file \
+             and line. Fix the code and save: giong dev builds and starts it again",
             self.log_path.display()
         ))
     }
@@ -1194,6 +1363,8 @@ impl Dev {
             "log": self.log_path.display().to_string(),
             "restarts": self.restarts,
             "build": self.build_json(),
+            "failure": self.failure.as_ref().map(Failed::to_json),
+            "starting": self.starting,
         });
         let _ = state::replace(&dir.join("dev.json"), format!("{doc:#}\n").as_bytes());
     }
@@ -1258,11 +1429,93 @@ impl Dev {
             let _ = r.child.wait();
         }
         let _ = fs::remove_file(self.project.root.join(".giong").join("dev.json"));
+        if let Some(exe) = &self.exe {
+            remove_copies(exe);
+        }
         devctl::unregister();
         // The folder of short socket paths, when the project's was too long.
         #[cfg(unix)]
         let _ = fs::remove_dir(short_socket_dir());
     }
+}
+
+/// The program to start for a build. On Windows a running program cannot be
+/// removed or replaced, so cargo's next build of it fails ("failed to remove
+/// file ... Access is denied") for as long as the service runs: each start
+/// runs a copy instead, in `giong-dev/` next to cargo's file. Elsewhere a new
+/// build replaces the file without touching the running process, which
+/// runs cargo's file itself.
+fn runnable(exe: &Path, n: u64) -> Result<PathBuf, Finding> {
+    #[cfg(windows)]
+    {
+        let dir = exe
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("giong-dev");
+        // Copies of earlier starts first (it removes the folder when empty).
+        remove_copies(exe);
+        let _ = fs::create_dir_all(&dir);
+        let stem = exe
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "service".into());
+        let copy = dir.join(format!("{stem}-{}-{n}.exe", std::process::id()));
+        fs::copy(exe, &copy).map_err(|e| {
+            start_failed(format!(
+                "{} cannot be copied to {} to run it: {e}",
+                exe.display(),
+                copy.display()
+            ))
+        })?;
+        Ok(copy)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = n;
+        Ok(exe.to_path_buf())
+    }
+}
+
+/// Removes the copies [`runnable`] made of `exe` (Windows): one whose
+/// process still runs cannot be removed and stays until the next call.
+fn remove_copies(exe: &Path) {
+    #[cfg(windows)]
+    {
+        let dir = exe
+            .parent()
+            .unwrap_or_else(|| Path::new("."))
+            .join("giong-dev");
+        let stem = exe
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        for entry in fs::read_dir(&dir).into_iter().flatten().flatten() {
+            if is_copy_of(&stem, &entry.file_name().to_string_lossy()) {
+                let _ = fs::remove_file(entry.path());
+            }
+        }
+        let _ = fs::remove_dir(&dir);
+    }
+    #[cfg(not(windows))]
+    let _ = exe;
+}
+
+/// Whether `name` is a copy [`runnable`] made of the binary `stem`:
+/// `<stem>-<pid>-<n>.exe`, and not one of another binary whose name starts
+/// the same (`app` and `app-worker`).
+#[cfg_attr(not(windows), allow(dead_code))] // tested everywhere
+fn is_copy_of(stem: &str, name: &str) -> bool {
+    let Some(rest) = name
+        .strip_prefix(stem)
+        .and_then(|r| r.strip_prefix('-'))
+        .and_then(|r| r.strip_suffix(".exe"))
+    else {
+        return false;
+    };
+    let digits =
+        |p: Option<&str>| p.is_some_and(|p| !p.is_empty() && p.bytes().all(|b| b.is_ascii_digit()));
+    let mut parts = rest.split('-');
+    digits(parts.next()) && digits(parts.next()) && parts.next().is_none()
 }
 
 /// Where the giong-mcp socket of the `n`th start goes: `.giong/` in the
@@ -1310,6 +1563,55 @@ fn start_failed(what: String) -> Finding {
         .fix("check that the binary was built and can run on this machine")
 }
 
+/// The one finding that says why a build failed: how many errors, the first
+/// ones with their place.
+fn build_failure(findings: &[Finding], errors: usize) -> Finding {
+    let first: Vec<String> = findings
+        .iter()
+        .filter(|f| f.severity == Severity::Error)
+        .take(5)
+        .map(|f| match &f.place {
+            Some(p) => format!("{}:{}:{}: {}", p.file, p.line, p.column, f.title),
+            None => f.title.clone(),
+        })
+        .collect();
+    Finding::new(
+        Code::BUILD_FAILED,
+        Severity::Error,
+        format!(
+            "the build failed ({errors} {})",
+            if errors == 1 { "error" } else { "errors" }
+        ),
+    )
+    .detail(first.join("\n"))
+    .fix("fix the code and save: giong dev builds and starts it again")
+}
+
+/// A service that returned from `main` (status 0) while giong dev watched.
+fn exited_by_itself(service: &Service) -> Finding {
+    Finding::new(
+        Code::SERVICE_EXITED,
+        Severity::Error,
+        "the service exited by itself (status 0)",
+    )
+    .detail(tail_text(service))
+    .fix(
+        "a service returns from main only when something ends it (a shutdown signal, a loop \
+         that finishes): save a file to start it again",
+    )
+}
+
+/// Whether a service's last lines say it could not bind its port.
+fn says_port_in_use(tail: &str) -> bool {
+    let t = tail.to_ascii_lowercase();
+    // Unix (EADDRINUSE: os error 98 on Linux, 48 on macOS), Windows
+    // (WSAEADDRINUSE, os error 10048), and the runtime's own error.
+    t.contains("address already in use")
+        || t.contains("addrinuse")
+        || t.contains("os error 10048")
+        || t.contains("only one usage of each socket address")
+}
+
 fn watch_limit() -> Finding {
     Finding::new(
         Code::WATCH_LIMIT,
@@ -1319,7 +1621,14 @@ fn watch_limit() -> Finding {
     .fix("move large data out of the project, or into a directory named target or node_modules")
 }
 
+/// The last lines of a service that ended: once its output threads have
+/// read everything (half a second at most: a program it started may hold
+/// its output open).
 fn tail_text(service: &Service) -> String {
+    let until = Instant::now() + Duration::from_millis(500);
+    while service.readers.iter().any(|r| !r.is_finished()) && Instant::now() < until {
+        std::thread::sleep(Duration::from_millis(5));
+    }
     service
         .tail
         .lock()
@@ -1801,13 +2110,21 @@ fn has_dev_feature(project: &Project, crate_name: &str) -> bool {
 #[cfg(unix)]
 fn giong_takes_sockets(project: &Project) -> bool {
     let Ok(lock) = fs::read_to_string(project.root.join("Cargo.lock")) else {
-        // No lock file yet: the build just made one, or will. Assume a
-        // current giong.
-        return true;
+        // No lock file yet: the build will make one, with a current giong
+        // when a package depends on a giong crate.
+        return project.packages().any(|p| {
+            p["dependencies"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|d| d["name"].as_str())
+                .any(|n| n == "giong" || n.starts_with("giong-"))
+        });
     };
-    lock_giong_version(&lock).map_or(true, |(v, from_path)| {
-        from_path || v >= crate::host::Version(1, 5, 0)
-    })
+    // Without giong in the lock file, nothing in the service takes them: a
+    // socket of giong dev's would only hold the port it binds.
+    lock_giong_version(&lock)
+        .is_some_and(|(v, from_path)| from_path || v >= crate::host::Version(1, 5, 0))
 }
 
 /// giong's version in a Cargo.lock, and whether it comes from a path (no
@@ -1948,6 +2265,64 @@ mod tests {
         let e = listen_addresses(Some("localhost:8080"), &[]).unwrap_err();
         assert_eq!(e.code, Code::HOST_NAME_BIND);
         assert!(listen_addresses(Some("127.0.0.1:0"), &[]).is_err());
+    }
+
+    #[test]
+    fn only_copies_of_the_same_binary_are_removed() {
+        assert!(is_copy_of("app", "app-1234-1.exe"));
+        assert!(is_copy_of("app", "app-1234-27.exe"));
+        assert!(!is_copy_of("app", "app-worker-1234-1.exe"));
+        assert!(!is_copy_of("app", "app-1234.exe"));
+        assert!(!is_copy_of("app", "app-1234-1-2.exe"));
+        assert!(!is_copy_of("app", "app-12a4-1.exe"));
+        assert!(!is_copy_of("app", "app.exe"));
+        assert!(is_copy_of("app-worker", "app-worker-9-3.exe"));
+    }
+
+    #[test]
+    fn a_port_in_use_is_told_on_every_system() {
+        for tail in [
+            "called `Result::unwrap()` on an `Err` value: Os { code: 98, kind: AddrInUse, message: \"Address already in use\" }",
+            "Error: Address already in use (os error 48)",
+            "bind: Only one usage of each socket address (protocol/network address/port) is normally permitted. (os error 10048)",
+        ] {
+            assert!(says_port_in_use(tail), "{tail}");
+        }
+        assert!(!says_port_in_use(
+            "thread 'main' panicked at src/main.rs:3:5:\nboom"
+        ));
+    }
+
+    #[test]
+    fn a_failed_build_is_one_finding_with_the_first_errors() {
+        let errors: Vec<Finding> = (1..=7)
+            .map(|n| {
+                Finding::new(Code::BUILD_FAILED, Severity::Error, format!("error {n}")).at(
+                    "src/main.rs",
+                    n,
+                    2,
+                )
+            })
+            .chain([Finding::new(
+                Code::BUILD_FAILED,
+                Severity::Warning,
+                "a warning",
+            )])
+            .collect();
+        let f = build_failure(&errors, 7);
+        assert_eq!(f.code, Code::BUILD_FAILED);
+        assert_eq!(f.title, "the build failed (7 errors)");
+        assert_eq!(f.detail.lines().count(), 5);
+        assert!(
+            f.detail.starts_with("src/main.rs:1:2: error 1"),
+            "{}",
+            f.detail
+        );
+        assert!(!f.detail.contains("warning"));
+        assert_eq!(
+            build_failure(&errors[..1], 1).title,
+            "the build failed (1 error)"
+        );
     }
 
     #[test]

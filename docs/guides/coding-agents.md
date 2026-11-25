@@ -31,7 +31,7 @@ One project has one runner, and the agent drives it with these commands only:
 giong dev --background          # once: builds, serves on 127.0.0.1, returns when it answers
 # ... edit the code: the runner rebuilds on every save and swaps the new build in ...
 curl http://127.0.0.1:8080/health
-giong dev status --json         # is it up, where, and the first error of the last build
+giong dev status --json         # is it up, where, and why not (failure: code, cause, last lines, fix)
 giong dev logs --lines 50       # what the service printed
 giong check --json              # compiler, clippy and giong's own checks: run before calling it done
 giong fix                       # applies the fixes that need no judgement
@@ -39,7 +39,7 @@ giong test                      # the tests, on io_uring and on epoll
 giong dev stop                  # at the end: the service, and the database giong started
 ```
 
-What the agent must not do while developing: `cargo run`, `cargo build --release`, start Docker or a container itself, or open a second terminal to run the service. Each of those starts a second copy that fights the runner for the port. A build that fails leaves the last good build serving and comes back as findings, so the agent reads `giong dev status --json`, fixes the code and saves again.
+What the agent must not do while developing: `cargo run`, `cargo build --release`, start Docker or a container itself, or open a second terminal to run the service. Each of those starts a second copy that fights the runner for the port. A change that does not compile, or that compiles but does not start (a panic at start-up, a port it cannot bind), stops the service instead of leaving an older build answering: the agent never tests code that is not in the files. Requests are refused until the code works, and `giong dev status --json` says why: `state` is `failed` and `failure` holds the code (`GIONG-E5009` for the compiler, `GIONG-E5017` for a service that stopped, `GIONG-E5014` for a port in use, `GIONG-E5018` for one that never listened), the cause, the compiler's errors or the service's last lines in `detail`, and the fix. The agent fixes the code and saves; the runner builds and serves again by itself.
 
 ## Connect the agent to giong over MCP
 

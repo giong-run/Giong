@@ -366,22 +366,13 @@ fn dev_reloads_an_edit_without_dropping_a_request() {
             || get(addr, path).is_ok_and(|(_, b)| b.contains(&new_text)),
         );
     }
-    // A build error keeps the old process serving.
-    let broken = files[0].clone();
-    let good = std::fs::read_to_string(&broken).unwrap();
-    std::fs::write(&broken, format!("{good}\nfn this_does_not_compile( {{\n")).unwrap();
-    std::thread::sleep(Duration::from_secs(5));
-    let (s, b) = get(addr, path).expect("the old build stops answering after a failed build");
-    assert!(s < 500 && b.contains("e2e reload 3"), "{s} {b}");
-    std::fs::write(&broken, good).unwrap();
-
     stop.store(true, Ordering::Relaxed);
     for c in clients {
         c.join().unwrap();
     }
     let failures = failures.lock().unwrap();
     let served = ok.load(Ordering::Relaxed);
-    eprintln!("dev reload: {served} requests over 3 reloads and a failed build");
+    eprintln!("dev reload: {served} requests over 3 reloads");
     assert!(served > 50, "only {served} requests ran during the reloads");
     assert!(
         failures.is_empty(),
@@ -391,6 +382,108 @@ fn dev_reloads_an_edit_without_dropping_a_request() {
         failures.first(),
         dev.log()
     );
+}
+
+/// K's rule for development: a change that breaks the service shows the
+/// error; no old build keeps answering, so neither a person nor an agent
+/// tests code that is not in the files. With the sockets giong dev hands
+/// down, a failed change also closes the port: a client is refused at once
+/// instead of waiting in a queue nobody takes from. The next save serves.
+#[test]
+fn dev_never_serves_an_old_build() {
+    if !has_command("new") || !has_command("dev") || !slow_enabled("dev_never_serves_an_old_build")
+    {
+        return;
+    }
+    let dir = TempDir::new("scenario-dev-fail");
+    let (out, app) = new_project(&dir, "app", &[]);
+    out.expect_code(0);
+    let port = free_port();
+    let addr: SocketAddr = format!("127.0.0.1:{port}").parse().unwrap();
+    let mut dev = Dev::start(&app, port);
+    let healthy = || get(addr, "/health").is_ok_and(|(s, _)| s < 500);
+    dev.wait_until(
+        "the first build to answer",
+        Duration::from_secs(600),
+        healthy,
+    );
+    let status = || {
+        giong(["dev", "status", "--json"])
+            .dir(&app)
+            .run()
+            .report("dev")
+    };
+    // Refused at once: neither answered by an old build nor left waiting.
+    let refused = |what: &str| {
+        let start = Instant::now();
+        let r = get(addr, "/health");
+        assert!(
+            r.is_err() && start.elapsed() < Duration::from_secs(2),
+            "after {what}: {r:?} after {:?}",
+            start.elapsed()
+        );
+    };
+    let main_rs = app.join("src/main.rs");
+    let good = std::fs::read_to_string(&main_rs).unwrap();
+
+    // It does not compile.
+    std::fs::write(&main_rs, format!("{good}\nfn this_does_not_compile( {{\n")).unwrap();
+    dev.wait_until("the failed build", Duration::from_secs(300), || {
+        status()["data"]["failure"]["stage"] == "build"
+    });
+    refused("a failed build");
+    let v = status();
+    assert_eq!(v["data"]["state"], "failed", "{v:#}");
+    assert_eq!(v["data"]["failure"]["code"], "GIONG-E5009", "{v:#}");
+    assert!(v["data"]["failure"]["stopped_pid"].is_u64(), "{v:#}");
+    // The event follows the state file (and the output reaches us later).
+    let log_has = |dev: &Dev| dev.log().contains("\"serving\":false");
+    let start = Instant::now();
+    while !log_has(&dev) && start.elapsed() < Duration::from_secs(10) {
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    assert!(
+        log_has(&dev),
+        "no build_failed event saying nothing serves:\n{}",
+        dev.log()
+    );
+
+    std::fs::write(&main_rs, &good).unwrap();
+    dev.wait_until(
+        "the fixed build to answer",
+        Duration::from_secs(300),
+        healthy,
+    );
+
+    // It compiles, and stops at start-up.
+    let boot = good.replacen(
+        "fn main() -> ExitCode {",
+        "fn main() -> ExitCode {\n    panic!(\"e2e boot failure\");\n    #[allow(unreachable_code)]",
+        1,
+    );
+    assert_ne!(boot, good, "the template has no fn main() -> ExitCode");
+    std::fs::write(&main_rs, &boot).unwrap();
+    dev.wait_until("the failed start", Duration::from_secs(300), || {
+        status()["data"]["failure"]["stage"] == "start"
+    });
+    refused("a failed start");
+    let v = status();
+    assert_eq!(v["data"]["failure"]["code"], "GIONG-E5017", "{v:#}");
+    assert!(
+        v["data"]["failure"]["detail"]
+            .as_str()
+            .unwrap_or("")
+            .contains("e2e boot failure"),
+        "{v:#}"
+    );
+
+    std::fs::write(&main_rs, &good).unwrap();
+    dev.wait_until("the fixed start to serve", Duration::from_secs(300), || {
+        status()["data"]["state"] == "serving"
+    });
+    assert!(healthy());
+    let v = status();
+    assert!(v["data"]["failure"].is_null(), "{v:#}");
 }
 
 /// The text to replace in round `round`: the original body first, then what

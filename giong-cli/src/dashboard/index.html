@@ -33,6 +33,9 @@ header { display: flex; flex-wrap: wrap; align-items: center; gap: 12px 20px; pa
 .facts { display: flex; flex-wrap: wrap; gap: 4px 16px; color: var(--muted); font-size: 12px; }
 .facts b { color: var(--ink); font-weight: 600; }
 .builderr { flex-basis: 100%; color: var(--bad); font-family: ui-monospace, Menlo, monospace; font-size: 12px; }
+.builderr pre { margin: 4px 0; padding: 6px 8px; max-height: 40vh; overflow: auto; white-space: pre-wrap;
+  word-break: break-word; color: var(--ink); background: var(--bg); border: 1px solid var(--line); border-radius: 6px; }
+.builderr .fix { color: var(--muted); font-family: inherit; }
 nav { display: flex; gap: 2px; padding: 0 20px; background: var(--panel); border-bottom: 1px solid var(--line);
   overflow-x: auto; }
 nav button { background: none; border: 0; border-bottom: 2px solid transparent; padding: 10px 12px;
@@ -262,7 +265,12 @@ async function loadState() {
   state = s;
   const st = $("status");
   const build = s.dev && s.dev.build;
+  // Why nothing serves: giong dev stops the old build when a change fails,
+  // so this is never hidden behind an old build that still answers.
+  const failure = s.dev && s.dev_alive !== false && s.dev.failure;
+  const failWord = { build: "build failed", start: "start failed", exited: "service stopped" };
   if (build && build.state === "building") { st.className = "pill warn"; st.textContent = "building"; }
+  else if (failure) { st.className = "pill bad"; st.textContent = (failWord[failure.stage] || "failed") + ": nothing serves"; }
   else if (build && build.state === "failed") { st.className = "pill bad"; st.textContent = "build failed"; }
   else if (s.overview) { st.className = "pill ok"; st.textContent = "running"; }
   else if (s.dev && s.dev_alive === false) { st.className = "pill muted"; st.textContent = "giong dev stopped"; }
@@ -284,7 +292,15 @@ async function loadState() {
   if (s.dev && s.dev.restarts != null) fact("restarts", s.dev.restarts);
   put("facts", f);
   const be = $("builderr");
-  if (build && build.state === "failed" && build.error) { be.hidden = false; be.textContent = build.error + (build.errors > 1 ? "  (+" + (build.errors - 1) + " more)" : ""); }
+  if (failure && !(build && build.state === "building")) {
+    be.hidden = false;
+    put("builderr",
+      el("div", {}, failure.code ? [codeLink(failure.code), " "] : null, el("b", {}, failure.title),
+        failure.stopped_pid ? " (the previous build was stopped too: no old code answers)" : null),
+      failure.detail ? el("pre", {}, failure.detail) : null,
+      failure.fix ? el("div", { class: "fix" }, "Fix: ", failure.fix) : null);
+  }
+  else if (build && build.state === "failed" && build.error) { be.hidden = false; be.textContent = build.error + (build.errors > 1 ? "  (+" + (build.errors - 1) + " more)" : ""); }
   else be.hidden = true;
   renderWarnings();
 }

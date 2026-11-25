@@ -36,7 +36,8 @@ One `giong dev` per project, started once: edit the code and it swaps in the new
 {{#if worker}}
 by itself.
 {{#else}}
-without refusing a connection. Try the service on the address it prints.
+without refusing a connection. Try the service on the address it prints. A change that
+does not compile or start stops it, so nothing old answers: `giong dev status` says why.
 {{/if}}
 {{/if}}
 
