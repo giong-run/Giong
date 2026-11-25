@@ -103,18 +103,21 @@ const OPENING_WAIT: Duration = Duration::from_millis(20);
 /// below 2^63 (292 years): what a sleep in progress is measured on, by the
 /// worker that sleeps and by the threads that read its pulse.
 ///
-/// On Unix it is `CLOCK_MONOTONIC` read directly: a worker reads it twice
-/// per sleep, and going through `Instant` (a subtraction from an epoch,
-/// then a `Duration` turned back into nanoseconds) cost about 70
-/// instructions a reading, a few percent of a small TCP echo. Only
-/// differences between readings are used, so where the clock starts (boot)
-/// does not matter. It stays out of line: inlined into the worker loop it
+/// On Unix it is the clock `Instant` reads (`CLOCK_MONOTONIC`, macOS's
+/// `CLOCK_UPTIME_RAW`), read directly: a worker reads it twice per sleep,
+/// and going through `Instant` (a subtraction from an epoch, then a
+/// `Duration` turned back into nanoseconds) cost about 70 instructions a
+/// reading, a few percent of a small TCP echo. Only differences between
+/// readings are used, so where the clock starts (boot) does not matter. On
+/// macOS it must be `Instant`'s clock: `CLOCK_MONOTONIC` there runs through
+/// system sleep and is slewed by time synchronization, so idle time read
+/// on it could pass the time a caller measured with `Instant`. It stays out of line: inlined into the worker loop it
 /// moved that loop's code so that every turn on epoll cost one or two
 /// instructions more, sleeping or not.
 #[cfg(unix)]
 #[inline(never)]
 fn clock_ns() -> u64 {
-    crate::sys::monotonic_ns() & !ASLEEP
+    crate::sys::instant_ns() & !ASLEEP
 }
 
 /// Nanoseconds on a clock that is the same for every thread of the process
