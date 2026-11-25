@@ -182,7 +182,7 @@ static TERM_IGNORED: AtomicBool = AtomicBool::new(false);
 const SAME_REQUEST_NS: u64 = 250_000_000;
 
 /// `CLOCK_MONOTONIC` in nanoseconds; never 0. Async-signal-safe.
-fn monotonic_ns() -> u64 {
+pub(crate) fn monotonic_ns() -> u64 {
     // SAFETY: all-zero is a valid timespec, which the call fills in.
     let mut ts: libc::timespec = unsafe { mem::zeroed() };
     // SAFETY: a valid clock and pointer; `clock_gettime` is
