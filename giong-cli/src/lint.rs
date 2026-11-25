@@ -482,10 +482,12 @@ pub fn mask(text: &str) -> String {
             b'\'' => {
                 // A character literal ('a', '\n', '\u{..}'), not a lifetime.
                 if b.get(i + 1) == Some(&b'\\') {
-                    let end = b[i + 2..]
+                    // The escaped character is never the end, even a quote.
+                    let from = (i + 3).min(b.len());
+                    let end = b[from..]
                         .iter()
                         .position(|c| *c == b'\'')
-                        .map_or(b.len(), |p| i + 2 + p);
+                        .map_or(b.len(), |p| from + p);
                     blank(&mut out, i + 1, end);
                     i = end + 1;
                 } else {
@@ -561,6 +563,16 @@ mod tests {
         assert!(!m.contains("// y") && !m.contains("/* a"));
         assert!(m.contains("'a: loop"));
         assert!(m.contains("let b = ' ';"));
+    }
+
+    /// `'\''` holds a quote: the literal ends at the quote after it, so the
+    /// next quote does not open a character or a string that hides code.
+    #[test]
+    fn an_escaped_quote_character_ends_where_it_ends() {
+        let src = "async fn h() {\n    let q = ['\\'','\"'];\n    std::thread::sleep(d);\n}\n";
+        assert_eq!(codes(src), [(5006, 3)]);
+        let m = mask("let q = b'\\''; let s = \"x\";");
+        assert_eq!(m, "let q = b'  '; let s = \" \";");
     }
 
     #[test]
