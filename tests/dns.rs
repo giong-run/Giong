@@ -605,10 +605,13 @@ fn lookups_of_one_name_at_the_same_time_share_one_query() {
 
 #[test]
 fn a_cancelled_lookup_hands_its_waiters_over() {
+    // Late enough that the first lookup is cancelled before its answer
+    // comes, however late a loaded machine runs the test's steps: with
+    // 200 ms, a worker that stalled 270 ms cancelled it after the answer.
     let dns = FakeDns::start(vec![(
         ("slow.test", A),
         Reply::Late(
-            Duration::from_millis(200),
+            Duration::from_secs(1),
             vec![a("slow.test", [192, 0, 2, 8], 300)],
         ),
     )]);

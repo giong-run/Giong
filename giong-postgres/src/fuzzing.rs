@@ -117,15 +117,16 @@ pub(crate) mod flags {
 }
 
 /// How long the fake server waits for the client's next request before it
-/// closes the connection. Waiting longer only makes a session slower: an
-/// early close is a server going away, which the client must handle too.
+/// closes the connection, when fuzzing. Waiting longer only makes a session
+/// slower: an early close is a server going away, which the client must
+/// handle too.
 const SERVER_PATIENCE: Duration = Duration::from_millis(10);
 
 /// Plays a server on `sock` that answers each request of the client (each
 /// `Sync` and each simple query) with the next of `answers`, as it is,
 /// whether or not it makes sense. It closes the connection when the answers
 /// run out, when the client says goodbye, or when the client stops asking.
-async fn serve(sock: UnixStream, answers: Vec<Vec<u8>>) {
+async fn serve(sock: UnixStream, answers: Vec<Vec<u8>>, patience: Duration) {
     let mut answers = answers.into_iter();
     let mut pending = Vec::new();
     loop {
@@ -152,7 +153,7 @@ async fn serve(sock: UnixStream, answers: Vec<Vec<u8>>) {
                 return;
             }
         }
-        match giong::time::timeout(SERVER_PATIENCE, sock.recv()).await {
+        match giong::time::timeout(patience, sock.recv()).await {
             Ok(Ok(chunk)) if !chunk.is_empty() => pending.extend_from_slice(&chunk),
             _ => return,
         }
@@ -168,6 +169,17 @@ async fn serve(sock: UnixStream, answers: Vec<Vec<u8>>) {
 /// (the server gives up long before), or when the connection is closed with
 /// requests still counted as in flight.
 pub(crate) async fn session(flags: u8, answers: Vec<Vec<u8>>) -> Vec<Result<(), Error>> {
+    session_with(flags, answers, SERVER_PATIENCE).await
+}
+
+/// [`session`] with a server that waits `patience` for each request: long,
+/// for a session that must get through whatever the machine's load (a
+/// thread sanitizer, other tests), whose client always asks or closes.
+pub(crate) async fn session_with(
+    flags: u8,
+    answers: Vec<Vec<u8>>,
+    patience: Duration,
+) -> Vec<Result<(), Error>> {
     let (ours, theirs) = UnixStream::pair().expect("a socket pair");
     let config = Config::new()
         .max_result_size(4096)
@@ -186,7 +198,7 @@ pub(crate) async fn session(flags: u8, answers: Vec<Vec<u8>>) -> Vec<Result<(), 
     if flags & flags::SHARED != 0 {
         client.set_shared(true);
     }
-    let server = giong::spawn(serve(theirs, answers));
+    let server = giong::spawn(serve(theirs, answers, patience));
     let run = async {
         let mut tasks = Vec::new();
         let c = client.clone();
