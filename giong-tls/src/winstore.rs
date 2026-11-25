@@ -4,9 +4,10 @@
 //! Windows keeps trusted roots in the `ROOT` store. Opened for the current
 //! user, it holds the user's own roots and, inherited, the machine's: the
 //! ones Microsoft ships, the ones Windows Update added and the ones an
-//! administrator or a group policy installed. A certificate in the
-//! `Disallowed` store is distrusted whatever else says, as Windows itself
-//! does.
+//! administrator or a group policy installed. A root that is also in the
+//! `Disallowed` store (the same certificate, byte for byte) is left out, as
+//! Windows itself does. An intermediate there is not refused: rustls takes
+//! the roots to trust, not certificates to refuse along a chain.
 //!
 //! Of the roots, only those valid for TLS server authentication are kept: a
 //! certificate restricted to other uses (code signing, e-mail) through its

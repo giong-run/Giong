@@ -1559,3 +1559,38 @@ fn shutting_down_the_read_half_ends_a_waiting_read() {
         assert_eq!(stats.tracked_ops, 0, "{stats:?}");
     });
 }
+
+#[test]
+fn a_read_or_recv_after_the_read_half_is_shut_gives_the_end_of_the_stream() {
+    giong::block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // `read` on one stream, `recv` on another: a stream takes one kind.
+        let reading = TcpStream::connect(addr).await.unwrap();
+        let reading_peer = listener.accept().await.unwrap();
+        let receiving = TcpStream::connect(addr).await.unwrap();
+        let receiving_peer = listener.accept().await.unwrap();
+        reading.shutdown(Shutdown::Read).unwrap();
+        receiving.shutdown(Shutdown::Read).unwrap();
+        for _ in 0..2 {
+            let (res, _) = timeout(Duration::from_secs(5), reading.read(Vec::with_capacity(64)))
+                .await
+                .expect("the read ended");
+            assert_eq!(res.unwrap(), 0, "the end of the stream");
+            let got = timeout(Duration::from_secs(5), receiving.recv())
+                .await
+                .expect("the recv ended")
+                .unwrap();
+            assert!(got.is_empty(), "the end of the stream");
+        }
+        // The write half still works.
+        let (res, _) = reading.write_all(b"after".to_vec()).await;
+        res.unwrap();
+        let got = recv_exact(&reading_peer, 5).await;
+        assert_eq!(got, b"after");
+        drop((reading, reading_peer, receiving, receiving_peer, listener));
+        sleep(Duration::from_millis(50)).await;
+        let stats = giong::observe::worker_stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}

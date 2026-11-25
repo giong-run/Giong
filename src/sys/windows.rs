@@ -477,7 +477,7 @@ pub(crate) unsafe fn sendmsg_nowait(sock: RawSock, msg: *const MsgHdr) -> isize 
     }
 }
 
-/// `WSARecvMsg` (an extension function, asked for once) on a non-blocking
+/// `WSARecvMsg` (an extension function, asked for until it is found) on a non-blocking
 /// socket, without an `OVERLAPPED`: the bytes received, or -1 with the
 /// thread's last error set (`WSAEMSGSIZE` for a datagram cut to fit, whose
 /// `dwFlags` then has `MSG_TRUNC`). `namelen`, `Control.len` and `dwFlags`
@@ -488,7 +488,7 @@ pub(crate) unsafe fn sendmsg_nowait(sock: RawSock, msg: *const MsgHdr) -> isize 
 /// `msg` must point at a live header whose pointers are valid for writing.
 #[cfg(feature = "unstable-udp-offload")]
 pub(crate) unsafe fn recvmsg_nowait(sock: RawSock, msg: *mut MsgHdr) -> isize {
-    use std::sync::OnceLock;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use windows_sys::Win32::Networking::WinSock::{
         SIO_GET_EXTENSION_FUNCTION_POINTER, WSAEOPNOTSUPP, WSAID_WSARECVMSG,
     };
@@ -499,10 +499,12 @@ pub(crate) unsafe fn recvmsg_nowait(sock: RawSock, msg: *mut MsgHdr) -> isize {
         *mut OVERLAPPED,
         WinSock::LPWSAOVERLAPPED_COMPLETION_ROUTINE,
     ) -> i32;
-    static RECV_MSG: OnceLock<usize> = OnceLock::new();
-    let f = *RECV_MSG.get_or_init(|| {
+    // Only a pointer that was found is kept: a lookup that failed (on a
+    // socket of another provider) is tried again on the next socket.
+    static RECV_MSG: AtomicUsize = AtomicUsize::new(0);
+    let mut f = RECV_MSG.load(Ordering::Relaxed);
+    if f == 0 {
         let guid = WSAID_WSARECVMSG;
-        let mut f = 0usize;
         let mut returned = 0u32;
         // SAFETY: asks the socket's provider for a function pointer; the
         // input and output are locals of the sizes given.
@@ -519,12 +521,11 @@ pub(crate) unsafe fn recvmsg_nowait(sock: RawSock, msg: *mut MsgHdr) -> isize {
                 None,
             )
         };
-        if rc == 0 {
-            f
-        } else {
-            0
+        if rc != 0 {
+            f = 0;
         }
-    });
+        RECV_MSG.store(f, Ordering::Relaxed);
+    }
     if f == 0 {
         WinSock::WSASetLastError(WSAEOPNOTSUPP);
         return -1;

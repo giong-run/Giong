@@ -148,13 +148,19 @@ pub(super) fn bind_socket(path: &Path) -> io::Result<Socket> {
 
 /// Two connected sockets, made through a listener bound to a fresh path
 /// in the temporary directory, whose file is removed before returning.
+///
+/// The name takes 28 bytes, so a temporary directory whose path is longer
+/// than 79 bytes (in UTF-8) fails with `UnixPathTooLong`. Another program
+/// of the same user could connect to the listener first: the accepted
+/// socket is kept only if it reads a random cookie the connected one
+/// wrote, and the pair is made again otherwise.
 pub(super) fn pair() -> io::Result<(Socket, Socket)> {
+    use std::io::{Read, Write};
     let dir = std::env::temp_dir();
     let mut tries = 0;
     loop {
-        let mut random = [0u8; 8];
-        crate::sys::random_bytes(&mut random);
-        let path = dir.join(format!("giong-{:016x}.sock", u64::from_ne_bytes(random)));
+        let random = random_u64();
+        let path = dir.join(format!("giong-{random:016x}.sock"));
         let addr = socket_addr(&path)?;
         let listener = new_socket()?;
         if let Err(e) = listener.bind(&addr) {
@@ -172,12 +178,55 @@ pub(super) fn pair() -> io::Result<(Socket, Socket)> {
             let a = new_socket()?;
             a.connect(&addr)?;
             let (b, _) = listener.accept()?;
-            Ok((a, b))
+            let cookie = random_u64().to_ne_bytes();
+            (&a).write_all(&cookie)?;
+            // A connection of another program would not send it: the
+            // wait is bounded, and a timeout counts as a wrong cookie.
+            b.set_read_timeout(Some(std::time::Duration::from_secs(2)))?;
+            let mut got = [0u8; 8];
+            match (&b).read_exact(&mut got) {
+                Ok(()) => {}
+                Err(e)
+                    if e.kind() == io::ErrorKind::TimedOut
+                        || e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::UnexpectedEof =>
+                {
+                    return Ok(None)
+                }
+                Err(e) => return Err(e),
+            }
+            b.set_read_timeout(None)?;
+            Ok((got == cookie).then_some((a, b)))
         })();
         drop(listener);
         let _ = std::fs::remove_file(&path);
-        return made;
+        match made {
+            Ok(Some(pair)) => return Ok(pair),
+            Ok(None) if tries < 8 => tries += 1,
+            Ok(None) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::ConnectionRefused,
+                    "UnixStream::pair: another program kept connecting to the listener first",
+                ))
+            }
+            Err(e) => return Err(e),
+        }
     }
+}
+
+/// 64 random bits; from the clock, the process and a counter in the case
+/// that cannot happen on Windows 10 and later, where the generator fails.
+fn random_u64() -> u64 {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    let mut random = [0u8; 8];
+    if crate::sys::random_bytes(&mut random) {
+        return u64::from_ne_bytes(random);
+    }
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let clock = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos() as u64);
+    clock ^ (u64::from(std::process::id()) << 32) ^ COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
 #[cfg(test)]

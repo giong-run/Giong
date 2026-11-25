@@ -1072,6 +1072,10 @@ impl UdpSocket {
     /// receive buffers must hold 64 KiB of payload (see
     /// [`Builder::recv_buffers`](crate::Builder::recv_buffers)): the kernel
     /// cuts a coalesced datagram that does not fit and drops the rest.
+    ///
+    /// On Windows, the sockets of this process bound to one address (one
+    /// per worker) are handles to one socket, so the option set through any
+    /// of them is set for all of them.
     #[cfg(feature = "unstable-udp-offload")]
     pub fn set_gro(&self, on: bool) -> io::Result<()> {
         self.before_recv("set_gro")?;
@@ -1127,6 +1131,10 @@ impl UdpSocket {
     /// has them); versions without them refuse it (`WSAEINVAL` or
     /// `WSAENOPROTOOPT`), and [`send_to_with`](Self::send_to_with) then
     /// leaves the ECN bits it is asked for out of the datagrams it sends.
+    ///
+    /// On Windows, the sockets of this process bound to one address (one
+    /// per worker) are handles to one socket, so the option set through any
+    /// of them is set for all of them.
     #[cfg(feature = "unstable-udp-offload")]
     pub fn set_recv_ecn(&self, on: bool) -> io::Result<()> {
         self.before_recv("set_recv_ecn")?;
@@ -1179,6 +1187,10 @@ impl UdpSocket {
     /// On Windows it is `IP_PKTINFO`, and `IPV6_PKTINFO` on an IPv6 socket
     /// (with `IP_PKTINFO` as well, for the IPv4 datagrams of a dual-stack
     /// one).
+    ///
+    /// On Windows, the sockets of this process bound to one address (one
+    /// per worker) are handles to one socket, so the option set through any
+    /// of them is set for all of them.
     #[cfg(feature = "unstable-udp-offload")]
     pub fn set_recv_local_addr(&self, on: bool) -> io::Result<()> {
         self.before_recv("set_recv_local_addr")?;
@@ -1628,7 +1640,8 @@ impl UdpSocket {
     /// `true` for a socket that joined an address another socket of this
     /// process bound: a handle to that socket, whose completions go to the
     /// other socket's worker, so nothing of this one goes through the
-    /// completion port.
+    /// completion port. Its sends with options are non-blocking calls,
+    /// tried again every millisecond while the socket's send buffer is full.
     #[cfg(windows)]
     fn is_joined(&self) -> bool {
         self.spread.as_ref().is_some_and(|m| !m.is_first())

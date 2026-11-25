@@ -50,4 +50,6 @@
 - **giong**: on Windows, `TcpStream::shutdown` and `UnixStream::shutdown` of the read half
   end a `recv` or `read` that waits, with the end of the stream, as on Unix; Windows left
   it waiting until the peer closed (giong-redis' client kept a task and a socket for each
-  dropped connection to a server that kept its side open).
+  dropped connection to a server that kept its side open). A `recv` or `read` started after
+  that shutdown returns the end of the stream too, where Windows fails it with
+  `WSAESHUTDOWN`.

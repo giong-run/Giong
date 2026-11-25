@@ -428,3 +428,25 @@ fn shutting_down_the_read_half_ends_a_waiting_recv() {
         assert!(got.is_empty(), "the end of the stream");
     });
 }
+
+#[test]
+fn a_read_or_recv_after_the_read_half_is_shut_gives_the_end_of_the_stream() {
+    giong::block_on(async {
+        // `read` on one stream, `recv` on another: a stream takes one kind.
+        let (reading, _a) = UnixStream::pair().unwrap();
+        let (receiving, _b) = UnixStream::pair().unwrap();
+        reading.shutdown(Shutdown::Read).unwrap();
+        receiving.shutdown(Shutdown::Read).unwrap();
+        for _ in 0..2 {
+            let (res, _) = timeout(Duration::from_secs(5), reading.read(Vec::with_capacity(64)))
+                .await
+                .expect("the read ended");
+            assert_eq!(res.unwrap(), 0, "the end of the stream");
+            let got = timeout(Duration::from_secs(5), receiving.recv())
+                .await
+                .expect("the recv ended")
+                .unwrap();
+            assert!(got.is_empty(), "the end of the stream");
+        }
+    });
+}

@@ -884,8 +884,16 @@ impl Iocp {
     }
 
     /// Whether a failed read (`code`) is the end of its file or pipe.
+    ///
+    /// A receive on a stream whose reading side was shut fails with
+    /// `WSAESHUTDOWN` on Windows, where Unix returns the end of the stream:
+    /// it is the end here too, whether it was refused at once or ended in
+    /// flight. Only streams can be shut on Windows (the Unix datagram
+    /// sockets are Unix only), so no datagram receive meets it.
     fn is_end(rec: &Record, code: i32) -> bool {
-        code == ERROR_HANDLE_EOF as i32 || (rec.reading && code == ERROR_BROKEN_PIPE as i32)
+        code == ERROR_HANDLE_EOF as i32
+            || (rec.reading && code == ERROR_BROKEN_PIPE as i32)
+            || (code == WSAESHUTDOWN && matches!(rec.after, After::Received { .. }))
     }
 
     /// The result `res` of an operation, with a datagram that was cut to
