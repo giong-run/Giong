@@ -1078,11 +1078,22 @@ fn load(
 
 /// A one-worker service answering HTTP/1.1 with `handler` on a loopback
 /// port, and an MCP server, until the closure returns.
+///
+/// One at a time: each caller drives its service with five client threads
+/// that send as fast as they are answered, and the tests of this file run
+/// in parallel. Two of them at once on a three-core macOS runner left the
+/// service's worker unscheduled for up to 177 ms, inside 1 ms sleeps: the
+/// slowest requests were then the ones caught in that gap, and both
+/// slow_requests verdicts were about it instead of the pool or the hold.
 fn with_http_service<H, Fut>(handler: H, f: impl FnOnce(SocketAddr, SocketAddr) + Send + 'static)
 where
     H: Fn(giong_http::Request) -> Fut + Clone + Send + Sync + 'static,
     Fut: std::future::Future<Output = giong_http::Response> + 'static,
 {
+    static ONE_AT_A_TIME: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    // A test that failed while holding it leaves it poisoned: the next one
+    // still runs.
+    let _turn = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
     let rt = giong::Builder::new().workers(1).build().unwrap();
     let handle = rt.handle();
     let server = open().start(&handle).unwrap();
