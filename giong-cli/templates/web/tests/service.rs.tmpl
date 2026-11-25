@@ -1,11 +1,22 @@
 //! The service end to end: the app served on a free port of 127.0.0.1 and
 //! called with giong-http's client, the way a real client calls it.
-{{#if db}}
+{{#if sqlite}}
 //!
+//! Each test has a SQLite file of its own in the system's temporary
+//! directory, deleted at the end: nothing to start, nothing shared.
+{{/if}}
+{{#if servers}}
+//!
+{{#if sqlite}}
+//! It talks to the Redis named by `REDIS_URL`, from the environment or from
+//! `.env` (`giong db up` writes it). Without it the tests print `SKIPPED` and
+//! pass. They only touch the keys they create.
+{{#else}}
 //! It talks to the database and Redis named by `DATABASE_URL` and `REDIS_URL`,
 //! from the environment or from `.env` (`giong db up` writes them). Without
 //! them the tests that need a store print `SKIPPED` and pass. They only touch
 //! the rows and keys they create, so a development database is fine.
+{{/if}}
 {{/if}}
 
 use std::time::Duration;
@@ -15,7 +26,34 @@ use giong_http::client::Client;
 use giong_web::Server;
 use {{crate}}::{app, AccessLog, State};
 
-{{#if db}}
+{{#if sqlite}}
+/// A SQLite file of the test's own, with the tables; deleted when dropped.
+struct TempDb {
+    path: std::path::PathBuf,
+    db: {{crate}}::db::Db,
+}
+
+impl TempDb {
+    fn new() -> TempDb {
+        let path = std::env::temp_dir().join(format!("{{crate}}-test-{}.db", run_tag()));
+        let db = {{crate}}::db::Db::open(&path, 2).unwrap();
+        db.setup({{crate}}::SCHEMA).unwrap();
+        TempDb { path, db }
+    }
+}
+
+impl Drop for TempDb {
+    fn drop(&mut self) {
+        for suffix in ["", "-wal", "-shm"] {
+            let mut file = self.path.clone().into_os_string();
+            file.push(suffix);
+            let _ = std::fs::remove_file(file);
+        }
+    }
+}
+
+{{/if}}
+{{#if servers}}
 /// A variable from the environment, else from `.env` in the project.
 fn setting(name: &str) -> Option<String> {
     if let Some(v) = std::env::var(name).ok().filter(|v| !v.is_empty()) {
@@ -29,9 +67,21 @@ fn setting(name: &str) -> Option<String> {
     })
 }
 
+{{/if}}
+{{#if db}}
+{{#if sqlite}}
+{{#if redis}}
+/// The state for the tests and the file it keeps its rows in, or `None`
+/// (and a line saying so) without Redis.
+{{#else}}
+/// The state for the tests, and the file it keeps its rows in.
+{{/if}}
+fn state() -> Option<(State, TempDb)> {
+{{#else}}
 /// The state for the tests, or `None` (and a line saying so) without a store.
 fn state() -> Option<State> {
-{{#if sql}}
+{{/if}}
+{{#if sql_server}}
     let Some(db_url) = setting("DATABASE_URL") else {
         eprintln!("SKIPPED: DATABASE_URL is not set (run giong db up, or set it)");
         return None;
@@ -43,6 +93,17 @@ fn state() -> Option<State> {
         return None;
     };
 {{/if}}
+{{#if sqlite}}
+    let temp = TempDb::new();
+    let state = State {
+        db: temp.db.clone(),
+{{#if redis}}
+        cache: giong_redis::Pool::new(giong_redis::Config::from_url(&redis_url).unwrap(), 1),
+        cache_ttl: Duration::from_secs(60),
+{{/if}}
+    };
+    Some((state, temp))
+{{#else}}
     Some(State {
 {{#if postgres}}
         db: giong_postgres::Pool::new(giong_postgres::Config::from_url(&db_url).unwrap(), 2),
@@ -58,6 +119,7 @@ fn state() -> Option<State> {
         redis: giong_redis::Pool::new(giong_redis::Config::from_url(&redis_url).unwrap(), 1),
 {{/if}}
     })
+{{/if}}
 }
 
 /// A tag that makes this run's rows and keys its own.
@@ -91,7 +153,11 @@ fn client() -> Client {
 {{#if db}}
 #[test]
 fn health_and_ready() {
+{{#if sqlite}}
+    let Some((state, _temp)) = state() else { return };
+{{#else}}
     let Some(state) = state() else { return };
+{{/if}}
     giong::block_on(async {
         let (base, client) = (serve(state), client());
         let resp = client.get(&format!("{base}/health")).send().await.unwrap();
@@ -153,11 +219,17 @@ fn health_hello_and_echo() {
 
 #[test]
 fn users_from_create_to_delete() {
+{{#if sqlite}}
+    let Some((state, _temp)) = state() else { return };
+    let tag = run_tag();
+    giong::block_on(async {
+{{#else}}
     let Some(state) = state() else { return };
     let tag = run_tag();
     giong::block_on(async {
         let setup = &state.db;
         setup.batch_execute({{crate}}::SCHEMA).await.unwrap();
+{{/if}}
         let (base, client) = (serve(state), client());
         let url = |path: &str| format!("{base}{path}");
         let email = format!("ada-{tag}@example.com");

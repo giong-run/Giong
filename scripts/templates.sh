@@ -8,7 +8,8 @@
 #   scripts/templates.sh --list       print the combinations
 #
 # The database tests read DATABASE_URL, MYSQL_URL and REDIS_URL (MYSQL_URL becomes the
-# DATABASE_URL of the mysql projects). Without them a project's database tests print
+# DATABASE_URL of the mysql projects). The sqlite projects need no server: their tests
+# use files of their own, and their service a file under $GIONG_TEMPLATES_DIR. Without them a project's database tests print
 # SKIPPED and pass, and its service is not started (it needs its database); with
 # GIONG_TEMPLATES_REQUIRE_DB=1 (as in CI) a SKIPPED fails the run.
 # Projects are written under $GIONG_TEMPLATES_DIR (default: a temporary directory) and
@@ -19,8 +20,10 @@ ROOT=$(pwd)
 
 # name           giong new flags
 COMBOS="
-web              --template web
-web-tls          --template web --tls
+web              --template web --db none
+web-tls          --template web --db none --tls
+web-sqlite       --template web
+web-sqlite-redis-tls --template web --db sqlite,redis --tls
 web-pg           --template web --db postgres
 web-pg-redis-tls --template web --db postgres,redis --tls
 web-mysql        --template web --db mysql
@@ -73,7 +76,7 @@ smoke() {
         sleep 0.2
     done
     case "$name" in
-        web*pg*|web*mysql*)
+        web*pg*|web*mysql*|web*sqlite*)
             curl -fsS -o /dev/null "http://127.0.0.1:$port/ready" || { cat "$out"; kill "$pid"; return 1; } ;;
     esac
     kill -TERM "$pid"
@@ -97,8 +100,10 @@ while read -r name flags; do
         failed+=("$name (giong new)"); continue
     fi
     url_env=()
-    case "$flags" in
+    case "$name" in
         *mysql*) url_env=(env "DATABASE_URL=${MYSQL_URL:-}") ;;
+        # The default database of the web template, so "web-sqlite" passes no --db.
+        *sqlite*) url_env=(env "DATABASE_URL=sqlite:$WORK/$name-data/app.db") ;;
     esac
     # The service needs its database to start: without one, no smoke run.
     missing=""

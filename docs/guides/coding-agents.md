@@ -7,7 +7,7 @@ Gióng is made for code that agents write: one obvious way to do each job, error
 `giong new` writes a project that already teaches agents how to work on it. For a project you already have, run the same step on its own:
 
 ```sh
-giong new api --db postgres   # a new project, with the files below
+giong new api                 # a new project (a users API on SQLite), with the files below
 giong ai init                 # an existing project: the same files, nothing else touched
 ```
 

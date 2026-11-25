@@ -1,0 +1,178 @@
+{{#file-if sqlite}}
+//! The SQLite database: one file, used from giong's blocking lane.
+//!
+//! SQLite is a C library that reads and writes the file in the thread that
+//! calls it: a query run on a worker would hold up every connection of that
+//! worker until the disk answers. [`Db::read`] and [`Db::write`] run their
+//! closure on a thread of `giong::spawn_blocking` instead, and the worker
+//! serves other requests meanwhile.
+//!
+//! The file is in WAL mode, with one write connection and a few read
+//! connections, shared by every worker. SQLite runs one write at a time
+//! whatever the number of connections, so writes queue for the one write
+//! connection instead of failing with `database is locked`; reads run side by
+//! side, and while a write runs.
+
+use std::path::Path;
+use std::sync::{Arc, Condvar, Mutex, PoisonError};
+use std::time::Duration;
+
+use giong_web::Error;
+use rusqlite::Connection;
+
+/// The database, shared by every worker: cloning it is cheap.
+#[derive(Clone)]
+pub struct Db {
+    inner: Arc<Inner>,
+}
+
+struct Inner {
+    writer: Mutex<Connection>,
+    /// The read connections no closure is using.
+    readers: Mutex<Vec<Connection>>,
+    /// Signalled when a read connection comes back.
+    returned: Condvar,
+}
+
+/// How long a statement waits for a lock that another process holds
+/// (`giong db migrate`, the `sqlite3` shell) before it fails.
+const BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+
+impl Db {
+    /// Opens the database at `path`, creating the file and its directory
+    /// when they are missing, with one write connection and `readers` read
+    /// connections.
+    pub fn open(path: &Path, readers: usize) -> Result<Db, String> {
+        let fail = |e: &dyn std::fmt::Display| format!("{}: {e}", path.display());
+        if let Some(dir) = path.parent().filter(|d| !d.as_os_str().is_empty()) {
+            std::fs::create_dir_all(dir).map_err(|e| fail(&e))?;
+        }
+        let writer = connect(path).map_err(|e| fail(&e))?;
+        // WAL: readers do not wait for the writer, nor it for them.
+        let mode: String = writer
+            .pragma_update_and_check(None, "journal_mode", "WAL", |row| row.get(0))
+            .map_err(|e| fail(&e))?;
+        if !mode.eq_ignore_ascii_case("wal") {
+            return Err(fail(&format!(
+                "SQLite keeps it in journal mode {mode:?}, not WAL: use a file on a local disk"
+            )));
+        }
+        let readers = (0..readers.max(1))
+            .map(|_| {
+                let conn = connect(path)?;
+                // A read connection refuses to write, so a write that went
+                // through Db::read by mistake fails in the tests.
+                conn.pragma_update(None, "query_only", true)?;
+                Ok(conn)
+            })
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(|e| fail(&e))?;
+        Ok(Db {
+            inner: Arc::new(Inner {
+                writer: Mutex::new(writer),
+                readers: Mutex::new(readers),
+                returned: Condvar::new(),
+            }),
+        })
+    }
+
+    /// Runs `sql` (statements separated by `;`) on the write connection, in
+    /// this thread: for startup and tests, before any worker serves. A
+    /// handler uses [`write`](Self::write).
+    pub fn setup(&self, sql: &str) -> rusqlite::Result<()> {
+        lock(&self.inner.writer).execute_batch(sql)
+    }
+
+    /// Runs `f` with a read connection, on the blocking lane, and gives its
+    /// result back to the worker. A `rusqlite::Error` turns into a `500`
+    /// with `?`.
+    pub async fn read<T, F>(&self, f: F) -> Result<T, Error>
+    where
+        F: FnOnce(&Connection) -> Result<T, Error> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        blocking(move || {
+            let lease = Lease::take(&inner);
+            f(lease.conn())
+        })
+        .await
+    }
+
+    /// Runs `f` with the write connection, on the blocking lane, one write
+    /// at a time. `conn.transaction()` makes several statements one change.
+    pub async fn write<T, F>(&self, f: F) -> Result<T, Error>
+    where
+        F: FnOnce(&mut Connection) -> Result<T, Error> + Send + 'static,
+        T: Send + 'static,
+    {
+        let inner = Arc::clone(&self.inner);
+        blocking(move || f(&mut lock(&inner.writer))).await
+    }
+}
+
+fn connect(path: &Path) -> rusqlite::Result<Connection> {
+    let conn = Connection::open(path)?;
+    conn.busy_timeout(BUSY_TIMEOUT)?;
+    // NORMAL in WAL mode: a commit survives the process crashing; only a
+    // power cut can lose the last commits, at a fraction of FULL's fsyncs.
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    conn.pragma_update(None, "foreign_keys", true)?;
+    Ok(conn)
+}
+
+/// A closure that panicked leaves the connection usable: its transaction,
+/// if any, was rolled back when the `Transaction` was dropped.
+fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Runs `f` on the blocking lane; a panic becomes a `500`.
+async fn blocking<T, F>(f: F) -> Result<T, Error>
+where
+    F: FnOnce() -> Result<T, Error> + Send + 'static,
+    T: Send + 'static,
+{
+    match giong::spawn_blocking(f).await {
+        Ok(result) => result,
+        Err(e) => Err(Error::internal(format!("a database closure failed: {e}"))),
+    }
+}
+
+/// A read connection, given back to the pool when dropped, even by a panic.
+struct Lease<'a> {
+    inner: &'a Inner,
+    conn: Option<Connection>,
+}
+
+impl<'a> Lease<'a> {
+    /// Waits, on the blocking thread, until a read connection is free.
+    fn take(inner: &'a Inner) -> Self {
+        let mut idle = lock(&inner.readers);
+        loop {
+            if let Some(conn) = idle.pop() {
+                return Lease {
+                    inner,
+                    conn: Some(conn),
+                };
+            }
+            idle = inner
+                .returned
+                .wait(idle)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+    }
+
+    fn conn(&self) -> &Connection {
+        self.conn.as_ref().expect("taken until dropped")
+    }
+}
+
+impl Drop for Lease<'_> {
+    fn drop(&mut self) {
+        if let Some(conn) = self.conn.take() {
+            lock(&self.inner.readers).push(conn);
+            self.inner.returned.notify_one();
+        }
+    }
+}

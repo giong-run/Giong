@@ -19,6 +19,11 @@ giong-postgres = { {{src_giong_postgres}} }
 {{#if mysql}}
 giong-mysql = { {{src_giong_mysql}} }
 {{/if}}
+{{#if sqlite}}
+# SQLite compiled in, so no system library is needed. Its calls block, so they
+# run on giong's blocking lane: see src/db.rs.
+rusqlite = { version = "0.43", features = ["bundled"] }
+{{/if}}
 {{#if redis}}
 giong-redis = { {{src_giong_redis}} }
 {{/if}}
