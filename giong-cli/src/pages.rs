@@ -351,6 +351,51 @@ Calls that return the kernel's `ENOBUFS` as it is, with no code, as on Linux:
 
 [All error codes](README.md)
 "#),
+    (60, r#"# GIONG-E0060: a file is already at the Unix socket path
+
+Raised by `UnixListener::bind` on Windows. In code: `giong::error::Code::UnixSocketInUse`. The error kind is `AddrInUse`, and Winsock's `WSAEADDRINUSE` is the `source()`.
+
+## What happened
+
+A Unix domain socket that listens is a file at its path. When the listener closes, the file stays, on Windows as on Unix, and a second bind to the same path fails while it is there. giong does not remove the file for you: another server may still be listening on it, and taking its path would leave that server unreachable.
+
+## How to fix it
+
+- If no server listens on the path any more (an earlier run of the same program, say), remove the file with `std::fs::remove_file` and bind again. A service usually does this at start-up, after making sure no other copy of itself runs.
+- Otherwise pick another path, or stop the server that holds it.
+
+[All error codes](README.md)
+"#),
+    (61, r#"# GIONG-E0061: Unix socket path too long
+
+Raised by `UnixListener::bind` and `UnixStream::connect` on Windows. In code: `giong::error::Code::UnixPathTooLong`. The error kind is `InvalidInput`.
+
+## What happened
+
+Winsock keeps the path of a Unix domain socket in a fixed field of 108 bytes, in UTF-8 and ending with a NUL, so a path may be at most 107 bytes long. Characters outside ASCII take two to four bytes each. The path is not shortened for you, since a shorter path names another socket.
+
+## How to fix it
+
+- Use a shorter path: a relative one (it is resolved against the current directory), or a directory near the root of the drive, such as `C:\run\app.sock`.
+- `UnixStream::pair` binds a short-lived socket in the temporary directory (`std::env::temp_dir()`); if that directory's path is very long, point the `TMP` environment variable at a shorter one.
+
+[All error codes](README.md)
+"#),
+    (62, r#"# GIONG-E0062: no Unix domain sockets on this Windows
+
+Raised by `UnixListener::bind`, `UnixStream::connect` and `UnixStream::pair` on Windows. In code: `giong::error::Code::UnixSocketsUnavailable`. The error kind is `Unsupported`, and Winsock's error (`WSAEAFNOSUPPORT` or similar) is in the message.
+
+## What happened
+
+Windows has had Unix domain stream sockets (`AF_UNIX`) since Windows 10 version 1803 and Windows Server 2019. On an older system, or one where the `afunix` driver is turned off, creating such a socket fails.
+
+## How to fix it
+
+- Run on Windows 10 version 1803 or later, or Windows Server 2019 or later, and check that `sc query afunix` shows the driver running.
+- Otherwise talk over TCP on a loopback address (`127.0.0.1`) instead.
+
+[All error codes](README.md)
+"#),
     (80, r#"# GIONG-E0080: the budget is at its limit
 
 Raised by `Budget::try_spawn`, `Budget::try_reserve` and `Budget::try_spawn_compute` in `giong::budget`, and by `giong::try_spawn_compute` inside a task of a budget. In code: `giong::error::Code::BudgetFull`. Its `io::ErrorKind` is `WouldBlock`.

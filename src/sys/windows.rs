@@ -461,6 +461,85 @@ pub(crate) unsafe fn send_to_nowait(
     ) as isize
 }
 
+/// `WSASendMsg` on a non-blocking socket, without an `OVERLAPPED`: the
+/// bytes sent, or -1 with the thread's last error set.
+///
+/// # Safety
+///
+/// `msg` must point at a live header whose pointers are valid.
+#[cfg(feature = "unstable-udp-offload")]
+pub(crate) unsafe fn sendmsg_nowait(sock: RawSock, msg: *const MsgHdr) -> isize {
+    let mut sent = 0u32;
+    if WinSock::WSASendMsg(sock, msg, 0, &mut sent, std::ptr::null_mut(), None) == 0 {
+        sent as isize
+    } else {
+        -1
+    }
+}
+
+/// `WSARecvMsg` (an extension function, asked for until it is found) on a non-blocking
+/// socket, without an `OVERLAPPED`: the bytes received, or -1 with the
+/// thread's last error set (`WSAEMSGSIZE` for a datagram cut to fit, whose
+/// `dwFlags` then has `MSG_TRUNC`). `namelen`, `Control.len` and `dwFlags`
+/// are written back into `msg`.
+///
+/// # Safety
+///
+/// `msg` must point at a live header whose pointers are valid for writing.
+#[cfg(feature = "unstable-udp-offload")]
+pub(crate) unsafe fn recvmsg_nowait(sock: RawSock, msg: *mut MsgHdr) -> isize {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use windows_sys::Win32::Networking::WinSock::{
+        SIO_GET_EXTENSION_FUNCTION_POINTER, WSAEOPNOTSUPP, WSAID_WSARECVMSG,
+    };
+    type RecvMsg = unsafe extern "system" fn(
+        RawSock,
+        *mut MsgHdr,
+        *mut u32,
+        *mut OVERLAPPED,
+        WinSock::LPWSAOVERLAPPED_COMPLETION_ROUTINE,
+    ) -> i32;
+    // Only a pointer that was found is kept: a lookup that failed (on a
+    // socket of another provider) is tried again on the next socket.
+    static RECV_MSG: AtomicUsize = AtomicUsize::new(0);
+    let mut f = RECV_MSG.load(Ordering::Relaxed);
+    if f == 0 {
+        let guid = WSAID_WSARECVMSG;
+        let mut returned = 0u32;
+        // SAFETY: asks the socket's provider for a function pointer; the
+        // input and output are locals of the sizes given.
+        let rc = unsafe {
+            WinSock::WSAIoctl(
+                sock,
+                SIO_GET_EXTENSION_FUNCTION_POINTER,
+                (&guid as *const windows_sys::core::GUID).cast(),
+                mem::size_of_val(&guid) as u32,
+                (&mut f as *mut usize).cast(),
+                mem::size_of::<usize>() as u32,
+                &mut returned,
+                std::ptr::null_mut(),
+                None,
+            )
+        };
+        if rc != 0 {
+            f = 0;
+        }
+        RECV_MSG.store(f, Ordering::Relaxed);
+    }
+    if f == 0 {
+        WinSock::WSASetLastError(WSAEOPNOTSUPP);
+        return -1;
+    }
+    // SAFETY: the provider handed out this pointer as `LPFN_WSARECVMSG`.
+    let recv_msg: RecvMsg = mem::transmute::<usize, RecvMsg>(f);
+    let mut got = 0u32;
+    if recv_msg(sock, msg, &mut got, std::ptr::null_mut(), None) == 0 {
+        got as isize
+    } else {
+        -1
+    }
+}
+
 /// The names `net` uses for a socket's raw handle. On Unix they are the
 /// standard library's descriptor traits; here the same names reach the
 /// socket handle, so that the code between the two reads the same.

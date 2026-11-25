@@ -708,7 +708,10 @@ fn blank_lines_do_not_keep_a_connection_idle_for_ever() {
     let mut c = server.client();
     let start = Instant::now();
     for _ in 0..200 {
-        if c.stream.write_all(b"\r\n").is_err() {
+        // Stop once the server has answered: a CRLF sent after it closed
+        // brings a reset, and Windows drops received data that was not read
+        // yet when one arrives (Linux still hands it out).
+        if c.answered() || c.stream.write_all(b"\r\n").is_err() {
             break;
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -986,7 +989,7 @@ fn at_the_connection_limit_an_idle_unix_connection_makes_room() {
 
 #[test]
 fn serves_over_a_unix_socket() {
-    use std::os::unix::net::UnixStream;
+    use crate::BlockingUnix as UnixStream;
 
     let path = std::env::temp_dir().join(format!("giong-http-{}.sock", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -1300,7 +1303,7 @@ fn new_connections_are_refused_while_memory_is_low() {
 
 #[test]
 fn file_bodies_are_copied_over_a_unix_socket() {
-    use std::os::unix::net::UnixStream;
+    use crate::BlockingUnix as UnixStream;
 
     let data = file_data(700_001);
     let tmp = TempFile::new("file-unix", &data);
@@ -1635,4 +1638,22 @@ fn the_write_timeout_counts_from_the_last_progress() {
         }
     }
     assert!(got < LEN, "a stalled client got the whole answer");
+}
+
+/// A blocking client of a Unix socket, as another program would connect:
+/// the standard library's on Unix, socket2's on Windows, whose standard
+/// library has no Unix sockets.
+#[cfg(unix)]
+use std::os::unix::net::UnixStream as BlockingUnix;
+
+#[cfg(windows)]
+struct BlockingUnix;
+
+#[cfg(windows)]
+impl BlockingUnix {
+    fn connect(path: impl AsRef<std::path::Path>) -> std::io::Result<socket2::Socket> {
+        let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None)?;
+        sock.connect(&socket2::SockAddr::unix(path)?)?;
+        Ok(sock)
+    }
 }

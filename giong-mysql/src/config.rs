@@ -129,6 +129,13 @@ impl Default for Config {
     }
 }
 
+/// Whether `host` names a Unix socket rather than a server on the network:
+/// an absolute path, which on Windows may also start with a drive letter
+/// (`C:\run\...`), as Windows' own Unix sockets are named.
+fn is_socket_path(host: &str) -> bool {
+    host.starts_with('/') || (cfg!(windows) && std::path::Path::new(host).is_absolute())
+}
+
 impl Config {
     /// The server and database, without user or password, for diagnostics:
     /// `db.internal:3306/app`.
@@ -167,9 +174,12 @@ impl Config {
     }
 
     /// The server's host: a DNS name, an IP address, or the absolute path of
-    /// its Unix socket (such as `/var/run/mysqld/mysqld.sock`).
+    /// its Unix socket (such as `/var/run/mysqld/mysqld.sock`; on Windows a
+    /// path such as `C:\mysql\mysql.sock`, though MySQL and MariaDB on
+    /// Windows offer named pipes instead, which giong-mysql does not speak:
+    /// connect over TCP there).
     pub fn host(mut self, host: &str) -> Self {
-        self.host = if host.starts_with('/') {
+        self.host = if is_socket_path(host) {
             Host::Unix(PathBuf::from(host))
         } else {
             let host = host
@@ -688,7 +698,7 @@ fn parse(url: &str) -> Result<Config, Error> {
             "ssl-mode" => ssl_mode = Some(value.to_ascii_uppercase()),
             "ssl-ca" => ssl_ca = Some(value),
             "socket" => {
-                if !value.starts_with('/') {
+                if !is_socket_path(&value) {
                     return Err(Error::config(format!(
                         "socket={value} is not an absolute path to the server's socket file"
                     )));
@@ -819,6 +829,14 @@ mod tests {
         assert_eq!(c.connect_timeout, Duration::from_secs(3));
         assert!(c.tls_connector().unwrap().is_none());
         assert!(!format!("{c:?}").contains("p:ss@w"));
+    }
+
+    /// On Windows a path with a drive letter names a socket too.
+    #[cfg(windows)]
+    #[test]
+    fn windows_paths_are_sockets() {
+        let c = Config::new().host(r"C:\mysql\mysql.sock");
+        assert_eq!(c.host, Host::Unix(r"C:\mysql\mysql.sock".into()));
     }
 
     #[test]

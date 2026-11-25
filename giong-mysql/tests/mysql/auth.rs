@@ -26,7 +26,14 @@ async fn user(client: &Client) -> String {
 fn root_over_the_unix_socket() {
     run(|s| async move {
         let client = Client::connect(&s.local()).await.unwrap();
-        assert_eq!(user(&client).await, "root@localhost");
+        // Over TCP on Windows (see `server`), where the server names the
+        // client by its address.
+        let root = if cfg!(windows) {
+            "root@127.0.0.1"
+        } else {
+            "root@localhost"
+        };
+        assert_eq!(user(&client).await, root);
         assert_eq!(client.server_version(), s.version);
         assert!(client.connection_id() > 0);
         let row = client
@@ -41,9 +48,16 @@ fn root_over_the_unix_socket() {
 #[test]
 fn a_url_works_as_well_as_the_setters() {
     run(|s| async move {
+        #[cfg(unix)]
         let url = format!(
             "mysql://root@localhost/{DATABASE}?socket={}&application-name=from-url",
             s.socket.display()
+        );
+        // No Unix socket on Windows (see `server`).
+        #[cfg(windows)]
+        let url = format!(
+            "mysql://root@127.0.0.1:{}/{DATABASE}?application-name=from-url",
+            s.port
         );
         let client = Client::connect(&Config::from_url(&url).unwrap())
             .await

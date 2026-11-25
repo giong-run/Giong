@@ -479,6 +479,7 @@ impl Pki {
     }
 }
 
+#[cfg(unix)]
 fn open_fds() -> usize {
     // macOS lists a process's own descriptors in /dev/fd.
     let dir = if cfg!(target_os = "macos") {
@@ -514,6 +515,34 @@ fn rss_kib() -> u64 {
         assert_eq!(n, size, "proc_pidinfo: {}", std::io::Error::last_os_error());
         info.pti_resident_size / 1024
     }
+}
+
+/// The process's open handles: sockets, files, events, threads and the rest.
+#[cfg(windows)]
+fn open_fds() -> usize {
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, GetProcessHandleCount};
+    let mut count = 0u32;
+    // SAFETY: the pseudo handle of this process, and a local to write to.
+    let ok = unsafe { GetProcessHandleCount(GetCurrentProcess(), &mut count) };
+    assert!(ok != 0, "GetProcessHandleCount failed");
+    count as usize
+}
+
+/// The process's working set, Windows' resident memory.
+#[cfg(windows)]
+fn rss_kib() -> u64 {
+    use windows_sys::Win32::System::ProcessStatus::{
+        K32GetProcessMemoryInfo, PROCESS_MEMORY_COUNTERS,
+    };
+    use windows_sys::Win32::System::Threading::GetCurrentProcess;
+    // SAFETY: all-zero is a valid value of this plain structure.
+    let mut counters: PROCESS_MEMORY_COUNTERS = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<PROCESS_MEMORY_COUNTERS>() as u32;
+    // SAFETY: the pseudo handle of this process, and a structure of the size
+    // given.
+    let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut counters, size) };
+    assert!(ok != 0, "GetProcessMemoryInfo failed");
+    counters.WorkingSetSize as u64 / 1024
 }
 
 fn median(values: &mut [u64]) -> u64 {

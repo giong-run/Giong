@@ -192,6 +192,20 @@ codes! {
     /// `raw_os_error` stays reachable.
     NetworkBuffersExhausted = 28, OutOfMemory, "the system ran out of network buffers";
 
+    // ------------------------------------------------------------ Windows
+    /// `UnixListener::bind` on Windows found a file already at the path. A
+    /// listener does not remove its socket file when it closes (as on
+    /// Unix), and giong never removes one itself, since a server may still
+    /// listen on it. The bind's own error (`WSAEADDRINUSE`) is the
+    /// [`source`](std::error::Error::source).
+    UnixSocketInUse = 60, AddrInUse, "a file is already at the Unix socket path";
+    /// A Unix socket path on Windows is longer than the 107 bytes of UTF-8
+    /// Winsock takes.
+    UnixPathTooLong = 61, InvalidInput, "Unix socket path too long";
+    /// This Windows has no Unix domain sockets: they came with Windows 10
+    /// version 1803 and Windows Server 2019.
+    UnixSocketsUnavailable = 62, Unsupported, "no Unix domain sockets on this Windows";
+
     // ------------------------------------------------------------ budgets
     /// A `try_` call of a [`Budget`](crate::budget::Budget) refused work:
     /// the budget is at one of its [`Limits`](crate::budget::Limits) (tasks,

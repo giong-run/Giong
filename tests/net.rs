@@ -1502,3 +1502,95 @@ mod macos {
         });
     }
 }
+
+/// Shutting down the read half of a stream ends a `recv` that waits on it
+/// with the end of the stream, while the peer keeps its side open: on Unix
+/// the kernel does it, on Windows the driver (which Windows leaves waiting).
+#[test]
+fn shutting_down_the_read_half_ends_a_waiting_recv() {
+    giong::block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Rc::new(TcpStream::connect(addr).await.unwrap());
+        let server = listener.accept().await.unwrap();
+        let reader = {
+            let client = client.clone();
+            giong::spawn(async move { client.recv().await })
+        };
+        sleep(Duration::from_millis(50)).await;
+        client.shutdown(Shutdown::Read).unwrap();
+        let got = timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the recv ended")
+            .unwrap()
+            .unwrap();
+        assert!(got.is_empty(), "the end of the stream");
+        drop((client, server, listener));
+        sleep(Duration::from_millis(50)).await;
+        let stats = giong::observe::worker_stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+        assert_eq!(stats.free_recv_buffers, stats.recv_buffers, "{stats:?}");
+    });
+}
+
+/// The same for a one-off `read`: it returns 0 bytes, the end of the stream.
+#[test]
+fn shutting_down_the_read_half_ends_a_waiting_read() {
+    giong::block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let client = Rc::new(TcpStream::connect(addr).await.unwrap());
+        let server = listener.accept().await.unwrap();
+        let reader = {
+            let client = client.clone();
+            giong::spawn(async move { client.read(Vec::with_capacity(64)).await.0 })
+        };
+        sleep(Duration::from_millis(50)).await;
+        client.shutdown(Shutdown::Read).unwrap();
+        let got = timeout(Duration::from_secs(5), reader)
+            .await
+            .expect("the read ended")
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, 0, "the end of the stream");
+        drop((client, server, listener));
+        sleep(Duration::from_millis(50)).await;
+        let stats = giong::observe::worker_stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}
+
+#[test]
+fn a_read_or_recv_after_the_read_half_is_shut_gives_the_end_of_the_stream() {
+    giong::block_on(async {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        // `read` on one stream, `recv` on another: a stream takes one kind.
+        let reading = TcpStream::connect(addr).await.unwrap();
+        let reading_peer = listener.accept().await.unwrap();
+        let receiving = TcpStream::connect(addr).await.unwrap();
+        let receiving_peer = listener.accept().await.unwrap();
+        reading.shutdown(Shutdown::Read).unwrap();
+        receiving.shutdown(Shutdown::Read).unwrap();
+        for _ in 0..2 {
+            let (res, _) = timeout(Duration::from_secs(5), reading.read(Vec::with_capacity(64)))
+                .await
+                .expect("the read ended");
+            assert_eq!(res.unwrap(), 0, "the end of the stream");
+            let got = timeout(Duration::from_secs(5), receiving.recv())
+                .await
+                .expect("the recv ended")
+                .unwrap();
+            assert!(got.is_empty(), "the end of the stream");
+        }
+        // The write half still works.
+        let (res, _) = reading.write_all(b"after".to_vec()).await;
+        res.unwrap();
+        let got = recv_exact(&reading_peer, 5).await;
+        assert_eq!(got, b"after");
+        drop((reading, reading_peer, receiving, receiving_peer, listener));
+        sleep(Duration::from_millis(50)).await;
+        let stats = giong::observe::worker_stats();
+        assert_eq!(stats.tracked_ops, 0, "{stats:?}");
+    });
+}

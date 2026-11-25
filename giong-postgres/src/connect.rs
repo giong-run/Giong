@@ -4,7 +4,10 @@
 use std::io;
 use std::net::Shutdown;
 use std::ops::{Deref, Range};
+#[cfg(unix)]
 use std::os::fd::{AsRawFd, BorrowedFd};
+#[cfg(windows)]
+use std::os::windows::io::{AsRawSocket, BorrowedSocket};
 use std::time::Duration;
 
 use giong::net::{TcpStream, UnixStream};
@@ -337,8 +340,12 @@ pub(crate) async fn open(config: &Config) -> Result<Stream, Error> {
 /// vanished is noticed.
 fn tune(tcp: &TcpStream) -> io::Result<()> {
     tcp.set_nodelay(true)?;
-    // SAFETY: the descriptor belongs to `tcp`, which outlives this borrow.
+    // SAFETY: the socket belongs to `tcp`, which outlives this borrow.
+    #[cfg(unix)]
     let fd = unsafe { BorrowedFd::borrow_raw(tcp.as_raw_fd()) };
+    // SAFETY: as above.
+    #[cfg(windows)]
+    let fd = unsafe { BorrowedSocket::borrow_raw(tcp.as_raw_socket()) };
     let sock = SockRef::from(&fd);
     sock.set_tcp_keepalive(
         &TcpKeepalive::new()

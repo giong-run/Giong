@@ -101,7 +101,7 @@ to type.
   `cargo-semver-checks` runs on every pull request.
 - **Linux first, and the same program elsewhere.** Tuned and measured on Linux with
   io_uring, with an epoll driver wherever io_uring is blocked. macOS runs on a kqueue
-  driver, for developing on a Mac; Windows runs the runtime crate on I/O completion ports.
+  driver, for developing on a Mac; Windows runs every crate on I/O completion ports.
   One API on all of them: where a system cannot do what Linux does, the difference is a
   documented cost, never a different result ([Platforms](#platforms)).
 
@@ -238,11 +238,11 @@ Against the Tokio crate each giong crate replaces, one core each (details and lo
 | | Linux | macOS | Windows |
 |---|---|---|---|
 | Driver | io_uring on 6.0 or newer (6.1+ recommended); epoll elsewhere, tested down to 5.15 | kqueue | I/O completion ports (IOCP) |
-| Crates | all thirteen | all thirteen | `giong` (the runtime) only, from 1.4 |
+| Crates | all thirteen | all thirteen | all thirteen (the runtime from 1.4, the others from 1.5) |
 | Tested in CI on | 6.18, real 5.15, 6.0, 6.1, 6.12 and Ubuntu 24.04 kernels, Docker's default seccomp profile | macOS 15 and 26, Apple Silicon | Windows Server 2022 and 2025 |
 | Tuned and measured | yes: every published number | correct, not tuned, no speed claim | correct, not tuned, no speed claim yet |
-| Not there | | kernel TLS; CPU pinning; GSO/GRO | Unix sockets; the HTTP, TLS, database, gRPC, QUIC and MCP crates; processor groups beyond 64 CPUs |
-| Use it for | production | developing and testing on a Mac | services that have to run on Windows, on the runtime crate |
+| Not there | | kernel TLS; CPU pinning; GSO/GRO | kernel TLS; processor groups beyond 64 CPUs; Unix sockets before Windows 10 1803 |
+| Use it for | production | developing and testing on a Mac | services that have to run on Windows |
 
 - **Rust 1.80** or newer for every crate except [`giong-quic`](giong-quic/README.md), and
   with it giong-http's `unstable-http3` feature, which need **1.85**. How this minimum, the
@@ -253,8 +253,9 @@ Against the Tokio crate each giong crate replaces, one core each (details and lo
   allow io_uring in Docker, Docker Compose and Kubernetes.
 - The differences from Linux on macOS and Windows, area by area, are in
   [docs/design/portability.md](docs/design/portability.md).
-- On a Windows machine, a service that needs the other crates runs under WSL2 (`uname -r`;
-  `wsl --update` for a 6.x kernel), in a Linux virtual machine or in Docker.
+- On Windows, Unix sockets are Winsock's `AF_UNIX` (Windows 10 version 1803 and later),
+  trust roots come from the certificate store, and kernel TLS is Linux's: `Ktls::Auto`
+  keeps connections in the process there.
 
 ## Quick start
 
@@ -782,8 +783,9 @@ Also:
   Silicon) on every change, ThreadSanitizer over the runtime's tests on the kqueue driver,
   and two-hour soaks of the runtime and of TLS (`macos-soak.yml`).
 - **Windows** (`windows-runtime.yml`): the runtime's suites in debug and release on Windows
-  Server 2022 and 2025, the release run 30 times over, and a build with Rust 1.80; the
-  soak test for 150 minutes, which also checks that no handle is left open.
+  Server 2022 and 2025, the release run 30 times over, every other crate's suites and clippy
+  on both, and builds with Rust 1.80 and 1.85; the soak test for 150 minutes, which also
+  checks that no handle is left open.
 - **HTTP/3**: `h3spec` against giong-http's HTTP/3 server on every change (85 of 86 cases
   pass and none fails; the other needs 0-RTT, which the example leaves off).
 - **valgrind memcheck** over the single-threaded tests (`scripts/valgrind.sh`): no invalid
@@ -841,11 +843,12 @@ younger than both, and one service runs on it so far.
 
 ## Limitations
 
-- **Windows has the runtime crate only.** In 1.4 `giong` builds and runs there (tasks,
-  timers, channels, TCP, UDP, files, DNS from the network adapters, Ctrl+C); Unix sockets
-  do not exist there, and giong-http, giong-tls, the database clients, giong-grpc,
-  giong-quic and giong-mcp are not built or tested on Windows yet. Trust roots from the
-  Windows certificate store and processor groups beyond 64 CPUs are missing too.
+- **Windows is correct, not tuned.** Every crate builds and passes its tests there, but no
+  speed is claimed yet. Kernel TLS is Linux's; processor groups beyond 64 CPUs are not
+  used; Unix sockets need Windows 10 version 1803 or later, and the UDP offloads for QUIC
+  (segmentation, receive coalescing, ECN) are used where the running Windows has them.
+  MySQL and MariaDB offer named pipes rather than Unix sockets on Windows, which
+  giong-mysql does not speak: it connects over TCP there.
 - **macOS is for development.** Correct and tested on every change, not tuned: files run on
   a pool of blocking threads, CPU pinning is skipped, kernel TLS and UDP segmentation
   offloads are Linux only, and the listen backlog is macOS's 128.

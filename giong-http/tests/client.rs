@@ -397,6 +397,15 @@ fn an_answer_sent_before_the_body_was_read_is_the_response() {
                   Connection: close\r\n\r\ntoo big!",
             )
             .await;
+            // Windows throws away what a socket received and nobody read
+            // yet when a reset arrives, so a server closing without reading
+            // takes its own answer with it there: this one reads the rest
+            // first, as giong-http's server does before it closes.
+            #[cfg(windows)]
+            {
+                let _ = stream.shutdown(std::net::Shutdown::Write);
+                while stream.recv().await.is_ok_and(|b| !b.is_empty()) {}
+            }
         });
         let client = Client::new();
         let body = vec![b'x'; 20 << 20];
@@ -783,11 +792,12 @@ fn a_server_that_does_not_answer_hits_the_timeout() {
         // closed port is refused.
         #[cfg(target_os = "macos")]
         drop(refusing);
-        let e = client
-            .get(&format!("http://127.0.0.1:{port}/"))
-            .send()
-            .await
-            .unwrap_err();
+        let request = client.get(&format!("http://127.0.0.1:{port}/"));
+        // Windows tries a refused connect twice more, half a second apart,
+        // before it gives up: about 2 s, longer than this client waits.
+        #[cfg(windows)]
+        let request = request.timeout(Duration::from_secs(20));
+        let e = request.send().await.unwrap_err();
         assert_eq!(e.kind(), ErrorKind::Connect, "{e}");
     });
 }

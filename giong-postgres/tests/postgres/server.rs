@@ -4,12 +4,18 @@
 //!
 //! The binaries are found through `GIONG_PG_BIN`, then in
 //! `/usr/lib/postgresql/<version>/bin` (Debian, Ubuntu and the GitHub
-//! runners), then on `PATH`. Without them the tests are skipped with a
-//! message, unless `GIONG_PG_REQUIRED=1`, which makes that a failure (CI sets
-//! it).
+//! runners), on Windows through `PGBIN` (set on the GitHub runners) and in
+//! `C:\Program Files\PostgreSQL\<version>\bin`, then on `PATH`. Without
+//! them the tests are skipped with a message, unless `GIONG_PG_REQUIRED=1`,
+//! which makes that a failure (CI sets it).
+//!
+//! On Windows the server listens on a Unix socket too (PostgreSQL 13 and
+//! later), so the same tests run there.
 
 use std::io::Write;
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
+#[cfg(unix)]
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -113,16 +119,54 @@ impl Server {
     fn command(&self, name: &str) -> Command {
         let bin = find_bin().expect("found before");
         let mut cmd = Command::new(bin.join(name));
-        if let Some((uid, gid)) = run_as() {
-            cmd.uid(uid).gid(gid);
-        }
+        as_owner(&mut cmd, run_as());
         cmd
     }
+}
+
+/// Runs `cmd` as `owner` (see [`run_as`]).
+#[cfg(unix)]
+fn as_owner(cmd: &mut Command, owner: Option<(u32, u32)>) {
+    if let Some((uid, gid)) = owner {
+        cmd.uid(uid).gid(gid);
+    }
+}
+
+/// Windows: the server runs as the tests' user.
+#[cfg(windows)]
+fn as_owner(_: &mut Command, _: Option<(u32, u32)>) {}
+
+/// `name` with the system's suffix for programs (`.exe` on Windows).
+fn exe(name: &str) -> String {
+    format!("{name}{}", std::env::consts::EXE_SUFFIX)
+}
+
+/// Kills the process `pid` this binary started and waits for it to go.
+#[cfg(unix)]
+fn kill(pid: i32) {
+    // SAFETY: plain system calls on a child process we started.
+    unsafe {
+        libc::kill(pid, libc::SIGKILL);
+        libc::waitpid(pid, std::ptr::null_mut(), 0);
+    }
+}
+
+#[cfg(windows)]
+fn kill(pid: i32) {
+    let _ = Command::new("taskkill")
+        .args(["/F", "/T", "/PID", &pid.to_string()])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
 }
 
 fn find_bin() -> Option<PathBuf> {
     if let Some(dir) = std::env::var_os("GIONG_PG_BIN") {
         return Some(PathBuf::from(dir));
+    }
+    #[cfg(windows)]
+    if let Some(bin) = windows_bin() {
+        return Some(bin);
     }
     let mut versions: Vec<(u32, PathBuf)> = std::fs::read_dir("/usr/lib/postgresql")
         .into_iter()
@@ -131,7 +175,7 @@ fn find_bin() -> Option<PathBuf> {
         .filter_map(|e| {
             let v = e.file_name().to_str()?.parse().ok()?;
             let bin = e.path().join("bin");
-            bin.join("initdb").exists().then_some((v, bin))
+            bin.join(exe("initdb")).exists().then_some((v, bin))
         })
         .collect();
     versions.sort();
@@ -140,12 +184,36 @@ fn find_bin() -> Option<PathBuf> {
     }
     std::env::var_os("PATH").and_then(|path| {
         std::env::split_paths(&path)
-            .find(|dir| dir.join("initdb").exists() && dir.join("postgres").exists())
+            .find(|dir| dir.join(exe("initdb")).exists() && dir.join(exe("postgres")).exists())
     })
+}
+
+/// Windows: `PGBIN` (the GitHub runners set it), then the newest version
+/// under `C:\Program Files\PostgreSQL`, where the installer puts them.
+#[cfg(windows)]
+fn windows_bin() -> Option<PathBuf> {
+    if let Some(dir) = std::env::var_os("PGBIN").map(PathBuf::from) {
+        if dir.join(exe("initdb")).exists() {
+            return Some(dir);
+        }
+    }
+    let root = std::env::var_os("ProgramFiles").map(PathBuf::from)?;
+    let mut versions: Vec<(u32, PathBuf)> = std::fs::read_dir(root.join("PostgreSQL"))
+        .ok()?
+        .flatten()
+        .filter_map(|e| {
+            let v = e.file_name().to_str()?.parse().ok()?;
+            let bin = e.path().join("bin");
+            bin.join(exe("initdb")).exists().then_some((v, bin))
+        })
+        .collect();
+    versions.sort();
+    versions.pop().map(|(_, bin)| bin)
 }
 
 /// PostgreSQL refuses to run as root: when the tests do, the server runs as
 /// the `postgres` user.
+#[cfg(unix)]
 pub fn run_as() -> Option<(u32, u32)> {
     // SAFETY: geteuid has no preconditions.
     if unsafe { libc::geteuid() } != 0 {
@@ -158,6 +226,18 @@ pub fn run_as() -> Option<(u32, u32)> {
     })
 }
 
+/// Windows: PostgreSQL refuses to run with administrative rights, and
+/// lowers them itself when started with them (`pg_ctl` does, `postgres`
+/// with a restricted token): the server runs as the tests' user.
+#[cfg(windows)]
+pub fn run_as() -> Option<(u32, u32)> {
+    None
+}
+
+#[cfg(windows)]
+pub fn chown_tree(_: &Path, _: Option<(u32, u32)>) {}
+
+#[cfg(unix)]
 pub fn chown_tree(path: &Path, owner: Option<(u32, u32)>) {
     let Some((uid, gid)) = owner else { return };
     std::os::unix::fs::chown(path, Some(uid), Some(gid)).unwrap();
@@ -171,11 +251,7 @@ pub fn chown_tree(path: &Path, owner: Option<(u32, u32)>) {
 extern "C" fn stop_server() {
     let pid = PID.load(Ordering::SeqCst);
     if pid > 0 {
-        // SAFETY: plain system calls on a child process we started.
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-            libc::waitpid(pid, std::ptr::null_mut(), 0);
-        }
+        kill(pid);
     }
     if let Some(dir) = DIR.get() {
         let _ = std::fs::remove_dir_all(dir);
@@ -238,7 +314,7 @@ fn start(bin: &Path) -> Server {
     unsafe { libc::atexit(stop_server) };
     chown_tree(&dir, owner);
 
-    let mut initdb = Command::new(bin.join("initdb"));
+    let mut initdb = Command::new(bin.join(exe("initdb")));
     initdb.args(["-D"]).arg(&data).args([
         "-U",
         "postgres",
@@ -249,9 +325,7 @@ fn start(bin: &Path) -> Server {
         "--locale=C",
         "--no-sync",
     ]);
-    if let Some((uid, gid)) = owner {
-        initdb.uid(uid).gid(gid);
-    }
+    as_owner(&mut initdb, owner);
     let out = initdb.output().expect("run initdb");
     assert!(
         out.status.success(),
@@ -275,6 +349,8 @@ fn start(bin: &Path) -> Server {
     std::fs::write(data.join("server.crt"), server_cert.pem()).unwrap();
     let key_path = data.join("server.key");
     std::fs::write(&key_path, server_key.serialize_pem()).unwrap();
+    // Windows checks no mode on the key.
+    #[cfg(unix)]
     std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600)).unwrap();
 
     let mut conf = std::fs::OpenOptions::new()
@@ -288,7 +364,9 @@ fn start(bin: &Path) -> Server {
          fsync = off\nsynchronous_commit = off\nfull_page_writes = off\n\
          max_connections = 200\npassword_encryption = 'scram-sha-256'\n\
          log_min_messages = warning\n",
-        socket_dir.display()
+        // PostgreSQL reads a backslash in a quoted setting as an escape:
+        // Windows paths go in with forward slashes, which it takes too.
+        socket_dir.display().to_string().replace('\\', "/")
     )
     .unwrap();
     std::fs::write(
@@ -347,6 +425,83 @@ const START_ATTEMPTS: usize = 5;
 /// Starts PostgreSQL on `port` and waits until it answers on its Unix
 /// socket, having bound both addresses; or, if it exits or could not bind
 /// one, stops it and gives its log.
+/// Starts the server through `pg_ctl`, which Windows needs: PostgreSQL
+/// refuses to run with administrative rights (as CI's runners give every
+/// process), and `pg_ctl` starts it with a token that has them taken away.
+/// The server's process is then not a child of this one: its PID comes from
+/// `postmaster.pid`, and a start that failed shows as a `FATAL` line in the
+/// log.
+#[cfg(windows)]
+fn launch(
+    bin: &Path,
+    data: &Path,
+    dir: &Path,
+    socket_dir: &Path,
+    port: u16,
+    _owner: Option<(u32, u32)>,
+) -> Result<(), String> {
+    let log_path = dir.join("server.log");
+    let _ = std::fs::remove_file(&log_path);
+    let status = Command::new(bin.join(exe("pg_ctl")))
+        .arg("start")
+        .arg("-W")
+        .arg("-D")
+        .arg(data)
+        .arg("-l")
+        .arg(&log_path)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("run pg_ctl start");
+    let log = || std::fs::read_to_string(&log_path).unwrap_or_default();
+    if !status.success() {
+        return Err(format!("pg_ctl start failed ({status}):\n{}", log()));
+    }
+    let started = Instant::now();
+    loop {
+        let text = log();
+        // A probe that comes too early gets a FATAL line of its own ("the
+        // database system is starting up", or "is not yet accepting
+        // connections" on newer servers), which is not the server failing.
+        let failed = text.lines().any(|line| {
+            line.contains("FATAL")
+                && !line.contains("is starting up")
+                && !line.contains("not yet accepting connections")
+        });
+        if failed {
+            return Err(text);
+        }
+        if PID.load(Ordering::SeqCst) == 0 {
+            let pid = std::fs::read_to_string(data.join("postmaster.pid"))
+                .ok()
+                .and_then(|f| f.lines().next()?.trim().parse::<i32>().ok());
+            if let Some(pid) = pid {
+                PID.store(pid, Ordering::SeqCst);
+            }
+        }
+        if PID.load(Ordering::SeqCst) != 0 && ready(bin, socket_dir, port, None) {
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(30),
+            "PostgreSQL did not start within 30 s:\n{}",
+            log()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let text = log();
+    if text.contains("could not bind") {
+        kill(PID.swap(0, Ordering::SeqCst));
+        let _ = std::fs::remove_file(socket_dir.join(format!(".s.PGSQL.{port}")));
+        let _ = std::fs::remove_file(socket_dir.join(format!(".s.PGSQL.{port}.lock")));
+        let _ = std::fs::remove_file(data.join("postmaster.pid"));
+        return Err(text);
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
 fn launch(
     bin: &Path,
     data: &Path,
@@ -364,15 +519,13 @@ fn launch(
     let (bin2, data2, log) = (bin.to_owned(), data.to_owned(), log_path.clone());
     std::thread::spawn(move || {
         let log = std::fs::File::create(&log).unwrap();
-        let mut cmd = Command::new(bin2.join("postgres"));
+        let mut cmd = Command::new(bin2.join(exe("postgres")));
         cmd.arg("-D")
             .arg(&data2)
             .stdin(Stdio::null())
             .stdout(log.try_clone().unwrap())
             .stderr(log);
-        if let Some((uid, gid)) = owner {
-            cmd.uid(uid).gid(gid);
-        }
+        as_owner(&mut cmd, owner);
         // Linux only: elsewhere a killed test binary leaves the server running
         // until the test's own cleanup or the CI job ends.
         #[cfg(target_os = "linux")]
@@ -413,8 +566,7 @@ fn launch(
     }
     let text = log();
     if text.contains("could not bind") {
-        // SAFETY: signalling the server this function started.
-        unsafe { libc::kill(pid as i32, libc::SIGKILL) };
+        kill(pid as i32);
         let _ = exited.recv();
         PID.store(0, Ordering::SeqCst);
         let _ = std::fs::remove_file(&socket);
@@ -427,10 +579,8 @@ fn launch(
 
 /// Whether the server answers `pg_isready` on its Unix socket.
 fn ready(bin: &Path, socket_dir: &Path, port: u16, owner: Option<(u32, u32)>) -> bool {
-    let mut cmd = Command::new(bin.join("pg_isready"));
-    if let Some((uid, gid)) = owner {
-        cmd.uid(uid).gid(gid);
-    }
+    let mut cmd = Command::new(bin.join(exe("pg_isready")));
+    as_owner(&mut cmd, owner);
     cmd.arg("-h")
         .arg(socket_dir)
         .args(["-p", &port.to_string(), "-q"])

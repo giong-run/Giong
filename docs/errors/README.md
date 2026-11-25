@@ -57,6 +57,14 @@ when it is no longer raised.
 |---|---|---|
 | [GIONG-E0028](E0028.md) | `NetworkBuffersExhausted` | the system ran out of network buffers |
 
+## Windows
+
+| Code | `Code::` | Meaning |
+|---|---|---|
+| [GIONG-E0060](E0060.md) | `UnixSocketInUse` | a file is already at the Unix socket path |
+| [GIONG-E0061](E0061.md) | `UnixPathTooLong` | Unix socket path too long |
+| [GIONG-E0062](E0062.md) | `UnixSocketsUnavailable` | no Unix domain sockets on this Windows |
+
 ## Messages between processes (`giong::ipc`)
 
 | Code | `Code::` | Meaning |

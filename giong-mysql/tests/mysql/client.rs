@@ -559,7 +559,12 @@ fn the_statement_timeout_is_enforced_by_the_server() {
         let e = client.query(SLOW_SELECT, &[]).await.unwrap_err();
         assert_eq!(e.server_code(), Some(s.timeout_code()), "{e}");
         assert!(e.to_string().contains("Config::statement_timeout"), "{e}");
-        assert!(started.elapsed() < Duration::from_secs(5));
+        // The server's own code says it was the limit that ended it; this
+        // only says it did not run to its end first. A windows-2022 runner
+        // took more than 5 s to stop it (MySQL 8.4 there looks at the limit
+        // less often in this recursion), so the bound is wider there.
+        let bound = Duration::from_secs(if cfg!(windows) { 30 } else { 5 });
+        assert!(started.elapsed() < bound, "{:?}", started.elapsed());
         assert_eq!(
             client
                 .query_one("SELECT 1", &[])

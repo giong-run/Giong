@@ -22,6 +22,19 @@ async fn native_tls_echo(tls: TlsStream) -> bool {
     }
 }
 
+/// `fut`, or a panic that shows the worker's state when it takes longer
+/// than [`LIMIT`]: a write that waits for ever would otherwise hold the
+/// test (and CI's job) until it is killed, saying nothing.
+async fn bounded<T>(what: &str, fut: impl std::future::Future<Output = T>) -> T {
+    match timeout(LIMIT, fut).await {
+        Ok(v) => v,
+        Err(_) => panic!(
+            "{what} took more than {LIMIT:?}; the worker: {:?}",
+            giong::observe::worker_stats()
+        ),
+    }
+}
+
 fn localhost() -> ServerName<'static> {
     ServerName::try_from("localhost").unwrap()
 }
@@ -29,6 +42,34 @@ fn localhost() -> ServerName<'static> {
 mod tokio_traits {
     use super::*;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    /// Writes `msg` and reads it back from the echo at the same time, and
+    /// gives the stream back. Writing all of it before reading needs the
+    /// connection, the buffers at both ends and the echo between them to
+    /// hold all of it at once: 1 MiB was more than a windows-2025 runner
+    /// held, and the test waited there until the job was cancelled.
+    async fn echo<S>(tls: S, msg: &[u8]) -> S
+    where
+        S: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    {
+        let (mut r, mut w) = tokio::io::split(tls);
+        let (writing, reading) = (
+            format!("writing {} bytes", msg.len()),
+            format!("reading {} bytes back", msg.len()),
+        );
+        let write = bounded(&writing, async {
+            w.write_all(msg).await.unwrap();
+            w.flush().await.unwrap();
+        });
+        let read = bounded(&reading, async {
+            let mut back = vec![0; msg.len()];
+            r.read_exact(&mut back).await.unwrap();
+            back
+        });
+        let ((), back) = futures_util::future::join(write, read).await;
+        assert!(back == msg, "{} bytes came back different", msg.len());
+        r.unsplit(w)
+    }
 
     #[test]
     fn tokio_rustls_client_against_a_giong_tls_server() {
@@ -46,15 +87,7 @@ mod tokio_traits {
                 .unwrap()
                 .unwrap();
             for len in [1, 1000, 16 * 1024, 1 << 20] {
-                let msg = pattern(len);
-                tls.write_all(&msg).await.unwrap();
-                tls.flush().await.unwrap();
-                let mut back = vec![0; len];
-                timeout(LIMIT, tls.read_exact(&mut back))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(back == msg, "{len} bytes came back different");
+                tls = echo(tls, &pattern(len)).await;
             }
             // tokio-rustls sends close_notify, then shuts the stream down.
             tls.shutdown().await.unwrap();
@@ -120,15 +153,7 @@ mod tokio_traits {
             let connector = TlsConnector::from_rustls(client_config(&pki, &[]));
             let mut tls = Compat::new(connector.connect("localhost", c).await.unwrap());
             assert!(format!("{tls:?}").contains("TlsStream"));
-            let msg = pattern(1 << 20);
-            tls.write_all(&msg).await.unwrap();
-            tls.flush().await.unwrap();
-            let mut back = vec![0; msg.len()];
-            timeout(LIMIT, tls.read_exact(&mut back))
-                .await
-                .unwrap()
-                .unwrap();
-            assert!(back == msg);
+            tls = echo(tls, &pattern(1 << 20)).await;
             // Shutting down sends close_notify through giong-tls.
             tls.shutdown().await.unwrap();
             assert!(server.await.unwrap(), "no close_notify arrived");
@@ -172,15 +197,7 @@ mod tokio_traits {
             assert!(tls.is_ktls());
             let mut tls = Compat::new(tls);
             for len in [1, 1000, 16 * 1024, 1 << 20] {
-                let msg = pattern(len);
-                tls.write_all(&msg).await.unwrap();
-                tls.flush().await.unwrap();
-                let mut back = vec![0; len];
-                timeout(LIMIT, tls.read_exact(&mut back))
-                    .await
-                    .unwrap()
-                    .unwrap();
-                assert!(back == msg, "{len} bytes came back different");
+                tls = echo(tls, &pattern(len)).await;
             }
             tls.shutdown().await.unwrap();
             assert!(server.await.unwrap(), "no close_notify arrived");
@@ -210,8 +227,11 @@ mod futures_traits {
                 .unwrap()
                 .unwrap();
             let msg = pattern(500_000);
-            tls.write_all(&msg).await.unwrap();
-            tls.flush().await.unwrap();
+            bounded(&format!("writing {} bytes", msg.len()), async {
+                tls.write_all(&msg).await.unwrap();
+                tls.flush().await.unwrap();
+            })
+            .await;
             let mut back = vec![0; msg.len()];
             timeout(LIMIT, tls.read_exact(&mut back))
                 .await

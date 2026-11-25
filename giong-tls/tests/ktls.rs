@@ -1010,6 +1010,7 @@ fn a_tampered_record_is_an_error_not_data() {
 }
 
 /// A control message setting the type of the record `sendmsg` sends.
+#[cfg(unix)]
 fn record_type(record_type: u8) -> Vec<u8> {
     let space = unsafe { libc::CMSG_SPACE(1) } as usize;
     let mut buf = vec![0u64; space.div_ceil(8)];
@@ -1027,6 +1028,9 @@ fn record_type(record_type: u8) -> Vec<u8> {
     unsafe { std::slice::from_raw_parts(buf.as_ptr().cast::<u8>(), space) }.to_vec()
 }
 
+// Kernel TLS is Linux's: the control messages that set a record's type
+// exist on Unix only.
+#[cfg(unix)]
 #[test]
 fn records_that_are_not_data_are_handled_as_rustls_would() {
     if !kernel_tls() {
@@ -1136,6 +1140,9 @@ fn records_that_are_not_data_are_handled_as_rustls_would() {
     }
 }
 
+// Kernel TLS is Linux's: the control messages that set a record's type
+// exist on Unix only.
+#[cfg(unix)]
 #[test]
 fn a_piece_of_a_handshake_message_that_starts_like_a_key_update_is_not_one() {
     if !kernel_tls() {

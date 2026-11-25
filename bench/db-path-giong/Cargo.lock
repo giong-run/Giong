@@ -75,6 +75,7 @@ version = "1.5.0"
 dependencies = [
  "giong",
  "libc",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -106,6 +107,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
