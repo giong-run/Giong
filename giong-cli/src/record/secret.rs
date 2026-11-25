@@ -297,6 +297,7 @@ pub fn percent_decode(s: &str) -> String {
             b'%' if i + 2 < b.len() => {
                 let hex = std::str::from_utf8(&b[i + 1..i + 3])
                     .ok()
+                    .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
                     .and_then(|h| u8::from_str_radix(h, 16).ok());
                 match hex {
                     Some(x) => {
@@ -451,5 +452,6 @@ mod tests {
         assert_eq!(percent_decode("a+b%20c"), "a b c");
         assert_eq!(percent_decode("100%"), "100%");
         assert_eq!(percent_decode("%zz%4"), "%zz%4");
+        assert_eq!(percent_decode("%+5"), "% 5");
     }
 }

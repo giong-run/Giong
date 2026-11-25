@@ -305,6 +305,7 @@ fn percent_decode(s: &str, what: &str) -> Result<String, Error> {
             let hex = bytes
                 .get(i + 1..i + 3)
                 .and_then(|h| std::str::from_utf8(h).ok())
+                .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
                 .and_then(|h| u8::from_str_radix(h, 16).ok())
                 .ok_or_else(|| {
                     Error::config(format!(
@@ -536,6 +537,7 @@ mod tests {
             "redis+unix://relative.sock",
             "redis://host?cacert=/x.pem",
             "redis://:%zz@host",
+            "redis://:%+5@host",
         ] {
             let e = Config::from_url(bad).unwrap_err();
             assert_eq!(e.kind(), crate::ErrorKind::Config, "{bad}");
