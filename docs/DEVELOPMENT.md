@@ -120,6 +120,20 @@ are cached the same way. A new apt package goes through the action, never a bare
 `gh run rerun --failed`), never a new push or a new enqueue: the jobs that passed keep
 their result. On a test failure, read the log and fix the cause first.
 
+## Supply chain
+
+`deny.toml` is the policy for what the workspace builds with, checked by
+[cargo-deny](https://github.com/EmbarkStudios/cargo-deny): only permissive licenses, crates
+from crates.io only (no git or other registry), no wildcard version requirement, and no
+crate with a RustSec advisory or a yanked version. CI's `lint` job checks the licenses,
+sources and bans on every pull request. Advisories appear at any time, independently of
+any change, so `.github/workflows/supply-chain.yml` checks them every day on `main` (and
+on a pull request that changes a `Cargo.toml`, `Cargo.lock` or `deny.toml`) and opens the
+issue labelled `supply-chain` when one applies. The fix is a `cargo update -p <crate>` in a
+pull request; an advisory that cannot apply to giong goes into `deny.toml`'s `ignore` with
+its reason. The lockfiles under `bench/` and `fuzz/` are not policed: they build
+comparisons and harnesses that are never published.
+
 ## One change, start to finish
 
 1. **Take one item** from the backlog of your line of work (see [The backlog](#the-backlog)).
@@ -141,8 +155,10 @@ their result. On a test failure, read the log and fix the cause first.
    errors, the minimum Rust versions (`scripts/msrv.sh`, the same script as CI's `msrv` job) and the tests on io_uring and on epoll (of the crates that
    changed, or of the whole workspace when the runtime did); `scripts/semver.sh` when a
    published crate's code changed; one round of ThreadSanitizer for unsafe code and
-   anything that crosses threads; loom for the wake-ups; and every fuzz target of a crate
-   whose parsing code changed. A missing tool fails the gate (`--install` installs them);
+   anything that crosses threads; loom for the wake-ups; every fuzz target of a crate
+   whose parsing code changed; and `cargo deny --workspace check` when a `Cargo.toml`,
+   `Cargo.lock` or `deny.toml` changed (no RustSec advisory or yanked crate, permissive
+   licenses, crates.io only; [Supply chain](#supply-chain)). A missing tool fails the gate (`--install` installs them);
    nothing is skipped quietly. `--quick` runs the fast part while iterating, `--plan` only
    prints. The gate also says which soak a release containing the change will need.
 6. **Write the changelog entry as a file in [`changelog.d/`](../changelog.d/README.md)**,

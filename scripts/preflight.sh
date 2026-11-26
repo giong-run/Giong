@@ -29,6 +29,9 @@
 #                             scripts/check.sh loom
 #   code that parses bytes from the network
 #                             every fuzz target of that crate for FUZZ_SECS (30) seconds
+#   a Cargo.toml, Cargo.lock or deny.toml
+#                             cargo deny --workspace check: no RustSec advisory or yanked
+#                             crate, permissive licenses, crates.io only (deny.toml)
 # A missing tool fails the gate with the command that installs it; nothing is skipped
 # quietly. CI runs the fast set on a pull request and every job, repeated, in the merge
 # queue (kernels, fallback tiers, Miri, Kani, instr, the server versions, macOS, Windows;
@@ -43,6 +46,7 @@ MODE=gate
 FUZZ_SECS="${FUZZ_SECS:-30}"
 MSRV=$(scripts/msrv.sh versions | head -n 1)   # every MSRV toolchain: scripts/msrv.sh
 SEMVER_CHECKS=0.51.0   # the version CI installs (.github/workflows/ci.yml, job semver)
+CARGO_DENY=0.22.1      # the version CI installs (.github/workflows/ci.yml, job lint)
 # The stable compiler CI pins (RUST_STABLE in .github/workflows/ci.yml): clippy's lints
 # and cargo's behaviour change between releases, so the gate runs the same one.
 STABLE=$(sed -n 's/^  RUST_STABLE: "\(.*\)"$/\1/p' .github/workflows/ci.yml | head -n 1)
@@ -55,7 +59,8 @@ install_tools() {
     rustup component add rustfmt clippy
     cargo install --locked cargo-fuzz
     cargo install --locked cargo-semver-checks --version "$SEMVER_CHECKS"
-    echo "ok: $STABLE (CI's stable), $MSRV, nightly with rust-src, cargo-fuzz and cargo-semver-checks $SEMVER_CHECKS"
+    cargo install --locked cargo-deny --version "$CARGO_DENY"
+    echo "ok: $STABLE (CI's stable), $MSRV, nightly with rust-src, cargo-fuzz, cargo-semver-checks $SEMVER_CHECKS and cargo-deny $CARGO_DENY"
 }
 
 install_hook() {
@@ -125,6 +130,7 @@ ALL=0                  # the runtime changed: every crate is built on it
 SEMVER=0               # a published crate's library code changed
 TSAN=0                 # ThreadSanitizer applies
 LOOM=0                 # the loom models apply
+DEPS=0                 # dependencies or the supply-chain policy changed
 SOAK=()                # files on a soak path (docs/RELEASING.md, "How long to soak")
 CHANGELOG_ENTRY=0
 OTHER_WS=()            # bench/ and sim/ are workspaces of their own
@@ -139,6 +145,9 @@ for f in "${FILES[@]}"; do
     esac
     case "$f" in
         *.rs|Cargo.toml|*/Cargo.toml|Cargo.lock) RUST=1 ;;
+    esac
+    case "$f" in
+        Cargo.toml|*/Cargo.toml|Cargo.lock|deny.toml) DEPS=1 ;;
     esac
     case "$f" in
         src/*|Cargo.toml|Cargo.lock) ALL=1 ;;
@@ -201,6 +210,7 @@ GATE=()
 [ "$SEMVER" = 1 ] && GATE+=("semver (scripts/semver.sh)")
 [ "$TSAN" = 1 ] && GATE+=("ThreadSanitizer, one round (scripts/check.sh tsan)")
 [ "$LOOM" = 1 ] && GATE+=("loom (scripts/check.sh loom)")
+[ "$DEPS" = 1 ] && GATE+=("supply chain (cargo deny --workspace check)")
 for d in "${!FUZZ[@]}"; do GATE+=("fuzz ${d/#./giong}: every target, ${FUZZ_SECS}s each"); done
 if [ ${#GATE[@]} -gt 0 ]; then
     echo "The gate also runs (not --quick):"
@@ -282,6 +292,9 @@ if [ "$MODE" = gate ]; then
     if [ "$RUST" = 1 ] && need "scripts/msrv.sh versions | while read -r v; do cargo +\$v --version || exit 1; done" \
         "Rust $(scripts/msrv.sh versions | paste -sd ' ')"; then
         step "MSRV (scripts/msrv.sh)" scripts/msrv.sh
+    fi
+    if [ "$DEPS" = 1 ] && need "cargo deny --version" "cargo-deny"; then
+        step "supply chain (cargo deny)" cargo deny --workspace check
     fi
     if [ "$SEMVER" = 1 ] && need "cargo semver-checks --version" "cargo-semver-checks"; then
         step "semver" scripts/semver.sh
