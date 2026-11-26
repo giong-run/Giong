@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use crate::parse::{is_field_value, is_token, is_token_str, trim};
+use crate::parse::{is_field_value, is_token_str, quick_field, trim};
 
 /// A parsed response head. Ranges are relative to the start of the head.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -166,61 +166,6 @@ impl Head {
             Framing::UntilClose
         }
     }
-}
-
-/// A header line read by [`quick_field`]. Ranges are relative to the
-/// start of the head.
-struct QuickField {
-    name: Range<usize>,
-    value: Range<usize>,
-    /// Where the next line starts.
-    next: usize,
-}
-
-/// Reads the header line at `head[pos..]` in one pass over its bytes, if
-/// it is well formed: a token, a colon, a value of visible ASCII, spaces,
-/// tabs and obs-text, and CRLF. `None` for anything else, the empty line
-/// included: [`checked_field`] then reads it with the same rules and says
-/// what is wrong. Every byte of every response head goes through here,
-/// where the checks one after the other went over each byte three times.
-fn quick_field(head: &[u8], pos: usize) -> Option<QuickField> {
-    let line = head.get(pos..)?;
-    let mut i = 0;
-    while *line.get(i)? != b':' {
-        if !is_token(line[i]) {
-            return None;
-        }
-        i += 1;
-    }
-    if i == 0 {
-        return None;
-    }
-    let colon = i;
-    i += 1;
-    while matches!(line.get(i), Some(b' ' | b'\t')) {
-        i += 1;
-    }
-    let value_start = i;
-    let mut value_end = i;
-    loop {
-        match *line.get(i)? {
-            b'\r' => break,
-            b' ' | b'\t' => i += 1,
-            b if b < 0x20 || b == 0x7f => return None,
-            _ => {
-                i += 1;
-                value_end = i;
-            }
-        }
-    }
-    if line.get(i + 1) != Some(&b'\n') {
-        return None;
-    }
-    Some(QuickField {
-        name: pos..pos + colon,
-        value: pos + value_start..pos + value_end,
-        next: pos + i + 2,
-    })
 }
 
 /// Reads a header line `line`, which starts at `start` in the head, or
