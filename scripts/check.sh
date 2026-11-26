@@ -17,6 +17,10 @@
 #                               so that giong falls back to epoll by itself
 #   scripts/check.sh tsan       all tests under ThreadSanitizer (needs nightly
 #                               with the rust-src component)
+#   scripts/check.sh asan       all tests under AddressSanitizer and
+#                               LeakSanitizer (needs nightly with the rust-src
+#                               component): reads and writes out of bounds or
+#                               after free, double frees, leaks
 #   scripts/check.sh loom       model-check the wake-up handshakes (src/notify.rs)
 #                               with loom, then run the same race on this CPU
 #   scripts/check.sh kani       prove the unsafe core with the Kani model checker
@@ -46,7 +50,7 @@
 #                               SIM_LONG_FROM (default 0), SIM_LONG_DAYS
 #                               (default 3650) split over every seed, one
 #                               process per CPU; a failure prints its seed
-#   scripts/check.sh all        everything above except seccomp, soak, miri, kani, sim and sim-long
+#   scripts/check.sh all        everything above except seccomp, asan, soak, miri, kani, sim and sim-long
 #
 # ROUNDS=n changes how often each test binary is repeated.
 # GIONG_TEST_EXPECT_DRIVER=io_uring (as CI sets it) makes the tests fail where
@@ -120,6 +124,29 @@ run_tsan() {
             cargo +nightly test -Zbuild-std --target "$target" --tests --quiet --workspace --all-features \
             -- "${skip[@]}"
     done
+}
+
+run_asan() {
+    local target
+    target="$(rustc -vV | sed -n 's/^host: //p')"
+    # many_clients_at_once_do_not_grow_the_process measures the process's
+    # resident memory, which ASan inflates on purpose (freed memory is held
+    # in quarantine so that a use after free is caught).
+    local skip=(--skip many_clients_at_once_do_not_grow_the_process)
+    # allocator_may_return_null: ASan's malloc aborts the process on a request
+    # over 1 TiB instead of failing it as the system allocator does, and the
+    # fs test of #296 asks for 2^60 bytes through try_reserve.
+    # scripts/lsan.supp: the tests that leak on purpose (Box::leak for the
+    # 'static data an API takes); any other leak fails the run.
+    # One round: the sanitizer finds what a test reaches, repeating adds
+    # little (TSan repeats because races depend on timing).
+    echo "== AddressSanitizer + LeakSanitizer"
+    RUSTFLAGS="-Zsanitizer=address" \
+    ASAN_OPTIONS="allocator_may_return_null=1 detect_leaks=1" \
+    LSAN_OPTIONS="suppressions=$PWD/scripts/lsan.supp print_suppressions=0" \
+    CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/asan" \
+        cargo +nightly test -Zbuild-std --target "$target" --tests --quiet --workspace --all-features \
+        --no-fail-fast -- "${skip[@]}"
 }
 
 run_loom() {
@@ -251,6 +278,7 @@ case "${1:-all}" in
     epoll) run_epoll ;;
     seccomp) run_seccomp ;;
     tsan) run_tsan ;;
+    asan) run_asan ;;
     loom) run_loom ;;
     soak)
         case "${2:-all}" in
@@ -263,6 +291,6 @@ case "${1:-all}" in
     sim) run_sim ;;
     sim-long) run_sim_long ;;
     all) run_test; run_fallback all; run_tsan; run_loom ;;
-    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|loom|soak [runtime|tls]|miri|kani|sim|sim-long|all]" >&2; exit 2 ;;
+    *) echo "usage: $0 [test|fallback|epoll|seccomp|tsan|asan|loom|soak [runtime|tls]|miri|kani|sim|sim-long|all]" >&2; exit 2 ;;
 esac
 echo "ok"
