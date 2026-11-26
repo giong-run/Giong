@@ -360,7 +360,22 @@ fn readers_that_stop_reading_hold_a_bounded_amount_of_memory() {
             std::thread::spawn(move || {
                 let mut s = std::net::TcpStream::connect(addr).unwrap();
                 let data: Vec<u8> = (0..LEN).map(|i| (i % 251) as u8).collect();
-                s.write_all(&data).unwrap();
+                let mut sent = 0;
+                while sent < LEN {
+                    match s.write(&data[sent..]) {
+                        Ok(n) => sent += n,
+                        // macOS refuses a send with ENOBUFS, where Linux
+                        // makes it wait, once loopback runs out of buffers
+                        // (128 peers with 1 MiB each in flight did, on a
+                        // macos-26 runner). It sends nothing then; Gióng's
+                        // own sends wait it out the same way.
+                        Err(e) if e.raw_os_error() == Some(libc::ENOBUFS) => {
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                        Err(e) => panic!("send after {sent} bytes: {e}"),
+                    }
+                }
                 s.shutdown(Shutdown::Write).unwrap();
             })
         })
