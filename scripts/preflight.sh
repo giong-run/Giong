@@ -156,6 +156,8 @@ for f in "${FILES[@]}"; do
         src/*|tests/*|Cargo.toml|fuzz/*) CRATES[giong]=1 ;;
         examples/rest-api/*) CRATES[rest-api]=1 ;;
         giong-*/*) CRATES[${f%%/*}]=1 ;;
+        # giong-cli embeds the error pages (`giong explain`, pages.rs).
+        docs/errors/*) CRATES[giong-cli]=1; RUST=1 ;;
     esac
     case "$f" in
         src/*.rs|giong-*/src/*.rs) SEMVER=1 ;;
