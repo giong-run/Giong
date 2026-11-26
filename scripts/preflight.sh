@@ -30,9 +30,9 @@
 #   code that parses bytes from the network
 #                             every fuzz target of that crate for FUZZ_SECS (30) seconds
 # A missing tool fails the gate with the command that installs it; nothing is skipped
-# quietly. CI runs every job once on a pull request ready for review and all of them,
-# repeated, in the merge queue (kernels, fallback tiers, Miri, Kani, instr, the server
-# versions), so the gate makes a green run likely; it does not replace it.
+# quietly. CI runs the fast set on a pull request and every job, repeated, in the merge
+# queue (kernels, fallback tiers, Miri, Kani, instr, the server versions, macOS, Windows;
+# docs/WORKFLOW.md), so the gate makes a green queue run likely; it does not replace it.
 # Exit status: 0 when every check it ran passed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
