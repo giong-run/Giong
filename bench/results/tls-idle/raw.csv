@@ -1,0 +1,7 @@
+binary,round,connections,rss_anon_kib_per_conn,vmrss_kib_per_conn,vmrss_after_mib
+main-1cb2988,1,8000,10.92,10.96,89.8
+unbuffered,1,8000,6.17,6.19,52.8
+main-1cb2988,2,8000,10.92,10.95,89.8
+unbuffered,2,8000,6.17,6.19,52.7
+main-1cb2988,3,8000,10.92,10.96,89.8
+unbuffered,3,8000,6.17,6.18,52.8

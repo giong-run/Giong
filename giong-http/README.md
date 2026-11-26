@@ -90,7 +90,7 @@ impl Handler for Files {
 }
 ```
 
-- A streamed request body has the limit `stream_body` returns instead of `max_body_size`. Announced longer: `413` before the handler runs. Chunked and growing past it: `GIONG-E1111` from `chunk`. Cut short, or a piece slower than `request_timeout` (the whole body has no deadline): `GIONG-E1112`. Broken chunked framing: `GIONG-E1113`.
+- A streamed request body has the limit `stream_body` returns instead of `max_body_size`. Announced longer: `413` before the handler runs. Chunked and growing past it: `GIONG-E1111` from `chunk`. Cut short, a piece slower than `request_timeout` (the whole body has no deadline), or, with `Server::min_body_rate` on, a body slower on average than that rate once its grace period is over (the slow-POST form of slowloris; off by default): `GIONG-E1112`. Broken chunked framing: `GIONG-E1113`.
 - A handler that returns before the end of the body has its response sent, then the connection closes (whatever the client still sends is read and dropped for a moment, so it gets the response instead of a reset).
 - A streamed response goes out with `Transfer-Encoding: chunked`; an HTTP/1.0 client gets it without a length and the connection closes after it. The head is sent when the handler returns, each piece as soon as it is sent, and pieces of 32 KiB or more are written without a copy.
 - The server waits for the producer without a time limit (an event stream can be quiet for long); each write has `write_timeout`. `send` fails with `GIONG-E1114` once the client is gone, which is noticed at the next write, or when the response has no body (`HEAD`, 204, 304). `BodySender::abort` ends the body without its last chunk, so the client can tell it is incomplete.

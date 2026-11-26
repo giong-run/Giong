@@ -650,8 +650,8 @@ hold to it.
       served. The runtime keeps the accounts; which key to use (a client address, a header,
       a TLS identity) is decided in `giong-web`, with the rate limiting planned for 1.x.
 - [ ] Idle connections as small as the kernel's share of them or smaller, where it is not
-      done before: an idle HTTPS connection under 4.5 KiB (12.5 KiB in 0.7; nginx with
-      OpenSSL 15), an idle HTTP/2 connection under 3 KiB (4.5), and HTTP/2 requests with
+      done before: an idle HTTPS connection under 4.5 KiB (12.5 KiB in 0.7, 6.1 in 1.5.2;
+      nginx with OpenSSL 15), an idle HTTP/2 connection under 3 KiB (4.5), and HTTP/2 requests with
       at most 4 heap allocations each (22).
 - [ ] Proven under attack: slow uploads, slow heads, slow readers, floods of HTTP/2 streams
       and of new connections, handlers that allocate more than they declared, alone and

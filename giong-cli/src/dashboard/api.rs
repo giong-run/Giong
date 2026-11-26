@@ -384,7 +384,12 @@ fn send(req: &Req, target: &Target) -> Resp {
     };
     // Only loopback: the box is for the service on this machine, not a proxy.
     let host = base.authority.rsplit_once(':').map_or("", |(h, _)| h);
-    if !matches!(host, "127.0.0.1" | "localhost" | "[::1]") && !host.starts_with("127.") {
+    // A name that only starts like a loopback address (`127.0.0.1.example.com`)
+    // goes through DNS to wherever its owner points it.
+    let loopback_v4 = host
+        .parse::<std::net::Ipv4Addr>()
+        .is_ok_and(|a| a.is_loopback());
+    if !matches!(host, "localhost" | "[::1]") && !loopback_v4 {
         return Resp::error(
             400,
             "GIONG-E5000",
@@ -674,6 +679,22 @@ mod tests {
         let r = send(&req, &Target::default());
         assert_eq!(r.status, 400);
         assert!(String::from_utf8_lossy(&r.body).contains("not on this machine"));
+        // Names that only look like loopback addresses resolve elsewhere.
+        for base in [
+            "http://127.0.0.1.nip.example:80",
+            "http://127.evil.example:80",
+        ] {
+            let req = Req {
+                body: format!(r#"{{"base_url":"{base}","method":"GET","path":"/"}}"#).into_bytes(),
+                ..req.clone()
+            };
+            let r = send(&req, &Target::default());
+            assert_eq!(r.status, 400, "{base}");
+            assert!(
+                String::from_utf8_lossy(&r.body).contains("not on this machine"),
+                "{base}"
+            );
+        }
     }
 
     #[test]

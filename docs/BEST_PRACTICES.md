@@ -105,6 +105,10 @@ let hash = giong::spawn_compute(move || expensive(input)).await;
   for the service rather than turning them off: `Server::request_timeout`, `idle_timeout`,
   `max_head_size`, `max_body_size`, `max_connections` (10,000 per `serve` call) and
   `min_free_memory`, which refuses new work before the process runs out of memory.
+- **Give streamed uploads a minimum rate.** `request_timeout` bounds each piece of a body
+  read as a stream, not the whole body, so a client sending a byte every 29 s holds its
+  handler for ever. `Server::min_body_rate(240, Duration::from_secs(10))` cuts such a
+  trickle and no real upload; leave it off for long-lived streams that send little.
 
 ## Buffers
 

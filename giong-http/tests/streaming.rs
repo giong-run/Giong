@@ -277,10 +277,20 @@ impl Handler for App {
                 let body = req.body_stream().expect("a streamed body");
                 assert!(req.body().is_empty());
                 let mut all = Vec::new();
+                // A handler that takes its time with the first piece.
+                let pause = req
+                    .header_str("x-pause-ms")
+                    .and_then(|ms| ms.parse().ok())
+                    .map(Duration::from_millis);
                 loop {
                     match body.chunk().await {
                         Ok(Some(piece)) => {
                             assert!(!piece.is_empty());
+                            if all.is_empty() {
+                                if let Some(pause) = pause {
+                                    sleep(pause).await;
+                                }
+                            }
                             all.extend_from_slice(&piece);
                         }
                         Ok(None) => break,
@@ -400,6 +410,78 @@ fn chunked_upload(tag: &str) -> String {
 }
 
 // ------------------------------------------------------------ request bodies
+
+/// A server that wants streamed bodies at 1,000 bytes per second or more
+/// after 200 ms.
+fn rated_server() -> TestServer {
+    TestServer::start(
+        Server::new()
+            .max_body_size(16)
+            .min_body_rate(1000, Duration::from_millis(200)),
+    )
+}
+
+#[test]
+fn a_trickling_body_is_cut_once_it_falls_below_the_minimum_rate() {
+    let server = rated_server();
+    let mut c = server.client();
+    let started = Instant::now();
+    c.send(upload("trickle", 1000));
+    // One byte every 100 ms: 10 bytes a second. Each wait is well within
+    // the request timeout (30 s), so without the rate this goes on for
+    // 100 s.
+    for _ in 0..1000 {
+        std::thread::sleep(Duration::from_millis(100));
+        if c.stream.write_all(b"x").is_err() || !seen("trickle").is_empty() {
+            break;
+        }
+    }
+    let why = seen("trickle");
+    assert!(
+        why[0].starts_with("GIONG-E1112") && why[0].contains("min_body_rate"),
+        "{why:?}"
+    );
+    // The grace (200 ms) plus what a few bytes earn, not the 100 s.
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+}
+
+#[test]
+fn a_body_that_keeps_the_minimum_rate_is_not_cut() {
+    let server = rated_server();
+    let mut c = server.client();
+    let body = pattern(2000);
+    c.send(upload("steady-rate", body.len()));
+    // 200 bytes every 50 ms: 4,000 bytes a second, for half a second.
+    for piece in body.chunks(200) {
+        std::thread::sleep(Duration::from_millis(50));
+        c.stream.write_all(piece).unwrap();
+    }
+    let r = c.reply();
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r.text().starts_with("2000 "), "{}", r.text());
+}
+
+#[test]
+fn the_time_a_handler_takes_does_not_count_against_the_minimum_rate() {
+    let server = rated_server();
+    let mut c = server.client();
+    let body = pattern(200_000);
+    // The handler sits on the first piece for a second, five times the
+    // grace: the client, held back meanwhile, is not to blame.
+    c.send(format!(
+        "POST /upload HTTP/1.1\r\nHost: t\r\nX-Tag: paused\r\nX-Pause-Ms: 1000\r\n\
+         Content-Length: {}\r\n\r\n",
+        body.len()
+    ));
+    c.send(&body[..]);
+    let r = c.reply();
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r.text().starts_with("200000 "), "{}", r.text());
+}
 
 #[test]
 fn a_large_body_arrives_piece_by_piece_and_the_connection_stays_usable() {

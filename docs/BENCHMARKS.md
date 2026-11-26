@@ -120,6 +120,12 @@ others are from 0.4's run on the same kind of VM.
   `.await` cost 43 KiB per idle connection. Each wrapper that took a future by value
   (spawn, `timeout`, `until_shutdown`) also kept two copies of it; an idle giong-http
   connection took 10.9 KiB, one with a pending request 15.0 KiB.
+- **An idle HTTPS connection holds no buffer either** (rustls in the process): 6.1 KiB of
+  heap, mostly its task with the TLS state and rustls' own allocations for the keys; it was
+  10.8 KiB until rustls' buffered connection, which keeps a 4 KiB receive buffer for the life
+  of every connection, was replaced by its unbuffered API in 1.5.2. 8,000 idle connections
+  to one worker take 52.8 MiB of resident memory instead of 89.8 (`bench/tls-idle.sh`,
+  [`bench/results/tls-idle/`](../bench/results/tls-idle/README.md)).
 - **"Pending" is mostly the request buffer**: 4 KiB, held while the handler runs, because
   the `Request` it was given points into it.
 - **Receive buffers are a cost per worker, not per connection**, and only as many are

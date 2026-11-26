@@ -69,7 +69,7 @@ use super::frame::{self, Head, Reason, PREFACE};
 use super::hpack::{Decoder, Encoder, Index, TABLE_SIZE};
 use super::request::{Builder, Built, TrailerBlock};
 use super::wake::Wakers;
-use crate::body::{Failure, Next, Pipe, StreamBody};
+use crate::body::{Failure, Next, Pipe, RateClock, StreamBody};
 use crate::budget::{self, Charge};
 use crate::heap::HeapFuture;
 use crate::request::{BodyBytes, Request};
@@ -144,8 +144,10 @@ const KEEP_STREAMS: Duration = Duration::from_secs(1);
 /// The larger of `max_body_size` and 1 MiB: what one connection may hold of
 /// request bodies, and of responses not sent yet (over HTTP/3 too).
 pub(crate) fn budget(cfg: &Config) -> u64 {
-    cfg.http2_budget
-        .unwrap_or_else(|| (cfg.max_body_size as u64).max(1 << 20))
+    match cfg.http2_budget {
+        0 => (cfg.max_body_size as u64).max(1 << 20),
+        set => set,
+    }
 }
 
 /// The window each stream starts with, once the client has our SETTINGS:
@@ -247,6 +249,8 @@ enum Recv {
         limit: u64,
         /// Bytes the handler had taken at the last look.
         taken: u64,
+        /// Against `Server::min_body_rate`, while it is on.
+        clock: RateClock,
     },
     /// Nothing more to hand over: the body is complete, was refused, or has
     /// no reader any more. Late DATA is counted and dropped.
@@ -814,6 +818,7 @@ impl Session {
     }
 
     fn on_data(&mut self, head: Head, payload: &[u8]) -> Result<(), ConnError> {
+        let min_rate = self.cfg.min_body_rate;
         if head.stream == 0 {
             return Err(protocol("DATA on stream 0"));
         }
@@ -900,9 +905,19 @@ impl Session {
                 st.held += data.len() as u64;
                 self.held += data.len() as u64;
             }
-            Recv::Pipe { pending, .. } => {
+            Recv::Pipe { pending, clock, .. } => {
                 pending.extend_from_slice(data);
                 st.held += data.len() as u64;
+                // A piece arrived: the timeout for the next one starts when
+                // the handler waits for it again (`service`), not from the
+                // first wait, so a body that keeps coming has no deadline as
+                // a whole.
+                if !data.is_empty() {
+                    st.deadline = None;
+                    if min_rate.is_on() {
+                        clock.got(data.len(), Instant::now());
+                    }
+                }
                 self.held += data.len() as u64;
             }
             Recv::Done => st.unacked += data.len() as u32,
@@ -1260,6 +1275,7 @@ impl Session {
                     pending: Vec::new(),
                     limit,
                     taken: 0,
+                    clock: RateClock::default(),
                 };
                 st.expect_continue = expect_continue;
                 self.push_start(slot, req);
@@ -1789,6 +1805,7 @@ impl Session {
     pub(crate) fn service(&mut self, slot: usize) {
         let waker = self.wakers.get(slot).clone();
         let request_timeout = self.cfg.request_timeout;
+        let min_rate = self.cfg.min_body_rate;
         let mut interim = None;
         let mut ended = false;
         let mut aborted = false;
@@ -1801,6 +1818,7 @@ impl Session {
             pipe,
             pending,
             taken,
+            clock,
             ..
         } = &mut st.recv
         {
@@ -1826,7 +1844,12 @@ impl Session {
             } else if pending.is_empty() && !st.remote_done {
                 // The handler waits for the client.
                 if st.deadline.is_none() {
-                    st.deadline = Some(Instant::now() + request_timeout);
+                    let now = Instant::now();
+                    let (wait, _) = min_rate.wait(clock, request_timeout);
+                    st.deadline = Some(now + wait);
+                    if min_rate.is_on() {
+                        clock.start(now);
+                    }
                 }
             } else {
                 st.deadline = None;
@@ -2157,6 +2180,7 @@ impl Session {
 
     /// Handles what timed out by `now`.
     pub(crate) fn on_timer(&mut self, now: Instant) {
+        let min_rate = self.cfg.min_body_rate;
         if !self.settings_acked && self.settings_deadline <= now {
             self.fail(ConnError {
                 reason: Reason::SettingsTimeout,
@@ -2209,7 +2233,14 @@ impl Session {
                     self.drop_held(slot);
                     let _ = self.answer_status(slot, 408);
                 }
-                Recv::Pipe { .. } => self.end_pipe(slot, Err(Failure::Cut)),
+                Recv::Pipe { clock, .. } => {
+                    let failure = if clock.too_slow(min_rate, now) {
+                        Failure::TooSlow(min_rate.per_sec)
+                    } else {
+                        Failure::Cut
+                    };
+                    self.end_pipe(slot, Err(failure));
+                }
                 Recv::Done => {}
             }
         }

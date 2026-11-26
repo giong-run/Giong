@@ -1112,3 +1112,53 @@ fn requests_in_early_data_are_marked_and_unsafe_ones_wait() {
         drop(control);
     });
 }
+
+#[test]
+fn a_trickling_streamed_body_is_cut_once_it_falls_below_the_minimum_rate() {
+    use std::future::Future;
+    use std::time::{Duration, Instant};
+    run(|| async {
+        let server = Server::new().min_body_rate(1000, Duration::from_millis(200));
+        let client = connect_to(server).await;
+
+        // 200 bytes every 50 ms (4,000 bytes a second): answered.
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        send.write_all(&post("/upload", &[])).await.unwrap();
+        for piece in pattern(2000).chunks(200) {
+            giong::time::sleep(Duration::from_millis(50)).await;
+            send.write_all(&data(piece)).await.unwrap();
+        }
+        send.finish().unwrap();
+        let reply = parse(&recv.read_to_end(1 << 20).await.unwrap());
+        assert_eq!(reply.status(), 200);
+
+        // One byte every 100 ms (10 bytes a second): the stream is reset
+        // soon after the grace, not after the request timeout (30 s).
+        let started = Instant::now();
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        send.write_all(&post("/upload", &[])).await.unwrap();
+        let trickle = async {
+            for _ in 0..100 {
+                giong::time::sleep(Duration::from_millis(100)).await;
+                if send.write_all(&data(b"x")).await.is_err() {
+                    break;
+                }
+            }
+        };
+        let read = recv.read_to_end(1 << 20);
+        let (mut trickle, mut read) = (std::pin::pin!(trickle), std::pin::pin!(read));
+        let outcome = std::future::poll_fn(|cx| {
+            let _ = trickle.as_mut().poll(cx);
+            read.as_mut().poll(cx)
+        })
+        .await;
+        assert!(outcome.is_err(), "{outcome:?}");
+        assert!(
+            started.elapsed() < Duration::from_secs(5),
+            "{:?}",
+            started.elapsed()
+        );
+        // Only that stream: the connection goes on.
+        assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
+    });
+}

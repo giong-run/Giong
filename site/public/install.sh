@@ -23,7 +23,12 @@ fail() { say "$*"; exit 1; }
 fetch() {
     # fetch URL FILE
     if command -v curl > /dev/null 2>&1; then
-        curl -fsSL --retry 3 -o "$2" "$1"
+        # An https URL stays https, redirects included: a redirect to plain
+        # http (which a network in the middle could then answer) is refused.
+        case "$1" in
+            https://*) curl -fsSL --proto '=https' --proto-redir '=https' --tlsv1.2 --retry 3 -o "$2" "$1" ;;
+            *) curl -fsSL --retry 3 -o "$2" "$1" ;;
+        esac
     elif command -v wget > /dev/null 2>&1; then
         wget -q -O "$2" "$1"
     else
@@ -65,7 +70,8 @@ latest_tag() {
     elif command -v curl > /dev/null 2>&1; then
         # The API allows 60 calls an hour per address; the release page's
         # redirect has no such limit: .../releases/latest -> .../releases/tag/vX.Y.Z
-        curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$repo/releases/latest" \
+        curl -fsSLI --proto '=https' --proto-redir '=https' --tlsv1.2 -o /dev/null -w '%{url_effective}' \
+            "https://github.com/$repo/releases/latest" \
             | sed -n 's|.*/releases/tag/\(v[^/]*\)$|\1|p'
     fi
     rm -f "$tmp_json"

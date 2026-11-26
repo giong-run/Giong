@@ -1,0 +1,13 @@
+endpoint     server            req/s median       min       max   p50 ms   p99 ms  cpu%   us/req  errors
+json         main-1cb2988            135248    122921    144844     0.29     1.01   100     7.31       0
+json         unbuffered              137319     83846    141673     0.27     0.92   100     7.20       0
+
+users        main-1cb2988             42705     40970     43570     0.96     2.35    99    23.18       0
+users        unbuffered               46047     38915     47181     0.91     2.37    99    21.54       0
+
+handshake    main-1cb2988              7353      7117      7668     1.96     4.73    98   133.43       0
+handshake    unbuffered                7630      6653      7840     1.78     4.70    98   128.18       0
+
+bytes64k     main-1cb2988             29029     27970     29937     1.56     3.34    98    33.80       0
+bytes64k     unbuffered               29687     29139     31316     1.55     3.03    98    33.29       0
+
