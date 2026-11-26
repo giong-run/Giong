@@ -132,6 +132,13 @@ let hash = giong::spawn_compute(move || expensive(input)).await;
   never sent. Answers are problem+json with a `GIONG-E` code.
 - **When an error is new to you, read its page**: it says what went wrong and how to fix
   it, often with the one line to change.
+- **Run production with `RUST_BACKTRACE` unset.** A handler that panics is answered with a
+  `500`, but the panic hook runs first, on the worker. With `RUST_BACKTRACE=1` the standard
+  hook symbolizes a backtrace there. The first panic loads the symbols, which holds up every
+  connection on that worker for about 70 ms. With debug info in the build, each later panic
+  holds it up for 3 to 5 ms, 20 to 30 times a normal request
+  ([#262](https://github.com/giong-run/Giong/issues/262)). To keep backtraces, install a hook
+  with `std::panic::set_hook` that records the panic without symbolizing it on the worker.
 
 ## Databases and Redis
 

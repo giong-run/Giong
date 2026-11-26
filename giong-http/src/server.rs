@@ -869,7 +869,10 @@ impl Server {
     /// runtime.
     ///
     /// A handler that panics has its request answered with `500 Internal
-    /// Server Error` (the panic hook reports the panic as usual). Over
+    /// Server Error` (the panic hook reports the panic as usual, on the
+    /// worker: with `RUST_BACKTRACE` set, the standard hook symbolizes a
+    /// backtrace there, and every connection on the worker waits for it;
+    /// see `docs/BEST_PRACTICES.md`). Over
     /// HTTP/1.1 its connection then closes; over HTTP/2 only its stream
     /// ends, and the other requests on the connection go on. A handler
     /// whose answer had begun when it panicked (a streamed body's producer
