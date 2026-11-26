@@ -86,12 +86,14 @@ const KEY_KINDS: [&str; 5] = ["api", "private", "secret", "access", "signing"];
 /// | `request`, `response` | `headers`: every header as `[name, value]` in order, names in lower case, secrets redacted (below); `body` (UTF-8 text) or `body_base64` (anything else), secrets redacted (below), at most [`max_body`](Self::max_body) bytes; `body_len`: the length of the whole body as it was sent; `truncated`: whether bytes were left out; `streamed`: the body was read or written as a stream and is not recorded |
 ///
 /// The values of `Authorization`, `Proxy-Authorization`, `Cookie`,
-/// `Set-Cookie`, `X-Api-Key` and `X-Auth-Token`, and of any header named
-/// with [`redact_header`](Self::redact_header), are written as
-/// `[redacted]`. So are the values of query parameters, form fields
-/// (`application/x-www-form-urlencoded` bodies) and JSON keys at any depth
-/// (bodies of a JSON content type, or that start with `{` or `[`) whose
-/// name says secret, on both sides:
+/// `Set-Cookie`, `X-Api-Key` and `X-Auth-Token`, of any header named with
+/// [`redact_header`](Self::redact_header), and of any other header whose
+/// name says secret (below: `X-Session-Token`, `Private-Token`,
+/// `X-Goog-Api-Key`) are written as `[redacted]`. So are the values of
+/// query parameters, form fields (`application/x-www-form-urlencoded` and
+/// `multipart/form-data` bodies) and JSON keys at any depth (bodies of a
+/// JSON content type, or that start with `{` or `[`) whose name says
+/// secret, on both sides:
 ///
 /// - a word of the name is `password`, `passwd`, `pwd`, `passphrase`,
 ///   `secret`, `token`, `apikey`, `cvv`, `cvc`, `ssn`, `authorization` or
@@ -105,8 +107,9 @@ const KEY_KINDS: [&str; 5] = ["api", "private", "secret", "access", "signing"];
 /// U+FFFD; when it holds a secret, the record keeps that redacted text
 /// instead of the raw bytes.
 /// [`redact_field`](Self::redact_field) adds a name and
-/// [`keep_field`](Self::keep_field) keeps one. Other text is written as it
-/// is: do not record traffic with real personal data.
+/// [`keep_field`](Self::keep_field) keeps one (a header too, except the six
+/// above). Other text is written as it is: do not record traffic with real
+/// personal data.
 ///
 /// A request dropped before its response was ready (a client gone, a
 /// [`Timeout`](super::Timeout) further out) writes no line. Lines go
@@ -176,9 +179,10 @@ impl Record {
         self
     }
 
-    /// Writes the query parameter, form field or JSON key `name` as it is,
-    /// although its name says secret (case does not matter): a `token` that
-    /// is a page cursor, say.
+    /// Writes the query parameter, form field, JSON key or header `name` as
+    /// it is, although its name says secret (case does not matter): a
+    /// `token` that is a page cursor, say. The six headers that are always
+    /// redacted stay redacted.
     pub fn keep_field(mut self, name: &str) -> Self {
         self.keep_fields = with(&self.keep_fields, name);
         self
@@ -279,6 +283,13 @@ impl Record {
         let ct = ct.as_deref().unwrap_or("");
         let redacted = if ct.contains("x-www-form-urlencoded") {
             self.redact_pairs(&text)
+        } else if ct.starts_with("multipart/form-data") {
+            // The boundary as sent: it is case-sensitive.
+            let original = String::from_utf8_lossy(content_type.unwrap_or_default());
+            match boundary(&original) {
+                Some(b) => self.redact_multipart(&text, b),
+                None => return Cow::Borrowed(body),
+            }
         } else if ct.contains("json") || text.trim_start().starts_with(['{', '[']) {
             self.redact_json(&text)
         } else {
@@ -290,9 +301,56 @@ impl Record {
         }
     }
 
+    /// Whether a header's value is redacted: one of [`SECRET_HEADERS`], one
+    /// named with [`redact_header`](Self::redact_header), or a name that
+    /// says secret by the rule fields follow (`x-session-token`,
+    /// `private-token`), unless kept with [`keep_field`](Self::keep_field).
     fn secret(&self, name: &str) -> bool {
         SECRET_HEADERS.iter().any(|s| name.eq_ignore_ascii_case(s))
             || self.redact.iter().any(|s| name.eq_ignore_ascii_case(s))
+            || self.secret_field(name)
+    }
+
+    /// A `multipart/form-data` body with the content of each part whose
+    /// field name says secret replaced: as far as parts can be told apart
+    /// when the body is cut short, and to the end for a part that does not
+    /// end.
+    fn redact_multipart<'a>(&self, s: &'a str, boundary: &str) -> Cow<'a, str> {
+        let delimiter = format!("--{boundary}");
+        let next = format!("\r\n{delimiter}");
+        let mut out = String::new();
+        let mut copied = 0;
+        let Some(mut at) = s.find(&delimiter) else {
+            return Cow::Borrowed(s);
+        };
+        loop {
+            let part = at + delimiter.len();
+            if s[part..].starts_with("--") {
+                break;
+            }
+            let Some(head_len) = s[part..].find("\r\n\r\n") else {
+                break;
+            };
+            let content = part + head_len + 4;
+            let end = s[content..].find(&next).map(|e| content + e);
+            let stop = end.unwrap_or(s.len());
+            if stop > content
+                && part_name(&s[part..part + head_len]).is_some_and(|n| self.secret_field(&n))
+            {
+                out.push_str(&s[copied..content]);
+                out.push_str(REDACTED);
+                copied = stop;
+            }
+            match end {
+                Some(e) => at = e + 2,
+                None => break,
+            }
+        }
+        if copied == 0 {
+            return Cow::Borrowed(s);
+        }
+        out.push_str(&s[copied..]);
+        Cow::Owned(out)
     }
 
     /// `"headers":[...]` for any header list.
@@ -455,6 +513,46 @@ fn secret_name(name: &str) -> bool {
         SECRET_WORDS.contains(&w.as_str())
             || (w == "key" && i > 0 && KEY_KINDS.contains(&words[i - 1].as_str()))
             || KEY_KINDS.iter().any(|k| w.strip_prefix(k) == Some("key"))
+    })
+}
+
+/// The `boundary` parameter of a `multipart/form-data` content type, its
+/// quotes taken off.
+fn boundary(content_type: &str) -> Option<&str> {
+    content_type
+        .split(';')
+        .skip(1)
+        .find_map(|param| {
+            let (k, v) = param.split_once('=')?;
+            k.trim().eq_ignore_ascii_case("boundary").then(|| {
+                let v = v.trim();
+                v.strip_prefix('"')
+                    .and_then(|v| v.strip_suffix('"'))
+                    .unwrap_or(v)
+            })
+        })
+        .filter(|b| !b.is_empty())
+}
+
+/// The field name of a multipart part, from the `name` parameter of its
+/// `Content-Disposition` header (`filename` is not it).
+fn part_name(head: &str) -> Option<String> {
+    let value = head.split("\r\n").find_map(|line| {
+        let (k, v) = line.split_once(':')?;
+        k.trim()
+            .eq_ignore_ascii_case("content-disposition")
+            .then_some(v)
+    })?;
+    value.split(';').skip(1).find_map(|param| {
+        let (k, v) = param.split_once('=')?;
+        k.trim().eq_ignore_ascii_case("name").then(|| {
+            let v = v.trim();
+            let v = v
+                .strip_prefix('"')
+                .and_then(|v| v.strip_suffix('"'))
+                .unwrap_or(v);
+            percent_decode(v).into_owned()
+        })
     })
 }
 
@@ -825,6 +923,108 @@ mod tests {
         // Without a secret the bytes are kept as they were.
         let plain = [b'{', 0xff, b'}'];
         assert!(matches!(rec.redact_body(&plain, None), Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn headers_whose_name_says_secret_are_redacted() {
+        let rec = Record::new(Sink::Stdout);
+        for name in [
+            "Authorization",
+            "X-Auth-Token",
+            "X-Session-Token",
+            "Private-Token",
+            "X-Goog-Api-Key",
+            "X-Access-Token",
+            "X-CSRF-Token",
+            "X-Amz-Security-Token",
+        ] {
+            assert!(rec.secret(name), "{name} should be redacted");
+        }
+        for name in [
+            "Content-Type",
+            "Sec-WebSocket-Key",
+            "Idempotency-Key",
+            "WWW-Authenticate",
+            "X-Request-Id",
+            "Access-Control-Allow-Credentials",
+        ] {
+            assert!(!rec.secret(name), "{name} should be kept");
+        }
+        let kept = rec.keep_field("x-page-token").keep_field("cookie");
+        assert!(!kept.secret("X-Page-Token"));
+        assert!(
+            kept.secret("Cookie"),
+            "the six built-in headers stay redacted"
+        );
+        let mut out = String::new();
+        kept.headers(
+            &mut out,
+            [
+                ("X-Session-Token", &b"s3"[..]),
+                ("X-Page-Token", b"p2"),
+                ("Accept", b"*/*"),
+            ]
+            .into_iter(),
+        );
+        assert_eq!(
+            out,
+            r#""headers":[["x-session-token","[redacted]"],["x-page-token","p2"],["accept","*/*"]]"#
+        );
+    }
+
+    #[test]
+    fn multipart_parts_of_secrets_are_redacted() {
+        let rec = Record::new(Sink::Stdout);
+        let body = "--XyZ\r\n\
+            Content-Disposition: form-data; name=\"user\"\r\n\r\n\
+            ada\r\n\
+            --XyZ\r\n\
+            content-disposition: form-data; name=\"newPassword\"\r\n\r\n\
+            hunter2\r\n\
+            --XyZ\r\n\
+            Content-Disposition: form-data; name=\"avatar\"; filename=\"token.png\"\r\n\
+            Content-Type: image/png\r\n\r\n\
+            PNG\r\n\
+            --XyZ\r\n\
+            Content-Disposition: form-data; name=api_key\r\n\r\n\
+            AK-1\r\n\
+            --XyZ--\r\n";
+        let expected = body
+            .replace("hunter2", "[redacted]")
+            .replace("AK-1", "[redacted]");
+        for ct in [
+            "multipart/form-data; boundary=XyZ",
+            "Multipart/Form-Data; charset=utf-8; boundary=\"XyZ\"",
+        ] {
+            assert_eq!(
+                &*rec.redact_body(body.as_bytes(), Some(ct.as_bytes())),
+                expected.as_bytes(),
+                "{ct}"
+            );
+        }
+        // The boundary is case-sensitive; without one nothing is read.
+        let wrong = rec.redact_body(body.as_bytes(), Some(b"multipart/form-data; boundary=xyz"));
+        assert!(matches!(wrong, Cow::Borrowed(_)));
+        let none = rec.redact_body(body.as_bytes(), Some(b"multipart/form-data"));
+        assert!(matches!(none, Cow::Borrowed(_)));
+        // Cut short inside a secret part: redacted to the end.
+        let cut = &body[..body.find("hunter2").unwrap() + 3];
+        assert_eq!(
+            rec.redact_multipart(cut, "XyZ"),
+            format!("{}[redacted]", &body[..body.find("hunter2").unwrap()])
+        );
+        // An empty secret part and a body without the boundary stay.
+        let empty = "--b\r\nContent-Disposition: form-data; name=\"token\"\r\n\r\n\r\n--b--";
+        assert!(matches!(rec.redact_multipart(empty, "b"), Cow::Borrowed(_)));
+        assert!(matches!(
+            rec.redact_multipart("password=p", "b"),
+            Cow::Borrowed(_)
+        ));
+        let kept = rec.keep_field("newpassword");
+        assert_eq!(
+            kept.redact_multipart(body, "XyZ"),
+            body.replace("AK-1", "[redacted]")
+        );
     }
 
     #[test]
