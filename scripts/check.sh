@@ -33,7 +33,9 @@
 #   scripts/check.sh miri       the unit tests and the tests Miri can run, on the
 #                               epoll driver, under Miri, which checks the unsafe
 #                               code against Rust's memory and aliasing rules
-#                               (needs nightly with the miri component)
+#                               (needs nightly with the miri component); also
+#                               giong-http's allocator and parsers and the
+#                               database clients' read buffers
 #   scripts/check.sh sim        the deterministic simulation (sim/README.md): its
 #                               scenarios, months of simulated uptime, and this
 #                               crate's tests on it without faults and then with
@@ -162,6 +164,18 @@ run_miri() {
     done
     echo "== Miri: tests/cancel.rs (files)"
     cargo +nightly miri test --quiet --test cancel -- --exact a_dropped_open_closes_the_descriptor_it_produced
+    # The unsafe code of the other crates that Miri can reach: giong-http's
+    # pooled allocator for connection futures (heap.rs) and the parsers on the
+    # request path, and the database clients' read buffers, which lend their
+    # spare capacity to the kernel (IoBufMut). Only the unit tests of those
+    # modules: the others open sockets or call ring's assembly, which Miri
+    # cannot run (an unsupported call aborts the whole test binary).
+    echo "== Miri: giong-http (allocator, parsers)"
+    cargo +nightly miri test --quiet -p giong-http --lib -- \
+        heap:: chunked:: parse:: trailers:: h2::hpack h2::frame h3::qpack h3::frame client::decode
+    echo "== Miri: giong-postgres, giong-mysql (read buffers)"
+    cargo +nightly miri test --quiet -p giong-postgres --lib -- connect::
+    cargo +nightly miri test --quiet -p giong-mysql --lib -- connect::
 }
 
 run_sim() {
