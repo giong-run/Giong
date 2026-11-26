@@ -171,12 +171,13 @@ moves bytes to the heap depending on timing, which made the heap per connection 
 |---|---:|---:|
 | `idle-http1` (io_uring / epoll) | 1,980 / 2,158 bytes | 2,009 / 2,200 bytes |
 | `idle-h2` (io_uring / epoll) | 4,473 / 4,556 bytes | 4,827 / 4,844 bytes |
-| `idle-https` (io_uring / epoll) | 6,069 / 6,086 bytes | 6,480 / 6,386 bytes |
+| `idle-https` (io_uring / epoll) | 6,069 / 6,086 bytes | 6,480 / 6,382 bytes |
 
 The instruction counts above were measured on a 4-vCPU Xeon VM (Linux 6.18) on 2026-11-20 and
 are the same on CI's runners; the memory is from the CI run that put 3fa75c3 on `main`
-(2026-11-20), except `idle-https`: rustls through its unbuffered API, which leaves an idle
-connection no receive buffer (10,834 bytes before, same VM, 2026-11-26;
+(2026-11-20), except `idle-https`, from the CI run of the change that moved rustls to its
+unbuffered API, which leaves an idle connection no receive buffer (10,834 bytes before, on
+a 4-vCPU VM, 2026-11-26;
 [`bench/results/tls-idle/`](../results/tls-idle/README.md)). What CI compares against is `baseline.csv`.
 
 ## When the check fails
