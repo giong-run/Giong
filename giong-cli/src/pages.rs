@@ -3201,16 +3201,16 @@ A directory or file could not be created: no permission, a full disk, a path tha
 "#),
     (5034, r#"# GIONG-E5034: the project's crates do not build on Windows
 
-Raised by the `giong` command (giong-cli): `giong new`, on Windows. In JSON output: `"code": "GIONG-E5034"`.
+Raised by the `giong` command (giong-cli): `giong new`, on Windows, up to giong-cli 1.5.0. In JSON output: `"code": "GIONG-E5034"`.
 
 ## What happened
 
-The project was written, but on Windows giong 1.x builds only the runtime crate (`giong`). giong-web, giong-grpc, giong-mcp and the database crates, which every template uses, need Linux or macOS.
+Up to giong 1.4, only the runtime crate (`giong`) built on Windows, so `giong new` warned that the project it wrote would not build there. Since 1.5 every crate builds and passes its tests on Windows, and CI builds and tests the projects `giong new` writes on Windows. giong-cli 1.5.1 and later no longer raise this code.
 
 ## How to fix it
 
-- Work on the project in WSL 2: `wsl --install`, then install Rust and giong-cli inside it and run `giong new` there.
-- Or work on Linux or macOS; production runs on Linux in any case.
+- Update giong-cli: `giong upgrade --self`, then `giong upgrade` in the project to move it to the current giong crates.
+- The project then builds on Windows as it is. Production still runs best on Linux, where io_uring is available.
 
 [All error codes](README.md)
 "#),

@@ -186,11 +186,9 @@ fn machine(r: &mut Report) {
         macos(r);
         "kqueue"
     } else if cfg!(windows) {
-        r.line(
-            "Note: on Windows, giong 1.4 runs the giong crate only; giong-http, giong-web, the \
-             database crates and giong-mcp need Linux or macOS. WSL 2 runs all of them.",
-        );
-        r.data("windows_runtime_only", json!(true));
+        // Every crate builds on Windows since 1.5 (the projects giong new
+        // writes are built and tested there in CI): the key stays, false.
+        r.data("windows_runtime_only", json!(false));
         "iocp"
     } else {
         "unsupported"

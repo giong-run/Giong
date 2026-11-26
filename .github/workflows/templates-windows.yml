@@ -1,0 +1,66 @@
+name: Templates on Windows
+
+# The projects `giong new` writes, built and tested on Windows the way a user
+# there would (scripts/templates.sh in Git Bash): fmt, clippy with warnings as
+# errors, the tests, and a smoke run. Only the combinations that need no
+# database server: the runners have none to give them. A draft, and a pull
+# request that changes nothing a template builds on, skip it (job `plan`,
+# scripts/ci-scope.py --relevant).
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: templates-windows-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # The same pinned toolchain as ci.yml and release.yml.
+  RUST_STABLE: "1.100.0"
+
+jobs:
+  plan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    outputs:
+      heavy: ${{ steps.plan.outputs.heavy }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 2
+      - id: plan
+        env:
+          EVENT: ${{ github.event_name }}
+          DRAFT: ${{ github.event.pull_request.draft && '--draft' || '' }}
+        run: |
+          if [ "$EVENT" = pull_request ]; then git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files.txt"; else : > "$RUNNER_TEMP/files.txt"; fi
+          python3 scripts/ci-scope.py --event "$EVENT" $DRAFT --explain \
+            --relevant src/ Cargo.toml Cargo.lock giong-cli/ giong-web/ giong-grpc/ giong-grpc-build/ \
+              giong-http/ giong-mcp/ giong-proto/ giong-tls/ scripts/templates.sh scripts/ci-scope.py \
+              .github/workflows/templates-windows.yml \
+            < "$RUNNER_TEMP/files.txt" | tee -a "$GITHUB_OUTPUT"
+
+  # Not `templates`: that name is the Linux job's (templates.yml).
+  templates-windows:
+    needs: plan
+    if: needs.plan.outputs.heavy == 'true'
+    runs-on: windows-2025
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    env:
+      GIONG_TEMPLATES_NO_SERVERS: 1
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+          components: clippy, rustfmt
+      - run: scripts/templates.sh
