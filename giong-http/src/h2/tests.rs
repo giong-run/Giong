@@ -1638,3 +1638,49 @@ fn each_piece_of_a_streamed_body_has_the_request_timeout_but_the_whole_body_has_
     assert!(reply.text().starts_with("GIONG-E1112"), "{}", reply.text());
     assert!(started.elapsed() >= TIMEOUT, "{:?}", started.elapsed());
 }
+
+#[test]
+fn a_trickling_streamed_body_is_cut_once_it_falls_below_the_minimum_rate() {
+    let server = TestServer::start(Server::new().min_body_rate(1000, Duration::from_millis(200)));
+    let mut c = server.client();
+    let started = Instant::now();
+    let id = c.open("POST", "/pipe", &[], false);
+    // One byte every 100 ms (10 bytes a second), until the server answers;
+    // without the rate, for 10 s.
+    for _ in 0..100 {
+        std::thread::sleep(Duration::from_millis(100));
+        c.send(frame::DATA, 0, id, b"x");
+        c.frames_within(Duration::from_millis(1));
+        if c.replies.get(&id).is_some_and(|r| r.done) {
+            break;
+        }
+    }
+    let reply = c.reply(id).expect("an answer");
+    assert!(
+        reply.text().starts_with("GIONG-E1112") && reply.text().contains("min_body_rate"),
+        "{}",
+        reply.text()
+    );
+    assert!(
+        started.elapsed() < Duration::from_secs(5),
+        "{:?}",
+        started.elapsed()
+    );
+    // Only that stream: the connection still answers.
+    assert_eq!(c.request("GET", "/", &[], b"").text(), "hello");
+}
+
+#[test]
+fn a_streamed_body_that_keeps_the_minimum_rate_is_not_cut() {
+    let server = TestServer::start(Server::new().min_body_rate(1000, Duration::from_millis(200)));
+    let mut c = server.client();
+    let id = c.open("POST", "/pipe", &[], false);
+    let body = pattern(2000);
+    // 200 bytes every 50 ms: 4,000 bytes a second.
+    for piece in body.chunks(200) {
+        std::thread::sleep(Duration::from_millis(50));
+        c.send_body(id, piece, false);
+    }
+    c.send_body(id, &[], true);
+    assert_eq!(c.reply(id).unwrap().text(), "read 2000");
+}

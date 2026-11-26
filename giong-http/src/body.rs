@@ -12,6 +12,7 @@ use std::future::poll_fn;
 use std::io;
 use std::rc::Rc;
 use std::task::{Poll, Waker};
+use std::time::{Duration, Instant};
 
 use giong::error::{Code, Error};
 
@@ -32,6 +33,89 @@ pub(crate) enum Failure {
     Malformed,
     /// The client reset the HTTP/2 stream.
     Reset,
+    /// The body arrived slower than `Server::min_body_rate` (bytes per
+    /// second) once its grace period was over.
+    TooSlow(u32),
+}
+
+/// `Server::min_body_rate`: the slowest average rate, in bytes per second,
+/// at which a streamed request body may arrive once its grace period is
+/// over. Only the time the server spends waiting for the client counts, not
+/// the time a handler takes with a piece. `per_sec == 0` is off, the
+/// default. Two `u32`s: with `Config::http2_budget` no longer an `Option`,
+/// `Config` stays the size it was (120 bytes).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct MinRate {
+    pub(crate) per_sec: u32,
+    pub(crate) grace_ms: u32,
+}
+
+impl MinRate {
+    pub(crate) fn is_on(self) -> bool {
+        self.per_sec != 0
+    }
+
+    /// How much longer the server may wait for the client, once `got`
+    /// bytes have arrived over `waited` of waiting: the grace period plus
+    /// what `got` bytes earn at the rate, less what was waited already.
+    /// Zero when the body is too slow. Only called when on.
+    pub(crate) fn left(self, got: u64, waited: Duration) -> Duration {
+        let earned = u128::from(self.grace_ms) * 1_000_000
+            + u128::from(got) * 1_000_000_000 / u128::from(self.per_sec.max(1));
+        let earned = Duration::from_nanos(u64::try_from(earned).unwrap_or(u64::MAX));
+        earned.saturating_sub(waited)
+    }
+
+    /// How long to wait for the next piece: the request timeout, or less
+    /// when the rate runs out first. The second value says whether the rate
+    /// sets it, so that running out of it means `TooSlow`, not `Cut`.
+    pub(crate) fn wait(self, clock: &RateClock, request_timeout: Duration) -> (Duration, bool) {
+        if !self.is_on() {
+            return (request_timeout, false);
+        }
+        let left = self.left(clock.got, clock.waited);
+        if left < request_timeout {
+            (left, true)
+        } else {
+            (request_timeout, false)
+        }
+    }
+}
+
+/// What a streamed request body has received, and how long the server has
+/// waited for it, for `MinRate`. Kept only while the rate is on.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct RateClock {
+    pub(crate) got: u64,
+    pub(crate) waited: Duration,
+    /// Since when the server has been waiting for the next piece (HTTP/2,
+    /// where the wait is not one `await`).
+    pub(crate) since: Option<Instant>,
+}
+
+impl RateClock {
+    /// A wait for the client starts.
+    pub(crate) fn start(&mut self, now: Instant) {
+        if self.since.is_none() {
+            self.since = Some(now);
+        }
+    }
+
+    /// `n` bytes arrived: the wait in progress, if any, ends.
+    pub(crate) fn got(&mut self, n: usize, now: Instant) {
+        if let Some(since) = self.since.take() {
+            self.waited += now.saturating_duration_since(since);
+        }
+        self.got += n as u64;
+    }
+
+    /// Whether the body has run out of `rate` at `now`.
+    pub(crate) fn too_slow(&self, rate: MinRate, now: Instant) -> bool {
+        let waiting = self
+            .since
+            .map_or(Duration::ZERO, |since| now.saturating_duration_since(since));
+        rate.is_on() && rate.left(self.got, self.waited + waiting).is_zero()
+    }
 }
 
 impl Failure {
@@ -65,6 +149,18 @@ impl Failure {
                  HTTP/2 stream that broke the protocol (a body longer or shorter than its \
                  content-length, data past the flow-control window), which the server reset",
                 "answer 400 Bad Request; the client sent an invalid body.",
+            )
+            .into(),
+            Failure::TooSlow(per_sec) => Error::new(
+                Code::HttpBodyIncomplete,
+                format!(
+                    "the request body was cut short: it arrived slower than the {per_sec} \
+                     bytes per second `Server::min_body_rate` asks for, once its grace period \
+                     was over"
+                ),
+                "nothing to fix on the server if the client is hostile or broken. If real \
+                 clients are that slow (a mobile upload, a stream that sends little), lower \
+                 `min_body_rate` or lengthen its grace period.",
             )
             .into(),
             Failure::Reset => Error::new(
@@ -647,5 +743,57 @@ mod tests {
                 .expect("a giong error");
             assert!(error.fix().ends_with('.'), "{error}");
         }
+    }
+}
+
+#[cfg(test)]
+mod rate_tests {
+    use super::*;
+
+    #[test]
+    fn the_allowance_is_the_grace_plus_what_the_bytes_earn() {
+        let rate = MinRate {
+            per_sec: 1000,
+            grace_ms: 200,
+        };
+        let ms = Duration::from_millis;
+        assert_eq!(rate.left(0, Duration::ZERO), ms(200));
+        assert_eq!(rate.left(500, Duration::ZERO), ms(700));
+        assert_eq!(rate.left(500, ms(650)), ms(50));
+        assert_eq!(rate.left(500, ms(700)), Duration::ZERO);
+        assert_eq!(rate.left(500, ms(5000)), Duration::ZERO);
+        // No overflow at the ends of the ranges.
+        let slow = MinRate {
+            per_sec: 1,
+            grace_ms: u32::MAX,
+        };
+        assert!(slow.left(u64::MAX, Duration::ZERO) > Duration::from_secs(1 << 30));
+        // The request timeout decides while the rate leaves more time.
+        let clock = RateClock::default();
+        assert_eq!(rate.wait(&clock, ms(100)), (ms(100), false));
+        assert_eq!(rate.wait(&clock, ms(30_000)), (ms(200), true));
+        assert_eq!(
+            MinRate::default().wait(&clock, ms(30_000)),
+            (ms(30_000), false)
+        );
+    }
+
+    #[test]
+    fn a_clock_counts_only_the_waits() {
+        let rate = MinRate {
+            per_sec: 1000,
+            grace_ms: 100,
+        };
+        let t0 = Instant::now();
+        let ms = Duration::from_millis;
+        let mut clock = RateClock::default();
+        clock.start(t0);
+        clock.got(50, t0 + ms(80));
+        // Not waiting: the handler's time is not counted.
+        assert!(!clock.too_slow(rate, t0 + ms(10_000)));
+        clock.start(t0 + ms(10_000));
+        assert!(!clock.too_slow(rate, t0 + ms(10_000) + ms(60)));
+        assert!(clock.too_slow(rate, t0 + ms(10_000) + ms(70)));
+        assert!(!clock.too_slow(MinRate::default(), t0 + ms(99_999)));
     }
 }

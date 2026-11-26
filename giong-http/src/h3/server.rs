@@ -18,6 +18,7 @@ use std::future::{poll_fn, Future};
 use std::pin::{pin, Pin};
 use std::rc::Rc;
 use std::task::{Context, Poll, Waker};
+use std::time::Instant;
 
 use giong::time::timeout;
 use giong_quic::{Connection, RecvStream, SendStream};
@@ -26,7 +27,7 @@ use super::frame::{
     self, kind, read_varint, write_varint, Code, Error, Header, Need, On, Settings, StreamType,
 };
 use super::qpack::{self, Encoder};
-use crate::body::{Failure, Next, Pipe};
+use crate::body::{Failure, Next, Pipe, RateClock};
 use crate::budget::{self, Charge};
 use crate::h2::hpack::Index;
 use crate::h2::request::{Builder, Built, TrailerBlock};
@@ -919,13 +920,26 @@ async fn exchange<H: Handler>(
     let pipe = Rc::new(Pipe::new(content_length));
     req.body = BodyBytes::Stream(pipe.clone());
     let request_timeout = cfg.request_timeout;
+    let min_rate = cfg.min_body_rate;
     let pump = async {
         let mut st = BodyState {
             keep: Some(max_head),
             ..BodyState::default()
         };
+        let mut clock = RateClock::default();
         loop {
-            let piece = match timeout(request_timeout, body_piece(r, &mut st, max_head)).await {
+            let (wait, by_rate) = min_rate.wait(&clock, request_timeout);
+            let start = min_rate.is_on().then(Instant::now);
+            let received = timeout(wait, body_piece(r, &mut st, max_head)).await;
+            if let Some(start) = start {
+                let n = match &received {
+                    Ok(Ok(Some(piece))) => piece.len(),
+                    _ => 0,
+                };
+                clock.waited += start.elapsed();
+                clock.got += n as u64;
+            }
+            let piece = match received {
                 Ok(Ok(Some(piece))) => piece,
                 Ok(Ok(None)) => break,
                 Ok(Err(stop)) => {
@@ -936,7 +950,11 @@ async fn exchange<H: Handler>(
                     return Err(stop);
                 }
                 Err(_) => {
-                    pipe.finish(Err(Failure::Cut));
+                    pipe.finish(Err(if by_rate {
+                        Failure::TooSlow(min_rate.per_sec)
+                    } else {
+                        Failure::Cut
+                    }));
                     return Err(Stop::Stream(Code::RequestCancelled));
                 }
             };
