@@ -18,11 +18,11 @@ giong image --tag shop:1.0              # an OCI image, without Docker or a Dock
 giong image --push ghcr.io/owner/shop:1.0
 ```
 
-One layer with the release binary at `/app`, CA certificates and a nonroot user, no shell. It is static when the musl target is installed (`rustup target add x86_64-unknown-linux-musl`); the same source gives the same digest. `--add static,migrations` adds folders, `--load` hands the image to Docker or Podman. A project from `giong new` also has a Dockerfile, for a pipeline that wants one.
+One layer with the release binary at `/app`, CA certificates and a nonroot user, no shell. It is static when the musl target is installed (`rustup target add x86_64-unknown-linux-musl`); the same source gives the same digest. A SQLite project keeps its file in a `/data` volume (`docker run -v shop-data:/data`). `--add static,migrations` adds folders, `--load` hands the image to Docker or Podman. A project from `giong new` also has a Dockerfile, for a pipeline that wants one.
 
 ## What production needs
 
-- **The address.** Development listens on `127.0.0.1`. In production set `LISTEN=0.0.0.0:8080` (the Dockerfile from `giong new` does).
+- **The address.** Development listens on `127.0.0.1`. In production set `LISTEN=0.0.0.0:8080` (the Dockerfile from `giong new` and the image from `giong image` do).
 - **Settings from the environment.** `.env` is for development only; give production its variables (`DATABASE_URL`, secrets) from the platform. `giong env check` lists what `.env.example` expects.
 - **Graceful shutdown.** Services from `giong new` shut down gracefully on `SIGTERM`. Give the platform's stop timeout a few seconds more than your slowest request.
 - **Migrations.** Run `giong db migrate` against the production `DATABASE_URL` before the new version starts.
