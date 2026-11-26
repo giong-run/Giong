@@ -1,0 +1,6 @@
+10 restarts, streams {'completed_on_old_build': 40}, 151480 short requests, errors {}
+20 restarts, streams {'completed_on_old_build': 80}, 301851 short requests, errors {}
+30 restarts, streams {'completed_on_old_build': 120}, 445572 short requests, errors {}
+40 restarts, streams {'completed_on_old_build': 160}, 591822 short requests, errors {}
+50 restarts, streams {'completed_on_old_build': 200}, 743153 short requests, errors {}
+{"restarts": 50, "stream_secs": 3, "streams_per_restart": 4, "streams": {"completed_on_old_build": 200}, "failed_streams": [], "stream_duration_s": {"min": 3.0, "max": 3.02}, "short_requests": 743169, "short_results": {"ok": 743169}, "short_errors": {}, "save_to_serve_s": {"median": 0.829, "max": 1.019}}

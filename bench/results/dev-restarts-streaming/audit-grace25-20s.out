@@ -1,0 +1,1 @@
+{"restarts": 3, "stream_secs": 20, "streams_per_restart": 4, "streams": {"completed_on_old_build": 12}, "failed_streams": [], "stream_duration_s": {"min": 20.03, "max": 20.05}, "short_requests": 293540, "short_results": {"ok": 293540}, "short_errors": {}, "save_to_serve_s": {"median": 0.807, "max": 0.959}}

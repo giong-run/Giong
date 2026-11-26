@@ -1,0 +1,11 @@
+[package]
+name = "devstream"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# The giong checkout under test.
+giong = { path = "../../../.." }
+giong-web = { path = "../../../../giong-web" }
+
+[workspace]
