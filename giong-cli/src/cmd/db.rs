@@ -672,6 +672,47 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
+/// A URL's `scheme`, `user` and `password` (as written, percent-encoded)
+/// and what follows the `@`; `None` without a `user:password@`.
+///
+/// Clients get the password in their environment, never in their command
+/// line, which every user of the machine can read (`ps`,
+/// `/proc/PID/cmdline`): a `DATABASE_URL` is often a shared server's.
+fn credentials(url: &str) -> Option<(&str, &str, &str, &str)> {
+    let (scheme, rest) = url.split_once("://")?;
+    let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (auth, _) = rest[..end].rsplit_once('@')?;
+    let (user, password) = auth.split_once(':')?;
+    Some((scheme, user, password, &rest[auth.len() + 1..]))
+}
+
+/// The URL without its password, and the password (decoded; `None` when
+/// the URL has none). The user stays: `postgres://user@host/db`.
+fn without_password(url: &str) -> (String, Option<String>) {
+    match credentials(url) {
+        Some((scheme, "", password, host)) => {
+            (format!("{scheme}://{host}"), Some(percent_decode(password)))
+        }
+        Some((scheme, user, password, host)) => (
+            format!("{scheme}://{user}@{host}"),
+            Some(percent_decode(password)),
+        ),
+        None => (url.to_string(), None),
+    }
+}
+
+/// The URL without its user and password, and those two (decoded; `None`
+/// when the URL has no password).
+fn without_credentials(url: &str) -> (String, Option<(String, String)>) {
+    match credentials(url) {
+        Some((scheme, user, password, host)) => (
+            format!("{scheme}://{host}"),
+            Some((percent_decode(user), percent_decode(password))),
+        ),
+        None => (url.to_string(), None),
+    }
+}
+
 /// Splits a database URL (`scheme://user:password@host:port/db?query`).
 pub fn parse_url(url: &str) -> Option<(Engine, UrlParts)> {
     let (scheme, rest) = url.split_once("://")?;
@@ -787,6 +828,10 @@ impl Runner {
                         Some(db) => replace_database(url, db),
                         None => url.clone(),
                     };
+                    let (target, password) = without_password(&target);
+                    if let Some(p) = password.filter(|p| !p.is_empty()) {
+                        cmd.env("PGPASSWORD", p);
+                    }
                     cmd.args(["-d", &target]);
                 }
                 Engine::Mysql => {
@@ -814,7 +859,22 @@ impl Runner {
                 }
                 Engine::Redis => {
                     cmd = Proc::new("redis-cli");
-                    cmd.args(["-u", url]);
+                    // redis-cli reads `redis://name@host` as a password, so
+                    // the user goes in --user and the password in
+                    // REDISCLI_AUTH, which it reads when -u gave none.
+                    let target = match without_credentials(url) {
+                        (bare, Some((user, password))) => {
+                            if !user.is_empty() {
+                                cmd.args(["--user", &user]);
+                            }
+                            if !password.is_empty() {
+                                cmd.env("REDISCLI_AUTH", password);
+                            }
+                            bare
+                        }
+                        (target, None) => target,
+                    };
+                    cmd.args(["-u", &target]);
                 }
                 Engine::Sqlite => {
                     let path = sqlite_path(url).ok_or_else(|| bad_url(url))?;
@@ -2555,6 +2615,58 @@ mod tests {
         assert_eq!(percent_decode("%€x"), "%€x");
         assert_eq!(percent_decode("p%+5"), "p%+5");
         assert_eq!(parse_url("postgres://u:p%€@h/d").unwrap().1.password, "p%€");
+    }
+
+    #[test]
+    fn passwords_leave_the_url_a_client_is_given() {
+        assert_eq!(
+            without_password("postgres://app:p%40ss@db:5432/shop?sslmode=require"),
+            (
+                "postgres://app@db:5432/shop?sslmode=require".to_string(),
+                Some("p@ss".to_string())
+            )
+        );
+        // An `@` after the host is not the end of a password.
+        assert_eq!(
+            without_password("postgres://u:pw@h/d?application_name=a@b"),
+            (
+                "postgres://u@h/d?application_name=a@b".to_string(),
+                Some("pw".to_string())
+            )
+        );
+        assert_eq!(
+            without_password("postgresql://:pw@[::1]:5433"),
+            (
+                "postgresql://[::1]:5433".to_string(),
+                Some("pw".to_string())
+            )
+        );
+        assert_eq!(
+            without_password("postgres://u@h/d"),
+            ("postgres://u@h/d".to_string(), None)
+        );
+        assert_eq!(
+            without_password("postgres://h/d?x=a:b@c"),
+            ("postgres://h/d?x=a:b@c".to_string(), None)
+        );
+        assert_eq!(
+            without_credentials("rediss://default:s%3Acret@cache:6380/2"),
+            (
+                "rediss://cache:6380/2".to_string(),
+                Some(("default".to_string(), "s:cret".to_string()))
+            )
+        );
+        assert_eq!(
+            without_credentials("redis://:pw@h:6379"),
+            (
+                "redis://h:6379".to_string(),
+                Some((String::new(), "pw".to_string()))
+            )
+        );
+        assert_eq!(
+            without_credentials("redis://h:6379"),
+            ("redis://h:6379".to_string(), None)
+        );
     }
 
     #[test]
