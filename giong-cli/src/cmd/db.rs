@@ -2915,7 +2915,10 @@ mod tests {
             2
         );
         assert_eq!(migration_error_line("FATAL: no", sql, true), 1);
-        assert_eq!(migration_error_line("psql:<stdin>:1: ERROR: x", "", true), 1);
+        assert_eq!(
+            migration_error_line("psql:<stdin>:1: ERROR: x", "", true),
+            1
+        );
     }
 
     #[test]
