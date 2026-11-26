@@ -40,7 +40,7 @@ jobs:
           DRAFT: ${{ github.event.pull_request.draft && '--draft' || '' }}
         run: |
           if [ "$EVENT" = pull_request ]; then git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files.txt"; else : > "$RUNNER_TEMP/files.txt"; fi
-          python3 scripts/ci-scope.py --event "$EVENT" $DRAFT --explain \
+          python3 scripts/ci-scope.py --event "$EVENT" --explain \
             --relevant src/ Cargo.toml Cargo.lock giong-cli/ giong-web/ giong-grpc/ giong-grpc-build/ \
               giong-http/ giong-mcp/ giong-proto/ giong-tls/ scripts/templates.sh scripts/ci-scope.py \
               .github/workflows/templates-windows.yml \
