@@ -729,6 +729,13 @@ Also:
   reused descriptor numbers), and the SIGTERM
   test is skipped (the sanitizer delivers signals only inside libc calls it intercepts,
   and giong's threads wait in raw system calls).
+- **AddressSanitizer and LeakSanitizer** (`scripts/check.sh asan`, Rust nightly) over the
+  workspace's tests on io_uring, every night in CI: reads and writes out of bounds or after
+  free, double frees and leaks in the unsafe code of every crate, including what Miri cannot
+  run (sockets, the rings, ring's assembly). 2,026 tests in 114 binaries, no report. The
+  only leaks are six tests that leak on purpose to get `'static` data
+  (`scripts/lsan.supp`); one test that measures the process's memory is skipped, since the
+  sanitizer holds freed memory back on purpose.
 - **The fallback io_uring setups and the epoll driver** (`scripts/check.sh fallback`): the
   whole suite again without the optional io_uring features of newer kernels
   (`GIONG_IO_URING_OFF=all`, as on 6.1 to 6.11), with `GIONG_RING_TIER=coop` (the flags of
@@ -799,11 +806,11 @@ Also:
   repeated tests, the fallback setups and the epoll driver, the tests inside Docker,
   ThreadSanitizer, Miri, the Kani proofs, the loom models, the real 5.15, 6.0 and 6.1 kernels and the core
   crate with its direct dependencies at the lowest versions it allows on every change, and
-  fuzzing and the soak test every night.
+  fuzzing, AddressSanitizer and the soak test every night.
 
 Not verified, and you should know it:
 
-- Neither sanitizer nor valgrind can see the kernel writing into memory, so cancellation
+- No sanitizer, nor valgrind, can see the kernel writing into memory, so cancellation
   safety rests on the design and on `tests/cancel.rs`.
 - valgrind 3.22 cannot run the multi-threaded tests (it treats `io_uring_enter` as
   non-blocking, so threads starve each other); ThreadSanitizer covers those.

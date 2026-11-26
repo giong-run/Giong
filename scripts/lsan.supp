@@ -1,0 +1,12 @@
+# LeakSanitizer suppressions for `scripts/check.sh asan`: the tests that leak
+# on purpose. Each one hands an API `'static` data made at run time
+# (`Box::leak`), or forgets a value a thread it starts still names
+# (`mem::forget`). A leak whose stack holds none of these functions fails the
+# run. Add a line only for a leak a test makes itself, never for one in the
+# crates.
+leak:a_refused_zero_copy_send_is_sent_again_with_a_copy
+leak:large_writes_arrive_intact_with_or_without_zero_copy
+leak:a_peer_that_breaks_the_ring_is_reported_not_followed
+leak:a_peer_that_closes_its_socket_mid_channel_is_gone_after_its_messages
+leak:an_argument_written_in_pieces_or_not_at_all_is_one_argument
+leak:tls12_with_record_limit
