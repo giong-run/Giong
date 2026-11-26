@@ -1248,8 +1248,16 @@ fn slow_requests_name_the_route_that_blocks_the_worker() {
                     }
                     giong::yield_now().await;
                 }
-                // A blocking call on the I/O worker.
-                std::thread::sleep(Duration::from_millis(40));
+                // A blocking call on the I/O worker. Longer on Windows:
+                // there the requests behind a 40 ms hold also waited about
+                // 50 ms more, the worker not run after its sleep (Windows
+                // Server gives threads long slices, and the four clients
+                // keep the CPUs busy). That time is rightly no one's, and
+                // the larger half of their extra time made the verdict
+                // "unattributed_wait"; a hold longer than such a wait stays
+                // the larger half.
+                let hold = if cfg!(windows) { 200 } else { 40 };
+                std::thread::sleep(Duration::from_millis(hold));
             } else {
                 observe::set_route(&FAST);
                 FAST_IN_FLIGHT.fetch_add(1, Relaxed);
