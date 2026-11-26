@@ -13,6 +13,9 @@ name: Soak
 # Then years of simulated uptime under hostile faults (sim/README.md), on new
 # seeds every night: rare fault combinations show up only after thousands of
 # seeds, more than the per-PR run can afford.
+# And every test of the workspace under AddressSanitizer and LeakSanitizer
+# (scripts/check.sh asan): out-of-bounds and use-after-free accesses and leaks
+# in the unsafe code of every crate, not only the core crate Miri can run.
 
 on:
   schedule:
@@ -178,3 +181,32 @@ jobs:
           SIM_FROM: ${{ inputs.sim_from }}
           RUN: ${{ github.run_number }}
         run: SIM_LONG_FROM="${SIM_FROM:-$(( RUN * 1200 ))}" scripts/check.sh sim-long
+
+  # Every test under AddressSanitizer, on io_uring, with the same services as
+  # the ThreadSanitizer jobs in ci.yml. About 20 minutes, too long to add to
+  # every merge, so nightly: a report names the access and both stacks.
+  asan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      GIONG_TEST_EXPECT_DRIVER: io_uring
+      GIONG_KTLS_REQUIRED: 1
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: nightly
+          components: rust-src
+      # The sanitizers' shadow memory and the runner's address-space
+      # randomisation, as for ThreadSanitizer.
+      - run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: "net: install redis-server, load tls"
+        uses: ./.github/actions/apt-install
+        with:
+          packages: redis-server
+          stop-services: redis-server
+          modules: tls
+      - name: AddressSanitizer
+        run: |
+          sudo prlimit --pid $$ --memlock=unlimited:unlimited
+          scripts/check.sh asan
