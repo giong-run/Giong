@@ -193,6 +193,7 @@ while read -r name flags; do
     fi
     if [ "$ok" = 1 ]; then
         echo "ok: $name ($(grep -c '^test result: ok' "$log") test runs$(grep -q SKIPPED "$log" && echo ', some SKIPPED'))"
+        grep '^smoke:' "$log"
     else
         tail -40 "$log"
         failed+=("$name")
