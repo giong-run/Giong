@@ -98,10 +98,12 @@ pub fn allows(req: &[Comparator], v: Version) -> bool {
 }
 
 fn comparator_allows(c: &Comparator, v: Version) -> bool {
-    let v = [v.0, v.1, v.2];
-    let low = c.parts;
+    // In u64, so that the end of a prefix ending in u32::MAX (`^4294967295`)
+    // does not overflow.
+    let v = [u64::from(v.0), u64::from(v.1), u64::from(v.2)];
+    let low = c.parts.map(u64::from);
     // The first version above everything the written prefix covers.
-    let prefix_end = |n: usize| -> [u32; 3] {
+    let prefix_end = |n: usize| -> [u64; 3] {
         let mut e = [0; 3];
         e[..n].copy_from_slice(&low[..n]);
         e[n - 1] += 1;
@@ -507,6 +509,13 @@ mod tests {
         assert!(!ok("1.4.*", "1.5.0"));
         assert!(parse_req("1.5.0-rc.1").is_none());
         assert!(parse_req("latest").is_none());
+        // The largest parts a manifest can hold: no overflow at the end of
+        // the prefix.
+        assert!(ok("^4294967295", "4294967295.7.1"));
+        assert!(ok("~1.4294967295", "1.4294967295.3"));
+        assert!(ok("<=1.4294967295", "1.4294967295.9"));
+        assert!(ok(">0.4294967295", "1.0.0"));
+        assert!(!ok(">0.4294967295", "0.4294967295.4294967295"));
     }
 
     #[test]
