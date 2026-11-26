@@ -9,29 +9,37 @@ byte searches, and each well-formed header line of a response read in one pass (
 reader, with its messages, still reads every other line).
 
 Machine: 4-vCPU cloud VM (Intel Xeon 2.1 GHz), Linux 6.18, rustc 1.97.0, valgrind 3.22,
-2026-11-26. "main" is `main` at 1cb2988; "change" is the change on top of it.
+2026-11-26. "main" is `main` at 81588a2 for the instruction counts and at 1cb2988 for the
+requests per second (the TLS change between them, #475, is not on the client's side);
+"change" is the change on top of it.
 
 ## Instructions and allocations (bench/instr)
 
-`scripts/instr.py measure --cases http1-client,h2,h2-streams,https --rounds 3` on both trees.
+`scripts/instr.py measure --cases http1-client,h2,h2-streams,https --rounds 3` on the
+change merged with `main` 81588a2, against `main` (all cases measured there).
 Each case runs the client and the server in one process, so the counts are both together;
-`h2-streams` is ten requests. [`instr-main-1cb2988.csv`](instr-main-1cb2988.csv),
+`h2-streams` is ten requests. [`instr-main-81588a2.csv`](instr-main-81588a2.csv),
 [`instr-change.csv`](instr-change.csv).
 
 | case | driver | main instructions | change | | main allocations | change |
 |---|---|---:|---:|---:|---:|---:|
-| `http1-client` | io_uring | 21,845 | 20,088 | −8.0% | 11 | 7 |
-| `http1-client` | epoll | 22,941 | 21,184 | −7.7% | 11 | 7 |
-| `h2` | io_uring | 29,720 | 28,241 | −5.0% | 22 | 14 |
-| `h2` | epoll | 30,852 | 29,374 | −4.8% | 22 | 14 |
-| `h2-streams` | io_uring | 240,259 | 225,085 | −6.3% | 230 | 150 |
-| `h2-streams` | epoll | 241,640 | 226,198 | −6.4% | 230 | 150 |
-| `https` | io_uring | 33,883 | 32,114 | −5.2% | 17 | 13 |
-| `https` | epoll | 34,953 | 33,184 | −5.1% | 17 | 13 |
+| `http1-client` | io_uring | 21,851 | 20,094 | −8.0% | 11 | 7 |
+| `http1-client` | epoll | 22,947 | 21,184 | −7.7% | 11 | 7 |
+| `h2` | io_uring | 29,744 | 28,265 | −5.0% | 22 | 14 |
+| `h2` | epoll | 30,875 | 29,393 | −4.8% | 22 | 14 |
+| `h2-streams` | io_uring | 240,484 | 225,107 | −6.4% | 230 | 150 |
+| `h2-streams` | epoll | 241,812 | 226,570 | −6.3% | 230 | 150 |
+| `https` | io_uring | 33,500 | 31,729 | −5.3% | 17 | 13 |
+| `https` | epoll | 34,580 | 32,815 | −5.1% | 17 | 13 |
 
-The server's code did not change (`http1`, the server alone, is 8,289 instructions on
-io_uring and 9,200 on epoll in both trees, and `web` 11,268 and 12,174), so the client's
-own instructions went down by 13% over HTTP/1.1 (from about 13,550 to 11,800 a request). Where the allocations went: 4 a request
+The first measurement, on 1cb2988 before #475, gave the same changes to within 0.1 point
+([`instr-main-1cb2988.csv`](instr-main-1cb2988.csv),
+[`instr-change-on-1cb2988.csv`](instr-change-on-1cb2988.csv)).
+
+The server's code did not change (`http1`, the server alone, is 8,294 instructions on
+io_uring and 9,205 on epoll on main 81588a2; 8,289 and 9,200 in both trees on 1cb2988), so the
+client's own instructions went down by 13% over HTTP/1.1 (from about 13,560 to 11,800 a
+request). Where the allocations went: 4 a request
 over HTTP/1.1 (the request's description made a second time, the method, the origin's copy
 of the host, the waker of the idle check), 8 over HTTP/2 (the same but the waker, the four
 strings of the `user-agent` and `accept-encoding` fields, and the reallocation of a

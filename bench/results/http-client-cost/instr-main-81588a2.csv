@@ -1,0 +1,80 @@
+# scripts/instr.py, 3 rounds, 2000 operations after 500 of warm-up, 2000 idle connections
+# rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
+# valgrind: valgrind-3.22.0
+# kernel: 6.18.44-fc-v880
+# driver io_uring: io_uring (named by GIONG_DRIVER), using packed-buffers, registered-ring, zero-copy-send
+# driver epoll: epoll (named by GIONG_DRIVER)
+# cpu: Intel(R) Xeon(R) Processor @ 2.10GHz
+round,driver,case,metric,value
+1,io_uring,http1,instructions,8299.640
+1,io_uring,http1,allocations,1.000
+1,io_uring,http1-client,instructions,21845.379
+1,io_uring,http1-client,allocations,11.008
+1,io_uring,h2,instructions,29735.659
+1,io_uring,h2,allocations,22.000
+1,io_uring,h2-streams,instructions,240449.116
+1,io_uring,h2-streams,allocations,230.003
+1,io_uring,https,instructions,33500.168
+1,io_uring,https,allocations,17.035
+1,io_uring,web,instructions,11263.406
+1,io_uring,web,allocations,3.000
+1,epoll,http1,instructions,9204.449
+1,epoll,http1,allocations,1.000
+1,epoll,http1-client,instructions,22946.696
+1,epoll,http1-client,allocations,11.000
+1,epoll,h2,instructions,30875.914
+1,epoll,h2,allocations,22.001
+1,epoll,h2-streams,instructions,241812.196
+1,epoll,h2-streams,allocations,230.004
+1,epoll,https,instructions,34579.959
+1,epoll,https,allocations,17.000
+1,epoll,web,instructions,12180.469
+1,epoll,web,allocations,3.000
+2,io_uring,http1,instructions,8293.639
+2,io_uring,http1,allocations,1.000
+2,io_uring,http1-client,instructions,21851.333
+2,io_uring,http1-client,allocations,11.008
+2,io_uring,h2,instructions,29743.603
+2,io_uring,h2,allocations,22.001
+2,io_uring,h2-streams,instructions,240483.585
+2,io_uring,h2-streams,allocations,230.005
+2,io_uring,https,instructions,33500.096
+2,io_uring,https,allocations,17.035
+2,io_uring,web,instructions,11263.404
+2,io_uring,web,allocations,3.000
+2,epoll,http1,instructions,9204.464
+2,epoll,http1,allocations,1.000
+2,epoll,http1-client,instructions,22946.590
+2,epoll,http1-client,allocations,11.000
+2,epoll,h2,instructions,30874.965
+2,epoll,h2,allocations,22.001
+2,epoll,h2-streams,instructions,241919.691
+2,epoll,h2-streams,allocations,230.005
+2,epoll,https,instructions,34579.965
+2,epoll,https,allocations,17.000
+2,epoll,web,instructions,12174.482
+2,epoll,web,allocations,3.000
+3,io_uring,http1,instructions,8293.744
+3,io_uring,http1,allocations,1.000
+3,io_uring,http1-client,instructions,21851.341
+3,io_uring,http1-client,allocations,11.008
+3,io_uring,h2,instructions,29747.769
+3,io_uring,h2,allocations,22.001
+3,io_uring,h2-streams,instructions,240553.009
+3,io_uring,h2-streams,allocations,230.005
+3,io_uring,https,instructions,33494.185
+3,io_uring,https,allocations,17.035
+3,io_uring,web,instructions,11269.409
+3,io_uring,web,allocations,3.000
+3,epoll,http1,instructions,9204.551
+3,epoll,http1,allocations,1.000
+3,epoll,http1-client,instructions,22946.581
+3,epoll,http1-client,allocations,11.000
+3,epoll,h2,instructions,30872.143
+3,epoll,h2,allocations,22.001
+3,epoll,h2-streams,instructions,241800.047
+3,epoll,h2-streams,allocations,230.004
+3,epoll,https,instructions,34579.939
+3,epoll,https,allocations,17.000
+3,epoll,web,instructions,12174.474
+3,epoll,web,allocations,3.000
