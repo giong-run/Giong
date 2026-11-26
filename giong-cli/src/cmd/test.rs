@@ -359,26 +359,29 @@ fn run_once(
                 }
                 all.push_str(&line);
                 all.push('\n');
-                continue;
             }
             Err(RecvTimeoutError::Disconnected) => break,
             Err(RecvTimeoutError::Timeout) => {}
         }
-        if let Some((at, _)) = ended {
-            if at.elapsed() >= LEFT_OPEN {
-                break;
+        // After every line too: output that never pauses must not keep the
+        // run from seeing that cargo ended or that the limit passed.
+        match ended {
+            // The wait is for output still buffered, not for a writer that
+            // never stops.
+            Some((at, _)) if at.elapsed() >= LEFT_OPEN => break,
+            Some(_) => {}
+            None => {
+                if let Some(status) = child.try_wait().map_err(cargo_missing)? {
+                    ended = Some((Instant::now(), status));
+                    // What the tests left running, so it does not hold the
+                    // pipes, a port or a file into the next run (the epoll one).
+                    stop_group(&child);
+                } else if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                    timed_out = true;
+                    stop_tree(&mut child);
+                    break;
+                }
             }
-        } else if let Some(status) = child.try_wait().map_err(cargo_missing)? {
-            ended = Some((Instant::now(), status));
-            // What the tests left running, so it does not hold the pipes,
-            // a port or a file into the next run (the epoll one).
-            stop_group(&child);
-            continue;
-        }
-        if ended.is_none() && timeout.is_some_and(|limit| started.elapsed() >= limit) {
-            timed_out = true;
-            stop_tree(&mut child);
-            break;
         }
     }
     if ended.is_none() && !timed_out {
@@ -687,8 +690,9 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A test that leaves a process running, which holds the output pipes,
-    /// and prints bytes that are not UTF-8: the run ends with cargo, not at
+    /// A test that leaves a process running, which holds the output pipes
+    /// and writes to them every 20 ms, and a test that prints bytes that are
+    /// not UTF-8: the run ends with cargo, not at
     /// the limit, reads every line, and stops what was left running.
     #[cfg(unix)]
     #[test]
@@ -709,7 +713,7 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
             dir.join("src/lib.rs"),
             format!(
                 "#[test]\nfn leaves_a_process() {{\n\
-                 let c = std::process::Command::new(\"sleep\").arg(\"600\").spawn().unwrap();\n\
+                 let c = std::process::Command::new(\"sh\").args([\"-c\", \"while :; do echo beat; sleep 0.02; done\"]).spawn().unwrap();\n\
                  std::fs::write({pid_file:?}, c.id().to_string()).unwrap();\n\
                  std::mem::forget(c);\n}}\n\
                  #[test]\nfn prints_bytes() {{\n\
@@ -767,8 +771,8 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A test that never ends: the run stops at the limit, cargo and the
-    /// test binary with it.
+    /// A test that never ends, printing every 20 ms: the run stops at the
+    /// limit, cargo and the test binary with it.
     #[test]
     fn stops_a_hung_suite() {
         if !cargo_here() {
@@ -784,7 +788,13 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         .unwrap();
         std::fs::write(
             dir.join("src/lib.rs"),
-            "#[test]\nfn forever() { std::thread::sleep(std::time::Duration::from_secs(600)); }\n",
+            "#[test]\nfn forever() {\n\
+             use std::io::Write;\n\
+             // Output that never pauses for long: the limit still applies.\n\
+             loop {\n\
+             let _ = std::io::stderr().write_all(b\"still trying\\n\");\n\
+             std::thread::sleep(std::time::Duration::from_millis(20));\n\
+             }\n}\n",
         )
         .unwrap();
         // Build first, so the limit measures the test, not the compiler.
