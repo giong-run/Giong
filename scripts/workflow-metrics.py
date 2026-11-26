@@ -415,7 +415,7 @@ def report(args):
                     "runner_s_pr_linux", "runner_s_pr_macos", "runner_s_pr_windows",
                     "runner_s_queue_linux", "runner_s_queue_macos", "runner_s_queue_windows",
                     "ejection_causes", "title"]
-            wr = csv.writer(f)
+            wr = csv.writer(f, lineterminator="\n")
             wr.writerow(cols)
             for r in rows:
                 flat = dict(r)
