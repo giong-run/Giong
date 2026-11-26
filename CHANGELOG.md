@@ -8,6 +8,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.5.1] - 2026-11-26
+
 The first round of fixes after 1.5.0, and the dev kit on SQLite. `giong new` writes a users API
 on SQLite by default, so a new project builds, passes its tests and serves with nothing to
 install or start, and `giong db` works on it. `giong upgrade` moves a project and the command to
@@ -16,6 +18,292 @@ than the files: a change that does not build or start stops the old build and sa
 crate runs on Windows now, Unix sockets included. A worker gives back the memory of a burst of
 tasks or timers, and a sleeping worker costs fewer instructions. Security fixes in
 `giong-cli` and `Record`, and many dev kit fixes. No API is removed or changed.
+
+### Added
+
+- **giong-cli**: `giong new` writes the users API on SQLite: `--db sqlite`, and the web
+  template's default, so a new project builds, passes its tests and serves with nothing to
+  install or start (no Docker, no database server). The database is the file
+  `data/<name>.db`, compiled in by rusqlite (feature `bundled`); the project's `src/db.rs`
+  runs every query on giong's blocking lane (`giong::spawn_blocking`), with one write
+  connection and a few read connections in WAL mode shared by every worker, so a query never
+  holds up a worker and writes queue instead of failing with `database is locked`. Its tests
+  use a file of their own each, its CI workflow starts no service, its Dockerfile keeps the
+  file in a `/data` volume. `--db sqlite,redis` adds the Redis cache; `--db none` writes the
+  service without a database (what `giong new` wrote without `--db` before).
+- **giong-cli**: `giong db` works on SQLite projects (a rusqlite dependency): `up` starts
+  nothing and writes `DATABASE_URL=sqlite:data/<name>.db` into `.env` when it names no SQLite
+  file; `migrate`, `status` and `new` work through the `sqlite3` shell, each file in one
+  transaction, also before `.env` exists; `reset --yes` drops every table of the file when
+  it is inside the project and keeps the file, so a running service carries on.
+- **giong-cli**: `giong upgrade` moves every giong crate of a project to the newest release
+  (or `--to`): the version of each giong dependency in every `Cargo.toml` of the workspace,
+  written as it was written (`"1.4"` becomes `"1.5"`), then `cargo update`, the release's
+  `rust-version` against rustc and the project's own, and `cargo check`; every file is put
+  back if a step fails. It refreshes the agent files `giong ai init` wrote, updates the
+  command first when the release is newer than it, and `--dry-run` lists the edits.
+  `giong upgrade --self` updates the command the way it was installed (the install script's
+  archive with its SHA-256, or `cargo install`). Codes `GIONG-E5093` to `GIONG-E5098`.
+- **giong-cli**: `giong doctor` reads the project's `Cargo.lock`: giong crates on different
+  releases (`GIONG-E5091`), a newer giong release out (`GIONG-E5090`, asked of crates.io
+  through `cargo info` at most once a day; `--offline` skips it, `GIONG_LATEST` answers it)
+  and the command older than it (`GIONG-E5092`).
+- **giong**: Unix domain sockets on Windows. `UnixListener` and `UnixStream` work there
+  (Windows 10 version 1803 and later, Server 2019 and later) through Winsock's `AF_UNIX`,
+  connected and accepted through the completion port like TCP. `UnixStream::pair` connects
+  two sockets through a short-lived listener in the temporary directory, since Windows has
+  no `socketpair`. Three codes say what Windows cannot do: `GIONG-E0060`
+  (`Code::UnixSocketInUse`, a file is already at the path: giong never removes it),
+  `GIONG-E0061` (`Code::UnixPathTooLong`, over the 107 bytes Winsock takes) and
+  `GIONG-E0062` (`Code::UnixSocketsUnavailable`, a Windows without them).
+- **giong**: `net::UnixSocketAddr`, the address `local_addr` and `peer_addr` of Unix sockets
+  return: the standard library's Unix `SocketAddr` on Unix, a type with the same
+  `as_pathname` and `is_unnamed` on Windows, whose standard library has none.
+- **giong**: the `unstable-udp-offload` feature builds on Windows. `send_to_with` and
+  `send_segments_to` split a send into datagrams with `UDP_SEND_MSG_SIZE` where Windows has
+  it (`gso_supported` says; Windows 10 22H2 does), `set_gro` turns on receive coalescing
+  (URO) on the versions that have it, `set_recv_ecn` and `SendOptions::ecn` read and write
+  the ECN bits (`IP_ECN`), `set_recv_local_addr` and `SendOptions::source` use `IP_PKTINFO`, and
+  `set_dont_fragment` sets "don't fragment" with the path MTU left to the caller. Datagrams
+  that a shared port's thread hands to the workers' sockets carry their control messages
+  too. Windows refuses ECN 3 (CE) on a send with `WSAEINVAL`, and where it has no ECN the
+  bits are left out of the datagrams sent.
+- **giong-tls**: Windows. `TlsConnector::with_system_roots` reads the roots Windows trusts
+  for TLS servers from its `ROOT` certificate store, without those in `Disallowed`. Kernel
+  TLS stays Linux's: `ktls_support()` says "Windows has no kernel TLS", so `Ktls::Auto`
+  keeps connections in the process and `Ktls::Required` fails with `GIONG-E2009`.
+- **giong-http**, **giong-web**: Windows. `Server::min_free_memory` reads the memory left
+  from the machine's available memory and, in a job object with a memory limit (a Windows
+  container), from that limit.
+- **giong-mcp**: Windows. The process figures come from the process's own counters
+  (working set, handles, threads, start time). A Unix socket there needs a token, as TCP
+  does, since giong-mcp cannot restrict the socket file to one user on Windows.
+- **giong-compat**, **giong-postgres**, **giong-mysql**, **giong-redis**, **giong-grpc**,
+  **giong-quic**: Windows. A database host given as a Windows path (`C:\run\pg`) is a Unix
+  socket, as a path starting with `/` is elsewhere. giong-quic runs without ECN on a Windows
+  that has none, as QUIC allows.
+
+### Changed
+
+- **giong-cli**: `giong new` no longer warns on Windows that the project's crates do not build
+  there (`GIONG-E5034`, "use WSL 2"). Every crate builds and passes its tests on Windows since
+  1.5, and CI now builds, tests and starts the projects `giong new` writes on Windows (those
+  that need no database server). `giong doctor` drops its matching note, and its JSON key
+  `windows_runtime_only` is now `false`.
+- **giong-cli**: `giong dev` never serves code older than the files. A change that does not
+  compile, or that compiles and then stops before it serves (a panic at start-up, a port it
+  cannot bind, no bind within `--ready-timeout`), now stops the build that was running too and
+  closes the port, so a request is refused at once instead of being answered by the old build.
+  The cause is shown with its code, the compiler's errors or the service's last lines, and the
+  fix: in the terminal, in `giong dev status` (`state` `failed`, and a new `failure` object in
+  its JSON and in `.giong/dev.json`) and at the top of the dashboard. The next save builds and
+  starts again; a service that stops by itself later is reported the same way and is not
+  restarted in a loop. `giong dev status` also says `starting` while a new build starts.
+- **giong-cli**: `giong new` without `--db` writes the web template on SQLite instead of the
+  hello service; `--db none` keeps the old output. The grpc and worker templates still
+  default to no database.
+- **giong**: a worker that goes to sleep reads the clock for `Handle::pulse` from
+  the clock `Instant` reads (`CLOCK_MONOTONIC`, `CLOCK_UPTIME_RAW` on macOS) directly
+  instead of through `Instant`, which saves about 250
+  instructions per sleep: a small TCP echo costs 7.2% fewer instructions on io_uring and
+  5.7% fewer on epoll, an HTTP/1.1 request about 2.9% and 2.6% fewer (Unix; Windows is
+  unchanged) ([#402](https://github.com/giong-run/Giong/pull/402)).
+- **giong**: each turn of a worker's event loop no longer calls out of line the checks that
+  almost always find nothing to do (deferred closes, timers, the io_uring completion queue,
+  the empty list of finished resources): `yield_now` costs 25.6% fewer instructions on
+  io_uring and 14.6% fewer on epoll, `spawn` 18.3% and 9.5% fewer, a small TCP echo about
+  4% fewer ([#288](https://github.com/giong-run/Giong/issues/288)).
+- **giong**: on Windows a TCP or Unix stream is non-blocking from the start, as on macOS,
+  so a send made outside the driver (giong-compat's, giong-tls') never holds the worker on
+  an accepted socket that has not met the driver yet.
+
+### Fixed
+
+- **giong**: `Budget::set_limits` with a memory limit below a `Budget::reserve` that is
+  waiting fails that reservation with `GIONG-E0081`, as it would have failed when asked.
+  Before, it stayed first in the queue, could never be granted, and every reservation of
+  the budget after it waited for ever (`try_reserve` refused them all)
+  ([#412](https://github.com/giong-run/Giong/pull/412)).
+- **giong-cli**: an HTTP answer with a chunk size near the largest number (such as
+  `ffffffffffffffff`) no longer panics `giong record replay`, the dashboard's request box or
+  the giong-mcp client of `giong top` and `giong routes`: it is reported as a chunk cut short.
+  The record and dashboard client also no longer copies a chunked body after every read to see
+  whether it is complete.
+- **giong-cli**: `giong db migrate` and `giong db reset` no longer hang forever on a long
+  migration that prints as it runs (rows from a `SELECT`, `NOTICE` lines). giong wrote the
+  whole script to the client before reading its output, so once the client had filled its
+  output pipe and giong had filled the input pipe, both waited on each other. The script is now
+  written while the output is read.
+- **giong-cli**: `giong dev` without a ready signal (Windows, a giong older than 1.5, a
+  service without giong) no longer takes another process accepting on the service's port
+  for the new build having started. A build that then failed to bind it was reported as
+  serving and then as a later crash; it is now a failed start, whose finding names who
+  holds the port.
+- **giong-cli**: `giong upgrade` reads a dependency's version only when it is one string. In a
+  Cargo.toml whose inline table ends early at a stray `}`, a version such as
+  `"1.4" }x = ["a"` was taken whole, and the edit replaced the bytes between the strings,
+  leaving other values in the file. Found by the manifest fuzz target.
+- **giong-cli**: `giong test` no longer waits for a process a test started and left running (a
+  server it never stopped). That process kept the output pipes open, so a suite that passed in
+  seconds was reported as timed out after 30 minutes. The run now ends with cargo and stops
+  what the tests left in its process group, so it does not hold a port into the epoll run.
+- **giong-cli**: test output that is not UTF-8 no longer stops `giong test` reading it. The
+  test went on writing into a closed pipe and failed with `Broken pipe`. Such bytes are now
+  shown replaced, as in `giong dev`. `giong check`, `giong dev` and `giong upgrade` read
+  cargo's output the same way.
+- **giong**: the compute lane no longer remembers every budget that ever ran a closure in it.
+  Each budget's fair-queue entry stayed after its last closure, even once the budget was
+  dropped, so a server that makes a budget per tenant (or per API key) and drops it when the
+  tenant goes quiet grew by one entry per budget for as long as it ran. Idle entries of dropped
+  budgets are now swept whenever the entries double, at O(1) per new budget; a budget that is
+  still alive keeps its place in the queue as before.
+- **giong-cli**: on Windows (and for a project whose giong is older than 1.5) `giong dev`
+  counts a new build as started only once it accepts connections on its `LISTEN` address,
+  within `--ready-timeout`, as it already did on Unix. Before, a build that was alive
+  300 ms after it started counted as serving, so one that crashed in a slow start-up was
+  reported as ready and then as a later crash (`stage: "exited"`), not as a failed start.
+- **giong-cli**: a `giong dev` whose new build cannot bind its port (`GIONG-E5014`) stays in
+  `giong dev status --all` and `giong dev stop --all`. Naming the process that holds the port
+  read the list of running `giong dev` processes, and the runner took its own entry for a
+  stale one (a process never matches itself there) and removed it.
+- **giong**: `Builder::spin_before_park(Duration::MAX)` no longer panics the first time a
+  worker is idle; a spin longer than a century counts as a century
+  ([#298](https://github.com/giong-run/Giong/issues/298)).
+- **giong-postgres**, **giong-mysql**: `Pool::wait_timeout(Duration::MAX)` no longer panics
+  on the first `get`; a wait longer than a century counts as a century (no limit)
+  ([#298](https://github.com/giong-run/Giong/issues/298)).
+- **giong-mysql**: `Config::statement_timeout(Duration::MAX)` is sent as the longest each
+  server takes (a year; about 49 days for MySQL's `max_execution_time`) instead of a number
+  no server accepts, which made every connection fail
+  ([#298](https://github.com/giong-run/Giong/issues/298)).
+- **giong**: `fs::read` of a file whose length is more than memory holds (a sparse disk
+  image or core dump is enough) returns `GIONG-E0204` (`FileTooLarge`, kind `OutOfMemory`)
+  instead of aborting the whole process; every allocation it makes is fallible now
+  ([#296](https://github.com/giong-run/Giong/issues/296)).
+- **giong-cli**: a chunk size written with a sign (`+5`) is refused as not hex by `giong bench`,
+  `giong record replay`, the dashboard's request box and the giong-mcp client of `giong top` and
+  `giong routes`, instead of being read as 5 (`usize::from_str_radix` takes a leading `+`).
+- **giong-web**: the recorder's JSON key unescaping needs four hex digits after `\u`, so
+  `\u+041` is no longer read as `A`.
+- **giong-cli**: `giong image --add` no longer panics on a file whose path is longer than 100
+  bytes and has names that are not ASCII (Vietnamese, Chinese, Japanese...): the path was cut
+  at a byte count to fit the tar header, which could fall inside a character. A file name that
+  is not UTF-8 is refused with `GIONG-E5073` instead of being renamed in the image, where the
+  service would not find it.
+- **giong-cli**: giong's own checks in `giong check` read `'\''` (a quote character) to its
+  end. They took the escaped quote for the closing one, so in code such as `['\'','"']`
+  the next quote opened a string that hid the code after it, and a blocking call there
+  (GIONG-E5006) was not reported.
+- **giong-cli**: `giong db` no longer panics on a database URL with a non-ASCII character
+  right after a `%` (such as a password `p%€`): the two bytes after the `%` cut the character.
+  The `%` is now kept as written, as for any `%` not followed by two hex digits.
+- **giong-postgres**, **giong-mysql**, **giong-redis**, **giong-http** (proxy URLs): a `%`
+  followed by a sign and a hex digit (`%+5`) is refused as a `%` not followed by two hex digits,
+  as the error already said, instead of being read as byte 5 (`u8::from_str_radix` takes a
+  leading `+`). The query-name decoding of `giong record` and giong-web's recorder keeps such
+  a `%` as written.
+- **giong-quic**: a connection that dies while it waits to be accepted (idle timeout, the
+  peer closed or reset it) leaves the accept queue and frees its place in the bound of
+  1,024 connections not yet accepted. Before, an application that accepted slowly could
+  find its endpoint refusing every new client because the queue was full of connections
+  that no longer existed, and `accept` then handed out those dead connections first
+  ([#222](https://github.com/giong-run/Giong/issues/222)).
+- **giong**: on Linux, `fs::read_dir` reads a directory on a network or FUSE filesystem (NFS,
+  SMB, 9p, Ceph, FUSE, or any filesystem giong does not know as local) on the blocking lane,
+  so a batch that takes a round trip, or hangs with its server, holds up one blocking thread
+  instead of the worker and every task on it. So is the rest of a directory once one batch
+  took a millisecond or more on the worker (a cold disk). Local directories are read as
+  before: listing 10,000 entries on tmpfs takes the same time
+  ([#413](https://github.com/giong-run/Giong/pull/413), [#259](https://github.com/giong-run/Giong/issues/259)).
+- **giong-cli**: the curl lines of `giong routes`, `giong openapi` (`x-codeSamples`) and the
+  dashboard quote a method that holds more than letters, digits, `-` and `_`. HTTP allows
+  `|`, `&`, `$` and a backquote in a method, and the method comes from the service, which
+  `--mcp` can point at someone else's: a pasted line ran what the method held. The
+  dashboard's "Copy as curl" of a recorded request quotes it too: that method came from
+  whatever client called the dev service.
+- **giong**: a burst of tasks or timers no longer keeps its memory for good. A worker's task
+  table, run queue and timer table only grew, so a service that once held a million tasks
+  kept about 110 MB per worker after they had all finished; the worker now gives a mostly
+  vacant table back before it sleeps, and hands out low slots first while something near the
+  end of the table keeps it big. One million sleeping tasks on one worker: 120 MB left after
+  `malloc_trim` before, 9 MB now (3 MB without timers). Spawning and timers cost no more
+  instructions.
+- **giong-web**: `Record` redacts the value of every header whose name says secret by the
+  rule it already applies to fields (`X-Session-Token`, `Private-Token`, `X-Goog-Api-Key`,
+  `X-CSRF-Token`), not only the six it names, and the parts of a `multipart/form-data`
+  body (what a browser's `FormData` sends) whose field name says secret. Before, those
+  values went into the recording as they were. `keep_field` keeps a header too.
+- **giong-web**: `Record` redacts the secret keys inside a JSON part of a
+  `multipart/form-data` body (metadata sent beside a file, by its content type or a
+  content that starts with `{` or `[`), as it does in a JSON body.
+- **giong-cli**: the tests that `giong new` writes for a web service with SQLite give each
+  test its own database file. The name came from the clock alone. On macOS, where the clock
+  ticks in microseconds, two tests starting at once could share one file, and the first to
+  finish deleted it under the other.
+- **giong-cli**: the tests that `giong new --template worker` writes give each test its own
+  Redis queue. The name came from the clock alone. On macOS, where the clock ticks in
+  microseconds, two tests starting at once could share a queue and take each other's jobs.
+- **giong-cli**: a new build that stopped at start-up while the previous one kept serving was
+  reported only in the terminal: `giong dev status` said `serving` and the dashboard `running`,
+  so a person or an agent tested the old code without knowing.
+- **giong-cli**: after the service stopped by itself, `giong dev` kept its listening socket
+  open, so a client waited in a queue nobody took from instead of being refused.
+- **giong-cli**: after a failed build, a change to `.env` alone restarted the binary of the
+  last build that worked, which is older than the files; it now builds.
+- **giong-cli**: a service that panics because its port is in use is reported as
+  `GIONG-E5014` naming the process that holds the port, now on Windows too (`netstat`), and
+  saying so when that process is `giong dev` itself (the service bound the address with
+  another listener than giong's).
+- **giong-cli**: `giong dev` no longer binds `LISTEN` for a project that does not depend on
+  giong at all (no giong in `Cargo.lock`): nothing in such a service takes the socket, so it
+  only kept the service from binding its own port.
+- **giong-cli**: on Windows, `giong dev` runs a copy of each build (`giong-dev/` next to
+  cargo's file), because a running program there cannot be replaced: cargo's next build
+  failed with "Access is denied" for as long as the service ran.
+- **giong-cli**: `giong db up` no longer adds `.giong/` to a `.gitignore` that lists
+  `/.giong` (as every `giong new` project does).
+- **giong-compat**, **giong-tls**: on Windows a send they make outside giong's driver hands
+  Winsock at most 1 MiB, as giong's own stream sends do (#360): Winsock takes the whole of
+  a send while the socket's buffer has room, and would hold all of it for a peer that has
+  stopped reading.
+- **giong**: on Windows, `TcpStream::shutdown` and `UnixStream::shutdown` of the read half
+  end a `recv` or `read` that waits, with the end of the stream, as on Unix; Windows left
+  it waiting until the peer closed (giong-redis' client kept a task and a socket for each
+  dropped connection to a server that kept its side open). A `recv` or `read` started after
+  that shutdown returns the end of the stream too, where Windows fails it with
+  `WSAESHUTDOWN`.
+
+### Security
+
+- **giong-cli**: `giong bench --against` builds the older commit under `~/.giong/bench`
+  (or `$GIONG_HOME/bench`) instead of the temporary directory, and the release check of
+  `giong doctor` and `giong upgrade` runs `cargo info` in `~/.giong`. Cargo reads
+  `.cargo/config.toml` from every folder above the one it runs in, and on a shared Linux
+  machine any user can make `/tmp/.cargo/config.toml`: its `build.rustc-wrapper` ran as the
+  user who benchmarked, and a source replacement could name another latest version.
+- **giong-cli**: `giong db` no longer puts the password of a `DATABASE_URL` (or
+  `REDIS_URL`) on a client's command line, which every user of the machine can read
+  (`ps`, `/proc/PID/cmdline`). `psql` gets the URL without its password and the password in
+  `PGPASSWORD`; `redis-cli` gets it in `REDISCLI_AUTH`, and the user in `--user`. MySQL
+  already used `MYSQL_PWD`.
+- **giong-cli**: `giong db` also keeps two other forms of password off a client's command
+  line: a `password=` in a PostgreSQL URL's query (given to `psql` in `PGPASSWORD`, winning
+  over one before the host as libpq does) and the older `redis://secret@host` form with no
+  user (given to `redis-cli` in `REDISCLI_AUTH`).
+- **giong-cli**: `giong upgrade --self`, `giong clean` and `giong bench --against` no longer
+  work in temporary folders whose names another user of the machine can guess
+  (`/tmp/giong-upgrade-<pid>`, `/tmp/giong-clean-probe-<pid>`, `/tmp/giong-bench-<repo>-<commit>`).
+  On a shared Linux machine that user could make the folder first, between giong removing an
+  old one and making it again, and swap the checked download before it was installed, or add
+  a build script that cargo then ran as you. The download and the compiler probe now use a new
+  folder giong made with mode 0700, and the older commit of `--against` is checked out inside
+  `giong-<uid>`, a folder only you can enter (a folder of that name made by anyone else, or a
+  link, is refused).
+- **giong-cli**: `giong doctor` reads `.env` and `.env.example` only as plain files, as
+  `giong env`, `giong db` and `giong bench` already do: a cloned repository that commits
+  `.env.example -> ~/.aws/credentials` no longer gets the key names of that file into the
+  report. A linked file is reported, not read
+  ([#411](https://github.com/giong-run/Giong/pull/411)).
 
 ## [1.5.0] - 2026-11-25
 
@@ -3497,7 +3785,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.0...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.1...HEAD
+[1.5.1]: https://github.com/giong-run/Giong/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/giong-run/Giong/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/giong-run/Giong/compare/v1.4.1...v1.4.2
 [1.4.1]: https://github.com/giong-run/Giong/compare/v1.4.0...v1.4.1
