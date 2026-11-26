@@ -1004,6 +1004,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
                 &format!("round {i}/{rounds_n} against {}", url.unwrap_or("")),
             );
             let outcome = loadgen::run(&load.plan(*addr, fixed));
+            only_errors(&outcome, &format!("in round {i}"))?;
             rounds.push(Round {
                 round: i,
                 role: "service",
@@ -1140,6 +1141,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
                 ));
             }
             drop(running);
+            only_errors(&outcome, &format!("of {} in round {i}", b.label))?;
             rounds.push(Round {
                 round: i,
                 role: b.role,
@@ -1188,7 +1190,30 @@ fn probe(load: &Load, addr: SocketAddr) -> Result<f64, Failure> {
             "check the URL and path (curl -i the same URL), or give --rate",
         ));
     }
+    only_errors(&o, "of the probe")?;
     Ok(o.rps())
+}
+
+/// Stops a benchmark whose service answered with error statuses only (a
+/// path it has no route for, such as the default `/` of a project from
+/// `giong new`): how fast it says 404 is not the speed to measure, and every
+/// round after would measure the same answers.
+fn only_errors(o: &Outcome, during: &str) -> Result<(), Failure> {
+    if o.answered() == 0 || o.statuses.range(..400).next().is_some() {
+        return Ok(());
+    }
+    let seen = o
+        .statuses
+        .iter()
+        .map(|(status, n)| format!("{n} x {status}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(Failure::new(
+        Code::BENCH_ERRORS,
+        format!("every answer {during} had an error status ({seen})"),
+        "give --path a route the service answers, such as --path /health (giong routes lists \
+         them), with --method and --data if it needs them, and read .giong/bench/service.log",
+    ))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1407,6 +1432,30 @@ fn finish(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_service_that_only_answers_errors_stops_the_benchmark() {
+        let answers = |statuses: &[(u16, u64)]| {
+            let mut o = Outcome::default();
+            for &(status, n) in statuses {
+                o.statuses.insert(status, n);
+                for _ in 0..n {
+                    o.latency.add(1_000);
+                }
+            }
+            o
+        };
+        let e = only_errors(&answers(&[(404, 30)]), "of the probe").unwrap_err();
+        assert_eq!(e.code, Code::BENCH_ERRORS);
+        assert!(e.what.contains("30 x 404"), "{}", e.what);
+        assert!(e.fix.contains("--path"), "{}", e.fix);
+        assert!(only_errors(&answers(&[(404, 2), (500, 1)]), "x").is_err());
+        // Some answers are fine: the rounds go on, and the report counts the rest.
+        only_errors(&answers(&[(200, 1), (404, 30)]), "x").unwrap();
+        only_errors(&answers(&[(301, 5)]), "x").unwrap();
+        // No answer at all is the probe's own error (the service is not there).
+        only_errors(&Outcome::default(), "x").unwrap();
+    }
 
     #[test]
     fn rates_parse() {
