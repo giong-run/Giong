@@ -58,7 +58,7 @@ VERSION = release.workspace_version()
 TAG = "v" + VERSION
 SITE_TAG = TAG          # the header always names the newest release
 # What the site says about platforms follows the released version (content.apply_version).
-C.apply_version(tuple(int(x) for x in VERSION.split("-")[0].split(".")[:2]))
+C.apply_version(tuple(int(x) for x in VERSION.split("-")[0].split(".")[:3]))
 MINOR = ".".join(VERSION.split(".")[:2])
 # The documentation as released: what `cargo add` installs is what the tag
 # holds, while main may already describe the next version.

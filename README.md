@@ -42,10 +42,10 @@ The full list is in [CHANGELOG.md](CHANGELOG.md).
 
 ## Start here
 
-The quickest start is the [`giong` command](giong-cli/README.md): `giong new api --db postgres`
-writes a service that builds and passes its tests, with `AGENTS.md` for your coding agent,
-and `giong dev` runs it on localhost and rebuilds on every save. By hand, for people and for
-AI agents alike, the one path:
+The quickest start is the [`giong` command](giong-cli/README.md): `giong new api`
+writes a service on SQLite that builds and passes its tests with nothing to install, with
+`AGENTS.md` for your coding agent, and `giong dev` runs it on localhost and rebuilds on every
+save. By hand, for people and for AI agents alike, the one path:
 
 1. **Add the crates for the job.** A web service: `cargo add giong giong-web serde --features serde/derive`.
    A bare HTTP server: `cargo add giong giong-http`. The table under

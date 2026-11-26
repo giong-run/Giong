@@ -203,8 +203,8 @@ claude mcp add --transport http giong http://127.0.0.1:7777/mcp \
 
 ## Deploy
 
-- **Production runs on Linux.** macOS is for developing and testing on a Mac; on Windows
-  only the runtime crate runs ([Platforms](../README.md#platforms)).
+- **Production runs on Linux.** macOS and Windows are for developing and testing there:
+  every crate runs, correct but not tuned ([Platforms](../README.md#platforms)).
 - **Containers need no settings**: where io_uring is blocked (Docker's and Kubernetes'
   default seccomp profiles, gVisor), giong runs on epoll and says so once on stderr. Allow
   io_uring for its full speed with the profile in [DEPLOYMENT.md](DEPLOYMENT.md), and

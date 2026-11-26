@@ -8,6 +8,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+The first round of fixes after 1.5.0, and the dev kit on SQLite. `giong new` writes a users API
+on SQLite by default, so a new project builds, passes its tests and serves with nothing to
+install or start, and `giong db` works on it. `giong upgrade` moves a project and the command to
+the newest release, and `giong doctor` says when one is out. `giong dev` never serves code older
+than the files: a change that does not build or start stops the old build and says why. Every
+crate runs on Windows now, Unix sockets included. A worker gives back the memory of a burst of
+tasks or timers, and a sleeping worker costs fewer instructions. Security fixes in
+`giong-cli` and `Record`, and many dev kit fixes. No API is removed or changed.
+
 ## [1.5.0] - 2026-11-25
 
 The developer kit and runtime 1.5. The new `giong` command (crate `giong-cli`) starts, runs,
