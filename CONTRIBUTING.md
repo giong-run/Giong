@@ -71,6 +71,7 @@ threads, also run:
 
 ```bash
 scripts/check.sh tsan        # ThreadSanitizer; needs nightly with the rust-src component
+scripts/check.sh asan        # AddressSanitizer and LeakSanitizer; the same toolchain
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
 scripts/check.sh soak        # 5 minutes of churn, plain and then over TLS, then checks for leaks (SOAK_SECS=…)
 scripts/check.sh seccomp     # io_uring blocked as Docker blocks it: giong must pick epoll
