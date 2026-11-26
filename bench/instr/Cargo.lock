@@ -77,7 +77,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "io-uring",
  "libc",
@@ -87,7 +87,7 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "giong",
  "giong-tls",
@@ -98,7 +98,7 @@ dependencies = [
 
 [[package]]
 name = "giong-mysql"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "giong",
  "giong-tls",
@@ -108,7 +108,7 @@ dependencies = [
 
 [[package]]
 name = "giong-postgres"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "giong",
  "giong-tls",
@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "giong-redis"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "giong",
  "giong-tls",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "giong",
  "libc",
@@ -139,7 +139,7 @@ dependencies = [
 
 [[package]]
 name = "giong-web"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "giong",
  "giong-http",

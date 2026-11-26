@@ -123,7 +123,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "io-uring",
  "libc",
@@ -133,7 +133,7 @@ dependencies = [
 
 [[package]]
 name = "giong-quic"
-version = "1.5.0"
+version = "1.5.1"
 dependencies = [
  "bytes",
  "giong",
