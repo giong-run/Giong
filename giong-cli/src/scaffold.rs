@@ -190,6 +190,8 @@ const TAKEN: &[&str] = &[
     "incremental",
     "serde",
     "serde_json",
+    // SQLite, the default database of `giong new`.
+    "rusqlite",
     "giong",
     "giong-web",
     "giong-http",
@@ -706,6 +708,7 @@ mod tests {
             ("giong-web", "depends on"),
             ("giong_web", "depends on"),
             ("serde", "depends on"),
+            ("rusqlite", "depends on"),
             ("con", "device"),
             ("com1", "device"),
             ("lpt9", "device"),
