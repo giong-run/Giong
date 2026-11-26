@@ -1362,9 +1362,7 @@ fn migrate(r: &Runner, root: &Path, rep: &mut Report) -> Result<(), Failure> {
         let out = r.run(&apply_script(r.engine(), m), None, false)?;
         if !out.ok {
             let wrapped = matches!(r.engine(), Engine::Postgres | Engine::Sqlite) && m.transaction;
-            let line = error_line(&out.stderr)
-                .map(|l| l.saturating_sub(u32::from(wrapped)).max(1))
-                .unwrap_or(1);
+            let line = migration_error_line(&out.stderr, &m.sql, wrapped);
             rep.push(
                 Finding::new(
                     Code::MIGRATION_FAILED,
@@ -1400,6 +1398,21 @@ fn migrate(r: &Runner, root: &Path, rep: &mut Report) -> Result<(), Failure> {
     rep.data("applied", json!(applied_now));
     rep.data("already_applied", json!(p.applied));
     Ok(())
+}
+
+/// The line of the migration file an error is reported at. The script that
+/// applies it has a `BEGIN;` line before the file when it is `wrapped` in a
+/// transaction, and a `;` line after it. psql names the line where the
+/// failing statement ends: for a last statement without its `;` that is the
+/// added line, and for one with an unclosed parenthesis (psql reads on to the
+/// end of the script) a line past the file. Either is kept inside the file.
+pub fn migration_error_line(stderr: &str, sql: &str, wrapped: bool) -> u32 {
+    let last = u32::try_from(sql.trim_end().lines().count())
+        .unwrap_or(u32::MAX)
+        .max(1);
+    error_line(stderr)
+        .map(|l| l.saturating_sub(u32::from(wrapped)).clamp(1, last))
+        .unwrap_or(1)
 }
 
 /// The script line an error names: psql's `psql:<stdin>:8: ERROR`,
@@ -2879,6 +2892,33 @@ mod tests {
             Some(2)
         );
         assert_eq!(error_line("FATAL: password authentication failed"), None);
+    }
+
+    #[test]
+    fn a_migration_error_is_reported_inside_the_file() {
+        // psql 17's answers to the script giong sends (BEGIN; + file + ;
+        // + INSERT + COMMIT;) for a file of 7 lines.
+        let sql = "-- bad\n-- notes\n-- notes\n-- notes\n\nCREATE TABLE t1 (id int);\nCREATE TABLE oops (;\n";
+        let unclosed = "psql:<stdin>:11: ERROR:  syntax error at or near \";\"";
+        assert_eq!(migration_error_line(unclosed, sql, true), 7);
+        let sql = "CREATE TABLE t1 (id int);\nSELECT\n  1\nFROM nope\n";
+        let no_semicolon = "psql:<stdin>:6: ERROR:  relation \"nope\" does not exist";
+        assert_eq!(migration_error_line(no_semicolon, sql, true), 4);
+        let sql = "SELECT 1;\nSELEC 2;\nSELECT 3;\n";
+        assert_eq!(
+            migration_error_line("psql:<stdin>:3: ERROR:  syntax error", sql, true),
+            2
+        );
+        // mysql names the line the statement starts at; nothing is wrapped.
+        assert_eq!(
+            migration_error_line("ERROR 1146 (42S02) at line 2: Table", sql, false),
+            2
+        );
+        assert_eq!(migration_error_line("FATAL: no", sql, true), 1);
+        assert_eq!(
+            migration_error_line("psql:<stdin>:1: ERROR: x", "", true),
+            1
+        );
     }
 
     #[test]
