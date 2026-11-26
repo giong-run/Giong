@@ -9,7 +9,7 @@ publish = false
 
 [dependencies]
 giong = { path = "../.." }
-giong-mcp = { path = "../../giong-mcp" }
+giong-mcp = { path = "../../giong-mcp", features = ["web"] }
 giong-postgres = { path = "../../giong-postgres" }
 giong-redis = { path = "../../giong-redis" }
 giong-tls = { path = "../../giong-tls" }

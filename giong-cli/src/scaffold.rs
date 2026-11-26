@@ -590,6 +590,16 @@ mod tests {
             let cargo = &files.iter().find(|f| f.path == "Cargo.toml").unwrap().text;
             assert!(cargo.contains("name = \"my-api\""));
             assert!(cargo.contains("debug = \"line-tables-only\""));
+            // giong routes and giong openapi ask giong-mcp's routes tool,
+            // which its `web` feature adds.
+            if o.template == Template::Web {
+                assert!(
+                    cargo
+                        .lines()
+                        .any(|l| l.starts_with("giong-mcp =") && l.contains("features = [\"web\"]")),
+                    "{o:?}: {cargo}"
+                );
+            }
             for db in Db::ALL {
                 let dep = match db {
                     Db::Sqlite => "rusqlite =".to_string(),
