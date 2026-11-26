@@ -1198,8 +1198,21 @@ fn slow_requests_blame_a_pool_that_makes_requests_wait() {
             .as_str()
             .unwrap()
             .contains("postgres pool"));
-        assert_eq!(checkout["slowest"][0]["pool"]["what"], "postgres");
-        assert_eq!(checkout["slowest"][0]["protocol"], "http/1.1");
+        // The slow request the verdict comes from: the one that waited
+        // longest for a connection. Not necessarily the slowest of all: on a
+        // loaded runner (Windows Server schedules threads in long slices) a
+        // request can be slowest because the system did not run the worker
+        // at all, which no wait explains (as in the blocker test below).
+        let waited = |s: &Value| s["pool"]["longest_ms"].as_f64().unwrap_or(-1.0);
+        let worst = checkout["slowest"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .max_by(|a, b| waited(a).total_cmp(&waited(b)))
+            .unwrap();
+        assert_eq!(worst["pool"]["what"], "postgres", "{answer}");
+        assert!(waited(worst) >= 29.0, "{answer}");
+        assert_eq!(checkout["slowest"][0]["protocol"], "http/1.1", "{answer}");
         assert!(answer["summary"]
             .as_str()
             .unwrap()
