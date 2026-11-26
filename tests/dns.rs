@@ -58,11 +58,21 @@ impl FakeDns {
         // TIME_WAIT, and on a runner 100 fresh TCP ports in a row had their
         // UDP twins refused. Sockets whose twin is busy stay open until a
         // pair is found: closed at once, the next bind may be given the
-        // same port again.
+        // same port again. Every third try is a port picked at random below
+        // the ephemeral range: Windows also reserves blocks of ports for
+        // one protocol (`netsh int ipv4 show excludedportrange`), and a
+        // twin in such a block is refused with WSAEACCES; on a runner 200
+        // tries in sequence all met one.
         let (mut busy_tcp, mut busy_udp, mut refusal) = (Vec::new(), Vec::new(), None);
-        let (udp, tcp, addr) = (0..200)
+        let (udp, tcp, addr) = (0..300)
             .find_map(|i| {
-                if i % 2 == 0 {
+                if i % 3 == 2 {
+                    let addr = SocketAddr::from(([127, 0, 0, 1], random_port(i)));
+                    let pair = StdUdpSocket::bind(addr)
+                        .and_then(|udp| StdTcpListener::bind(addr).map(|tcp| (udp, tcp, addr)));
+                    return pair.map_err(|err| refusal = Some(err)).ok();
+                }
+                if i % 3 == 0 {
                     let tcp = StdTcpListener::bind("127.0.0.1:0").unwrap();
                     let addr = tcp.local_addr().unwrap();
                     match StdUdpSocket::bind(addr) {
@@ -197,6 +207,17 @@ impl FakeDns {
             .timeout(Duration::from_secs(5));
         Resolver::new(cfg)
     }
+}
+
+/// A port from 20000 to 47999, below Windows' ephemeral range (49152 on),
+/// a different one for each call. The caller binds it for both protocols,
+/// so a port something else holds is skipped.
+fn random_port(try_number: usize) -> u16 {
+    use std::hash::{BuildHasher, Hasher};
+    let mut h = std::collections::hash_map::RandomState::new().build_hasher();
+    h.write_usize(try_number);
+    h.write_u32(std::process::id());
+    20_000 + (h.finish() % 28_000) as u16
 }
 
 fn record(events: &Mutex<Vec<(Instant, String)>>, what: String) {
