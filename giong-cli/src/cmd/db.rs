@@ -932,26 +932,38 @@ impl Runner {
             },
         }
         let program = format!("{:?}", cmd.get_program());
-        let mut child = cmd
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .map_err(|e| client_missing(self, &program, e))?;
-        if let Some(mut stdin) = child.stdin.take() {
-            // A client that exits early (bad credentials) closes its end:
-            // the error is in its output, not in this write.
-            let _ = stdin.write_all(sql.as_bytes());
-        }
-        let out = child
-            .wait_with_output()
-            .map_err(|e| client_missing(self, &program, e))?;
+        let out = feed(&mut cmd, sql).map_err(|e| client_missing(self, &program, e))?;
         Ok(SqlOut {
             ok: out.status.success(),
             stdout: String::from_utf8_lossy(&out.stdout).into_owned(),
             stderr: String::from_utf8_lossy(&out.stderr).into_owned(),
         })
     }
+}
+
+/// Runs `cmd` with `input` on its standard input and its output captured.
+/// The input is written on its own thread while the output is read: a
+/// client prints as it reads (rows, notices), and once both pipes are full a
+/// writer that waits for the whole script to go in first never finishes.
+fn feed(cmd: &mut Proc, input: &str) -> std::io::Result<std::process::Output> {
+    let mut child = cmd
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let writer = child.stdin.take().map(|mut stdin| {
+        let input = input.to_owned();
+        std::thread::spawn(move || {
+            // A client that exits early (bad credentials) closes its end:
+            // the error is in its output, not in this write.
+            let _ = stdin.write_all(input.as_bytes());
+        })
+    });
+    let out = child.wait_with_output();
+    if let Some(w) = writer {
+        let _ = w.join();
+    }
+    out
 }
 
 /// psql reading the script from standard input, stopping at the first
@@ -2354,6 +2366,25 @@ fn run(args: &Args) -> Result<Report, Failure> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A client that prints as it reads, fed more than the pipes hold: the
+    /// script goes in while the output comes out, instead of both waiting.
+    #[cfg(unix)]
+    #[test]
+    fn a_long_script_with_output_does_not_fill_both_pipes() {
+        let script = "SELECT 1;\n".repeat(200_000);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let input = script.clone();
+        std::thread::spawn(move || {
+            let _ = tx.send(feed(&mut Proc::new("cat"), &input));
+        });
+        let out = rx
+            .recv_timeout(Duration::from_secs(60))
+            .expect("the client and giong both wait on a full pipe")
+            .unwrap();
+        assert!(out.status.success());
+        assert_eq!(out.stdout.len(), script.len());
+    }
 
     /// A cloned repository can commit `.env` or the state file's temporary
     /// name as a link: giong db never writes through one.
