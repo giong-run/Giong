@@ -945,19 +945,41 @@ curl -fsSL https://giong.run/skills/giong.zip -o giong.zip && unzip -o giong.zip
 )
 
 
+def sqlite_start():
+    """1.5.1: `giong new` writes a users API on SQLite by default, nothing to install or start."""
+    g = globals()
+    DEVKIT["steps"][1] = (
+        "Start a project", "giong new api",
+        "A JSON API on SQLite with tests, migrations, CI, a Dockerfile and the files that teach "
+        "coding agents; nothing to install, `--db postgres` for a server database.")
+    g["CLI_START"] = """curl -fsSL https://giong.run/install.sh | sh
+giong new api                 # a users API on SQLite that passes its tests
+cd api
+giong dev --background        # serve 127.0.0.1:8080, rebuild on save
+curl http://127.0.0.1:8080/health
+giong check                   # compiler, clippy, giong's checks
+giong test                    # on io_uring and on epoll
+giong dev stop                # the service; data/api.db kept"""
+    CLI_TASKS[0] = ("Start a project", "giong new api --template web", "new")
+
+
 # ---------------------------------------------------------------- by version
 # Facts that changed with a release. build.py calls apply_version() with the workspace
 # version before it reads anything here, so the site never says more than the released
-# version does: macOS from 1.2, Windows from 1.4.
+# version does: macOS from 1.2, Windows from 1.4 (the runtime crate) and 1.5.1 (every
+# crate), and `giong new` on SQLite by default from 1.5.1. `v` is (major, minor, patch).
 def apply_version(v):
     g = globals()
-    mac, win = v >= (1, 2), v >= (1, 4)
+    mac, win, win_all = v >= (1, 2), v >= (1, 4), v >= (1, 5, 1)
+    if v >= (1, 5, 1):
+        sqlite_start()
     if not mac:
         return
     g["RUNTIME_PLATFORM"] = "Linux 6.0+, macOS" + (", Windows" if win else "")
     g["PLATFORM_LINE"] = (
         "Linux first: io_uring on 6.0 or newer, epoll elsewhere. macOS runs on kqueue, for "
-        "development" + ("; Windows runs the runtime crate on I/O completion ports." if win else "."))
+        "development" + ("; Windows runs every crate on I/O completion ports." if win_all else
+                         "; Windows runs the runtime crate on I/O completion ports." if win else "."))
     HERO["lede"] = (
         "An async runtime for Rust services, tuned on Linux and running on "
         + ("macOS and Windows too. " if win else "macOS too. ") +
@@ -975,7 +997,11 @@ def apply_version(v):
                   "6.18. Elsewhere giong runs on its epoll driver, tested down to 5.15. Every crate."),
         ("macos", "**Development.** A kqueue driver, tested on macOS 15 and 26 on Apple Silicon. Every "
                   "crate; correct, not tuned."),
-    ] + ([("windows", "**The runtime crate.** I/O completion ports, tested on Windows Server 2022 and 2025: "
+    ] + ([("windows", "**Every crate.** I/O completion ports, tested on Windows Server 2022 and 2025: "
+                      "tasks, timers, channels, TCP, UDP, Unix sockets (Windows 10 1803 or newer), "
+                      "files, DNS, and the HTTP, TLS, database and other crates; correct, not tuned.")]
+         if win_all else
+         [("windows", "**The runtime crate.** I/O completion ports, tested on Windows Server 2022 and 2025: "
                       "tasks, timers, channels, TCP, UDP, files, DNS. Unix sockets and the other crates "
                       "come in later 1.x releases.")] if win else [
           ("windows", "Not yet: use WSL2 with a 6.x kernel, a Linux virtual machine or Docker.")]) + [
@@ -987,12 +1013,14 @@ def apply_version(v):
     ]
     LIMITS[0] = (("Tuned for Linux", "io_uring on 6.0 or newer, epoll elsewhere; on epoll giong is as fast "
                   "as other epoll runtimes, not faster. macOS is for development"
-                  + (", and Windows has the runtime crate only." if win else ".")))
+                  + (", and so is Windows." if win_all else ", and Windows has the runtime crate only." if win else ".")))
     for n, (q, _) in enumerate(FAQ):
         if q.startswith("Does it run on macOS"):
             FAQ[n] = (q, (
                 "macOS, yes, for development: a kqueue driver runs every crate, tested on macOS 15 and 26 "
                 "on Apple Silicon, correct but not tuned. " + (
+                    "Windows, yes, every crate: I/O completion ports, tested on Windows Server 2022 and "
+                    "2025, correct but not tuned; Linux is where giong is fast." if win_all else
                     "Windows, the runtime crate: tasks, timers, channels, TCP, UDP and files on I/O "
                     "completion ports, tested on Windows Server 2022 and 2025; the HTTP, TLS, database "
                     "and other crates come to Windows in later 1.x releases. Until then use WSL2 or "
@@ -1010,7 +1038,8 @@ def apply_version(v):
         if "not run in production" in x:
             NOT_YET[n] = "One production user so far, its author's service"
     COMPARE[0] = ("Platforms", "Linux: io_uring on ≥ 6.0, an epoll driver elsewhere (tested on 5.15); "
-                  "macOS (kqueue)" + ("; Windows (IOCP, the runtime crate)" if win else ""),
+                  "macOS (kqueue)" + ("; Windows (IOCP)" if win_all else
+                                      "; Windows (IOCP, the runtime crate)" if win else ""),
                   COMPARE[0][2], COMPARE[0][3])
 
 

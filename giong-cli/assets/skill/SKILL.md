@@ -7,7 +7,7 @@ description: Write, review and debug Rust services on the giong async runtime an
 
 giong is a thread-per-core async runtime for Rust: one worker per core, each with its own
 io_uring ring (epoll where io_uring is blocked; kqueue on macOS; I/O completion ports on
-Windows, runtime crate only), and its own crates for a whole service with no Tokio
+Windows), and its own crates for a whole service with no Tokio
 underneath. The API is strict and stays on major version 1: one way to do each thing,
 coded errors that say how to fix them, releases that only add.
 
