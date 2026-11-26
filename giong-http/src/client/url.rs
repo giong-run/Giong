@@ -1,15 +1,18 @@
 //! Absolute `http` and `https` URLs, and resolving a redirect's `Location`
 //! against them (RFC 3986).
 
+use std::borrow::Cow;
 use std::fmt;
 use std::net::Ipv6Addr;
+use std::rc::Rc;
 
 /// A URL the client can send a request to.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Url {
     pub(crate) https: bool,
-    /// Lower case; an IPv6 address without its brackets.
-    pub(crate) host: String,
+    /// Lower case; an IPv6 address without its brackets. Shared with the
+    /// URL's [`Origin`], which every request looks its connections up by.
+    pub(crate) host: Rc<str>,
     pub(crate) port: u16,
     /// The path and query, starting with `/`; never a fragment.
     pub(crate) target: String,
@@ -19,7 +22,7 @@ pub(crate) struct Url {
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 pub(crate) struct Origin {
     pub(crate) https: bool,
-    pub(crate) host: String,
+    pub(crate) host: Rc<str>,
     pub(crate) port: u16,
 }
 
@@ -110,6 +113,16 @@ impl Url {
         if self.port != self.default_port() {
             out.put(":");
             push_port(out, self.port);
+        }
+    }
+
+    /// The value of the `Host` header, as HTTP/2's `:authority`: the host
+    /// itself, not copied, unless the header needs brackets or a port.
+    pub(crate) fn authority(&self) -> Cow<'_, str> {
+        if self.port == self.default_port() && !self.host.contains(':') {
+            Cow::Borrowed(&self.host)
+        } else {
+            Cow::Owned(self.host_header())
         }
     }
 
@@ -263,10 +276,33 @@ fn remove_dot_segments(path: &str) -> String {
     result
 }
 
+/// `host` in lower case, copied once.
+fn lowercase(host: &str) -> Rc<str> {
+    if host.bytes().any(|b| b.is_ascii_uppercase()) {
+        Rc::from(host.to_ascii_lowercase())
+    } else {
+        Rc::from(host)
+    }
+}
+
+/// Where `byte` first appears in `s`. The searches here look for ASCII
+/// bytes, which never occur inside a multi-byte UTF-8 sequence, so every
+/// position found is a char boundary. Byte loops: `str`'s pattern searches
+/// cost several times as much on strings this short, and every request
+/// parses its URL.
+fn find(s: &str, byte: u8) -> Option<usize> {
+    s.bytes().position(|b| b == byte)
+}
+
 fn parse(input: &str, lenient: bool) -> Result<Url, String> {
-    let (scheme, rest) = input.split_once("://").ok_or_else(|| {
-        format!("{input:?} is not an absolute URL; it must start with http:// or https://")
-    })?;
+    let (scheme, rest) = match input.as_bytes().windows(3).position(|w| w == b"://") {
+        Some(at) => (&input[..at], &input[at + 3..]),
+        None => {
+            return Err(format!(
+                "{input:?} is not an absolute URL; it must start with http:// or https://"
+            ))
+        }
+    };
     let https = if scheme.eq_ignore_ascii_case("https") {
         true
     } else if scheme.eq_ignore_ascii_case("http") {
@@ -276,10 +312,13 @@ fn parse(input: &str, lenient: bool) -> Result<Url, String> {
             "{input:?} has the scheme {scheme:?}; only http and https URLs are supported"
         ));
     };
-    let rest = rest.split('#').next().unwrap_or("");
-    let end = rest.find(['/', '?']).unwrap_or(rest.len());
+    let rest = &rest[..find(rest, b'#').unwrap_or(rest.len())];
+    let end = rest
+        .bytes()
+        .position(|b| b == b'/' || b == b'?')
+        .unwrap_or(rest.len());
     let (authority, target) = rest.split_at(end);
-    if authority.contains('@') {
+    if find(authority, b'@').is_some() {
         return Err(format!(
             "{input:?} has a user name or password in it; they are not sent from a URL: \
              set an Authorization header instead"
@@ -299,10 +338,10 @@ fn parse(input: &str, lenient: bool) -> Result<Url, String> {
                     .ok_or_else(|| format!("{input:?} has {p:?} after the IPv6 address"))?,
             ),
         };
-        (addr.to_string(), port)
+        (Rc::from(addr.to_string()), port)
     } else {
-        let (host, port) = match authority.rsplit_once(':') {
-            Some((h, p)) => (h, Some(p)),
+        let (host, port) = match authority.bytes().rposition(|b| b == b':') {
+            Some(colon) => (&authority[..colon], Some(&authority[colon + 1..])),
             None => (authority, None),
         };
         if host.is_empty() {
@@ -321,7 +360,7 @@ fn parse(input: &str, lenient: bool) -> Result<Url, String> {
                 "{input:?} has {host:?} as its host, which is not a host name or an IPv4 address"
             ));
         }
-        (host.to_ascii_lowercase(), port)
+        (lowercase(host), port)
     };
     let port = match port {
         None | Some("") => {
@@ -376,7 +415,7 @@ mod tests {
     fn urls_are_read() {
         let u = url("HTTPS://API.Example.com/v1/users?id=7#top");
         assert!(u.https);
-        assert_eq!(u.host, "api.example.com");
+        assert_eq!(&*u.host, "api.example.com");
         assert_eq!(u.port, 443);
         assert_eq!(u.target, "/v1/users?id=7");
         assert_eq!(u.host_header(), "api.example.com");
@@ -387,12 +426,23 @@ mod tests {
         assert_eq!(u.host_header(), "127.0.0.1:8080");
 
         let u = url("http://[::1]:3000?x=1");
-        assert_eq!(u.host, "::1");
+        assert_eq!(&*u.host, "::1");
         assert_eq!(u.target, "/?x=1");
         assert_eq!(u.host_header(), "[::1]:3000");
         assert_eq!(u.to_string(), "http://[::1]:3000/?x=1");
         assert_eq!(url("http://h:/").port, 80);
-        assert_eq!(url("http://my_host.local/").host, "my_host.local");
+        assert_eq!(&*url("http://my_host.local/").host, "my_host.local");
+    }
+
+    #[test]
+    fn the_authority_is_borrowed_unless_it_needs_a_port_or_brackets() {
+        let u = url("https://api.example.com/x");
+        assert!(matches!(u.authority(), Cow::Borrowed("api.example.com")));
+        assert_eq!(url("http://127.0.0.1:8080/").authority(), "127.0.0.1:8080");
+        assert_eq!(url("https://[::1]/").authority(), "[::1]");
+        assert_eq!(url("https://example.com:443/").authority(), "example.com");
+        // The host is shared with the origin, not copied.
+        assert!(Rc::ptr_eq(&u.host, &u.origin().host));
     }
 
     #[test]

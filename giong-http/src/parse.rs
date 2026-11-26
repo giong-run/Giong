@@ -43,7 +43,7 @@ pub(crate) fn find_head_end(buf: &[u8], from: usize) -> Option<usize> {
     None
 }
 
-fn is_token(b: u8) -> bool {
+pub(crate) fn is_token(b: u8) -> bool {
     TOKEN[b as usize]
 }
 

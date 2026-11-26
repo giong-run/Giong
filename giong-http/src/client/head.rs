@@ -7,7 +7,7 @@
 
 use std::ops::Range;
 
-use crate::parse::{is_field_value, is_token_str, trim};
+use crate::parse::{is_field_value, is_token, is_token_str, trim};
 
 /// A parsed response head. Ranges are relative to the start of the head.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -82,33 +82,22 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, String> {
     let mut keep_alive = false;
     let mut closing = false;
     let mut transfer_encoding = false;
-    while let Some((start, line)) = lines.next_line()? {
-        let colon = line
-            .iter()
-            .position(|&b| b == b':')
-            .ok_or("a header line has no colon")?;
-        let (name, raw_value) = (&line[..colon], &line[colon + 1..]);
-        if !is_token_str(name) {
-            return Err(format!(
-                "the header name {:?} is not valid (whitespace before the colon, or a folded line?)",
-                String::from_utf8_lossy(name)
-            ));
-        }
-        let value = trim(raw_value);
-        if !is_field_value(value) {
-            return Err(format!(
-                "the {} header has a control character in its value",
-                String::from_utf8_lossy(name)
-            ));
-        }
-        let lead = raw_value
-            .iter()
-            .take_while(|&&b| b == b' ' || b == b'\t')
-            .count();
-        let value_start = start + colon + 1 + lead;
-        parsed
-            .fields
-            .push((start..start + colon, value_start..value_start + value.len()));
+    loop {
+        // A well-formed line is read in one pass; any other goes through
+        // `next_line` and `checked_field`, which say what is wrong with it,
+        // or end the loop at the empty line.
+        let (name, value) = match quick_field(head, lines.pos) {
+            Some(field) => {
+                lines.pos = field.next;
+                (field.name, field.value)
+            }
+            None => match lines.next_line()? {
+                Some((start, line)) => checked_field(start, line)?,
+                None => break,
+            },
+        };
+        parsed.fields.push((name.clone(), value.clone()));
+        let (name, value) = (&head[name], &head[value]);
 
         if name.eq_ignore_ascii_case(b"content-length") {
             if value.is_empty() || value.len() > 19 || !value.iter().all(u8::is_ascii_digit) {
@@ -177,6 +166,90 @@ impl Head {
             Framing::UntilClose
         }
     }
+}
+
+/// A header line read by [`quick_field`]. Ranges are relative to the
+/// start of the head.
+struct QuickField {
+    name: Range<usize>,
+    value: Range<usize>,
+    /// Where the next line starts.
+    next: usize,
+}
+
+/// Reads the header line at `head[pos..]` in one pass over its bytes, if
+/// it is well formed: a token, a colon, a value of visible ASCII, spaces,
+/// tabs and obs-text, and CRLF. `None` for anything else, the empty line
+/// included: [`checked_field`] then reads it with the same rules and says
+/// what is wrong. Every byte of every response head goes through here,
+/// where the checks one after the other went over each byte three times.
+fn quick_field(head: &[u8], pos: usize) -> Option<QuickField> {
+    let line = head.get(pos..)?;
+    let mut i = 0;
+    while *line.get(i)? != b':' {
+        if !is_token(line[i]) {
+            return None;
+        }
+        i += 1;
+    }
+    if i == 0 {
+        return None;
+    }
+    let colon = i;
+    i += 1;
+    while matches!(line.get(i), Some(b' ' | b'\t')) {
+        i += 1;
+    }
+    let value_start = i;
+    let mut value_end = i;
+    loop {
+        match *line.get(i)? {
+            b'\r' => break,
+            b' ' | b'\t' => i += 1,
+            b if b < 0x20 || b == 0x7f => return None,
+            _ => {
+                i += 1;
+                value_end = i;
+            }
+        }
+    }
+    if line.get(i + 1) != Some(&b'\n') {
+        return None;
+    }
+    Some(QuickField {
+        name: pos..pos + colon,
+        value: pos + value_start..pos + value_end,
+        next: pos + i + 2,
+    })
+}
+
+/// Reads a header line `line`, which starts at `start` in the head, or
+/// says what is wrong with it.
+fn checked_field(start: usize, line: &[u8]) -> Result<(Range<usize>, Range<usize>), String> {
+    let colon = line
+        .iter()
+        .position(|&b| b == b':')
+        .ok_or("a header line has no colon")?;
+    let (name, raw_value) = (&line[..colon], &line[colon + 1..]);
+    if !is_token_str(name) {
+        return Err(format!(
+            "the header name {:?} is not valid (whitespace before the colon, or a folded line?)",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    let value = trim(raw_value);
+    if !is_field_value(value) {
+        return Err(format!(
+            "the {} header has a control character in its value",
+            String::from_utf8_lossy(name)
+        ));
+    }
+    let lead = raw_value
+        .iter()
+        .take_while(|&&b| b == b' ' || b == b'\t')
+        .count();
+    let value_start = start + colon + 1 + lead;
+    Ok((start..start + colon, value_start..value_start + value.len()))
 }
 
 /// The CRLF-terminated lines of a head, up to the empty one.
@@ -320,5 +393,44 @@ mod tests {
             let e = parse(input).unwrap_err();
             assert!(e.contains(says), "{input:?}: {e}");
         }
+    }
+
+    #[test]
+    fn the_one_pass_reader_agrees_with_the_careful_one() {
+        // Lines of bytes that matter to the rules, in every order: where
+        // the one-pass reader takes a line, the careful one takes it too,
+        // with the same name, value and next line.
+        let alphabet = [
+            b'a', b'Z', b'-', b':', b' ', b'\t', b'\r', b'\n', 0x7f, 0x80, 0x01, b'"', b'0',
+        ];
+        let mut seed = 0x9e37_79b9_7f4a_7c15_u64;
+        let mut next = move || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed as usize
+        };
+        let mut taken = 0;
+        for _ in 0..200_000 {
+            let len = next() % 10;
+            let mut buf: Vec<u8> = (0..len)
+                .map(|_| alphabet[next() % alphabet.len()])
+                .collect();
+            buf.extend_from_slice(b"\r\n\r\n");
+            let Some(quick) = quick_field(&buf, 0) else {
+                continue;
+            };
+            taken += 1;
+            let mut lines = Lines { head: &buf, pos: 0 };
+            let (start, line) = lines.next_line().unwrap().unwrap();
+            assert_eq!(
+                checked_field(start, line),
+                Ok((quick.name.clone(), quick.value.clone())),
+                "{:?}",
+                String::from_utf8_lossy(&buf)
+            );
+            assert_eq!(lines.pos, quick.next, "{:?}", String::from_utf8_lossy(&buf));
+        }
+        assert!(taken > 1_000, "only {taken} lines were well formed");
     }
 }

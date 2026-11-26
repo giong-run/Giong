@@ -13,6 +13,7 @@
 //! `max_head_size`, and frames the client must answer (PING, SETTINGS) by
 //! not reading while too much output waits.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::collections::{HashMap, VecDeque};
 use std::future::{poll_fn, Future};
@@ -76,8 +77,9 @@ pub(crate) struct Request<'a> {
     pub(crate) scheme: &'a str,
     pub(crate) authority: &'a str,
     pub(crate) path: &'a str,
-    /// Lowercase names, without the fields HTTP/2 forbids.
-    pub(crate) fields: &'a [(String, String)],
+    /// Lowercase names, without the fields HTTP/2 forbids. Borrowed from
+    /// the request where they can be.
+    pub(crate) fields: &'a [(Cow<'a, str>, Cow<'a, str>)],
     pub(crate) body: Option<&'a [u8]>,
     pub(crate) head_request: bool,
 }
@@ -759,7 +761,7 @@ impl State {
         };
         e.field(b":path", req.path.as_bytes(), path_index, &mut block);
         for (name, value) in req.fields {
-            let index = match name.as_str() {
+            let index = match &**name {
                 "authorization" | "cookie" | "proxy-authorization" => Index::Never,
                 "content-length" => Index::No,
                 _ if value.len() > 256 => Index::No,
@@ -2252,8 +2254,11 @@ pub(crate) mod fuzzing {
         let method = a.pick(&["GET", "POST", "HEAD", "PUT"]);
         let body = vec![b'b'; a.pick(&BODIES)];
         let fields = [
-            ("user-agent".to_owned(), "fuzz".to_owned()),
-            ("content-length".to_owned(), body.len().to_string()),
+            (Cow::Borrowed("user-agent"), Cow::Borrowed("fuzz")),
+            (
+                Cow::Borrowed("content-length"),
+                Cow::Owned(body.len().to_string()),
+            ),
         ];
         let path = a.pick(&["/", "/a?b=c"]);
         let id = awake(st, |st| {
