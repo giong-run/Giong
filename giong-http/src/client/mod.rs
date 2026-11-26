@@ -97,6 +97,7 @@ mod pool;
 mod proxy;
 mod url;
 
+use std::borrow::Cow;
 use std::cell::{Cell, OnceCell, RefCell};
 use std::collections::HashMap;
 use std::fmt;
@@ -731,7 +732,8 @@ impl Client {
         let url = Url::parse(url).map_err(Error::request);
         RequestBuilder {
             client: self.clone(),
-            method: method.to_owned(),
+            method: known_method(method)
+                .map_or_else(|| Cow::Owned(method.to_owned()), Cow::Borrowed),
             url,
             headers: Vec::new(),
             body: None,
@@ -1323,7 +1325,7 @@ impl Client {
             let authority = headers
                 .iter()
                 .find(|(n, _)| n.eq_ignore_ascii_case("host"))
-                .map_or_else(|| url.host_header(), |(_, v)| v.clone());
+                .map_or_else(|| url.authority(), |(_, v)| Cow::Borrowed(v.as_str()));
             let req = h2::Request {
                 method,
                 scheme: if url.https { "https" } else { "http" },
@@ -1426,7 +1428,7 @@ impl Client {
         let authority = headers
             .iter()
             .find(|(n, _)| n.eq_ignore_ascii_case("host"))
-            .map_or_else(|| url.host_header(), |(_, v)| v.clone());
+            .map_or_else(|| url.authority(), |(_, v)| Cow::Borrowed(v.as_str()));
         let req = h2::Request {
             method,
             scheme: "https",
@@ -1611,7 +1613,7 @@ impl Client {
             )
         };
         let connect = async {
-            let addrs = giong::net::lookup_host((origin.host.as_str(), port))
+            let addrs = giong::net::lookup_host((&*origin.host, port))
                 .await
                 .map_err(failed)?;
             self.h3_open_any(quic, origin, &addrs, connect_timeout)
@@ -1777,8 +1779,8 @@ impl Client {
     /// last response.
     async fn run(
         &self,
-        mut method: String,
-        mut url: Url,
+        method: &str,
+        first: &Url,
         mut headers: Vec<(String, String)>,
         mut body: Option<Vec<u8>>,
         mut source: Option<StreamBody>,
@@ -1788,11 +1790,15 @@ impl Client {
         let max = config.redirects;
         let streamed = source.is_some();
         let mut hops = 0;
+        let mut method = Cow::Borrowed(method);
+        // The URL redirected to, once there is one.
+        let mut moved: Option<Url> = None;
         loop {
+            let url = moved.as_ref().unwrap_or(first);
             let pending = self
                 .execute(
                     &method,
-                    &url,
+                    url,
                     &headers,
                     body.as_deref(),
                     &mut source,
@@ -1836,7 +1842,7 @@ impl Client {
             if (status == 303 && method != "HEAD")
                 || (matches!(status, 301 | 302) && method == "POST")
             {
-                method = "GET".to_owned();
+                method = Cow::Borrowed("GET");
                 body = None;
                 headers.retain(|(n, _)| !n.eq_ignore_ascii_case("content-type"));
             }
@@ -1851,7 +1857,7 @@ impl Client {
             // The redirect's own body is read and dropped, so that its
             // connection can serve the next request.
             pending.read_whole(config).await?;
-            url = next;
+            moved = Some(next);
             hops += 1;
         }
     }
@@ -2071,7 +2077,15 @@ impl Pending {
             None => self.body.take_with_head(),
             Some(_) => None,
         }
-        .unwrap_or_else(|| self.body.head_bytes().to_vec());
+        .unwrap_or_else(|| {
+            // The head and the body in one allocation, not one for the
+            // head and another as the body arrives. The length is at most
+            // `max`, checked above.
+            let length = self.body.length().map_or(0, |n| n as usize);
+            let mut data = Vec::with_capacity(start + length);
+            data.extend_from_slice(self.body.head_bytes());
+            data
+        });
         if let Some(n) = self.body.length() {
             data.reserve(n as usize);
         }
@@ -2156,44 +2170,49 @@ fn not_sent_again(e: Error, method: &str) -> Error {
 
 /// The fields of an HTTP/2 request after its pseudo-headers: the same as
 /// over HTTP/1.1, in lowercase, with `Host` turned into `:authority`.
-fn h2_fields(
+fn h2_fields<'a>(
     method: &str,
-    headers: &[(String, String)],
+    headers: &'a [(String, String)],
     body: Option<&[u8]>,
-    user_agent: &str,
+    user_agent: &'a str,
     accept_encoding: bool,
     streamed: bool,
     trailers: bool,
-) -> Vec<(String, String)> {
+) -> Vec<(Cow<'a, str>, Cow<'a, str>)> {
     let mut fields = Vec::with_capacity(headers.len() + 4);
     let has = |name: &str| headers.iter().any(|(n, _)| n.eq_ignore_ascii_case(name));
     if !has("user-agent") && !user_agent.is_empty() {
-        fields.push(("user-agent".to_owned(), user_agent.to_owned()));
+        fields.push((Cow::Borrowed("user-agent"), Cow::Borrowed(user_agent)));
     }
     if accept_encoding {
         fields.push((
-            "accept-encoding".to_owned(),
-            decode::ACCEPT_ENCODING.to_owned(),
+            Cow::Borrowed("accept-encoding"),
+            Cow::Borrowed(decode::ACCEPT_ENCODING),
         ));
     }
     for (name, value) in headers {
         if name.eq_ignore_ascii_case("host") {
             continue;
         }
-        fields.push((name.to_ascii_lowercase(), value.clone()));
+        let name = if name.bytes().any(|b| b.is_ascii_uppercase()) {
+            Cow::Owned(name.to_ascii_lowercase())
+        } else {
+            Cow::Borrowed(name.as_str())
+        };
+        fields.push((name, Cow::Borrowed(value.as_str())));
     }
     if trailers {
         // The response is read as a stream, trailers included
         // (StreamingResponse::trailers), and some servers (gRPC) only send
         // them to a client that says it reads them.
-        fields.push(("te".to_owned(), "trailers".to_owned()));
+        fields.push((Cow::Borrowed("te"), Cow::Borrowed("trailers")));
     }
     if streamed {
         // No length: the body ends with the stream.
     } else if body.is_some() || matches!(method, "POST" | "PUT" | "PATCH") {
         fields.push((
-            "content-length".to_owned(),
-            body.map_or(0, <[u8]>::len).to_string(),
+            Cow::Borrowed("content-length"),
+            Cow::Owned(body.map_or(0, <[u8]>::len).to_string()),
         ));
     }
     fields
@@ -2250,6 +2269,16 @@ impl fmt::Debug for Client {
             .field("origins", &self.shared.hosts.borrow().len())
             .finish()
     }
+}
+
+/// `method` as a `'static` string if it is one of RFC 9110's, which most
+/// requests use: a request then holds no copy of it.
+fn known_method(method: &str) -> Option<&'static str> {
+    [
+        "GET", "POST", "PUT", "DELETE", "HEAD", "PATCH", "OPTIONS", "TRACE",
+    ]
+    .into_iter()
+    .find(|known| *known == method)
 }
 
 fn is_idempotent(method: &str) -> bool {
@@ -2341,7 +2370,8 @@ fn encode_request(
 #[must_use = "a request does nothing until it is sent"]
 pub struct RequestBuilder {
     client: Client,
-    method: String,
+    /// A method of RFC 9110 is not copied.
+    method: Cow<'static, str>,
     url: Result<Url, Error>,
     headers: Vec<(String, String)>,
     body: Option<Vec<u8>>,
@@ -2501,25 +2531,17 @@ impl RequestBuilder {
         }
         let _wait = giong::observe::wait(giong::observe::Wait::Upstream, "http");
         let url = self.url?;
-        let client = self.client;
+        let (client, method) = (self.client, self.method);
         let timeout = self.timeout.unwrap_or(client.shared.config.timeout);
-        let what = url.describe(&self.method);
         let run = async {
             let pending = client
-                .run(
-                    self.method,
-                    url,
-                    self.headers,
-                    self.body,
-                    self.source,
-                    false,
-                )
+                .run(&method, &url, self.headers, self.body, self.source, false)
                 .await?;
             pending.read_whole(&client.shared.config).await
         };
         match giong::time::timeout(timeout, run).await {
             Ok(result) => result,
-            Err(_) => Err(timed_out(&what, timeout)),
+            Err(_) => Err(timed_out(&url.describe(&method), timeout)),
         }
     }
 
@@ -2541,10 +2563,9 @@ impl RequestBuilder {
         // Up to the head; the body is read later, piece by piece.
         let _wait = giong::observe::wait(giong::observe::Wait::Upstream, "http");
         let url = self.url?;
-        let client = self.client;
+        let (client, method) = (self.client, self.method);
         let timeout = self.timeout.unwrap_or(client.shared.config.timeout);
-        let what = url.describe(&self.method);
-        let run = client.run(self.method, url, self.headers, self.body, self.source, true);
+        let run = client.run(&method, &url, self.headers, self.body, self.source, true);
         match giong::time::timeout(timeout, run).await {
             Ok(Ok(pending)) => Ok(StreamingResponse {
                 pending,
@@ -2552,7 +2573,7 @@ impl RequestBuilder {
                 idle_timeout: client.shared.config.idle_timeout,
             }),
             Ok(Err(e)) => Err(e),
-            Err(_) => Err(timed_out(&what, timeout)),
+            Err(_) => Err(timed_out(&url.describe(&method), timeout)),
         }
     }
 }
