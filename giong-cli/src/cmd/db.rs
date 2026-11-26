@@ -672,42 +672,86 @@ fn percent_decode(s: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// A URL's `scheme`, `user` and `password` (as written, percent-encoded)
-/// and what follows the `@`; `None` without a `user:password@`.
+/// A URL's `scheme`, the user and password before its host (as written,
+/// percent-encoded; the password `None` without a `:`), and what follows
+/// the `@`; `None` without an `@` before the host.
 ///
 /// Clients get the password in their environment, never in their command
 /// line, which every user of the machine can read (`ps`,
 /// `/proc/PID/cmdline`): a `DATABASE_URL` is often a shared server's.
-fn credentials(url: &str) -> Option<(&str, &str, &str, &str)> {
+fn credentials(url: &str) -> Option<(&str, &str, Option<&str>, &str)> {
     let (scheme, rest) = url.split_once("://")?;
     let end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
     let (auth, _) = rest[..end].rsplit_once('@')?;
-    let (user, password) = auth.split_once(':')?;
-    Some((scheme, user, password, &rest[auth.len() + 1..]))
+    let host = &rest[auth.len() + 1..];
+    Some(match auth.split_once(':') {
+        Some((user, password)) => (scheme, user, Some(password), host),
+        None => (scheme, auth, None, host),
+    })
 }
 
 /// The URL without its password, and the password (decoded; `None` when
-/// the URL has none). The user stays: `postgres://user@host/db`.
+/// the URL has none). The user stays: `postgres://user@host/db`. libpq
+/// also reads a `password=` in the query, which wins over the one before
+/// the host, as it does there.
 fn without_password(url: &str) -> (String, Option<String>) {
-    match credentials(url) {
-        Some((scheme, "", password, host)) => {
+    let (bare, before_host) = match credentials(url) {
+        Some((scheme, "", Some(password), host)) => {
             (format!("{scheme}://{host}"), Some(percent_decode(password)))
         }
-        Some((scheme, user, password, host)) => (
+        Some((scheme, user, Some(password), host)) => (
             format!("{scheme}://{user}@{host}"),
             Some(percent_decode(password)),
         ),
-        None => (url.to_string(), None),
+        _ => (url.to_string(), None),
+    };
+    let (bare, in_query) = without_query_password(&bare);
+    (bare, in_query.or(before_host))
+}
+
+/// The URL without the `password=` pairs of its query, and the last one's
+/// value (decoded).
+fn without_query_password(url: &str) -> (String, Option<String>) {
+    let Some(q) = url.find('?') else {
+        return (url.to_string(), None);
+    };
+    let (base, rest) = (&url[..q], &url[q + 1..]);
+    let (query, fragment) = rest.split_at(rest.find('#').unwrap_or(rest.len()));
+    let mut password = None;
+    let kept: Vec<&str> = query
+        .split('&')
+        .filter(|pair| match pair.split_once('=') {
+            Some(("password", v)) => {
+                password = Some(percent_decode(v));
+                false
+            }
+            _ => !pair.is_empty(),
+        })
+        .collect();
+    if password.is_none() {
+        return (url.to_string(), None);
     }
+    let mut out = base.to_string();
+    if !kept.is_empty() {
+        out.push('?');
+        out.push_str(&kept.join("&"));
+    }
+    out.push_str(fragment);
+    (out, password)
 }
 
 /// The URL without its user and password, and those two (decoded; `None`
-/// when the URL has no password).
+/// when the URL has neither). redis-cli reads `redis://secret@host`, with
+/// no `:`, as a password, so that form gives an empty user.
 fn without_credentials(url: &str) -> (String, Option<(String, String)>) {
     match credentials(url) {
-        Some((scheme, user, password, host)) => (
+        Some((scheme, user, Some(password), host)) => (
             format!("{scheme}://{host}"),
             Some((percent_decode(user), percent_decode(password))),
+        ),
+        Some((scheme, password, None, host)) => (
+            format!("{scheme}://{host}"),
+            Some((String::new(), percent_decode(password))),
         ),
         None => (url.to_string(), None),
     }
@@ -2666,6 +2710,38 @@ mod tests {
         assert_eq!(
             without_credentials("redis://h:6379"),
             ("redis://h:6379".to_string(), None)
+        );
+        // The older form, a password with no user and no `:`.
+        assert_eq!(
+            without_credentials("redis://s%40cret@h:6379/1"),
+            (
+                "redis://h:6379/1".to_string(),
+                Some((String::new(), "s@cret".to_string()))
+            )
+        );
+        // libpq's password in the query, which wins over the one before
+        // the host; the other pairs stay.
+        assert_eq!(
+            without_password("postgres://u@h/d?sslmode=require&password=p%26w"),
+            (
+                "postgres://u@h/d?sslmode=require".to_string(),
+                Some("p&w".to_string())
+            )
+        );
+        assert_eq!(
+            without_password("postgres://u:old@h/d?password=new&application_name=x"),
+            (
+                "postgres://u@h/d?application_name=x".to_string(),
+                Some("new".to_string())
+            )
+        );
+        assert_eq!(
+            without_password("postgres://h/d?password=pw"),
+            ("postgres://h/d".to_string(), Some("pw".to_string()))
+        );
+        assert_eq!(
+            without_password("postgres://h/d?passwordx=1"),
+            ("postgres://h/d?passwordx=1".to_string(), None)
         );
     }
 
