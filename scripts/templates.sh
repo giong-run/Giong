@@ -14,6 +14,11 @@
 # GIONG_TEMPLATES_REQUIRE_DB=1 (as in CI) a SKIPPED fails the run.
 # Projects are written under $GIONG_TEMPLATES_DIR (default: a temporary directory) and
 # share one target directory, so each one only compiles its own code.
+#
+# On Windows (Git Bash) the same steps run, without the epoll test run (there is no epoll),
+# and the smoke run stops the service with kill, as Windows has no SIGTERM: the graceful
+# stop on Windows is the runtime's own tests' to check. GIONG_TEMPLATES_NO_SERVERS=1 runs
+# only the combinations that need no database server (the Windows runners have none).
 set -uo pipefail
 cd "$(dirname "$0")/.."
 ROOT=$(pwd)
@@ -43,11 +48,22 @@ if [ "${1:-}" = "--list" ]; then
 fi
 FILTER="${1:-}"
 
+case "$(uname -s)" in
+    MINGW* | MSYS* | CYGWIN*) WINDOWS=1 EXE=.exe ;;
+    *) WINDOWS=0 EXE= ;;
+esac
+
 WORK="${GIONG_TEMPLATES_DIR:-$(mktemp -d)}"
 mkdir -p "$WORK"
+if [ "$WINDOWS" = 1 ]; then
+    # C:/... rather than /tmp/...: the paths reach programs that are not Git Bash's
+    # (giong, a sqlite: URL the service opens).
+    WORK=$(cygpath -m "$WORK")
+    ROOT=$(cygpath -m "$ROOT")
+fi
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$WORK/target}"
 cargo build -q -p giong-cli || exit 1
-GIONG="$CARGO_TARGET_DIR/debug/giong"
+GIONG="$CARGO_TARGET_DIR/debug/giong$EXE"
 
 # A port for a smoke run: below the range the kernel hands out to outgoing
 # connections (ip_local_port_range, 32768-60999 by default), which the
@@ -86,7 +102,7 @@ smoke_once() {
     cargo build -q || return 1
     # shellcheck disable=SC2086
     "$@" env LISTEN="127.0.0.1:$port" WORKERS=2 INTERVAL_SECS=1 GIONG_MCP= \
-        "$CARGO_TARGET_DIR/debug/${name}" >"$out" 2>&1 &
+        "$CARGO_TARGET_DIR/debug/${name}$EXE" >"$out" 2>&1 &
     pid=$!
     local start=$SECONDS
     deadline=$((SECONDS + 30))
@@ -112,6 +128,12 @@ smoke_once() {
         web*pg*|web*mysql*|web*sqlite*)
             curl -fsS -o /dev/null "http://127.0.0.1:$port/ready" || { cat "$out"; kill "$pid"; return 1; } ;;
     esac
+    if [ "$WINDOWS" = 1 ]; then
+        kill "$pid"
+        wait "$pid" 2>/dev/null
+        echo "smoke: $name served (stopped with kill: Windows has no SIGTERM)"
+        return 0
+    fi
     kill -TERM "$pid"
     local status=0
     wait "$pid" || status=$?
@@ -125,6 +147,9 @@ failed=()
 while read -r name flags; do
     [ -n "$name" ] || continue
     case "$name" in *"$FILTER"*) ;; *) continue ;; esac
+    if [ "${GIONG_TEMPLATES_NO_SERVERS:-0}" = 1 ]; then
+        case "$flags" in *postgres* | *mysql* | *redis*) continue ;; esac
+    fi
     dir="$WORK/$name"
     rm -rf "$dir"
     echo "=== $name: giong new $flags"
@@ -151,7 +176,9 @@ while read -r name flags; do
         cargo fmt --check
         cargo clippy -q --all-targets -- -D warnings
         "${url_env[@]}" cargo test -q -- --show-output 2>&1
-        "${url_env[@]}" env GIONG_DRIVER=epoll cargo test -q -- --show-output 2>&1
+        if [ "$WINDOWS" = 0 ]; then
+            "${url_env[@]}" env GIONG_DRIVER=epoll cargo test -q -- --show-output 2>&1
+        fi
         if [ -n "$missing" ]; then
             # Its tests printed SKIPPED for the same reason.
             echo "smoke: SKIPPED for $name: $missing is not set"
