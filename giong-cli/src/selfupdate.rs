@@ -183,8 +183,11 @@ enum Download {
 }
 
 fn curl(url: &str, out: &Path) -> Result<(), String> {
-    let status = Command::new("curl")
-        .args(["-fsSL", "--retry", "3", "--max-time", "600", "-o"])
+    let mut cmd = Command::new("curl");
+    cmd.args(["-fsSL", "--retry", "3", "--max-time", "600"]);
+    cmd.args(https_only(url));
+    let status = cmd
+        .arg("-o")
         .arg(out)
         .arg(url)
         .stdin(Stdio::null())
@@ -198,6 +201,18 @@ fn curl(url: &str, out: &Path) -> Result<(), String> {
             String::from_utf8_lossy(&o.stderr).trim()
         )),
         Err(e) => Err(format!("curl could not be started: {e}")),
+    }
+}
+
+/// The curl options that keep an https download on https: a redirect to plain
+/// http, which anyone on the network path could answer with another archive
+/// and its matching `.sha256`, is refused, and TLS is 1.2 or later. A mirror
+/// named with `http://` (a local one, as the tests use) is left as it is.
+fn https_only(url: &str) -> &'static [&'static str] {
+    if url.starts_with("https://") {
+        &["--proto", "=https", "--proto-redir", "=https", "--tlsv1.2"]
+    } else {
+        &[]
     }
 }
 
@@ -364,6 +379,17 @@ pub fn tidy(exe: &Path) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_https_download_never_follows_a_redirect_to_http() {
+        let args = https_only("https://github.com/giong-run/giong/releases/download/v1.5.1/x");
+        let pair = |flag: &str| args.iter().position(|a| *a == flag).map(|i| args[i + 1]);
+        assert_eq!(pair("--proto"), Some("=https"));
+        assert_eq!(pair("--proto-redir"), Some("=https"));
+        assert!(args.contains(&"--tlsv1.2"));
+        // A mirror the user named over http (a local one) still works.
+        assert!(https_only("http://127.0.0.1:8765/dist/v1.5.1/x").is_empty());
+    }
 
     #[test]
     fn the_install_is_told_by_its_folder() {

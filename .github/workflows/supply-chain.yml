@@ -1,0 +1,74 @@
+name: Supply chain
+
+# RustSec advisories against the workspace's Cargo.lock (deny.toml,
+# `cargo deny --workspace check advisories`): a vulnerable, unsound or yanked
+# crate in what giong's crates build with. Advisories appear at any time, so
+# this runs every day on main and opens (or adds to) the issue labelled
+# `supply-chain` when one applies; the fix is usually `cargo update -p <crate>`
+# in a pull request. A pull request that changes a Cargo.toml, Cargo.lock or
+# deny.toml runs it too, so a dependency change that brings an advisory shows
+# on the pull request. The license, source and ban rules, which depend only
+# on the change, run in ci.yml's lint job.
+
+on:
+  schedule:
+    - cron: "41 4 * * *"
+  pull_request:
+    paths:
+      - "Cargo.lock"
+      - "**/Cargo.toml"
+      - "deny.toml"
+      - ".github/workflows/supply-chain.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: supply-chain-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  advisories:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      issues: write   # the `supply-chain` issue, on the daily run only
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-deny@0.22.1
+      - name: cargo deny --workspace check advisories
+        id: deny
+        run: |
+          set -o pipefail
+          cargo deny --workspace --color never check advisories 2>&1 | tee deny.log
+      - name: Open or update the supply-chain issue
+        if: failure() && steps.deny.outcome == 'failure' && github.event_name == 'schedule'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RUN: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: |
+          gh label create supply-chain --color B60205 \
+              --description "A RustSec advisory applies to the workspace" 2>/dev/null || true
+          {
+              echo "The daily supply-chain check found an advisory for a crate in Cargo.lock: $RUN"
+              echo
+              echo "Fix: \`cargo update -p <crate>\` (or a newer version requirement) in a pull request,"
+              echo "or, if the advisory cannot apply to giong, an \`ignore\` entry in deny.toml with the reason."
+              echo
+              echo '```'
+              grep -E '^(error|warning)\[|ID:|Crate:|Version:|Title:|Solution:|├|└' deny.log | head -n 80
+              echo '```'
+          } > body.md
+          n=$(gh issue list --label supply-chain --state open --json number --jq '.[0].number')
+          if [ -n "$n" ]; then
+              gh issue comment "$n" --body-file body.md
+          else
+              gh issue create --title "Supply chain: a RustSec advisory applies to Cargo.lock" \
+                  --label supply-chain --body-file body.md
+          fi

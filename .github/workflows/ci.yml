@@ -122,6 +122,15 @@ jobs:
       - run: cargo doc --workspace --all-features --no-deps
         env:
           RUSTDOCFLAGS: -D warnings
+      # The supply-chain policy in deny.toml: permissive licenses, crates from
+      # crates.io only, no wildcard requirements. These depend only on the
+      # change. RustSec advisories, which appear at any time, are checked by
+      # .github/workflows/supply-chain.yml, so that a new advisory opens an
+      # issue instead of failing every pull request at once.
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-deny@0.22.1
+      - run: cargo deny --workspace check bans licenses sources
 
   msrv:
     runs-on: ubuntu-24.04
