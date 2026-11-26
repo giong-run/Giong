@@ -577,13 +577,23 @@ fn datagrams_of_a_shared_port_keep_their_control_messages() {
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
     const WORKERS: usize = 3;
-    // A port below the ephemeral range, free now.
+    // A port below the ephemeral range, free now. On loopback too: a
+    // socket of another process bound to 127.0.0.1 alone may not stop the
+    // wildcard bind, and would take the datagrams sent here.
+    let free = |p: u16| {
+        std::net::UdpSocket::bind(("0.0.0.0", p)).is_ok()
+            && std::net::UdpSocket::bind(("127.0.0.1", p)).is_ok()
+    };
     let port = (20_000u16..30_000)
         .map(|p| p.wrapping_add((std::process::id() % 9_000) as u16))
-        .find(|&p| std::net::UdpSocket::bind(("0.0.0.0", p)).is_ok())
+        .find(|&p| free(p))
         .expect("a free port");
     let addr = std::net::SocketAddr::from(([0, 0, 0, 0], port));
     let bound = Arc::new(AtomicUsize::new(0));
+    // How many datagrams the server took and answered: when a reply does
+    // not come, they say whether the request or the reply went missing.
+    let received = Arc::new(AtomicUsize::new(0));
+    let replied = Arc::new(AtomicUsize::new(0));
     let rt = Builder::new()
         .workers(WORKERS)
         .recv_buffers(64, GRO_BUFFER)
@@ -591,17 +601,21 @@ fn datagrams_of_a_shared_port_keep_their_control_messages() {
         .unwrap();
     let handle = rt.handle();
     let b = bound.clone();
+    let (rx, tx) = (received.clone(), replied.clone());
     let server = std::thread::spawn(move || {
         rt.run(move |_| {
             let b = b.clone();
+            let (rx, tx) = (rx.clone(), tx.clone());
             async move {
                 let socket = UdpSocket::bind(addr).unwrap();
                 socket.set_recv_local_addr(true).unwrap();
                 let index = b.fetch_add(1, Ordering::SeqCst);
                 while let Some(Ok((dg, from))) = giong::until_shutdown(socket.recv_from()).await {
+                    rx.fetch_add(1, Ordering::SeqCst);
                     let local = dg.local_ip() == Some(std::net::IpAddr::from([127, 0, 0, 1]));
                     let reply = vec![index as u8, u8::from(local)];
                     socket.send_to(reply, from).await.0.unwrap();
+                    tx.fetch_add(1, Ordering::SeqCst);
                 }
             }
         })
@@ -611,6 +625,7 @@ fn datagrams_of_a_shared_port_keep_their_control_messages() {
         std::thread::sleep(Duration::from_millis(1));
     }
     let mut reached = std::collections::HashSet::new();
+    let mut sent = 0;
     for i in 0..30 {
         let client = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         client
@@ -618,8 +633,16 @@ fn datagrams_of_a_shared_port_keep_their_control_messages() {
             .unwrap();
         for _ in 0..3 {
             client.send_to(b"where", ("127.0.0.1", port)).unwrap();
+            sent += 1;
             let mut buf = [0u8; 4];
-            let (n, _) = client.recv_from(&mut buf).unwrap();
+            let (n, _) = client.recv_from(&mut buf).unwrap_or_else(|e| {
+                panic!(
+                    "sender {i}: no reply ({e}): {sent} sent, {} received and {} answered by \
+                     the server",
+                    received.load(Ordering::SeqCst),
+                    replied.load(Ordering::SeqCst),
+                )
+            });
             assert_eq!(n, 2);
             assert_eq!(
                 buf[1], 1,
