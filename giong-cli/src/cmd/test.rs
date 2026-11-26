@@ -4,7 +4,7 @@
 //! `.env` is read for the tests (development only); each failing test becomes
 //! a finding with its panic message.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::Path;
 use std::process::Stdio;
 use std::sync::mpsc::RecvTimeoutError;
@@ -238,17 +238,38 @@ pub(crate) fn cargo_here() -> bool {
     ok
 }
 
+/// How often the run checks whether cargo ended and the limit passed.
+const POLL: Duration = Duration::from_millis(100);
+
+/// How long the output may stay open once cargo ended: a process that left
+/// the run's group (or, on Windows, any process a test left running) keeps
+/// the pipes open, and `cargo test` itself does not wait for it either.
+const LEFT_OPEN: Duration = Duration::from_secs(2);
+
+/// Stops what is left of the run's process group after cargo ended. Only on
+/// Unix, where the group outlives its leader; elsewhere [`LEFT_OPEN`] bounds
+/// the wait.
+fn stop_group(child: &std::process::Child) {
+    #[cfg(unix)]
+    kill_group(child.id());
+    #[cfg(not(unix))]
+    let _ = child;
+}
+
+#[cfg(unix)]
+fn kill_group(pid: u32) {
+    // The group process_group(0) made: cargo, the test binary, what it spawned.
+    let _ = std::process::Command::new("kill")
+        .args(["-s", "KILL", "--", &format!("-{pid}")])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status();
+}
+
 /// Stops cargo and everything it started.
 fn stop_tree(child: &mut std::process::Child) {
     #[cfg(unix)]
-    {
-        // The group process_group(0) made: cargo, the test binary, what it spawned.
-        let _ = std::process::Command::new("kill")
-            .args(["-s", "KILL", "--", &format!("-{}", child.id())])
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status();
-    }
+    kill_group(child.id());
     #[cfg(not(unix))]
     {
         let _ = std::process::Command::new("taskkill")
@@ -309,7 +330,7 @@ fn run_once(
     {
         let tx = tx.clone();
         readers.push(std::thread::spawn(move || {
-            for line in BufReader::new(stream).lines().map_while(Result::ok) {
+            for line in crate::build::lossy_lines(stream) {
                 if tx.send(line).is_err() {
                     break;
                 }
@@ -320,12 +341,18 @@ fn run_once(
     let mut all = String::new();
     let stderr = std::io::stderr();
     let mut timed_out = false;
+    // When cargo ended; the pipes can stay open after it, held by a process
+    // a test started and left running (a server it never stopped).
+    let mut ended: Option<(Instant, std::process::ExitStatus)> = None;
     loop {
-        let line = match timeout {
-            None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
-            Some(limit) => rx.recv_timeout(limit.saturating_sub(started.elapsed())),
-        };
-        match line {
+        let mut wait = POLL;
+        if let Some(limit) = timeout {
+            wait = wait.min(limit.saturating_sub(started.elapsed()));
+        }
+        if let Some((at, _)) = ended {
+            wait = wait.min(LEFT_OPEN.saturating_sub(at.elapsed()));
+        }
+        match rx.recv_timeout(wait) {
             Ok(line) => {
                 if echo {
                     let _ = writeln!(stderr.lock(), "{line}");
@@ -333,20 +360,39 @@ fn run_once(
                 all.push_str(&line);
                 all.push('\n');
             }
-            Err(RecvTimeoutError::Timeout) => {
-                timed_out = true;
-                stop_tree(&mut child);
-                break;
-            }
             Err(RecvTimeoutError::Disconnected) => break,
+            Err(RecvTimeoutError::Timeout) => {}
+        }
+        // After every line too: output that never pauses must not keep the
+        // run from seeing that cargo ended or that the limit passed.
+        match ended {
+            // The wait is for output still buffered, not for a writer that
+            // never stops.
+            Some((at, _)) if at.elapsed() >= LEFT_OPEN => break,
+            Some(_) => {}
+            None => {
+                if let Some(status) = child.try_wait().map_err(cargo_missing)? {
+                    ended = Some((Instant::now(), status));
+                    // What the tests left running, so it does not hold the
+                    // pipes, a port or a file into the next run (the epoll one).
+                    stop_group(&child);
+                } else if timeout.is_some_and(|limit| started.elapsed() >= limit) {
+                    timed_out = true;
+                    stop_tree(&mut child);
+                    break;
+                }
+            }
         }
     }
-    if !timed_out {
+    if ended.is_none() && !timed_out {
         for r in readers {
             let _ = r.join();
         }
     }
-    let status = child.wait().map_err(cargo_missing)?;
+    let status = match ended {
+        Some((_, status)) => status,
+        None => child.wait().map_err(cargo_missing)?,
+    };
     let mut result = parse_output(&all);
     if timed_out {
         result.timed_out = timeout.map(|t| t.as_secs());
@@ -644,8 +690,89 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A test that never ends: the run stops at the limit, cargo and the
-    /// test binary with it.
+    /// A test that leaves a process running, which holds the output pipes
+    /// and writes to them every 20 ms, and a test that prints bytes that are
+    /// not UTF-8: the run ends with cargo, not at
+    /// the limit, reads every line, and stops what was left running.
+    #[cfg(unix)]
+    #[test]
+    fn a_process_left_running_does_not_hold_the_run() {
+        if !cargo_here() {
+            return;
+        }
+        let dir = std::env::temp_dir().join(format!("giong-test-leak-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("src")).unwrap();
+        std::fs::write(
+            dir.join("Cargo.toml"),
+            "[package]\nname = \"leak\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n[workspace]\n",
+        )
+        .unwrap();
+        let pid_file = dir.join("left.pid");
+        std::fs::write(
+            dir.join("src/lib.rs"),
+            format!(
+                "#[test]\nfn leaves_a_process() {{\n\
+                 let c = std::process::Command::new(\"sh\").args([\"-c\", \"while :; do echo beat; sleep 0.02; done\"]).spawn().unwrap();\n\
+                 std::fs::write({pid_file:?}, c.id().to_string()).unwrap();\n\
+                 std::mem::forget(c);\n}}\n\
+                 #[test]\nfn prints_bytes() {{\n\
+                 use std::io::Write;\n\
+                 let mut e = std::io::stderr();\n\
+                 for _ in 0..20_000 {{ e.write_all(b\"\\xff\\xfe not utf-8\\n\").unwrap(); }}\n}}\n"
+            ),
+        )
+        .unwrap();
+        let mut build = cargo();
+        build.args(["test", "--no-run", "-q"]).current_dir(&dir);
+        without_outer_build(&mut build);
+        assert!(build.status().unwrap().success());
+        let started = Instant::now();
+        let (r, all, _) = run_once(
+            &dir,
+            None,
+            false,
+            &[],
+            &[],
+            false,
+            Some(Duration::from_secs(60)),
+        )
+        .unwrap();
+        let took = started.elapsed();
+        assert_eq!(r.timed_out, None, "{r:?}");
+        assert_eq!((r.passed, r.failed), (2, 0), "{r:?}");
+        assert!(r.build_error.is_none(), "{r:?}");
+        assert!(
+            all.matches("not utf-8").count() >= 20_000,
+            "{} lines",
+            all.lines().count()
+        );
+        assert!(took < Duration::from_secs(30), "{took:?}");
+        // The process the test left was stopped with the run's group.
+        let pid = std::fs::read_to_string(&pid_file).unwrap();
+        let alive = || {
+            // A stopped process nobody has reaped yet is not running.
+            if let Ok(stat) = std::fs::read_to_string(format!("/proc/{}/stat", pid.trim())) {
+                return !stat
+                    .rsplit_once(") ")
+                    .is_some_and(|(_, rest)| rest.starts_with('Z'));
+            }
+            std::process::Command::new("kill")
+                .args(["-0", pid.trim()])
+                .stderr(Stdio::null())
+                .status()
+                .is_ok_and(|s| s.success())
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while alive() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!alive(), "the left process {} still runs", pid.trim());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A test that never ends, printing every 20 ms: the run stops at the
+    /// limit, cargo and the test binary with it.
     #[test]
     fn stops_a_hung_suite() {
         if !cargo_here() {
@@ -661,7 +788,13 @@ test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; fini
         .unwrap();
         std::fs::write(
             dir.join("src/lib.rs"),
-            "#[test]\nfn forever() { std::thread::sleep(std::time::Duration::from_secs(600)); }\n",
+            "#[test]\nfn forever() {\n\
+             use std::io::Write;\n\
+             // Output that never pauses for long: the limit still applies.\n\
+             loop {\n\
+             let _ = std::io::stderr().write_all(b\"still trying\\n\");\n\
+             std::thread::sleep(std::time::Duration::from_millis(20));\n\
+             }\n}\n",
         )
         .unwrap();
         // Build first, so the limit measures the test, not the compiler.

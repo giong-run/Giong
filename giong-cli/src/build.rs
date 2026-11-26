@@ -42,7 +42,7 @@ pub fn run(dir: &Path, subcommand: &str, args: &[String]) -> Result<Outcome, Fai
     let stderr = child.stderr.take().expect("piped");
     let err_thread = std::thread::spawn(move || {
         let mut tail: Vec<String> = Vec::new();
-        for line in BufReader::new(stderr).lines().map_while(Result::ok) {
+        for line in lossy_lines(stderr) {
             tail.push(line);
             if tail.len() > 40 {
                 tail.remove(0);
@@ -52,7 +52,7 @@ pub fn run(dir: &Path, subcommand: &str, args: &[String]) -> Result<Outcome, Fai
     });
     let mut out = Outcome::default();
     let stdout = child.stdout.take().expect("piped");
-    for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+    for line in lossy_lines(stdout) {
         let Ok(v) = serde_json::from_str::<Value>(&line) else {
             continue;
         };
@@ -80,6 +80,29 @@ pub fn run(dir: &Path, subcommand: &str, args: &[String]) -> Result<Outcome, Fai
         );
     }
     Ok(out)
+}
+
+/// The lines of a stream, any bytes that are not UTF-8 replaced: a build script
+/// or a test may print anything, and a reader that stopped at the first such line would
+/// leave it writing into a closed pipe.
+pub(crate) fn lossy_lines(stream: impl std::io::Read) -> impl Iterator<Item = String> {
+    let mut reader = BufReader::new(stream);
+    let mut buf = Vec::new();
+    std::iter::from_fn(move || {
+        buf.clear();
+        match reader.read_until(b'\n', &mut buf) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => {
+                if buf.ends_with(b"\n") {
+                    buf.pop();
+                    if buf.ends_with(b"\r") {
+                        buf.pop();
+                    }
+                }
+                Some(String::from_utf8_lossy(&buf).into_owned())
+            }
+        }
+    })
 }
 
 /// One JSON message of cargo.
