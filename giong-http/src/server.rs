@@ -19,7 +19,7 @@ use giong::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use giong::observe::RequestTrace;
 use giong::time::{sleep, timeout};
 
-use crate::body::{Failure, Next, Pipe, StreamBody};
+use crate::body::{Failure, Next, Pipe, RateClock, StreamBody};
 use crate::budget::{self, Charge, FREE};
 use crate::chunked::{Decoder, Progress};
 use crate::h2::PREFACE;
@@ -511,9 +511,11 @@ pub(crate) struct Config {
     pub(crate) max_concurrent_streams: u32,
     /// What an HTTP/2 connection may hold of request bodies and of
     /// responses not sent yet, instead of the larger of `max_body_size`
-    /// and 1 MiB: for the fuzz harness, which needs a small one.
-    pub(crate) http2_budget: Option<u64>,
+    /// and 1 MiB: for the fuzz harness, which needs a small one. `0` for
+    /// none: an `Option` would take 8 bytes more in every connection.
+    pub(crate) http2_budget: u64,
     pub(crate) max_buffered_request_bytes: BufferedLimit,
+    pub(crate) min_body_rate: crate::body::MinRate,
 }
 
 impl Config {
@@ -614,8 +616,12 @@ impl Server {
                 http2: true,
                 http2_prior_knowledge: true,
                 max_concurrent_streams: 100,
-                http2_budget: None,
+                http2_budget: 0,
                 max_buffered_request_bytes: BufferedLimit::AUTO,
+                min_body_rate: crate::body::MinRate {
+                    per_sec: 0,
+                    grace_ms: 0,
+                },
             },
             min_free_memory: u64::MAX,
         }
@@ -702,6 +708,38 @@ impl Server {
     /// sizing a container.
     pub fn max_buffered_request_bytes(mut self, bytes: usize) -> Self {
         self.cfg.max_buffered_request_bytes = BufferedLimit::bytes(bytes);
+        self
+    }
+
+    /// The slowest average rate, in bytes per second, at which a request
+    /// body read as a stream (see [`Handler::stream_body`]) may arrive once
+    /// `grace` has passed (default: off).
+    ///
+    /// [`request_timeout`](Self::request_timeout) bounds the wait for each
+    /// piece of a streamed body, not the whole body, so a client that sends
+    /// one byte every 29 seconds holds a handler, its buffers and a
+    /// connection (over HTTP/2 and HTTP/3, a stream) for as long as it
+    /// likes: the slow-POST form of slowloris. With a minimum rate, the
+    /// body may take the grace period plus the time its bytes earn at the
+    /// rate, counting only the time the server waits for the client (not
+    /// the time the handler takes with a piece, during which flow control
+    /// holds the client back). A body that falls behind is cut: the
+    /// handler's [`BodyStream::chunk`](crate::BodyStream::chunk) fails with
+    /// `GIONG-E1112`, and the connection closes after the response (over
+    /// HTTP/2 and HTTP/3, the stream is reset). The average is over the
+    /// whole body, so a client that sent quickly at first may pause later.
+    ///
+    /// For uploads, 240 bytes per second after 10 seconds (what ASP.NET
+    /// Core's Kestrel uses by default) cuts a trickle and no real client.
+    /// Leave it off for long-lived streams that send little (a gRPC
+    /// client stream of rare messages, a log tail), which
+    /// `request_timeout` already bounds between two pieces. `0` turns it
+    /// off; the grace is kept to whole milliseconds, at most about 49 days.
+    pub fn min_body_rate(mut self, bytes_per_sec: u32, grace: Duration) -> Self {
+        self.cfg.min_body_rate = crate::body::MinRate {
+            per_sec: bytes_per_sec,
+            grace_ms: u32::try_from(grace.as_millis()).unwrap_or(u32::MAX),
+        };
         self
     }
 
@@ -2281,8 +2319,9 @@ impl<T: Transport> Conn<T> {
         if left > 0 {
             self.continue_body(body).await?;
         }
+        let mut clock = RateClock::default();
         while left > 0 {
-            let chunk = self.recv_body().await?;
+            let chunk = self.recv_body(&mut clock).await?;
             let n = usize::try_from(left).map_or(chunk.len(), |left| left.min(chunk.len()));
             let piece = chunk[..n].to_vec();
             if n < chunk.len() {
@@ -2303,6 +2342,7 @@ impl<T: Transport> Conn<T> {
         let mut input = self.buf[self.pos..].to_vec();
         self.pos = self.buf.len();
         let mut waited = false;
+        let mut clock = RateClock::default();
         loop {
             let progress = decoder.feed(&input);
             let piece = mem::take(&mut decoder.body);
@@ -2323,7 +2363,7 @@ impl<T: Transport> Conn<T> {
                         waited = true;
                         self.continue_body(body).await?;
                     }
-                    let chunk = self.recv_body().await?;
+                    let chunk = self.recv_body(&mut clock).await?;
                     input.extend_from_slice(&chunk);
                 }
                 Err(413) => return Err(Failure::TooLarge(body.limit)),
@@ -2343,10 +2383,27 @@ impl<T: Transport> Conn<T> {
     }
 
     /// The next piece of a streamed request body, within the request
-    /// timeout.
-    async fn recv_body(&self) -> Result<T::Chunk, Failure> {
-        match timeout(self.cfg.request_timeout, self.stream.recv()).await {
-            Ok(Ok(chunk)) if !chunk.is_empty() => Ok(chunk),
+    /// timeout, and within `min_body_rate` when it is on (`clock` counts
+    /// what the body has received and waited for).
+    async fn recv_body(&self, clock: &mut RateClock) -> Result<T::Chunk, Failure> {
+        let rate = self.cfg.min_body_rate;
+        if !rate.is_on() {
+            return match timeout(self.cfg.request_timeout, self.stream.recv()).await {
+                Ok(Ok(chunk)) if !chunk.is_empty() => Ok(chunk),
+                _ => Err(Failure::Cut),
+            };
+        }
+        let (wait, by_rate) = rate.wait(clock, self.cfg.request_timeout);
+        let start = Instant::now();
+        let received = timeout(wait, self.stream.recv()).await;
+        let now = Instant::now();
+        clock.waited += now - start;
+        match received {
+            Ok(Ok(chunk)) if !chunk.is_empty() => {
+                clock.got += chunk.len() as u64;
+                Ok(chunk)
+            }
+            Err(_) if by_rate => Err(Failure::TooSlow(rate.per_sec)),
             _ => Err(Failure::Cut),
         }
     }

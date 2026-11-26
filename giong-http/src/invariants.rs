@@ -624,7 +624,7 @@ pub mod h2_connection {
             .write_timeout(Duration::from_millis(20))
             .idle_timeout(Duration::from_millis(20))
             .max_concurrent_streams(8);
-        server.cfg.http2_budget = Some(2 * 1024);
+        server.cfg.http2_budget = 2 * 1024;
         server
     }
 
