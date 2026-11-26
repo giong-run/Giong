@@ -10,6 +10,14 @@ use giong_quic::{ClientConfig, Endpoint, ServerConfig, TransportConfig};
 
 const ALPN: &[u8] = b"giong-test";
 
+/// How many handshakes the accept-bound tests start at once. Each one
+/// sends the server a padded Initial and gets back a flight of about four
+/// datagrams; under ThreadSanitizer, with one slow worker, a hundred at once
+/// overflowed both sockets' default receive buffers (thousands of
+/// `RcvbufErrors` a run), and a connect whose flights kept being lost
+/// backed off past its 10 s timeout (#478).
+const WAVE: usize = 25;
+
 fn provider() -> Arc<rustls::crypto::CryptoProvider> {
     Arc::new(rustls::crypto::ring::default_provider())
 }
@@ -739,9 +747,9 @@ fn a_server_that_does_not_accept_refuses_connections_past_its_bound() {
                 .unwrap()
                 .transport(patient());
             let (mut made, mut refused) = (Vec::new(), 0);
-            // In waves, so that the client's own socket keeps up.
-            for _ in 0..12 {
-                let tasks: Vec<_> = (0..100)
+            // In waves of WAVE, so that neither socket overflows (#478).
+            for _ in 0..1200 / WAVE {
+                let tasks: Vec<_> = (0..WAVE)
                     .map(|_| {
                         let (client, cfg) = (client.clone(), cfg.clone());
                         giong::spawn(async move {
@@ -818,8 +826,8 @@ fn connections_lost_before_they_are_accepted_free_their_place() {
             };
             // Fill the server's queue: nobody accepts yet.
             let mut first = Vec::new();
-            for _ in 0..11 {
-                first.extend(wave(100).await);
+            for _ in 0..1100 / WAVE {
+                first.extend(wave(WAVE).await);
             }
             assert_eq!(first.len(), 1024);
             // Their clients close them while they wait in the queue, a few
@@ -834,7 +842,10 @@ fn connections_lost_before_they_are_accepted_free_their_place() {
             drop(first);
             giong::time::sleep(Duration::from_millis(500)).await;
             // New clients get in, and they are what the server accepts.
-            let second = wave(100).await;
+            let mut second = Vec::new();
+            for _ in 0..100 / WAVE {
+                second.extend(wave(WAVE).await);
+            }
             assert_eq!(second.len(), 100, "new clients were refused");
             let mut accepted = Vec::new();
             for _ in 0..100 {
