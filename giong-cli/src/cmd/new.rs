@@ -303,21 +303,6 @@ fn run(args: &Args) -> Result<Report, Failure> {
     r.data("tls", json!(o.tls));
     r.data("giong_version", json!(scaffold::GIONG_VERSION));
 
-    if cfg!(windows) {
-        r.push(
-            Finding::new(
-                Code::WINDOWS_LIMITED,
-                Severity::Warning,
-                "this project's crates do not build on Windows",
-            )
-            .detail(
-                "On Windows, giong 1.x builds the runtime crate only; giong-web, giong-grpc, \
-                 giong-mcp and the database crates need Linux or macOS.",
-            )
-            .fix("work on it in WSL 2 (wsl --install, then giong new inside it), or on Linux or macOS"),
-        );
-    }
-
     check_target(&dir)?;
     if args.has("dry-run") {
         let mut paths: Vec<String> = paths.iter().map(|p| p.to_string()).collect();
