@@ -2612,7 +2612,7 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
         let left = preface_deadline.saturating_duration_since(Instant::now());
         // On the heap, like the write below: over TLS this receive is
         // larger than any state of the loop that follows.
-        match HeapFuture::new(giong::time::timeout(left, io.recv())).await {
+        match HeapFuture::with(move || giong::time::timeout(left, io.recv())).await {
             Ok(Ok(chunk)) if !chunk.is_empty() => input.extend_from_slice(&chunk),
             _ => return,
         }
@@ -2624,7 +2624,9 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
         let out = mem::take(&mut s.out);
         // On the heap: inline, this write would be kept beside every state
         // of the connection's future, as large as the largest of them.
-        let _ = HeapFuture::new(giong::time::timeout(cfg.write_timeout, io.write_all(out))).await;
+        let _ =
+            HeapFuture::with(move || giong::time::timeout(cfg.write_timeout, io.write_all(out)))
+                .await;
         return;
     }
     input.drain(..PREFACE.len());
@@ -2667,7 +2669,7 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             if RequestTrace::is_on() {
                 start_trace(&mut traces, slot);
             }
-            match catching(|| HeapFuture::new(handler.call(req))) {
+            match catching(|| HeapFuture::with(move || handler.call(req))) {
                 Ok(task) => {
                     tasks[slot] = Some(task);
                     poll_handler(&mut s, &mut tasks, &mut traces, slot);
@@ -2846,7 +2848,7 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
     recv.set(None);
     // On the heap, like the preface's receive: once per connection, and
     // inline its states would be kept beside every state of the loop.
-    HeapFuture::new(close_and_linger(io, cfg.write_timeout)).await;
+    HeapFuture::with(move || close_and_linger(io, cfg.write_timeout)).await;
 }
 
 /// Closes our side of the connection, and reads what is still on its way

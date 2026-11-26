@@ -10,7 +10,9 @@
   live in states of their own, and the rarer, larger waits (a body that is still arriving,
   a file or large body sent from where it is, the HTTP/2 preface and the last close) run in
   heap blocks the worker reuses, so that an idle connection is no longer as large as the
-  largest of them. Requests take fewer instructions as well: `http1` −0.9%, `http1-client`
-  −0.4%, `web` and `https` −0.2%; HTTP/2 requests are unchanged (`h2` −0.1%, `h2-streams`
-  +0.02% on io_uring and −0.01% on epoll, within its noise). Allocations are unchanged.
-  Method and raw data: `bench/results/idle-conn-memory/`.
+  largest of them. Requests take fewer instructions as well, because a handler's future is
+  now made in its heap block instead of copied there, and the block is taken and given back
+  with less work: `http1` −1.5%, `web` −2.3%, `http1-client` −0.5%, `https` −0.4%, `h2`
+  −0.3%, `h2-streams` −0.2% (`bench/instr`, io_uring); in `bench/giong-http`, a JSON response
+  takes 2.8% fewer instructions and a 64 KiB body or file 3.1% fewer. Allocations are
+  unchanged. Method and raw data: `bench/results/idle-conn-memory/`.

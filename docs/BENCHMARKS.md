@@ -137,7 +137,9 @@ the others are from 0.4's run on the same kind of VM.
   HTTP/1.1 and from 3,480 to 2,696 over HTTPS: 1,318 bytes of heap per idle HTTP/1.1
   connection instead of 2,062, 3,318 over HTTP/2 instead of 4,566, 5,285 over HTTPS
   instead of 6,069 (io_uring), and 8,000 idle HTTP/2 connections over TLS take 81.2 MiB
-  instead of 104.4, with no request measurably costing more instructions
+  instead of 104.4. Requests got cheaper too, because a handler's future is made in its
+  heap block instead of copied there: 1.5% fewer instructions per HTTP/1.1 request, 2.3%
+  through a `giong-web` router, 0.2–0.5% for the client, HTTPS and HTTP/2 cases
   ([`bench/results/idle-conn-memory/`](../bench/results/idle-conn-memory/README.md)).
 - **"Pending" is mostly the request buffer**: 4 KiB, held while the handler runs, because
   the `Request` it was given points into it.

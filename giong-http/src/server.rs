@@ -1018,7 +1018,7 @@ impl Server {
                 // once, inside the HTTP state, and nothing else: an input the
                 // task captures, or a local of it that is borrowed, keeps its
                 // bytes in the task for as long as the connection lasts.
-                let handshake = HeapFuture::new(async move {
+                let handshake = HeapFuture::with(move || async move {
                     let tls = acceptor.accept(stream).await?;
                     let h2 = tls.alpn_protocol().as_deref() == Some(b"h2");
                     let peer = Transport::peer_addr(&tls);
@@ -1033,7 +1033,7 @@ impl Server {
                     if h2 {
                         // On the heap, so that HTTP/1.1 connections do not
                         // carry the larger HTTP/2 state.
-                        HeapFuture::new(serve_h2(tls, cfg, peer, handler, slot)).await;
+                        HeapFuture::with(move || serve_h2(tls, cfg, peer, handler, slot)).await;
                     } else {
                         Conn::new(tls, cfg, Some(slot)).serve(handler).await;
                     }
@@ -2104,7 +2104,7 @@ impl<T: Transport> Conn<T> {
                     let made = {
                         let mut trace = if traced { self.trace_handler() } else { None };
                         let made = catching(|| {
-                            HeapFuture::new(Caught {
+                            HeapFuture::with(|| Caught {
                                 fut: handler.call(req),
                                 trace: trace.take(),
                             })
@@ -2146,7 +2146,7 @@ impl<T: Transport> Conn<T> {
                     // requests go out first. On the heap like the handler's
                     // future, so that the rarer streaming paths do not make
                     // every connection larger.
-                    let answer = HeapFuture::new(async {
+                    let answer = HeapFuture::with(|| async {
                         self.flush().await?;
                         Ok::<_, End>(self.answer_streaming(handler, req, body).await)
                     });
@@ -2204,7 +2204,7 @@ impl<T: Transport> Conn<T> {
                 (stream, keep_alive)
             };
             if let Some(body) = stream {
-                if HeapFuture::new(self.write_stream(&body, minor == 1))
+                if HeapFuture::with(|| self.write_stream(&body, minor == 1))
                     .await
                     .is_err()
                 {
@@ -2235,15 +2235,17 @@ impl<T: Transport> Conn<T> {
                 let input = self.buf[self.pos..].to_vec();
                 self.release_read_buffer_all();
                 self.charge.shrink_to(0);
-                let h2 = crate::h2::serve(
-                    &self.stream,
-                    &self.cfg,
-                    &self.peer,
-                    handler,
-                    input,
-                    self._slot.as_ref(),
-                );
-                HeapFuture::new(h2).await;
+                HeapFuture::with(|| {
+                    crate::h2::serve(
+                        &self.stream,
+                        &self.cfg,
+                        &self.peer,
+                        handler,
+                        input,
+                        self._slot.as_ref(),
+                    )
+                })
+                .await;
             }
             End::Status(_) | End::Busy => {
                 self.write_refusal(end);
@@ -2625,7 +2627,7 @@ impl<T: Transport> Conn<T> {
         // be kept in every connection's future, idle or not.
         let (body, total) = match at_hand {
             Ok(at_hand) => at_hand,
-            Err(wait) => HeapFuture::new(self.read_body(&head, wait)).await?,
+            Err(wait) => HeapFuture::with(|| self.read_body(&head, wait)).await?,
         };
 
         // What the request holds goes with it, and is given back when the
@@ -2931,14 +2933,19 @@ impl<T: Transport> Conn<T> {
         } else {
             match mem::take(&mut self.body) {
                 Body::File(f) => {
-                    let write = self
-                        .stream
-                        .write_all_with_file(out, &f.file, f.offset, f.len);
-                    HeapFuture::new(until_stalled(idle, write)).await
+                    let stream = &self.stream;
+                    HeapFuture::with(|| {
+                        until_stalled(
+                            idle,
+                            stream.write_all_with_file(out, &f.file, f.offset, f.len),
+                        )
+                    })
+                    .await
                 }
                 body => {
-                    let write = self.stream.write_all_with_body(out, body);
-                    HeapFuture::new(until_stalled(idle, write)).await
+                    let stream = &self.stream;
+                    HeapFuture::with(|| until_stalled(idle, stream.write_all_with_body(out, body)))
+                        .await
                 }
             }
         };

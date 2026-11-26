@@ -13,7 +13,11 @@ its own or in a block on the heap that the worker reuses (`HeapFuture`): the rar
 waits (a body still arriving, a file or a body of 32 KiB or more sent from where it is, the
 HTTP/2 preface and the last close of an HTTP/2 connection) are allocated only while they
 run, and `serve_h2` and `h2::serve` borrow their configuration instead of taking it by
-value.
+value. Taking and giving back such a block got cheaper at the same time, which every
+request gains from, since a handler's future lives in one: the future is made in its block
+(`HeapFuture::with`) instead of made on the stack and copied there whole, the worker's cache
+of blocks is reached without a borrow flag, and what is rare (a new size, a list that has to
+grow) is kept out of the common path.
 
 Machine: 4-vCPU cloud VM (Intel Xeon), Linux 6.18, rustc 1.97.0, valgrind 3.22, 2026-11-26.
 "main-81588a2" is `main` at 81588a2; "change" is the change on top of it.
@@ -48,23 +52,38 @@ The heap per idle connection below moved by exactly these differences: 744 bytes
 | `idle-h2` epoll | heap bytes per connection | 4,582.5 | **3,334.5** | **−27.2%** |
 | `idle-https` io_uring | heap bytes per connection | 6,069.3 | **5,285.3** | **−12.9%** |
 | `idle-https` epoll | heap bytes per connection | 6,085.9 | **5,301.9** | **−12.9%** |
-| `idle-http1` io_uring / epoll | resident bytes per connection | 2,187.3 / 2,242.6 | 1,452.0 / 1,507.3 | −33.6% / −32.8% |
-| `idle-h2` io_uring / epoll | resident bytes per connection | 4,907.0 / 4,862.0 | 3,743.7 / 3,661.8 | −23.7% / −24.7% |
-| `idle-https` io_uring / epoll | resident bytes per connection | 6,479.9 / 6,381.6 | 5,697.5 / 5,599.2 | −12.1% / −12.3% |
-| `http1` io_uring / epoll | instructions per request | 8,293.7 / 9,204.5 | 8,212.7 / 9,123.6 | −0.98% / −0.88% |
-| `http1-client` io_uring / epoll | instructions per request | 21,851.3 / 22,946.6 | 21,770.4 / 22,865.6 | −0.37% / −0.35% |
-| `https` io_uring / epoll | instructions per request | 33,500.1 / 34,580.0 | 33,430.2 / 34,516.0 | −0.21% / −0.19% |
-| `web` io_uring / epoll | instructions per request | 11,263.4 / 12,174.5 | 11,242.4 / 12,147.6 | −0.19% / −0.22% |
-| `h2` io_uring / epoll | instructions per request | 29,743.6 / 30,875.0 | 29,725.4 / 30,854.4 | −0.06% / −0.07% |
-| `h2-streams` io_uring / epoll | instructions per ten requests | 240,531.8 / 241,812.9 | 240,590.1 / 241,777.2 | +0.02% / −0.01% |
+| `idle-http1` io_uring / epoll | resident bytes per connection | 2,187.3 / 2,242.6 | 1,464.3 / 1,507.3 | −33.1% / −32.8% |
+| `idle-h2` io_uring / epoll | resident bytes per connection | 4,907.0 / 4,862.0 | 3,702.8 / 3,629.1 | −24.5% / −25.4% |
+| `idle-https` io_uring / epoll | resident bytes per connection | 6,479.9 / 6,381.6 | 5,695.5 / 5,599.2 | −12.1% / −12.3% |
+| `http1` io_uring / epoll | instructions per request | 8,293.7 / 9,204.5 | **8,172.6 / 9,089.5** | **−1.46% / −1.25%** |
+| `http1-client` io_uring / epoll | instructions per request | 21,851.3 / 22,946.6 | 21,730.3 / 22,825.6 | −0.55% / −0.53% |
+| `https` io_uring / epoll | instructions per request | 33,500.1 / 34,580.0 | 33,364.2 / 34,455.8 | −0.41% / −0.36% |
+| `web` io_uring / epoll | instructions per request | 11,263.4 / 12,174.5 | **10,999.5 / 11,916.5** | **−2.34% / −2.12%** |
+| `h2` io_uring / epoll | instructions per request | 29,743.6 / 30,875.0 | 29,667.8 / 30,797.9 | −0.25% / −0.25% |
+| `h2-streams` io_uring / epoll | instructions per ten requests | 240,483.6 / 241,812.2 | 240,048.0 / 241,304.4 | −0.18% / −0.21% |
 
 Allocations are unchanged in every case: the blocks the worker reuses for `HeapFuture` are
-not new allocations once warm. `h2-streams` is the median of eight rounds (the three above
-and five more, [`instr-h2-streams-main-81588a2.csv`](instr-h2-streams-main-81588a2.csv),
-[`instr-h2-streams-change.csv`](instr-h2-streams-change.csv)); its rounds spread over
-±0.03 to ±0.04% on either tree (io_uring: 240,449 to 240,590 on main, 240,474 to 240,654
-with the change), so +0.02% and −0.01% are within the noise of the measurement. None of the HTTP/2
-request path changed.
+not new allocations once warm. The three rounds of a case lie within 0.07% of their median
+(within 0.05% for the HTTP/2 cases), so the smallest of these changes (`h2-streams`, −0.18%)
+is outside the noise of the measurement.
+The cases `idle-https`, `https`, `h2`, `h2-streams` and `idle-h2` of the change were measured
+again, in a second run with the same settings, after the last edit to the HTTPS
+connection's task; the csv has that run for them.
+
+## Instructions per response (bench/giong-http, callgrind)
+
+[`callgrind.sh`](callgrind.sh) on both builds of `bench/giong-http` (one worker, plain TCP,
+2,000 keep-alive requests after 300 of warm-up, two runs of each, interleaved;
+[`callgrind.txt`](callgrind.txt)). `bytes64k` answers with a 64 KiB body and `file64k` with
+64 KiB of a file, the two responses whose write moved to a heap block.
+
+| path | main-81588a2 | change | change |
+|---|---:|---:|---:|
+| `/json` | 6,588.8 | **6,404.5** | **−2.8%** |
+| `/file?n=65536` (`file64k`) | 5,993.8 | **5,808.0** | **−3.1%** |
+| `/bytes?n=65536` (`bytes64k`) | 6,021.2 | **5,837.0** | **−3.1%** |
+
+The two runs of each build gave the same count to within 3 instructions.
 
 ## Resident memory, 8,000 idle HTTPS connections (bench/tls-idle.sh)
 
@@ -126,4 +145,32 @@ All three rounds gave the same values to within 0.01 KiB. What one stream in pro
 did not change; it was 1.1 KiB when `giong-http/README.md` last measured it, and is 1.51 on
 `main` too, so it grew before this change, and is the next thing to look at in HTTP/2.
 
-THROUGHPUT_SECTION
+## Throughput (bench/tls.sh endpoints)
+
+A copy of `bench/tls.sh` whose list of servers names the two builds of `bench/giong-http`
+(with TLS, `GIONG_KTLS=off`, and without), the rest unchanged: one core for the server, three
+for `wrk`, 50 connections, 5 s per measurement after 2 s of warm-up, a fresh server for each
+round. The builds alternate within every round, so each round gives one pair; the table has
+the median over the pairs of the change's requests per second against main's.
+[`throughput/raw.csv`](throughput/raw.csv) has every measurement, with the run and the order
+the builds ran in.
+
+| endpoint | with TLS | without TLS |
+|---|---:|---:|
+| `json` | +2.2% (16 pairs) | +0.3% (16 pairs) |
+| `users` | **+9.9%** (6 pairs, 5 up) | **+6.2%** (6 pairs, all up) |
+| `bytes64k` | −0.4% (6 pairs) | −1.0% (6 pairs) |
+| `file64k` | −0.7% (26 pairs) | +0.5% (16 pairs) |
+| `handshake` | −0.7% (74 pairs) | |
+
+The rounds of one build spread over ±3 to ±8% on this VM, so only `users` moved by more than
+the noise: its handler's future is the largest of these, and it is now made in its heap block
+instead of copied there. `handshake` (a resumed TLS 1.3 handshake and one request per
+connection) needed more pairs to settle: with main always first (runs A and B) the change
+measured −2.6%, with the change first (run C) −0.3%, and in runs whose order alternates or
+rotates −1.3% (run D, 24 pairs) and +0.2% (run E, 24 rotations of main, the first version of
+the change and the final one; the first version measured +1.2%). The server's instructions
+per connection on that path are 0.06% fewer with the change (`callgrind.sh <binary>
+handshake`: 1,286,445 against 1,287,213), and callgrind's cache simulation
+counts 1.1% fewer instruction-cache misses and 4 to 7% fewer data-cache misses on it, so the
+−0.7% is taken for the VM's noise; it is to be measured again on bare metal.
