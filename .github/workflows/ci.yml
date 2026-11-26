@@ -1,10 +1,11 @@
 name: CI
 
 on:
-  # `ready_for_review`: a draft runs the short set (job `plan`), so marking it ready
-  # starts the full one.
+  # Not `ready_for_review`: since Workflow v2 (docs/WORKFLOW.md) a draft and a pull
+  # request ready for review run the same jobs here, so marking a draft ready needs no
+  # new run; the run of its last push stands.
   pull_request:
-    types: [opened, synchronize, reopened, ready_for_review]
+    types: [opened, synchronize, reopened]
   # A pull request in the merge queue: the same jobs, on main with the pull
   # request and those queued before it merged, before main moves.
   merge_group:
@@ -51,12 +52,14 @@ env:
   GIONG_REDIS_REQUIRED: "1"
 
 jobs:
-  # What this run needs (scripts/ci-scope.py). The merge queue, a dispatch and a push to
-  # main run everything, repeated. A pull request runs every job once when it is ready
-  # for review, a short set while it is a draft, and only `lint` and `msrv` when it
+  # What this run needs (scripts/ci-scope.py; docs/WORKFLOW.md, Workflow v2). The merge
+  # queue, a dispatch and a push to main run everything, repeated, macOS and Windows
+  # included. A pull request runs the fast set (lint, msrv, default features, the build,
+  # one round of the tests on io_uring and on epoll), and only `lint` and `msrv` when it
   # changes nothing that is built, tested or read by a test (the site, changelog.d/,
-  # prose). Whatever a pull request ran, the merge queue runs the full set on main with
-  # the change merged before main moves: what lands is tested exactly as before.
+  # prose); so does a merge group made only of such files. Whatever a pull request ran,
+  # the merge queue runs the full set on main with the change merged before main moves:
+  # nothing with code in it lands without every job.
   # If this job fails, every job that needs it is skipped and `all-checks` fails.
   plan:
     runs-on: ubuntu-24.04
@@ -66,9 +69,12 @@ jobs:
       heavy: ${{ steps.plan.outputs.heavy }}
       rounds: ${{ steps.plan.outputs.rounds }}
       tsan: ${{ steps.plan.outputs.tsan }}
+      fallback: ${{ steps.plan.outputs.fallback }}
     steps:
       # On a pull request the checked-out commit merges the head into the base, so its
       # first parent is the base and the diff between the two is the pull request.
+      # In the merge queue the diff is the whole group's: the base it was built on to
+      # the group's commit, every pull request ahead in the queue included.
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 2
@@ -76,18 +82,23 @@ jobs:
         env:
           EVENT: ${{ github.event_name }}
           DRAFT: ${{ github.event.pull_request.draft && '--draft' || '' }}
+          GROUP_BASE: ${{ github.event.merge_group.base_sha }}
         run: |
           if [ "$EVENT" = pull_request ]; then
               git diff --name-only HEAD^1 HEAD > "$RUNNER_TEMP/files.txt"
+          elif [ "$EVENT" = merge_group ] && git fetch --no-tags --depth=1 origin "$GROUP_BASE" &&
+                  git diff --name-only "$GROUP_BASE" HEAD > "$RUNNER_TEMP/files.txt"; then
+              :
           else
+              # Anything else, or a group whose base could not be had: everything runs.
               : > "$RUNNER_TEMP/files.txt"
           fi
           python3 scripts/ci-scope.py --event "$EVENT" $DRAFT --explain < "$RUNNER_TEMP/files.txt" | tee -a "$GITHUB_OUTPUT"
           {
               echo "### CI plan: \`$(sed -n 's/^scope=//p' "$GITHUB_OUTPUT" | tail -n 1)\`"
               echo
-              echo "docs: lint and msrv only. draft: lint, msrv, default features, build, tests once."
-              echo "pr: every job, each suite once. full (merge queue): every job, every repetition."
+              echo "docs: lint and msrv only. draft and pr: lint, msrv, default features, build, tests once on io_uring and on epoll."
+              echo "full (merge queue): every job, every repetition, macOS and Windows. See docs/WORKFLOW.md."
           } >> "$GITHUB_STEP_SUMMARY"
 
   lint:
@@ -105,6 +116,8 @@ jobs:
       - run: python3 scripts/release.py check
       # The CI gate's decisions (scripts/ci-gate.py), on the kinds of failure it meets.
       - run: python3 scripts/test_ci_gate.py
+      # What a pull request and a merge group run (scripts/ci-scope.py, Workflow v2).
+      - run: python3 scripts/test_ci_scope.py
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --workspace --all-features --no-deps
         env:
@@ -391,13 +404,14 @@ jobs:
   fallback-tiers:
     name: fallback (${{ matrix.tier }})
     needs: [plan, build]
-    if: needs.plan.outputs.heavy == 'true'
+    # Every tier in the merge queue; the epoll tier alone on a pull request.
+    if: needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
     timeout-minutes: 50
     strategy:
       fail-fast: false
       matrix:
-        tier: [no-features, coop, basic, epoll]
+        tier: ${{ fromJSON(needs.plan.outputs.fallback) }}
     env:
       ROUNDS: ${{ needs.plan.outputs.rounds }}
       GIONG_TEST_EXPECT_DRIVER: io_uring
@@ -437,7 +451,7 @@ jobs:
     steps:
       - run: >
           test "${{ needs.fallback-tiers.result }}" = success ||
-          { test "${{ needs.plan.result }}" = success && test "${{ needs.plan.outputs.heavy }}" = false &&
+          { test "${{ needs.plan.result }}" = success && test "${{ needs.plan.outputs.scope }}" = docs &&
           test "${{ needs.fallback-tiers.result }}" = skipped; }
 
   # The epoll driver where it is needed: a container with Docker's default
@@ -928,22 +942,26 @@ jobs:
   # `all-checks` fails when they do: main requires only this workflow's checks,
   # and a red macOS run in the queue once merged #336 and broke main on macOS.
   # A pull request runs them as workflows of their own, which do not gate
-  # merging; their `plan` sees the caller's event, so here they run in full.
+  # merging, and only when it touches platform code (ci-scope.py --platform);
+  # their `plan` sees the caller's event, so here they run in full. A merge
+  # group made only of files no build reads skips them, as it skips the rest.
   macos:
-    if: github.event_name != 'pull_request'
+    needs: plan
+    if: github.event_name != 'pull_request' && needs.plan.outputs.scope != 'docs'
     uses: ./.github/workflows/macos.yml
 
   windows:
-    if: github.event_name != 'pull_request'
+    needs: plan
+    if: github.event_name != 'pull_request' && needs.plan.outputs.scope != 'docs'
     uses: ./.github/workflows/windows-runtime.yml
 
   # Every job of this workflow passed. One name to require on main, so that
   # the jobs that are not required by themselves (Miri, Kani, the kernels,
   # Docker, the other server versions, loom, h2spec, h3spec, the lowest dependency
   # versions, the simulation, gVisor, musl) hold a merge back as well. When `plan` chose a
-  # short set (a draft, or a pull request that changes no code), the jobs it left
-  # out may be skipped; `plan`, `lint` and `msrv` must pass in any case, and in the
-  # merge queue every job must.
+  # short set (any pull request, or a merge group that changes no code), the jobs it
+  # left out may be skipped; `plan`, `lint` and `msrv` must pass in any case, and in a
+  # merge group with code every job must.
   all-checks:
     needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl, macos, windows]
     if: always()

@@ -29,7 +29,7 @@ jobs:
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     outputs:
-      heavy: ${{ steps.plan.outputs.heavy }}
+      scope: ${{ steps.plan.outputs.scope }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -49,7 +49,10 @@ jobs:
   # Not `templates`: that name is the Linux job's (templates.yml).
   templates-windows:
     needs: plan
-    if: needs.plan.outputs.heavy == 'true'
+    # Not part of the merge queue's run: it stays on every pull request ready for
+    # review that changes what a template builds on (scope `pr`), as before
+    # Workflow v2.
+    if: needs.plan.outputs.scope == 'pr' || needs.plan.outputs.scope == 'full'
     runs-on: windows-2025
     timeout-minutes: 60
     defaults:

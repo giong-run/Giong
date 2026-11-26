@@ -187,7 +187,7 @@ echo
 CI_SCOPE=$(printf '%s\n' "${FILES[@]}" | python3 scripts/ci-scope.py 2>/dev/null | sed -n 's/^scope=//p')
 case "$CI_SCOPE" in
     docs) echo "CI on the pull request: lint and msrv only (no file a build or test reads changed)." ;;
-    pr) echo "CI on the pull request: every job once (a draft runs a short set); the merge queue runs all, repeated." ;;
+    pr) echo "CI on the pull request: the fast set (build, tests once on io_uring and epoll); the merge queue runs every job, repeated, macOS and Windows included (docs/WORKFLOW.md)." ;;
 esac
 if [ "$RUST" = 0 ]; then
     echo "Docs, scripts or configuration only: no cargo build needed."

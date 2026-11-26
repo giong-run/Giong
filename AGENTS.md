@@ -153,16 +153,20 @@ scripts/semver.sh            # no breaking API change since the last release (ca
 scripts/instr.py check       # instructions per operation and heap per idle connection vs bench/instr/baseline.csv
 ```
 
-Continuous integration requires `all-checks` on every pull request, which passes when
-every job of the workflow passed: `lint` (fmt, clippy, doc), `msrv`, `test`, `fallback`,
-`tsan` and the jobs named below. A change is done when all of them would pass. The `plan`
-job (`scripts/ci-scope.py`) picks how much a run does: a pull request ready for review runs
-every job once (each suite one round, two ThreadSanitizer runs), a draft runs a short set
-(lint, msrv, default features, the build, one round of the tests), and a pull request that
-changes no file a build or test reads (the site, `changelog.d/`, prose) runs `lint` and
-`msrv` only. A pull request is merged through the merge queue, which runs every job, with
-every repetition (five rounds, three ThreadSanitizer runs), on `main` with the pull request
-merged, and merges it only if they pass (docs/DEVELOPMENT.md, "CI tiers"). `main` then moves to the
+Continuous integration gates `main` on `all-checks` (through the `CI gate` status),
+which passes when every job of the workflow passed: `lint` (fmt, clippy, doc), `msrv`,
+`test`, `fallback`, `tsan` and the jobs named below. A change is done when all of them
+would pass. The `plan` job (`scripts/ci-scope.py`) picks how much a run does; the process
+is versioned in docs/WORKFLOW.md (currently Workflow v2): a pull request, draft or ready,
+runs the fast set (lint, msrv, default features, the build, one round of the tests on
+io_uring and of the epoll tier; macOS and Windows only when it touches their code), and a
+pull request that changes no file a build or test reads (the site, `changelog.d/`, prose)
+runs `lint` and `msrv` only. A pull request is merged through the merge queue, which runs
+every job, with every repetition (five rounds, three ThreadSanitizer runs, Miri, Kani, the
+kernels, macOS, Windows), on `main` with the pull request merged, and merges it only if
+they pass (docs/DEVELOPMENT.md, "CI tiers"). The heavy jobs therefore first run in the
+queue: pass `scripts/preflight.sh` before marking ready, and dispatch CI on the branch
+for a change to the unsafe core, a driver or the scheduler. `main` then moves to the
 commit that run tested, so a push to `main` (`.github/workflows/main.yml`) runs the jobs
 again only when no merge queue run passed for that commit, or when the push changes one
 of the two workflows.
@@ -300,6 +304,11 @@ is loaded.
   November 2026 more than half of all pull request runs were cancelled by the next push
   after running a median of 7 minutes. Iterate locally (`scripts/preflight.sh --quick`, run
   by the pre-push hook) and as a draft.
+- **The heavy jobs first run in the merge queue** (Workflow v2, docs/WORKFLOW.md): Miri,
+  Kani, ThreadSanitizer, the kernels, instr, macOS and Windows no longer run on a pull
+  request that does not touch their platform. A failure there ejects the pull request from
+  the queue. A test that fails there on code the pull request did not touch goes into
+  `.github/known-flakes.txt` with an issue within the hour, then gets fixed; never skipped.
 
 - **TCP keeps no message boundaries.** On Linux 6.12 and newer, streams receive through
   packed buffer rings, and a receive ends wherever a shared buffer fills up: a test that
