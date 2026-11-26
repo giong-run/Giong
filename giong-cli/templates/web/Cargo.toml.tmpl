@@ -6,7 +6,8 @@ publish = false
 
 [dependencies]
 giong = { {{src_giong}} }
-giong-mcp = { {{src_giong_mcp}} }
+# `web`: the routes tool, which `giong routes` and `giong openapi` ask.
+giong-mcp = { {{src_giong_mcp}}, features = ["web"] }
 {{#if tls}}
 giong-tls = { {{src_giong_tls}} }
 giong-web = { {{src_giong_web}}, features = ["serde", "tls"] }
