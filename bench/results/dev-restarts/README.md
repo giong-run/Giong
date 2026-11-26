@@ -36,3 +36,6 @@ giong dev stop
 ```
 
 `giong-dev-100.out` is `giong dev`'s own output from that run.
+
+Long responses in flight across a restart (streamed bodies, and what the grace does to
+them): [`dev-restarts-streaming`](../dev-restarts-streaming/).
