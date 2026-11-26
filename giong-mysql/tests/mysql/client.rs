@@ -588,9 +588,13 @@ fn a_cancel_request_stops_the_running_statement() {
         });
         sleep(Duration::from_millis(200)).await;
         token.cancel().await.unwrap();
-        let e = timeout(Duration::from_secs(5), slow)
+        // As in the statement timeout test above: MySQL 8.4 on the Windows
+        // runners looks at a killed query less often in this recursion, and
+        // took more than 5 s to stop it there.
+        let bound = Duration::from_secs(if cfg!(windows) { 30 } else { 5 });
+        let e = timeout(bound, slow)
             .await
-            .unwrap()
+            .expect("the cancelled statement did not stop within the bound")
             .unwrap()
             .unwrap_err();
         assert_eq!(e.server_code(), Some(1317), "{e}");
