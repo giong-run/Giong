@@ -30,9 +30,9 @@
 #   code that parses bytes from the network
 #                             every fuzz target of that crate for FUZZ_SECS (30) seconds
 # A missing tool fails the gate with the command that installs it; nothing is skipped
-# quietly. CI runs every job once on a pull request ready for review and all of them,
-# repeated, in the merge queue (kernels, fallback tiers, Miri, Kani, instr, the server
-# versions), so the gate makes a green run likely; it does not replace it.
+# quietly. CI runs the fast set on a pull request and every job, repeated, in the merge
+# queue (kernels, fallback tiers, Miri, Kani, instr, the server versions, macOS, Windows;
+# docs/WORKFLOW.md), so the gate makes a green queue run likely; it does not replace it.
 # Exit status: 0 when every check it ran passed.
 set -uo pipefail
 cd "$(dirname "$0")/.."
@@ -187,7 +187,7 @@ echo
 CI_SCOPE=$(printf '%s\n' "${FILES[@]}" | python3 scripts/ci-scope.py 2>/dev/null | sed -n 's/^scope=//p')
 case "$CI_SCOPE" in
     docs) echo "CI on the pull request: lint and msrv only (no file a build or test reads changed)." ;;
-    pr) echo "CI on the pull request: every job once (a draft runs a short set); the merge queue runs all, repeated." ;;
+    pr) echo "CI on the pull request: the fast set (build, tests once on io_uring and epoll); the merge queue runs every job, repeated, macOS and Windows included (docs/WORKFLOW.md)." ;;
 esac
 if [ "$RUST" = 0 ]; then
     echo "Docs, scripts or configuration only: no cargo build needed."
@@ -309,4 +309,4 @@ if [ ${#FAILED[@]} -gt 0 ]; then
     exit 1
 fi
 [ "$MODE" = quick ] && echo "Quick mode: run scripts/preflight.sh without --quick before pushing."
-echo "CI runs every job once when the pull request is ready for review, and all of them, repeated, in the merge queue."
+echo "CI runs the fast set on the pull request, and every job, repeated, in the merge queue (docs/WORKFLOW.md)."

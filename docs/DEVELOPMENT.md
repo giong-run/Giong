@@ -6,6 +6,10 @@ the flow of work, so that many agents in parallel stay fast without lowering the
 Everything here applies to people too. Where it and [CONTRIBUTING.md](../CONTRIBUTING.md)
 disagree, CONTRIBUTING.md wins: report the difference.
 
+The process has a version: **Workflow v2**, described with its measurements in
+[WORKFLOW.md](WORKFLOW.md). A change to the process goes there first (a new minor or
+major version, measured against the last), then here.
+
 The bar does not move: `main` changes only through a pull request that passes every CI job,
 in the merge queue, which runs them all once more on `main` with the change merged. What
 this page changes is how often a change has to go round that loop before it lands.
@@ -40,31 +44,34 @@ a red job is fixed at its cause, whatever it takes.
 
 ## CI tiers
 
-The job `plan` (`scripts/ci-scope.py`) chooses what a run does; `scripts/preflight.sh
---plan` prints its choice for a branch.
+The job `plan` (`scripts/ci-scope.py`, tested by `scripts/test_ci_scope.py`) chooses what
+a run does; `scripts/preflight.sh --plan` prints its choice for a branch. Under Workflow
+v2 ([WORKFLOW.md](WORKFLOW.md#ci-tiers) has the full table and the reasons):
 
-| The run | What runs | Expected time |
-|---|---|---|
-| Pull request that changes no file a build or test reads: `site/`, `changelog.d/`, `bench/results/`, `assets/`, `skills/`, prose | `lint` (fmt, clippy, docs, `release.py check`, which builds the site) and `msrv` | 2 min |
-| Draft pull request | the above, default features, the release build, one round of the tests on io_uring; the Fuzz, gRPC, Proto and macOS workflows skip drafts | 16 min, 1,000 runner-seconds (a twelfth of a full run) |
-| Pull request ready for review | every job once: each suite one round on every tier, two ThreadSanitizer runs, the kernels and server versions four at a time, Miri, Kani, instr, macOS, Windows (when code it builds changed) | 17 min of jobs, 8,400 runner-seconds (two thirds of a full run) |
-| Merge queue, a push to `main` that no queue run tested, a dispatch | every job with every repetition: five rounds per tier, three ThreadSanitizer runs, every matrix entry at once; macOS and Windows, called from `ci.yml` so that `all-checks` fails when they do | 24 min, 12,200 runner-seconds |
+| The run | What runs |
+|---|---|
+| Pull request that changes no file a build or test reads: `site/`, `changelog.d/`, `bench/results/`, `docs/workflow/`, `assets/`, `skills/`, `.github/known-flakes.txt`, prose | `lint` (fmt, clippy, docs, `release.py check`, which builds the site) and `msrv` |
+| Any other pull request, draft or ready | the above, default features, the release build, one round of the tests on io_uring and of the epoll tier |
+| ...ready for review, touching macOS or Windows code (`ci-scope.py --platform`) | also the macOS or Windows workflow |
+| Merge queue, a push to `main` that no queue run tested, a dispatch of CI | every job with every repetition: five rounds per tier, three ThreadSanitizer runs, Miri, Kani, the kernels, the server versions, instr, semver; macOS and Windows, called from `ci.yml` so that `all-checks` fails when they do |
+| Merge queue, a group of only such docs files | `lint` and `msrv` |
 
-The times are those of the pull request that introduced the tiers (#218) and of the queue
-runs before it. **Runners are the scarce resource**: the organisation gets 60 Linux jobs at
-a time, shared by every pull request and the merge queue, and GitHub has no priority
-between them. A full run asks for 46 jobs, so two pull requests running full sets starve
-the queue (the 1.4.0 release waited behind 60 queued runs). Every tier above exists to
-give runners back: a draft takes a twelfth, a ready pull request two thirds and its two
-largest matrices four jobs at a time, and a push that cancels a run frees its jobs.
+**Runners are the scarce resource**: the organisation gets 60 jobs at a time (5 on
+macOS), shared by every pull request and the merge queue, with no priority between them.
+In v1 a ready pull request ran every job once and the queue then ran them all again; the
+runners that took held the queue at two groups at a time, and the queue is where a
+change waited longest (162 of 201 minutes, [measured](workflow/data/v1/README.md)). v2
+leaves the heavy jobs to the queue alone, so it can build more groups at once.
 
 Prose counts as code where code reads it: `docs/errors/` (tests check every page) and
 every Markdown file a crate pulls in with `include_str!` (its code blocks are doc tests),
-such as the READMEs. Anything `ci-scope.py` cannot place counts as code. What lands on
-`main` is tested exactly as before: the queue runs everything, whatever the pull request
-ran. A failure that only a repetition shows (a race, a rare timing) is then found in the
-queue instead of on the pull request, and ejects the pull request from it: fix it like any
-red job.
+such as the READMEs. Anything `ci-scope.py` cannot place counts as code. Nothing with code
+in it lands without the queue's full run, whatever the pull request ran. A failure that
+only a heavy job or a repetition shows (Miri, a kernel, macOS, a race) is then found in
+the queue instead of on the pull request, and ejects the pull request from it: fix it like
+any red job. For a risky change (the unsafe core, a driver, the scheduler, cross-thread
+wake-ups), run the full set on the branch before enqueueing: Actions, CI, Run workflow,
+on the branch.
 
 **One compiler.** CI's stable Rust is pinned (`RUST_STABLE` in the workflows), not
 `stable`, so a Rust release cannot turn `main` red overnight, and `scripts/preflight.sh`
@@ -90,7 +97,10 @@ ran out of time inside a `net: ` step. Everything else fails the gate at once: a
 lint, a build, and a job that ran out of time anywhere else, since a hang is a bug. **A
 failing test is never rerun to pass**, with the one exception the project's rules make: a
 known flake whose issue is open with a fix on its way, listed in
-`.github/known-flakes.txt`, is rerun once, and the run's summary names the issue.
+`.github/known-flakes.txt`, is rerun once, and the run's summary names the issue. A test
+that fails in the queue on code the pull request did not touch goes into that list
+within the hour, in a pull request of its own that only adds the line (it runs as docs:
+minutes to land), then gets its fix ([WORKFLOW.md](WORKFLOW.md#flaky-tests)).
 
 **Naming a step `net: `** is a promise that it only fetches or installs: it goes through
 `scripts/ci-net.sh` (retries with a time limit on every try, `fetch` with a SHA-256) or
@@ -113,7 +123,11 @@ their result. On a test failure, read the log and fix the cause first.
 ## One change, start to finish
 
 1. **Take one item** from the backlog of your line of work (see [The backlog](#the-backlog)).
-   One concern per pull request. Work too large to review in one sitting
+   One concern per pull request, where related small fixes from one line of work (the
+   same crate, the same debug round) count as one concern: up to about five share a pull
+   request, each its own commit with its own test and `Fixes #N` in the description
+   ([WORKFLOW.md](WORKFLOW.md#batching-fixes)). The unsafe core, a driver and a public
+   API change keep a pull request of their own. Work too large to review in one sitting
    is split into pull requests that each pass CI on their own; a long line of work keeps a
    draft pull request open and lands in pieces.
 2. **Branch from the newest `main`**: `git fetch origin main && git switch -c <type>/<name> origin/main`.
@@ -134,8 +148,10 @@ their result. On a test failure, read the log and fix the cause first.
 6. **Write the changelog entry as a file in [`changelog.d/`](../changelog.d/README.md)**,
    never in `CHANGELOG.md`.
 7. **Open the pull request as a draft** and fill in the template; the description is the
-   handoff (see below). A draft runs the short set of CI jobs. **Mark it ready for
-   review** when the work is complete and the full gate passes: that starts every job.
+   handoff (see below). A draft runs the fast set of CI jobs. **Mark it ready for
+   review** when the work is complete and the full gate passes. Marking it ready starts
+   no new CI run (the fast set of its last push stands); it starts the macOS and Windows
+   workflows when the change touches their code.
 8. **Push finished steps, not edits.** A push cancels the run in progress. Collect the
    fixes for one round of CI or review into one push. Push sooner only when the running
    job is already red, or when the fix is for a job that has not started.
@@ -198,11 +214,11 @@ their result. On a test failure, read the log and fix the cause first.
 | cross-thread wake-ups: `src/notify.rs`, the injector, `TaskWaker` | the above (the gate runs loom) | 2 to 4 hours per driver |
 
 The soak tiers are defined in [RELEASING.md](RELEASING.md#how-long-to-soak); a major
-release soaks for 72 hours whatever changed. CI runs every job on every pull request
-ready for review and again in the merge queue whatever the table says, including what no
-local machine runs (kernels 5.15 to 6.18, the
-older ring tiers, Miri, Kani, instruction counts, other server versions): the gate makes a
-green run likely, it does not replace it.
+release soaks for 72 hours whatever changed. The merge queue runs every job whatever the
+table says, including what no local machine runs (kernels 5.15 to 6.18, the older ring
+tiers, Miri, Kani, instruction counts, other server versions, macOS, Windows): the gate
+makes a green queue run likely, it does not replace it. Since Workflow v2 those jobs no
+longer run on the pull request, so the gate is what keeps them from ejecting it.
 
 ## The backlog
 
