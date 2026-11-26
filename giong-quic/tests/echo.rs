@@ -769,6 +769,88 @@ fn a_server_that_does_not_accept_refuses_connections_past_its_bound() {
         .unwrap();
 }
 
+/// Connections that die while they wait to be accepted leave the accept
+/// queue and their place in the bound (issue #222): after the clients of a
+/// full queue close their connections, new clients are let in, and
+/// `accept` gives only those.
+#[test]
+fn connections_lost_before_they_are_accepted_free_their_place() {
+    giong::Builder::new()
+        .workers(1)
+        .recv_buffers(512, giong::net::GRO_RECV_BUFFER)
+        .block_on(async {
+            let (tls, ca) = server_tls();
+            let patient = || TransportConfig::default().idle_timeout(Duration::from_secs(600));
+            let server = Endpoint::server(
+                "127.0.0.1:0".parse().unwrap(),
+                ServerConfig::new(tls).unwrap().transport(patient()),
+            )
+            .unwrap();
+            let addr = server.local_addr().unwrap();
+            let client =
+                std::rc::Rc::new(Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap());
+            let cfg = ClientConfig::new(client_tls(ca))
+                .unwrap()
+                .transport(patient());
+            let wave = |n: usize| {
+                let tasks: Vec<_> = (0..n)
+                    .map(|_| {
+                        let (client, cfg) = (client.clone(), cfg.clone());
+                        giong::spawn(async move {
+                            giong::time::timeout(
+                                Duration::from_secs(10),
+                                client.connect(addr, "localhost", &cfg),
+                            )
+                            .await
+                            .expect("a connect never ends")
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                async move {
+                    let mut made = Vec::new();
+                    for t in tasks {
+                        if let Ok(conn) = t.await.unwrap() {
+                            made.push(conn);
+                        }
+                    }
+                    made
+                }
+            };
+            // Fill the server's queue: nobody accepts yet.
+            let mut first = Vec::new();
+            for _ in 0..11 {
+                first.extend(wave(100).await);
+            }
+            assert_eq!(first.len(), 1024);
+            // Their clients close them while they wait in the queue, a few
+            // at a time: a CONNECTION_CLOSE is sent once, and a burst of a
+            // thousand could overflow the server's socket.
+            for some in first.chunks(16) {
+                for conn in some {
+                    conn.close(0, b"bye");
+                }
+                giong::time::sleep(Duration::from_millis(10)).await;
+            }
+            drop(first);
+            giong::time::sleep(Duration::from_millis(500)).await;
+            // New clients get in, and they are what the server accepts.
+            let second = wave(100).await;
+            assert_eq!(second.len(), 100, "new clients were refused");
+            let mut accepted = Vec::new();
+            for _ in 0..100 {
+                let conn = giong::time::timeout(Duration::from_secs(5), server.accept())
+                    .await
+                    .expect("a live connection is accepted")
+                    .expect("the endpoint is open");
+                accepted.push(conn);
+            }
+            let more = giong::time::timeout(Duration::from_millis(300), server.accept()).await;
+            assert!(more.is_err(), "a closed connection came out of accept");
+            drop((second, accepted));
+        })
+        .unwrap();
+}
+
 #[test]
 fn a_client_can_count_a_connection_made_that_the_server_never_completes() {
     // Why the bound test above gives both sides a long idle timeout: the

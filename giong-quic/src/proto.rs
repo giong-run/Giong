@@ -81,6 +81,9 @@ struct Conn {
     /// Handed to `accept` already (a server endpoint with early data hands
     /// a connection over before its handshake ends).
     handed: bool,
+    /// In `State::accepted`, which holds a reference to it, waiting for the
+    /// application to accept it.
+    queued: bool,
     /// Client: the connection started with 0-RTT keys. Server: the
     /// endpoint accepts early data.
     early: bool,
@@ -220,6 +223,7 @@ fn hand_over(
         return;
     }
     conn.handed = true;
+    conn.queued = true;
     conn.refs += 1;
     accepted.push_back(i);
     if let Some(w) = accept_waker.take() {
@@ -293,6 +297,7 @@ impl State {
             dirty: false,
             incoming,
             handed: false,
+            queued: false,
             early,
             epoch: 0,
             early_bi: VecDeque::new(),
@@ -605,6 +610,18 @@ impl State {
                 break;
             }
         }
+        if conn.queued && conn.lost.is_some() {
+            // Lost while waiting to be accepted (idle timeout, the peer
+            // closed or reset it): it leaves the accept queue and its place
+            // in the bound, so that dead connections neither keep new
+            // clients out nor come out of `accept`.
+            conn.queued = false;
+            conn.refs -= 1;
+            self.unaccepted -= 1;
+            if let Some(at) = self.accepted.iter().position(|&h| h == i) {
+                self.accepted.remove(at);
+            }
+        }
         if conn.c.is_drained() && conn.refs == 0 {
             if conn.incoming && !conn.handed {
                 self.unaccepted -= 1;
@@ -912,6 +929,7 @@ impl Shared {
         while let Some(h) = st.accepted.pop_front() {
             st.unaccepted -= 1;
             let c = st.conn(h);
+            c.queued = false;
             c.refs -= 1;
             if c.lost.is_none() {
                 c.c.close(now, 0u32.into(), Bytes::new());
@@ -930,6 +948,7 @@ impl Shared {
             let mut st = self.st.borrow_mut();
             if let Some(h) = st.accepted.pop_front() {
                 st.unaccepted -= 1;
+                st.conn(h).queued = false;
                 return Poll::Ready(Some(h));
             }
             if st.closed {
