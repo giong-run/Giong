@@ -903,6 +903,13 @@ impl Session {
             Recv::Pipe { pending, .. } => {
                 pending.extend_from_slice(data);
                 st.held += data.len() as u64;
+                // A piece arrived: the timeout for the next one starts when
+                // the handler waits for it again (`service`), not from the
+                // first wait, so a body that keeps coming has no deadline as
+                // a whole.
+                if !data.is_empty() {
+                    st.deadline = None;
+                }
                 self.held += data.len() as u64;
             }
             Recv::Done => st.unacked += data.len() as u32,
