@@ -39,6 +39,7 @@ impl Handler for App {
             // Reads the body, then answers with its size in the body, and
             // its size and the request's trailers in trailers.
             "/sum" => {
+                self.record("sum started");
                 let body = req.body_stream().expect("a streamed body");
                 assert!(body.trailers().is_none(), "no trailers before the end");
                 // An HTTP/2 stream the client resets drops its handler.
@@ -281,9 +282,17 @@ fn an_aborted_request_body_cancels_the_request() {
             let app = App::default();
             let base = serve(app.clone());
             let (request, body) = client.post(&format!("{base}/sum")).streamed_body();
+            let started = app.clone();
             let upload = giong::spawn(async move {
                 body.send("partial").await.unwrap();
-                sleep(Duration::from_millis(20)).await;
+                // Once the handler runs: a request aborted before it reaches
+                // the server (on a runner slow to connect, the reset can go
+                // out with the request's headers) never calls the handler,
+                // which then has nothing to see.
+                eventually(&format!("{version:?}: the handler starts"), || {
+                    started.seen("sum started")
+                })
+                .await;
                 body.abort();
             });
             let error = request.send().await.unwrap_err();
