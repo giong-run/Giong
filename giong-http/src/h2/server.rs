@@ -2585,15 +2585,19 @@ enum Wake<R, W> {
 /// already received, which may include the client's preface. `slot` is the
 /// connection's place under `max_connections`, if it has one: it is marked
 /// idle while no stream is open, so that the accept loop may close it.
+///
+/// `cfg` and `peer` are borrowed: an `async fn` keeps its arguments twice
+/// (as received, and moved into its body), and this future lives as long
+/// as the connection.
 pub(crate) async fn serve<T: Transport, H: Handler>(
     io: &T,
-    cfg: Config,
-    peer: Option<SocketAddr>,
+    cfg: &Config,
+    peer: &Option<SocketAddr>,
     handler: &H,
     mut input: Vec<u8>,
     slot: Option<&crate::server::Slot>,
 ) {
-    let mut s = Session::new(cfg, peer);
+    let mut s = Session::new(*cfg, *peer);
     s.start();
     if let Some(slot) = slot {
         slot.allow_idle();
@@ -2606,7 +2610,9 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             break;
         }
         let left = preface_deadline.saturating_duration_since(Instant::now());
-        match giong::time::timeout(left, io.recv()).await {
+        // On the heap, like the write below: over TLS this receive is
+        // larger than any state of the loop that follows.
+        match HeapFuture::new(giong::time::timeout(left, io.recv())).await {
             Ok(Ok(chunk)) if !chunk.is_empty() => input.extend_from_slice(&chunk),
             _ => return,
         }
@@ -2616,7 +2622,9 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
             "the connection did not start with the HTTP/2 preface",
         ));
         let out = mem::take(&mut s.out);
-        let _ = giong::time::timeout(cfg.write_timeout, io.write_all(out)).await;
+        // On the heap: inline, this write would be kept beside every state
+        // of the connection's future, as large as the largest of them.
+        let _ = HeapFuture::new(giong::time::timeout(cfg.write_timeout, io.write_all(out))).await;
         return;
     }
     input.drain(..PREFACE.len());
@@ -2836,7 +2844,15 @@ pub(crate) async fn serve<T: Transport, H: Handler>(
     // so that the client does not get a reset instead of the GOAWAY.
     drop(tasks);
     recv.set(None);
-    let _ = giong::time::timeout(cfg.write_timeout, io.close_write()).await;
+    // On the heap, like the preface's receive: once per connection, and
+    // inline its states would be kept beside every state of the loop.
+    HeapFuture::new(close_and_linger(io, cfg.write_timeout)).await;
+}
+
+/// Closes our side of the connection, and reads what is still on its way
+/// for a moment.
+async fn close_and_linger<T: Transport>(io: &T, write_timeout: Duration) {
+    let _ = giong::time::timeout(write_timeout, io.close_write()).await;
     let deadline = Instant::now() + ERROR_LINGER;
     loop {
         let left = deadline.saturating_duration_since(Instant::now());
