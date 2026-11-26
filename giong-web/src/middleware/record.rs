@@ -472,6 +472,7 @@ fn percent_decode(s: &str) -> Cow<'_, str> {
             b'%' if i + 2 < b.len() => {
                 match std::str::from_utf8(&b[i + 1..i + 3])
                     .ok()
+                    .filter(|h| h.bytes().all(|c| c.is_ascii_hexdigit()))
                     .and_then(|h| u8::from_str_radix(h, 16).ok())
                 {
                     Some(v) => {
@@ -622,6 +623,15 @@ fn base64_into(out: &mut String, input: &[u8]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn query_names_decode_two_hex_digits_only() {
+        assert_eq!(percent_decode("api%5Fkey"), "api_key");
+        assert_eq!(percent_decode("a+b"), "a b");
+        // A sign is not a hex digit (u8::from_str_radix takes "+5").
+        assert_eq!(percent_decode("%+5"), "% 5");
+        assert_eq!(percent_decode("%4"), "%4");
+    }
 
     #[test]
     fn json_keys_unescape_four_hex_digits_only() {

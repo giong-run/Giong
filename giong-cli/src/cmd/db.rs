@@ -648,23 +648,26 @@ pub struct UrlParts {
 }
 
 fn percent_decode(s: &str) -> String {
-    // On bytes: a `%` before a character of more than one byte must not
-    // cut that character (slicing the `str` there panicked), and only two
-    // hex digits make an escape (`from_str_radix` also takes a `+`).
-    let hex = |c: u8| (c as char).to_digit(16).map(|d| d as u8);
     let b = s.as_bytes();
     let mut out = Vec::with_capacity(b.len());
     let mut i = 0;
     while i < b.len() {
-        if b[i] == b'%' && i + 2 < b.len() {
-            if let (Some(h), Some(l)) = (hex(b[i + 1]), hex(b[i + 2])) {
-                out.push(h << 4 | l);
+        // Bytes, not `&s[..]`: the two after a '%' may cut a character. And
+        // two hex digits, not from_str_radix alone, which also takes "+5".
+        let hex = b.get(i + 1..i + 3).and_then(|h| {
+            let (hi, lo) = ((h[0] as char).to_digit(16)?, (h[1] as char).to_digit(16)?);
+            Some((hi * 16 + lo) as u8)
+        });
+        match (b[i], hex) {
+            (b'%', Some(v)) => {
+                out.push(v);
                 i += 3;
-                continue;
+            }
+            (c, _) => {
+                out.push(c);
+                i += 1;
             }
         }
-        out.push(b[i]);
-        i += 1;
     }
     String::from_utf8_lossy(&out).into_owned()
 }
@@ -2607,13 +2610,11 @@ mod tests {
         assert_eq!(replace_database("postgres://h", "x"), "postgres://h/x");
         assert_eq!(percent_decode("a%2"), "a%2");
         assert_eq!(percent_decode("%zz%41"), "%zzA");
-        // A `%` before a two-byte character used to panic, cutting it.
-        assert_eq!(percent_decode("p%a\u{e9}"), "p%a\u{e9}");
-        assert_eq!(
-            parse_url("mysql://u:p%a\u{e9}@h/d").unwrap().1.password,
-            "p%a\u{e9}"
-        );
-        assert_eq!(percent_decode("%+1"), "%+1");
+        // A character cut by the two bytes after '%' (it panicked), and a
+        // sign, which from_str_radix takes, are left as written.
+        assert_eq!(percent_decode("%€x"), "%€x");
+        assert_eq!(percent_decode("p%+5"), "p%+5");
+        assert_eq!(parse_url("postgres://u:p%€@h/d").unwrap().1.password, "p%€");
     }
 
     #[test]

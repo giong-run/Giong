@@ -944,6 +944,16 @@ impl Dev {
         if mcp_on {
             cmd.env("GIONG_MCP", format!("unix:{}", mcp.display()));
         }
+        // Where to look for the new build once it runs without a ready
+        // signal. Looked at before it starts: a port something else already
+        // accepts on (a process left over, another service) answers whether
+        // or not the new build binds it, so it proves nothing.
+        let probes: Vec<SocketAddr> = if self.once || shared {
+            Vec::new()
+        } else {
+            self.addresses.iter().map(|a| probe_address(*a)).collect()
+        };
+        let held = accepts(&probes);
         #[cfg(unix)]
         let (child, ready) = if shared {
             let (ours, theirs) = std::os::unix::net::UnixStream::pair()
@@ -987,16 +997,18 @@ impl Dev {
         // build was stopped first, so the port is free until the new one
         // binds it. With an address, the build has started when it accepts
         // a connection there; without one, or with --once (a program that
-        // may never listen), alive after a moment counts.
+        // may never listen), alive after a moment counts. With a port that
+        // something else held before the build started, the build cannot
+        // bind it (it fails with the port in use, which names the holder)
+        // unless it shares the port: alive at --ready-timeout counts.
         let spawned = Instant::now();
         let floor = spawned + Duration::from_millis(300);
         let deadline = spawned + self.ready_timeout;
-        let probes: Vec<SocketAddr> = if self.once {
-            Vec::new()
+        let mut settle_until = if held {
+            Some(deadline)
         } else {
-            self.addresses.iter().map(|a| probe_address(*a)).collect()
+            probes.is_empty().then_some(floor)
         };
-        let mut settle_until = probes.is_empty().then_some(floor);
         loop {
             if let Ok(Some(status)) = service.child.try_wait() {
                 // With --once, a program that finishes its work at once and
