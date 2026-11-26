@@ -58,6 +58,15 @@
 # valgrind), main 82cfb59 (after #410) against the change merged with it,
 # scripts/instr.py on both, 3 rounds; rows that moved 0.05% or less, and the
 # resident-set rows (page-granular noise inside their 10%), are unchanged.
+# The https instruction rows and every idle-https row: rustls in the process
+# through its unbuffered API, which leaves an idle connection no receive
+# buffer, and outgoing records written through a scratch buffer each thread
+# shares (changelog.d/perf-tls-idle-memory.md), measured on a 4-vCPU cloud VM
+# (Linux 6.18, the same rustc and valgrind), main 1cb2988 against the
+# change, scripts/instr.py on both, 3 rounds: idle-https 10,834 to 6,069
+# heap bytes per connection (io_uring), https -1.2% (io_uring) and -0.9%
+# (epoll) instructions; allocations unchanged. The idle-https rows are the
+# change's CI run (45877914608), which gave the same heap bytes as the VM.
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1100.4,1
 io_uring,spawn,allocations,1.000,1
@@ -83,7 +92,7 @@ io_uring,h2,instructions,29665.1,1
 io_uring,h2,allocations,22.000,1
 io_uring,h2-streams,instructions,240853.9,0.5
 io_uring,h2-streams,allocations,230.005,0.5
-io_uring,https,instructions,33902.4,1
+io_uring,https,instructions,33486.2,1
 io_uring,https,allocations,17.035,1
 io_uring,web,instructions,11308.7,1
 io_uring,web,allocations,3.000,1
@@ -99,9 +108,9 @@ io_uring,idle-http1,allocations,3.030,1
 io_uring,idle-h2,heap_bytes,4565.8,1
 io_uring,idle-h2,rss_bytes,4849.7,10
 io_uring,idle-h2,allocations,25.040,1
-io_uring,idle-https,heap_bytes,10801.0,1
-io_uring,idle-https,rss_bytes,11225.1,10
-io_uring,idle-https,allocations,121.140,1
+io_uring,idle-https,heap_bytes,6069.3,1
+io_uring,idle-https,rss_bytes,6479.9,10
+io_uring,idle-https,allocations,122.100,1
 epoll,spawn,instructions,996.5,1
 epoll,spawn,allocations,1.000,1
 epoll,yield,instructions,306.2,1
@@ -126,7 +135,7 @@ epoll,h2,instructions,30687.2,1
 epoll,h2,allocations,22.001,1
 epoll,h2-streams,instructions,241879.5,0.5
 epoll,h2-streams,allocations,230.004,0.5
-epoll,https,instructions,34898.4,1
+epoll,https,instructions,34577.9,1
 epoll,https,allocations,17.000,1
 epoll,web,instructions,12162.5,1
 epoll,web,allocations,3.000,1
@@ -142,6 +151,6 @@ epoll,idle-http1,allocations,4.020,1
 epoll,idle-h2,heap_bytes,4582.4,1
 epoll,idle-h2,rss_bytes,4804.6,10
 epoll,idle-h2,allocations,25.040,1
-epoll,idle-https,heap_bytes,10804.3,1
-epoll,idle-https,rss_bytes,11106.3,10
-epoll,idle-https,allocations,121.100,1
+epoll,idle-https,heap_bytes,6085.9,1
+epoll,idle-https,rss_bytes,6381.6,10
+epoll,idle-https,allocations,122.100,1

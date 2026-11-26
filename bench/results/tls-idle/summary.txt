@@ -1,0 +1,4 @@
+8000 idle HTTPS connections, one worker; median of the rounds
+binary            anon KiB/conn  RSS KiB/conn  RSS after MiB
+main-1cb2988              10.92         10.96           89.8
+unbuffered                 6.17          6.19           52.8

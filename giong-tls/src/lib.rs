@@ -84,6 +84,7 @@ mod keychain;
 mod ktls;
 mod received;
 mod sys;
+mod user;
 #[cfg(windows)]
 mod winstore;
 
@@ -106,7 +107,7 @@ use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::future::poll_fn;
-use std::io::{self, Read, Write};
+use std::io;
 use std::mem;
 use std::net::Shutdown;
 use std::path::{Path, PathBuf};
@@ -118,13 +119,13 @@ use giong::error::Code;
 use giong::net::TcpStream;
 use giong::time::timeout;
 use rustls::client::ResolvesClientCert;
+use rustls::client::UnbufferedClientConnection;
 use rustls::pki_types::pem::PemObject;
 use rustls::pki_types::{PrivateKeyDer, ServerName};
+use rustls::server::UnbufferedServerConnection;
 use rustls::sign::CertifiedKey;
-use rustls::{
-    ClientConfig, ClientConnection, Connection, RootCertStore, ServerConfig, ServerConnection,
-    SignatureScheme,
-};
+use rustls::{ClientConfig, RootCertStore, ServerConfig, SignatureScheme};
+use user::User;
 
 /// The rustls crate, for building the configurations that
 /// [`TlsAcceptor::from_rustls`] and [`TlsConnector::from_rustls`] take.
@@ -189,6 +190,25 @@ pub(crate) fn mismatched_key(e: rustls::Error) -> io::Error {
 }
 
 /// What rustls reported, with the code that says what to do about it.
+/// The error a receive in the process fails with.
+fn read_error(e: user::ReadError) -> io::Error {
+    match e {
+        user::ReadError::Tls(e) => tls_error(e),
+        user::ReadError::TooLarge => coded(
+            Code::TlsProtocol,
+            "the peer sent more TLS data than a record or a handshake message may hold \
+             before it could be processed",
+            "check that the other side speaks TLS on this port.",
+        ),
+        user::ReadError::EarlyData => coded(
+            Code::TlsProtocol,
+            "the client sent 0-RTT (early) data, which giong-tls does not accept",
+            "set max_early_data_size to 0 in the rustls ServerConfig given to \
+             TlsAcceptor::from_rustls: 0-RTT data can be replayed.",
+        ),
+    }
+}
+
 fn tls_error(e: rustls::Error) -> io::Error {
     match e {
         // What `openssl req -x509` makes unless told otherwise, and what
@@ -246,9 +266,24 @@ fn handshake_eof() -> io::Error {
 /// connection's whole life (about 64 KiB per idle connection otherwise).
 const WIRE_KEPT: usize = 16 * 1024;
 
+/// How many scratch buffers for outgoing records a thread keeps between
+/// writes, for all its streams: one per stream writing at the same moment.
+const SPARE_WIRES_KEPT: usize = 4;
+
+thread_local! {
+    /// Scratch buffers for outgoing records, shared by the thread's streams
+    /// so that an idle stream keeps none (it kept its own, about 660 bytes
+    /// after a small response).
+    static SPARE_WIRES: RefCell<Vec<Vec<u8>>> = const { RefCell::new(Vec::new()) };
+}
+
 /// Encrypted records of one write that are sent as soon as this many have
 /// gathered, even if more pieces of the write follow.
 const SEND_AT: usize = 64 * 1024;
+
+/// Plaintext encrypted per call into rustls: what its buffered connection
+/// took per write.
+const ENCRYPT_AT: usize = 64 * 1024;
 
 #[cfg(test)]
 thread_local! {
@@ -264,20 +299,6 @@ fn flush_room() -> usize {
     return FLUSH_ROOM.with(Cell::get);
     #[cfg(not(test))]
     usize::MAX
-}
-
-/// `true` if `records`, whole TLS records as rustls writes them, hold one
-/// of application data (content type 23; under TLS 1.3 every encrypted
-/// record says so).
-fn has_application_data(records: &[u8]) -> bool {
-    let mut at = 0;
-    while let Some(header) = records.get(at..at + 5) {
-        if header[0] == 23 {
-            return true;
-        }
-        at += 5 + usize::from(u16::from_be_bytes([header[3], header[4]]));
-    }
-    false
 }
 
 /// The error a send fails with once the sending direction has ended for
@@ -682,8 +703,10 @@ impl TlsAcceptor {
             }
         };
         let Some(_) = &self.chacha else {
-            let conn = ServerConnection::new(self.config.clone()).map_err(tls_error)?;
-            return TlsStream::new(tcp, conn.into())
+            let conn = UnbufferedServerConnection::new(self.config.clone())
+                .and_then(User::server)
+                .map_err(tls_error)?;
+            return TlsStream::new(tcp, conn)
                 .handshake(self.handshake_timeout, Duration::ZERO, None)
                 .await;
         };
@@ -697,8 +720,10 @@ impl TlsAcceptor {
         if first.is_empty() {
             return Err(handshake_eof());
         }
-        let conn = ServerConnection::new(self.config_for(&first)).map_err(tls_error)?;
-        TlsStream::new(tcp, conn.into())
+        let conn = UnbufferedServerConnection::new(self.config_for(&first))
+            .and_then(User::server)
+            .map_err(tls_error)?;
+        TlsStream::new(tcp, conn)
             .handshake(self.handshake_timeout, started.elapsed(), Some(first))
             .await
     }
@@ -987,8 +1012,10 @@ impl TlsConnector {
                 tcp
             }
         };
-        let conn = ClientConnection::new(self.config.clone(), name).map_err(tls_error)?;
-        TlsStream::new(tcp, conn.into())
+        let conn = UnbufferedClientConnection::new(self.config.clone(), name)
+            .and_then(User::client)
+            .map_err(tls_error)?;
+        TlsStream::new(tcp, conn)
             .handshake(self.handshake_timeout, Duration::ZERO, None)
             .await
     }
@@ -1198,9 +1225,6 @@ pub struct TlsStream {
     engine: RefCell<Engine>,
     /// Decrypted data not handed out yet.
     plain: RefCell<Vec<u8>>,
-    /// Scratch buffer for outgoing TLS records, reused between writes while
-    /// it is small (see [`WIRE_KEPT`]).
-    wire: RefCell<Vec<u8>>,
     /// The handshake has returned. From then on, records rustls queues in
     /// answer to what arrives (TLS 1.3 key updates) may wait for the next
     /// send instead of going out alone (see [`hold_output`](Self::hold_output)).
@@ -1236,8 +1260,8 @@ pub struct TlsStream {
 // would cost an allocation and a pointer to follow on every call.
 #[allow(clippy::large_enum_variant)]
 enum Engine {
-    /// rustls, in the process.
-    User(Connection),
+    /// rustls, in the process (see [`user`]).
+    User(User),
     /// The kernel; rustls keeps what it needs for key updates and session
     /// tickets.
     Kernel(ktls::Kernel),
@@ -1269,7 +1293,7 @@ impl Drop for Sending<'_> {
 }
 
 impl TlsStream {
-    fn new(tcp: TcpStream, conn: Connection) -> Self {
+    fn new(tcp: TcpStream, conn: User) -> Self {
         Self::with_engine(tcp, Engine::User(conn), Vec::new(), false)
     }
 
@@ -1285,7 +1309,6 @@ impl TlsStream {
             tcp,
             engine: RefCell::new(engine),
             plain: RefCell::new(plain),
-            wire: RefCell::new(Vec::new()),
             established: Cell::new(false),
             eof: Cell::new(peer_closed),
             close_notify: Cell::new(peer_closed),
@@ -1300,7 +1323,7 @@ impl TlsStream {
 
     /// rustls' connection, on a stream rustls encrypts. Never held across
     /// an `.await`.
-    fn conn(&self) -> RefMut<'_, Connection> {
+    fn conn(&self) -> RefMut<'_, User> {
         RefMut::map(self.engine.borrow_mut(), |e| match e {
             Engine::User(c) => c,
             Engine::Kernel(_) => unreachable!("rustls' connection on a kernel TLS stream"),
@@ -1411,15 +1434,14 @@ impl TlsStream {
         if conn.is_handshaking() {
             return false;
         }
-        (matches!(*conn, Connection::Server(_))
-            && conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3))
+        conn.is_server() && conn.protocol_version() == Some(rustls::ProtocolVersion::TLSv1_3)
     }
 
     /// Takes the scratch buffer for outgoing records. It starts with what
     /// a receive left unsent (see [`flush_now`](Self::flush_now)), which has
     /// to go out before anything else. The caller holds the send lock.
     fn take_wire(&self) -> Vec<u8> {
-        let mut wire = mem::take(&mut *self.wire.borrow_mut());
+        let mut wire = SPARE_WIRES.with(|spare| spare.borrow_mut().pop().unwrap_or_default());
         let mut unsent = self.unsent.borrow_mut();
         if unsent.capacity() > 0 {
             wire.extend_from_slice(&unsent);
@@ -1429,18 +1451,23 @@ impl TlsStream {
         wire
     }
 
-    /// Keeps `wire` for the next write, unless a large write grew it: a
-    /// connection that once sent a large response should not hold that much
-    /// for the rest of its life.
+    /// Gives `wire` back to the thread's spare buffers for the next write,
+    /// unless a large write grew it: a thread that once sent a large
+    /// response should not hold that much for the rest of its life.
     fn keep_wire(&self, mut wire: Vec<u8>) {
         if !wire.is_empty() && !self.broken.get() {
             // The write ended before its first send (a file that could not
             // be read, say): what `take_wire` handed over is still owed.
             self.unsent.borrow_mut().append(&mut wire);
         }
-        if wire.capacity() <= WIRE_KEPT {
+        if wire.capacity() <= WIRE_KEPT && wire.capacity() > 0 {
             wire.clear();
-            *self.wire.borrow_mut() = wire;
+            SPARE_WIRES.with(|spare| {
+                let mut spare = spare.borrow_mut();
+                if spare.len() < SPARE_WIRES_KEPT {
+                    spare.push(wire);
+                }
+            });
         }
     }
 
@@ -1483,12 +1510,7 @@ impl TlsStream {
     /// holds already, and sends them. The caller holds the send lock.
     async fn send_queued(&self, wire: &mut Vec<u8>) -> io::Result<()> {
         loop {
-            {
-                let mut conn = self.conn();
-                while conn.wants_write() {
-                    conn.write_tls(wire)?;
-                }
-            }
+            self.conn().write_tls(wire);
             if wire.is_empty() {
                 return Ok(());
             }
@@ -1521,12 +1543,7 @@ impl TlsStream {
             return Ok(());
         }
         let mut unsent = self.unsent.borrow_mut();
-        {
-            let mut conn = self.conn();
-            while conn.wants_write() {
-                conn.write_tls(&mut *unsent)?;
-            }
-        }
+        self.conn().write_tls(&mut unsent);
         loop {
             // All of it, or as much as a test lets the socket take.
             let len = unsent.len().min(flush_room());
@@ -1589,23 +1606,32 @@ impl TlsStream {
     async fn send_plain(&self, wire: &mut Vec<u8>, data: &[u8], last: bool) -> io::Result<()> {
         let mut sent = 0;
         while sent < data.len() {
+            let piece = &data[sent..data.len().min(sent + ENCRYPT_AT)];
             let (carried, refused) = {
                 let mut conn = self.conn();
-                while conn.wants_write() {
-                    conn.write_tls(wire)?;
-                }
+                conn.write_tls(wire);
                 let carried = !wire.is_empty();
-                let start = wire.len();
-                let n = conn.writer().write(&data[sent..])?;
-                while conn.wants_write() {
-                    conn.write_tls(wire)?;
-                }
-                sent += n;
-                // rustls took the bytes and encrypted none of them: the key
-                // has encrypted as many records as its cipher allows and,
-                // on TLS 1.2, cannot be changed. rustls queued close_notify
-                // instead and drops everything it is given from then on.
-                (carried, n > 0 && !has_application_data(&wire[start..]))
+                let refused = match conn.encrypt(piece, wire) {
+                    Ok(_) => {
+                        sent += piece.len();
+                        false
+                    }
+                    // The key has encrypted as many records as its cipher
+                    // allows and, on TLS 1.2, cannot be changed: rustls
+                    // queued close_notify, which goes out below, and
+                    // encrypts nothing more.
+                    Err(user::Refused::Exhausted) => {
+                        conn.write_tls(wire);
+                        true
+                    }
+                    Err(user::Refused::Closed) => {
+                        drop(conn);
+                        self.closed.set(Some(Code::TlsBroken));
+                        return Err(sending_closed(Code::TlsBroken));
+                    }
+                    Err(user::Refused::Tls(e)) => return Err(tls_error(e)),
+                };
+                (carried, refused)
             };
             let more = sent < data.len() || !last;
             if !wire.is_empty() && (carried || refused || !more || wire.len() >= SEND_AT) {
@@ -1691,50 +1717,11 @@ impl TlsStream {
         let result = {
             let mut conn = self.conn();
             let mut plain = self.plain.borrow_mut();
-            let mut input = &chunk[..];
-            let mut result = Ok(());
-            while !input.is_empty() {
-                // rustls buffers a bounded amount of plaintext, so it has to
-                // be drained as the records are fed in.
-                match conn.read_tls(&mut input) {
-                    Ok(0) => {
-                        result = Err(coded(
-                            Code::TlsProtocol,
-                            "rustls accepted no more TLS data",
-                            "this is a bug in giong-tls; please report it at \
-                             https://github.com/giong-run/Giong/issues.",
-                        ));
-                        break;
-                    }
-                    Ok(_) => {}
-                    Err(e) => {
-                        result = Err(e);
-                        break;
-                    }
-                }
-                match conn.process_new_packets() {
-                    Ok(state) => {
-                        let n = state.plaintext_bytes_to_read();
-                        if n > 0 {
-                            let at = plain.len();
-                            plain.resize(at + n, 0);
-                            if let Err(e) = conn.reader().read_exact(&mut plain[at..]) {
-                                plain.truncate(at);
-                                result = Err(e);
-                                break;
-                            }
-                        }
-                        if state.peer_has_closed() {
-                            self.close_notify.set(true);
-                            self.eof.set(true);
-                            break;
-                        }
-                    }
-                    Err(e) => {
-                        result = Err(tls_error(e));
-                        break;
-                    }
-                }
+            // Data decrypted before a failure stays in `plain`.
+            let result = conn.read_tls(&chunk, &mut plain).map_err(read_error);
+            if conn.peer_closed() {
+                self.close_notify.set(true);
+                self.eof.set(true);
             }
             result
         };
@@ -1941,12 +1928,7 @@ impl TlsStream {
     /// take at once goes the usual way. The caller holds the send lock, so
     /// no other send is in flight.
     async fn send_closing(&self, wire: &mut Vec<u8>) -> io::Result<()> {
-        {
-            let mut conn = self.conn();
-            while conn.wants_write() {
-                conn.write_tls(wire)?;
-            }
-        }
+        self.conn().write_tls(wire);
         // Linux holds the bytes for the FIN (`MSG_MORE`); elsewhere this is
         // a plain send that does not wait.
         match sys::send_now(sys::AsRawFd::as_raw_fd(&self.tcp), wire, true) {
@@ -2337,27 +2319,6 @@ mod tests {
     }
 
     #[test]
-    fn records_are_scanned_for_application_data() {
-        // Header: type, version, length; then that many bytes.
-        let record = |typ: u8, len: u16| {
-            let mut r = vec![typ, 3, 3];
-            r.extend_from_slice(&len.to_be_bytes());
-            r.resize(5 + len as usize, 0xAA);
-            r
-        };
-        assert!(!has_application_data(&[]));
-        assert!(!has_application_data(&record(21, 26)));
-        assert!(has_application_data(&record(23, 0)));
-        let mut alert_then_data = record(21, 26);
-        alert_then_data.extend(record(23, 300));
-        assert!(has_application_data(&alert_then_data));
-        // A data record's body never counts as a header.
-        let mut alert = record(21, 26);
-        alert[5] = 23;
-        assert!(!has_application_data(&alert));
-    }
-
-    #[test]
     fn secrets_are_extractable_only_when_the_kernel_will_take_them() {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
         let (cert, key) = (key.cert.pem(), key.key_pair.serialize_pem());
@@ -2482,6 +2443,48 @@ mod tests {
             let tls = connector.connect("localhost", tcp).await.unwrap();
             assert!(tls.recv().await.unwrap().is_empty());
             assert!(tls.received_close_notify());
+            server.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn a_connection_keeps_a_receive_buffer_only_while_it_holds_part_of_a_record() {
+        // rustls' buffered connection kept 4 KiB for this for its whole life,
+        // most of what an idle HTTPS connection cost.
+        let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).unwrap();
+        let cert = key.cert.pem();
+        let acceptor = TlsAcceptor::with_certificates(
+            &Certificates::from_pem(cert.as_bytes(), key.key_pair.serialize_pem().as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        let connector = TlsConnector::with_root_pem(cert.as_bytes()).unwrap();
+        giong::block_on(async move {
+            let listener = giong::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let addr = listener.local_addr().unwrap();
+            let server = giong::spawn(async move {
+                let tcp = listener.accept().await.unwrap();
+                let tls = acceptor.accept(tcp).await.unwrap();
+                assert_eq!(&tls.recv().await.unwrap()[..], b"hello");
+                assert_eq!(tls.conn().partial_capacity(), 0);
+                tls.write_all(b"go".to_vec()).await.0.unwrap();
+                // The client sends the first bytes of a record header.
+                let mut recv = std::pin::pin!(tls.recv());
+                for _ in 0..400 {
+                    let ready = poll_fn(|cx| Poll::Ready(recv.as_mut().poll(cx).is_ready())).await;
+                    assert!(!ready);
+                    if tls.conn().partial_capacity() > 0 {
+                        break;
+                    }
+                    giong::time::sleep(Duration::from_millis(5)).await;
+                }
+                assert!(tls.conn().partial_capacity() > 0);
+            });
+            let tcp = TcpStream::connect(addr).await.unwrap();
+            let tls = connector.connect("localhost", tcp).await.unwrap();
+            tls.write_all(b"hello".to_vec()).await.0.unwrap();
+            assert_eq!(&tls.recv().await.unwrap()[..], b"go");
+            tls.tcp().write_all(vec![23u8, 3, 3]).await.0.unwrap();
             server.await.unwrap();
         });
     }
