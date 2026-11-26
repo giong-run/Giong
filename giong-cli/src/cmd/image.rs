@@ -399,6 +399,23 @@ pub fn port_from_example(text: &str) -> Option<u16> {
         })
 }
 
+/// The file name of a SQLite database from an uncommented
+/// `DATABASE_URL=sqlite:...` in `.env.example` (`sqlite:data/shop.db` gives
+/// `shop.db`), so the image keeps it where the Dockerfile from `giong new`
+/// does: `/data`, owned by nonroot.
+pub fn sqlite_file_from_example(text: &str) -> Option<String> {
+    let url = text
+        .lines()
+        .map(str::trim)
+        .find_map(|l| l.strip_prefix("DATABASE_URL="))?
+        .trim()
+        .trim_matches(['"', '\'']);
+    let path = url.strip_prefix("sqlite:")?;
+    let file = path.rsplit('/').next()?.trim();
+    (!file.is_empty() && file != "." && file != ".." && !file.contains(['\\', '?']))
+        .then(|| file.to_string())
+}
+
 /// Files under `rel` (a file or a directory) in `root`, sorted.
 fn collect(root: &Path, rel: &str, out: &mut Vec<Entry>) -> Result<(), Failure> {
     let bad = |what: String| {
@@ -533,6 +550,8 @@ pub struct Meta {
     pub port: u16,
     pub created: u64,
     pub labels: BTreeMap<String, String>,
+    /// The SQLite file kept in `/data`, from [`sqlite_file_from_example`].
+    pub sqlite: Option<String>,
 }
 
 /// A reference as containerd stores it: `svc:1` is
@@ -561,7 +580,15 @@ pub fn oci(layer: &[u8], m: &Meta) -> (Vec<(String, Vec<u8>)>, String) {
     // inside a container no published port reaches. The Dockerfile it comes
     // with sets the same; `docker run -e LISTEN=...` still wins.
     env.push(format!("LISTEN=0.0.0.0:{}", m.port));
-    let config = json!({
+    // The service runs as nonroot in /app, which root owns: a SQLite file
+    // relative to it could not be made. The Dockerfile keeps it in a /data
+    // volume; so does the image.
+    let mut volumes = serde_json::Map::new();
+    if let Some(file) = &m.sqlite {
+        env.push(format!("DATABASE_URL=sqlite:///data/{file}"));
+        volumes.insert("/data".into(), json!({}));
+    }
+    let mut config = json!({
         "architecture": m.arch,
         "os": "linux",
         "created": created,
@@ -575,9 +602,11 @@ pub fn oci(layer: &[u8], m: &Meta) -> (Vec<(String, Vec<u8>)>, String) {
         },
         "rootfs": { "type": "layers", "diff_ids": [layer_digest] },
         "history": [{ "created": created, "created_by": "giong image" }],
-    })
-    .to_string()
-    .into_bytes();
+    });
+    if !volumes.is_empty() {
+        config["config"]["Volumes"] = volumes.into();
+    }
+    let config = config.to_string().into_bytes();
     let config_digest = format!("sha256:{}", sha256::hex(&config));
     let manifest = json!({
         "schemaVersion": 2,
@@ -809,12 +838,11 @@ fn run(args: &Args) -> Result<Report, Failure> {
             pkg_version.replace('+', "_")
         ))?,
     };
-    let port = port_flag.unwrap_or_else(|| {
-        crate::state::read_to_string(&root.join(".env.example"))
-            .ok()
-            .and_then(|t| port_from_example(&t))
-            .unwrap_or(8080)
-    });
+    let example = crate::state::read_to_string(&root.join(".env.example")).ok();
+    let port = port_flag
+        .or_else(|| example.as_deref().and_then(port_from_example))
+        .unwrap_or(8080);
+    let sqlite = example.as_deref().and_then(sqlite_file_from_example);
     let mut extra = Vec::new();
     if let Some(t) = &target {
         extra.push("--target".to_string());
@@ -931,6 +959,9 @@ fn run(args: &Args) -> Result<Report, Failure> {
             entries.push(Entry::file(lib, 0o755, data));
         }
     }
+    if sqlite.is_some() {
+        entries.push(Entry::dir("data", 0o755, NONROOT));
+    }
     entries.extend(added.iter().cloned());
 
     let created = source_date(&root);
@@ -965,6 +996,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
         port,
         created,
         labels,
+        sqlite: sqlite.clone(),
     };
     let (files, digest) = oci(&layer, &meta);
     let archive_entries: Vec<Entry> = files
@@ -1017,6 +1049,12 @@ fn run(args: &Args) -> Result<Report, Failure> {
         rfc3339(created)
     );
     r.line(line);
+    if let Some(file) = &sqlite {
+        r.line(format!(
+            "  SQLite file /data/{file}: give it a volume to keep it, docker run -v {}-data:/data",
+            name.rsplit('/').next().unwrap_or(&name)
+        ));
+    }
     r.line(format!("  digest {digest}"));
     r.line(format!("Image: {}", out.display()));
 
@@ -1170,6 +1208,20 @@ mod tests {
         assert_eq!(port_from_example("# LISTEN=0.0.0.0:3000\n"), Some(3000));
         assert_eq!(port_from_example("A=1\nLISTEN=\"[::]:8443\"\n"), Some(8443));
         assert_eq!(port_from_example("A=1\n"), None);
+        let lite = "# The database file\nDATABASE_URL=sqlite:data/shop.db\nLISTEN=127.0.0.1:8080\n";
+        assert_eq!(sqlite_file_from_example(lite).as_deref(), Some("shop.db"));
+        assert_eq!(
+            sqlite_file_from_example("DATABASE_URL=\"sqlite:///var/lib/a.db\"").as_deref(),
+            Some("a.db")
+        );
+        for other in [
+            "DATABASE_URL=postgres://u:p@127.0.0.1/shop\n",
+            "# DATABASE_URL=sqlite:data/shop.db\n",
+            "DATABASE_URL=sqlite:data/\n",
+            "A=1\n",
+        ] {
+            assert_eq!(sqlite_file_from_example(other), None, "{other}");
+        }
     }
 
     #[test]
@@ -1380,6 +1432,7 @@ mod tests {
             port: 3000,
             created: 0,
             labels: BTreeMap::new(),
+            sqlite: None,
         };
         let (files, digest) = oci(&layer, &meta);
         let get = |p: &str| {
@@ -1425,5 +1478,26 @@ mod tests {
         assert_eq!(docker[0]["RepoTags"][0], "svc:1.0.0");
         // The same input, the same digest.
         assert_eq!(oci(&layer, &meta).1, digest);
+        assert!(cfg["config"].get("Volumes").is_none());
+        // A SQLite project keeps its file in a /data volume, as its
+        // Dockerfile does.
+        let lite = Meta {
+            sqlite: Some("svc.db".into()),
+            ..meta
+        };
+        let (files, _) = oci(&layer, &lite);
+        let cfg = files
+            .iter()
+            .filter(|f| f.0.starts_with("blobs/"))
+            .filter_map(|f| serde_json::from_slice::<Value>(&f.1).ok())
+            .find(|v| v.get("config").is_some_and(|c| c.get("Env").is_some()))
+            .unwrap();
+        let env = cfg["config"]["Env"].as_array().unwrap();
+        assert!(
+            env.iter()
+                .any(|e| e == "DATABASE_URL=sqlite:///data/svc.db"),
+            "{env:?}"
+        );
+        assert!(cfg["config"]["Volumes"].get("/data").is_some());
     }
 }
