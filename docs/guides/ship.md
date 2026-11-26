@@ -5,7 +5,7 @@ From a project that passes `giong check` and `giong test` to an image running in
 ## Measure before you ship
 
 ```sh
-giong bench --against main             # this checkout against main, round by round
+giong bench --against main --path /health   # this checkout against main, round by round
 giong bench http://127.0.0.1:8080/users/7 --rate auto
 ```
 
