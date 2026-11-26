@@ -557,6 +557,10 @@ pub fn oci(layer: &[u8], m: &Meta) -> (Vec<(String, Vec<u8>)>, String) {
     let created = rfc3339(m.created);
     let mut env = vec!["PATH=/usr/local/bin:/usr/bin:/bin".to_string()];
     env.push("SSL_CERT_FILE=/etc/ssl/certs/ca-certificates.crt".into());
+    // A service from `giong new` listens on 127.0.0.1 without LISTEN, which
+    // inside a container no published port reaches. The Dockerfile it comes
+    // with sets the same; `docker run -e LISTEN=...` still wins.
+    env.push(format!("LISTEN=0.0.0.0:{}", m.port));
     let config = json!({
         "architecture": m.arch,
         "os": "linux",
@@ -1403,6 +1407,15 @@ mod tests {
         assert_eq!(cfg["config"]["Entrypoint"][0], "/app/svc");
         assert_eq!(cfg["config"]["User"], "65532:65532");
         assert!(cfg["config"]["ExposedPorts"].get("3000/tcp").is_some());
+        assert!(
+            cfg["config"]["Env"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|e| e == "LISTEN=0.0.0.0:3000"),
+            "{}",
+            cfg["config"]["Env"]
+        );
         assert_eq!(
             cfg["rootfs"]["diff_ids"][0],
             manifest["layers"][0]["digest"]

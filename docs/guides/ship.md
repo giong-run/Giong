@@ -22,7 +22,7 @@ One layer with the release binary at `/app`, CA certificates and a nonroot user,
 
 ## What production needs
 
-- **The address.** Development listens on `127.0.0.1`. In production set `LISTEN=0.0.0.0:8080` (the Dockerfile from `giong new` does).
+- **The address.** Development listens on `127.0.0.1`. In production set `LISTEN=0.0.0.0:8080` (the Dockerfile from `giong new` and the image from `giong image` do).
 - **Settings from the environment.** `.env` is for development only; give production its variables (`DATABASE_URL`, secrets) from the platform. `giong env check` lists what `.env.example` expects.
 - **Graceful shutdown.** Services from `giong new` shut down gracefully on `SIGTERM`. Give the platform's stop timeout a few seconds more than your slowest request.
 - **Migrations.** Run `giong db migrate` against the production `DATABASE_URL` before the new version starts.
