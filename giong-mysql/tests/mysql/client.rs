@@ -560,10 +560,13 @@ fn the_statement_timeout_is_enforced_by_the_server() {
         assert_eq!(e.server_code(), Some(s.timeout_code()), "{e}");
         assert!(e.to_string().contains("Config::statement_timeout"), "{e}");
         // The server's own code says it was the limit that ended it; this
-        // only says it did not run to its end first. A windows-2022 runner
-        // took more than 5 s to stop it (MySQL 8.4 there looks at the limit
-        // less often in this recursion), so the bound is wider there.
-        let bound = Duration::from_secs(if cfg!(windows) { 30 } else { 5 });
+        // only says it did not run to its end first. MySQL on the Windows
+        // runners acts on its 100 ms limit late: more than 5 s on a
+        // windows-2022 runner, 31.4 s on a windows-2025 one where the cancel
+        // test, the same query on the same server shortly before, stopped
+        // in under 3 s. The wait is on the server's side, not the client's,
+        // so the bound there only says it did not hang.
+        let bound = Duration::from_secs(if cfg!(windows) { 120 } else { 5 });
         assert!(started.elapsed() < bound, "{:?}", started.elapsed());
         assert_eq!(
             client
