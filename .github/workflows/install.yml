@@ -36,10 +36,6 @@ jobs:
   install:
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
-    permissions:
-      contents: read
-      id-token: write
-      attestations: write
     strategy:
       fail-fast: false
       matrix:
@@ -130,43 +126,3 @@ jobs:
           if (-not $refused) { throw "install.ps1 installed an archive whose checksum does not match" }
           if (Test-Path (Join-Path $env:GIONG_INSTALL "giong.exe")) { throw "the damaged giong.exe was installed" }
           Stop-Process -Id $server.Id
-      # TEMPORARY: one dispatched run to try release.yml's attest steps; removed before review.
-      - id: att
-        if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        run: |
-          archive=$(ls dist/v$GIONG_VERSION/giong-* | grep -v sha256)
-          case "${{ matrix.target }}" in *windows*) bin="target/${{ matrix.target }}/release/giong.exe" ;; *) bin="target/${{ matrix.target }}/release/giong" ;; esac
-          { echo "archive=$archive"; echo "sbom=$(ls sbom/*.cdx.json)"; echo "bin=$bin"; } >> "$GITHUB_OUTPUT"
-      - if: github.event_name == 'workflow_dispatch'
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: |
-            ${{ steps.att.outputs.archive }}
-            ${{ steps.att.outputs.bin }}
-      - if: github.event_name == 'workflow_dispatch'
-        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6 # v4.2.2
-        with:
-          subject-path: |
-            ${{ steps.att.outputs.archive }}
-            ${{ steps.att.outputs.bin }}
-          sbom-path: ${{ steps.att.outputs.sbom }}
-      - if: github.event_name == 'workflow_dispatch'
-        shell: bash
-        env:
-          GH_TOKEN: ${{ github.token }}
-          ARCHIVE: ${{ steps.att.outputs.archive }}
-          BIN: ${{ steps.att.outputs.bin }}
-        run: |
-          for file in "$ARCHIVE" "$BIN"; do
-            for type in https://slsa.dev/provenance/v1 https://cyclonedx.org/bom; do
-              gh attestation verify "$file" --repo "$GITHUB_REPOSITORY" --predicate-type "$type" \
-                --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/install.yml" \
-                --source-ref "$GITHUB_REF" --deny-self-hosted-runners
-            done
-          done
-          # The wrong workflow must fail.
-          if gh attestation verify "$ARCHIVE" --repo "$GITHUB_REPOSITORY" \
-            --signer-workflow "$GITHUB_REPOSITORY/.github/workflows/release.yml"; then
-            echo "::error::accepted for release.yml"; exit 1
-          fi
