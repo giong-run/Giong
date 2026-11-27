@@ -111,6 +111,35 @@ impl Cmd {
         c
     }
 
+    /// A command that will carry a secret (the password in `HELLO`), with
+    /// room for `capacity` bytes of arguments so that the buffer never moves
+    /// (and leaves no copy behind) before [`wipe`](Self::wipe).
+    pub(crate) fn with_capacity(name: &str, capacity: usize) -> Self {
+        let mut c = Self {
+            body: Vec::with_capacity(capacity),
+            count: 0,
+            name: Name::new(name),
+        };
+        c.push(name.as_bytes());
+        c
+    }
+
+    /// Overwrites the arguments with zeros once the command is sent.
+    pub(crate) fn wipe(mut self) {
+        zeroize::Zeroize::zeroize(&mut self.body);
+    }
+
+    /// The room for arguments, to check that a secret never moved.
+    pub(crate) fn capacity(&self) -> usize {
+        self.body.capacity()
+    }
+
+    /// The bytes [`encode`](Self::encode) writes, at most.
+    pub(crate) fn encoded_len(&self) -> usize {
+        // `*`, up to 20 digits and CRLF before the arguments.
+        23 + self.body.len()
+    }
+
     /// Adds an argument.
     pub fn arg(mut self, arg: impl ToArg) -> Self {
         write_bulk(&mut self.body, &arg);

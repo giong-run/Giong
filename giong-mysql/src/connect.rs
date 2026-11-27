@@ -14,6 +14,7 @@ use giong::net::{TcpStream, UnixStream};
 use giong::RecvBuf;
 use giong_tls::TlsStream;
 use socket2::{SockRef, TcpKeepalive};
+use zeroize::{Zeroize, Zeroizing};
 
 use std::rc::Rc;
 
@@ -612,6 +613,16 @@ impl Setup {
         let (r, _) = self.stream.write_all(out).await;
         r.map_err(|e| Error::io(ErrorKind::Connect, "writing to the server failed", e))
     }
+
+    /// [`send`](Self::send) for a packet that holds the password: the
+    /// buffer, sized so that it never moves, is wiped once written.
+    async fn send_secret(&mut self, secret: &[u8]) -> Result<(), Error> {
+        let mut out = Vec::with_capacity(4 + secret.len());
+        self.seq = protocol::packet(&mut out, self.seq, |out| out.extend_from_slice(secret));
+        let (r, mut out) = self.stream.write_all(out).await;
+        out.zeroize();
+        r.map_err(|e| Error::io(ErrorKind::Connect, "writing to the server failed", e))
+    }
 }
 
 /// A server error while connecting: refused credentials are
@@ -738,6 +749,15 @@ async fn open(
 }
 
 /// What to answer for an authentication plugin's first request.
+/// The password with a NUL after it, as the clear-text exchanges send it:
+/// sized so that nothing moves, and wiped when dropped.
+fn nul_terminated(password: &str) -> Zeroizing<Vec<u8>> {
+    let mut p = Zeroizing::new(Vec::with_capacity(password.len() + 1));
+    p.extend_from_slice(password.as_bytes());
+    p.push(0);
+    p
+}
+
 fn first_response(plugin: &str, password: &str, nonce: &[u8]) -> Option<Vec<u8>> {
     match plugin {
         "caching_sha2_password" => Some(auth::caching_sha2(password, nonce)),
@@ -809,9 +829,7 @@ async fn authenticate(
                 nonce = data.strip_suffix(&[0]).unwrap_or(data).to_vec();
                 let response = match plugin.as_str() {
                     "mysql_clear_password" | "sha256_password" if secure => {
-                        let mut p = password.as_bytes().to_vec();
-                        p.push(0);
-                        p
+                        nul_terminated(password)
                     }
                     "mysql_clear_password" | "sha256_password" => {
                         return Err(Error::new(
@@ -823,18 +841,20 @@ async fn authenticate(
                             ),
                         ))
                     }
-                    other => first_response(other, password, &nonce).ok_or_else(|| {
-                        Error::new(
-                            ErrorKind::Auth,
-                            format!(
-                                "the server asks for the {other} authentication plugin for \
+                    other => first_response(other, password, &nonce)
+                        .map(Zeroizing::new)
+                        .ok_or_else(|| {
+                            Error::new(
+                                ErrorKind::Auth,
+                                format!(
+                                    "the server asks for the {other} authentication plugin for \
                                  {user:?}, which giong-mysql does not support; use \
                                  caching_sha2_password (MySQL 8's default)"
-                            ),
-                        )
-                    })?,
+                                ),
+                            )
+                        })?,
                 };
-                setup.send(|out| out.extend_from_slice(&response)).await?;
+                setup.send_secret(&response).await?;
             }
             Some(0x01) if plugin == "caching_sha2_password" => {
                 match packet.get(1..) {
@@ -843,9 +863,7 @@ async fn authenticate(
                     // The server has no cached hash: it needs the password.
                     Some([0x04]) => {
                         if secure {
-                            let mut p = password.as_bytes().to_vec();
-                            p.push(0);
-                            setup.send(|out| out.extend_from_slice(&p)).await?;
+                            setup.send_secret(&nul_terminated(password)).await?;
                         } else if let Some(pem) = &config.server_public_key {
                             let sealed = auth::rsa_encrypt_password(password, &nonce, pem)?;
                             setup.send(|out| out.extend_from_slice(&sealed)).await?;

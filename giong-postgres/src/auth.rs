@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex, PoisonError};
 
 use giong::sync::oneshot;
 use ring::{digest, hmac, pbkdf2, rand::SecureRandom};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, ErrorKind};
 
@@ -20,7 +21,9 @@ fn auth_error(message: impl Into<String>) -> Error {
 
 /// The client side of a SCRAM-SHA-256 exchange.
 pub(crate) struct Scram {
-    password: Vec<u8>,
+    /// Wiped when dropped, like every copy of the password and of the keys
+    /// derived from it that this crate holds.
+    password: Zeroizing<Vec<u8>>,
     client_first_bare: String,
     nonce: String,
     state: State,
@@ -58,7 +61,7 @@ impl Scram {
             // SASLprep would normalize non-ASCII passwords first; PostgreSQL
             // uses the raw bytes when a password is not valid SASLprep input,
             // and for passwords already in NFKC form the two agree.
-            password: password.as_bytes().to_vec(),
+            password: Zeroizing::new(password.as_bytes().to_vec()),
             client_first_bare: format!("n={user},r={nonce}"),
             nonce: nonce.to_owned(),
             state: State::Started,
@@ -80,7 +83,7 @@ impl Scram {
     #[cfg(any(test, fuzzing))]
     pub(crate) fn client_final(&mut self, server_first: &[u8]) -> Result<Vec<u8>, Error> {
         let (salt, iterations) = self.server_first(server_first)?;
-        let salted = salted_password(&self.password, &salt, iterations);
+        let salted = Zeroizing::new(salted_password(&self.password, &salt, iterations));
         self.client_final_salted(&salted)
     }
 
@@ -257,14 +260,21 @@ pub(crate) struct KeyCache {
 
 #[derive(Clone, PartialEq, Eq)]
 struct KeyId {
-    /// SHA-256 of the password.
+    /// SHA-256 of the password: no login, but it would let a guess be
+    /// checked offline, so it is wiped like the password.
     password: [u8; 32],
     salt: Vec<u8>,
     iterations: u32,
 }
 
+impl Drop for KeyId {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.password);
+    }
+}
+
 enum KeyState {
-    Ready([u8; 32]),
+    Ready(Zeroizing<[u8; 32]>),
     /// Being derived; these connections wait for it.
     Deriving(Vec<oneshot::Sender<[u8; 32]>>),
 }
@@ -288,7 +298,7 @@ impl KeyCache {
         let start = {
             let mut entries = self.entries.lock().unwrap_or_else(PoisonError::into_inner);
             match entries.iter_mut().find(|(k, _)| *k == id) {
-                Some((_, KeyState::Ready(key))) => return *key,
+                Some((_, KeyState::Ready(key))) => return **key,
                 Some((_, KeyState::Deriving(waiting))) => {
                     waiting.push(tx);
                     false
@@ -311,7 +321,7 @@ impl KeyCache {
             let job = Derive {
                 cache: Arc::clone(self),
                 id,
-                password: password.to_vec(),
+                password: Zeroizing::new(password.to_vec()),
                 salt: salt.to_vec(),
                 iterations,
             };
@@ -336,14 +346,14 @@ impl KeyCache {
 struct Derive {
     cache: Arc<KeyCache>,
     id: KeyId,
-    password: Vec<u8>,
+    password: Zeroizing<Vec<u8>>,
     salt: Vec<u8>,
     iterations: NonZeroU32,
 }
 
 impl Derive {
     fn run(self) {
-        let key = salted_password(&self.password, &self.salt, self.iterations);
+        let key = Zeroizing::new(salted_password(&self.password, &self.salt, self.iterations));
         let waiting = {
             let mut entries = self
                 .cache
@@ -351,7 +361,7 @@ impl Derive {
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner);
             match entries.iter_mut().find(|(k, _)| *k == self.id) {
-                Some((_, state)) => match std::mem::replace(state, KeyState::Ready(key)) {
+                Some((_, state)) => match std::mem::replace(state, KeyState::Ready(key.clone())) {
                     KeyState::Deriving(waiting) => waiting,
                     KeyState::Ready(_) => Vec::new(),
                 },
@@ -359,7 +369,7 @@ impl Derive {
             }
         };
         for tx in waiting {
-            let _ = tx.send(key);
+            let _ = tx.send(*key);
         }
     }
 }
@@ -378,16 +388,30 @@ impl Drop for Derive {
 /// The answer to an MD5 password request: `"md5" + md5(md5(password + user)
 /// + salt)` in hex.
 pub(crate) fn md5_password(user: &str, password: &str, salt: [u8; 4]) -> String {
-    let mut inner = Vec::with_capacity(password.len() + user.len());
+    let mut inner = Zeroizing::new(Vec::with_capacity(password.len() + user.len()));
     inner.extend_from_slice(password.as_bytes());
     inner.extend_from_slice(user.as_bytes());
-    let mut outer = hex(&md5(&inner)).into_bytes();
+    // md5(password + user) is what the server stores, and logs in as well
+    // as the password: wiped too. Sized so that adding the salt does not
+    // move it.
+    let stored = Zeroizing::new(md5(&inner));
+    let mut outer = Zeroizing::new(Vec::with_capacity(2 * stored.len() + salt.len()));
+    hex_into(&mut outer, &stored[..]);
     outer.extend_from_slice(&salt);
     format!("md5{}", hex(&md5(&outer)))
 }
 
 fn hex(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Lower-case hex of `bytes`, added to `out` without any other copy.
+fn hex_into(out: &mut Vec<u8>, bytes: &[u8]) {
+    const DIGITS: &[u8; 16] = b"0123456789abcdef";
+    for b in bytes {
+        out.push(DIGITS[usize::from(b >> 4)]);
+        out.push(DIGITS[usize::from(b & 15)]);
+    }
 }
 
 /// MD5 (RFC 1321), for the MD5 password scheme only: `ring` leaves it out

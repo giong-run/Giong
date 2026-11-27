@@ -67,6 +67,7 @@ dependencies = [
  "giong-tls",
  "ring",
  "socket2",
+ "zeroize",
 ]
 
 [[package]]
