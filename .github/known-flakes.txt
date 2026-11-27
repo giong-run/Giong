@@ -7,3 +7,4 @@
 # ISSUE  TEST NAME (a Python regular expression, matched against the whole name libtest
 #        prints under "failures:")
 483 soak
+504 the_descriptor_count_is_flat_over_runtime_lives
