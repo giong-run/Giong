@@ -36,8 +36,14 @@ fn hooked() -> Hooked {
 
 /// Runs `fut` on the system's readiness driver, or on the one
 /// `GIONG_DRIVER` names.
+///
+/// With precise timers: the tests count the retries' waits, and macOS adds
+/// slack to a wait's time limit otherwise. Each 32 ms wait then ended about
+/// 9 ms late on the CI runners, and a write gave up after 49 tries in 2 s,
+/// not 67 (#482). The schedule is what the tests check; Linux and Windows
+/// ignore the option.
 fn run<F: Future>(fut: F) -> F::Output {
-    let builder = giong::Builder::new();
+    let builder = giong::Builder::new().precise_timers(true);
     #[cfg(target_os = "linux")]
     let builder = if std::env::var_os("GIONG_DRIVER").is_some() {
         builder

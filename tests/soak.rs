@@ -75,6 +75,18 @@ struct Counters {
     ports_used_up: AtomicU64,
     /// Errors that none of the scenarios should produce.
     unexpected: AtomicU64,
+    /// The longest a worker's 1 ms sleep overran, in microseconds: how long
+    /// a worker went without running its tasks (#483).
+    worker_stall_us: AtomicU64,
+    /// The same for a plain thread outside the runtime that sleeps 10 ms
+    /// at a time: a stall seen here too is the machine's, not the workers'.
+    plain_stall_us: AtomicU64,
+    /// The longest file write and file close, in microseconds. On Windows
+    /// both can hold the worker thread: closing is a `CloseHandle` on the
+    /// worker, and a write that extends a file is done synchronously even
+    /// on an overlapped handle.
+    file_write_us: AtomicU64,
+    file_close_us: AtomicU64,
 }
 
 impl Counters {
@@ -84,8 +96,28 @@ impl Counters {
 
     fn unexpected(&self, what: &str, err: impl std::fmt::Display) {
         if self.unexpected.fetch_add(1, Ordering::Relaxed) < 20 {
-            eprintln!("soak: unexpected error in {what}: {err}");
+            eprintln!(
+                "soak: unexpected error in {what}: {err} ({})",
+                self.longest()
+            );
         }
+    }
+
+    fn record_max(counter: &AtomicU64, took: Duration) {
+        counter.fetch_max(took.as_micros() as u64, Ordering::Relaxed);
+    }
+
+    /// The longest stalls and file calls so far, for the log.
+    fn longest(&self) -> String {
+        let ms = |c: &AtomicU64| c.load(Ordering::Relaxed) as f64 / 1000.0;
+        format!(
+            "longest so far: worker stall {:.1} ms, plain thread stall {:.1} ms, \
+             file write {:.1} ms, file close {:.1} ms",
+            ms(&self.worker_stall_us),
+            ms(&self.plain_stall_us),
+            ms(&self.file_write_us),
+            ms(&self.file_close_us),
+        )
     }
 }
 
@@ -365,15 +397,21 @@ async fn files(dir: std::path::PathBuf, deadline: Instant, counters: Arc<Counter
                 .open(&path)
                 .await?;
             let len = 1 + rng.below(64 * 1024) as usize;
+            let started = Instant::now();
             let (res, _) = file.write_all_at(vec![7u8; len], 0).await;
+            Counters::record_max(&counters.file_write_us, started.elapsed());
             res?;
             let (res, buf) = file.read_at(vec![0u8; len], 0).await;
             assert_eq!(res?, len);
             assert!(buf.iter().all(|&b| b == 7));
             assert_eq!(file.metadata().await?.len(), len as u64);
+            let started = Instant::now();
             if rng.below(2) == 0 {
                 file.close().await?;
-            } // else: closed on drop
+            } else {
+                drop(file);
+            }
+            Counters::record_max(&counters.file_close_us, started.elapsed());
             giong::fs::remove_file(&path).await
         }
         .await;
@@ -381,6 +419,17 @@ async fn files(dir: std::path::PathBuf, deadline: Instant, counters: Arc<Counter
             Ok(()) => Counters::bump(&counters.files),
             Err(err) => counters.unexpected("files", err),
         }
+    }
+}
+
+/// Measures how long the worker goes without running its tasks: the
+/// longest overrun of a 1 ms sleep.
+async fn heartbeat(deadline: Instant, counters: Arc<Counters>) {
+    while Instant::now() < deadline {
+        let started = Instant::now();
+        sleep(Duration::from_millis(1)).await;
+        let late = started.elapsed().saturating_sub(Duration::from_millis(1));
+        Counters::record_max(&counters.worker_stall_us, late);
     }
 }
 
@@ -952,6 +1001,18 @@ fn run(workers: usize, secs: u64) -> Run {
         })
     };
 
+    let watch = {
+        let (stop, counters) = (stop.clone(), counters.clone());
+        std::thread::spawn(move || {
+            while !stop.load(Ordering::Relaxed) {
+                let started = Instant::now();
+                std::thread::sleep(Duration::from_millis(10));
+                let late = started.elapsed().saturating_sub(Duration::from_millis(10));
+                Counters::record_max(&counters.plain_stall_us, late);
+            }
+        })
+    };
+
     let deadline = Instant::now() + Duration::from_secs(secs);
     let idle = Arc::new(Mutex::new(Vec::new()));
     {
@@ -1002,6 +1063,7 @@ fn run(workers: usize, secs: u64) -> Run {
                         counters.clone(),
                     )));
                     tasks.push(giong::spawn(files(dir, deadline, counters.clone())));
+                    tasks.push(giong::spawn(heartbeat(deadline, counters.clone())));
                     tasks.push(giong::spawn(cross_worker(
                         workers,
                         deadline,
@@ -1038,6 +1100,7 @@ fn run(workers: usize, secs: u64) -> Run {
     }
     stop.store(true, Ordering::Relaxed);
     sampler.join().unwrap();
+    watch.join().unwrap();
     let _ = std::fs::remove_dir_all(&dir);
     drop(port_holder);
 
@@ -1056,6 +1119,10 @@ fn run(workers: usize, secs: u64) -> Run {
         c.cross_worker.load(Ordering::Relaxed),
         c.connects_refused.load(Ordering::Relaxed),
         c.ports_used_up.load(Ordering::Relaxed),
+    );
+    eprintln!(
+        "soak: {}",
+        c.longest().replacen("longest so far", "longest", 1)
     );
     let samples = std::mem::take(&mut *samples.lock().unwrap());
     let idle = std::mem::take(&mut *idle.lock().unwrap());
