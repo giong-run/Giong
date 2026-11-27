@@ -67,6 +67,13 @@
 # heap bytes per connection (io_uring), https -1.2% (io_uring) and -0.9%
 # (epoll) instructions; allocations unchanged. The idle-https rows are the
 # change's CI run (45877914608), which gave the same heap bytes as the VM.
+# The instruction and allocation rows of http1-client, h2, h2-streams and
+# https: the client's cost per request (changelog.d/perf-http-client-cost.md),
+# measured on a 4-vCPU cloud VM (Linux 6.18, the same rustc and valgrind),
+# main 81588a2 against the change merged with it, scripts/instr.py on both,
+# 3 rounds: http1-client -8.0% (io_uring) and -7.7% (epoll) instructions,
+# h2 -5.0% and -4.8%, h2-streams -6.4% and -6.3%, https -5.3% and -5.1%;
+# 4 allocations fewer a request over HTTP/1.1 and HTTPS, 8 over HTTP/2.
 # The http1 and web instruction rows and every idle-http1, idle-h2 and
 # idle-https heap and resident-set row: a connection's future keeps across an
 # .await only what waiting for the next request needs
@@ -101,14 +108,14 @@ io_uring,file-read,instructions,190.2,1
 io_uring,file-read,allocations,0.000,1
 io_uring,http1,instructions,8172.6,1
 io_uring,http1,allocations,1.000,1
-io_uring,http1-client,instructions,21790.8,1
-io_uring,http1-client,allocations,11.008,1
-io_uring,h2,instructions,29665.1,1
-io_uring,h2,allocations,22.000,1
-io_uring,h2-streams,instructions,240853.9,0.5
-io_uring,h2-streams,allocations,230.005,0.5
-io_uring,https,instructions,33486.2,1
-io_uring,https,allocations,17.035,1
+io_uring,http1-client,instructions,20094.3,1
+io_uring,http1-client,allocations,7.008,1
+io_uring,h2,instructions,28265.4,1
+io_uring,h2,allocations,14.001,1
+io_uring,h2-streams,instructions,225106.8,0.5
+io_uring,h2-streams,allocations,150.005,0.5
+io_uring,https,instructions,31729.2,1
+io_uring,https,allocations,13.035,1
 io_uring,web,instructions,10999.5,1
 io_uring,web,allocations,3.000,1
 io_uring,redis-get,instructions,7788.1,1
@@ -144,14 +151,14 @@ epoll,file-read,instructions,241.9,3
 epoll,file-read,allocations,0.016,1
 epoll,http1,instructions,9089.5,1
 epoll,http1,allocations,1.000,1
-epoll,http1-client,instructions,22819.9,1
-epoll,http1-client,allocations,11.000,1
-epoll,h2,instructions,30687.2,1
-epoll,h2,allocations,22.001,1
-epoll,h2-streams,instructions,241879.5,0.5
-epoll,h2-streams,allocations,230.004,0.5
-epoll,https,instructions,34577.9,1
-epoll,https,allocations,17.000,1
+epoll,http1-client,instructions,21183.7,1
+epoll,http1-client,allocations,7.000,1
+epoll,h2,instructions,29393.4,1
+epoll,h2,allocations,14.001,1
+epoll,h2-streams,instructions,226570.3,0.5
+epoll,h2-streams,allocations,150.004,0.5
+epoll,https,instructions,32814.9,1
+epoll,https,allocations,13.000,1
 epoll,web,instructions,11916.5,1
 epoll,web,allocations,3.000,1
 epoll,redis-get,instructions,8484.7,1

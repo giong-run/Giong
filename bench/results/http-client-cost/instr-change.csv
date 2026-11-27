@@ -1,0 +1,56 @@
+# scripts/instr.py, 3 rounds, 2000 operations after 500 of warm-up, 2000 idle connections
+# rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
+# valgrind: valgrind-3.22.0
+# kernel: 6.18.44-fc-v880
+# driver io_uring: io_uring (named by GIONG_DRIVER), using packed-buffers, registered-ring, zero-copy-send
+# driver epoll: epoll (named by GIONG_DRIVER)
+# cpu: Intel(R) Xeon(R) Processor @ 2.10GHz
+round,driver,case,metric,value
+1,io_uring,http1-client,instructions,20088.442
+1,io_uring,http1-client,allocations,7.008
+1,io_uring,h2,instructions,28265.425
+1,io_uring,h2,allocations,14.001
+1,io_uring,h2-streams,instructions,225093.309
+1,io_uring,h2-streams,allocations,150.005
+1,io_uring,https,instructions,31729.166
+1,io_uring,https,allocations,13.035
+1,epoll,http1-client,instructions,21189.697
+1,epoll,http1-client,allocations,7.000
+1,epoll,h2,instructions,29396.886
+1,epoll,h2,allocations,14.001
+1,epoll,h2-streams,instructions,226441.112
+1,epoll,h2-streams,allocations,150.003
+1,epoll,https,instructions,32820.798
+1,epoll,https,allocations,13.000
+2,io_uring,http1-client,instructions,20094.327
+2,io_uring,http1-client,allocations,7.008
+2,io_uring,h2,instructions,28253.390
+2,io_uring,h2,allocations,14.000
+2,io_uring,h2-streams,instructions,225106.796
+2,io_uring,h2-streams,allocations,150.005
+2,io_uring,https,instructions,31729.201
+2,io_uring,https,allocations,13.035
+2,epoll,http1-client,instructions,21183.713
+2,epoll,http1-client,allocations,7.000
+2,epoll,h2,instructions,29393.375
+2,epoll,h2,allocations,14.001
+2,epoll,h2-streams,instructions,226570.305
+2,epoll,h2-streams,allocations,150.004
+2,epoll,https,instructions,32814.944
+2,epoll,https,allocations,13.000
+3,io_uring,http1-client,instructions,20094.433
+3,io_uring,http1-client,allocations,7.008
+3,io_uring,h2,instructions,28268.020
+3,io_uring,h2,allocations,14.001
+3,io_uring,h2-streams,instructions,225429.159
+3,io_uring,h2-streams,allocations,150.006
+3,io_uring,https,instructions,31729.195
+3,io_uring,https,allocations,13.035
+3,epoll,http1-client,instructions,21183.590
+3,epoll,http1-client,allocations,7.000
+3,epoll,h2,instructions,29389.430
+3,epoll,h2,allocations,14.001
+3,epoll,h2-streams,instructions,226752.650
+3,epoll,h2-streams,allocations,150.005
+3,epoll,https,instructions,32814.940
+3,epoll,https,allocations,13.000

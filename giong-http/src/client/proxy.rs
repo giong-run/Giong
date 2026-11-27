@@ -322,7 +322,7 @@ fn parse_server(input: &str, lenient: bool) -> Result<Server, Error> {
         }
     };
     Ok(Server {
-        host: url.host,
+        host: url.host.to_string(),
         port: url.port,
         authorization,
     })
