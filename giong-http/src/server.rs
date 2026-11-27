@@ -2082,26 +2082,36 @@ impl<T: Transport> Conn<T> {
         let mut conn = self;
         async move {
             if let Some(input) = conn.run(&*handler).await {
-                let Conn {
-                    stream,
-                    cfg,
-                    peer,
-                    _slot: Some(slot),
-                    ..
-                } = conn
-                else {
-                    unreachable!("only a connection with a slot is handed over");
-                };
-                drop(giong::spawn(serve_h2(
-                    stream,
-                    cfg,
-                    peer,
-                    handler,
-                    slot,
-                    move || input,
-                )));
+                conn.hand_over_to_h2(handler, input);
             }
         }
+    }
+
+    /// Goes on with an accept loop's HTTP/2 connection in a task of its own
+    /// (see [`serve`](Self::serve)). Out of line: inline, the spawn made the
+    /// connection's future too large to poll from the executor's loop
+    /// without a call, which every HTTP/1.1 request paid for.
+    #[cold]
+    #[inline(never)]
+    fn hand_over_to_h2<H: Handler>(self, handler: Rc<H>, input: Vec<u8>) {
+        let Conn {
+            stream,
+            cfg,
+            peer,
+            _slot: Some(slot),
+            ..
+        } = self
+        else {
+            unreachable!("only a connection with a slot is handed over");
+        };
+        drop(giong::spawn(serve_h2(
+            stream,
+            cfg,
+            peer,
+            handler,
+            slot,
+            move || input,
+        )));
     }
 
     /// Serves the connection's requests until it closes. Returns what has
