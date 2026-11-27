@@ -205,14 +205,14 @@ Measured with `bench/h2.sh` against axum 0.8 on hyper's HTTP/2 (through `axum-se
 - Our reading, not profiled: with 10 or 100 streams in flight on a connection, one read brings many requests and one write takes many answers, much as pipelining does over HTTP/1.1, and giong-http turns that batching into requests served as it does for pipelined ones ([giong-web's benchmark](../giong-web/README.md#performance)). hyper gains far less from either.
 - Not measured yet: several cores, a load generator on another machine, request bodies.
 
-Memory per connection, measured with `bench/hold` over HTTP/2 with prior knowledge: 5,000 connections on one worker thread, the server's resident memory before and after, divided by 5,000. KiB, the same in all 5 rounds within 0.2%:
+Memory per connection, measured with `bench/hold` over HTTP/2 with prior knowledge: 5,000 connections on one worker thread, the server's resident memory before and after, divided by 5,000. KiB, the same in all rounds within 0.2% (giong-http's row measured again in 1.5.2 with `PARTS=memory MEM_SERVERS=giong-http bench/h2.sh 3`, `bench/results/idle-conn-memory/`):
 
 | Server | Idle (one request answered) | One request in progress | Each further request in progress |
 |---|---|---|---|
-| **giong-http** | **4.2** | **5.9** | **1.1** |
+| **giong-http** | **3.5** | **4.9** | **1.5** |
 | axum | 23.8 | 23.0 | 2.0 |
 
-An idle connection gives its buffers back, so what it keeps is its task, its HPACK tables and its state; an idle HTTP/1.1 connection still costs 1.9 KiB. Results are in `bench/results/h2/`.
+An idle connection gives its buffers back, so what it keeps is its task, its HPACK tables and its state; an idle HTTP/1.1 connection still costs 1.3 KiB of heap (`bench/instr`'s `idle-http1`). Results are in `bench/results/h2/`.
 
 ## HTTP/3 (unstable)
 

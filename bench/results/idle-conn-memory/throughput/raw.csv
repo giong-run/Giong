@@ -1,0 +1,369 @@
+run,order,server,endpoint,round,rps,p50_ms,p99_ms,cpu_pct,us_per_req,errors
+A,main first,main-81588a2 TLS,json,1,143103.48,268.00us,796.00us,101,6.92,0
+A,main first,main-81588a2 TLS,users,1,45920.90,0.94ms,2.13ms,101,21.56,0
+A,main first,main-81588a2 TLS,handshake,1,7378.28,1.91ms,5.47ms,97,131.30,0
+A,main first,main-81588a2 TLS,bytes64k,1,30303.09,1.55ms,3.23ms,98,32.37,0
+A,main first,main-81588a2 TLS,file64k,1,22150.03,2.04ms,6.94ms,99,44.00,0
+A,main first,change TLS,json,1,146871.20,265.00us,690.00us,101,6.77,0
+A,main first,change TLS,users,1,52343.04,0.86ms,1.63ms,99,19.05,0
+A,main first,change TLS,handshake,1,8308.64,1.76ms,4.15ms,98,118.44,0
+A,main first,change TLS,bytes64k,1,30440.66,1.54ms,2.67ms,98,32.44,0
+A,main first,change TLS,file64k,1,22498.16,2.02ms,3.50ms,98,43.52,0
+A,main first,main-81588a2,json,1,148684.32,262.00us,1.11ms,100,6.61,0
+A,main first,main-81588a2,users,1,54484.33,786.00us,2.05ms,99,18.16,0
+A,main first,main-81588a2,bytes64k,1,63988.59,615.00us,1.57ms,99,15.17,0
+A,main first,main-81588a2,file64k,1,51383.63,0.92ms,1.52ms,100,19.12,0
+A,main first,change,json,1,149453.03,260.00us,0.99ms,98,6.56,0
+A,main first,change,users,1,58778.44,718.00us,1.54ms,99,16.94,0
+A,main first,change,bytes64k,1,61973.02,640.00us,1.49ms,98,15.57,0
+A,main first,change,file64k,1,49880.18,0.95ms,1.49ms,100,19.73,0
+A,main first,main-81588a2 TLS,json,2,137928.59,272.00us,1.49ms,100,7.11,0
+A,main first,main-81588a2 TLS,users,2,48010.24,0.90ms,2.15ms,98,20.53,0
+A,main first,main-81588a2 TLS,handshake,2,8127.22,1.82ms,4.05ms,99,121.63,0
+A,main first,main-81588a2 TLS,bytes64k,2,31210.01,1.49ms,3.65ms,98,31.62,0
+A,main first,main-81588a2 TLS,file64k,2,22310.86,2.03ms,4.34ms,99,43.85,0
+A,main first,change TLS,json,2,139127.66,274.00us,845.00us,101,7.13,0
+A,main first,change TLS,users,2,47903.93,0.89ms,6.84ms,101,20.67,0
+A,main first,change TLS,handshake,2,7790.28,1.87ms,4.48ms,98,126.60,0
+A,main first,change TLS,bytes64k,2,29789.84,1.54ms,3.51ms,97,32.55,0
+A,main first,change TLS,file64k,2,22051.06,2.05ms,3.76ms,98,44.68,0
+A,main first,main-81588a2,json,2,155332.31,252.00us,716.00us,101,6.39,0
+A,main first,main-81588a2,users,2,55410.84,754.00us,1.73ms,101,17.94,0
+A,main first,main-81588a2,bytes64k,2,63331.46,625.00us,1.42ms,99,15.33,0
+A,main first,main-81588a2,file64k,2,49813.08,0.95ms,1.40ms,99,19.64,0
+A,main first,change,json,2,161029.41,245.00us,617.00us,101,6.16,0
+A,main first,change,users,2,57583.14,728.00us,2.03ms,101,17.27,0
+A,main first,change,bytes64k,2,66966.80,589.00us,1.42ms,99,14.49,0
+A,main first,change,file64k,2,50692.36,0.94ms,1.42ms,100,19.42,0
+A,main first,main-81588a2 TLS,json,3,146222.81,267.00us,675.00us,101,6.80,0
+A,main first,main-81588a2 TLS,users,3,47369.36,0.93ms,2.02ms,100,20.86,0
+A,main first,main-81588a2 TLS,handshake,3,8629.33,1.77ms,3.54ms,100,113.98,0
+A,main first,main-81588a2 TLS,bytes64k,3,30008.23,1.57ms,2.81ms,98,32.84,0
+A,main first,main-81588a2 TLS,file64k,3,23421.10,1.98ms,3.19ms,99,42.20,0
+A,main first,change TLS,json,3,149307.39,256.00us,715.00us,99,6.63,0
+A,main first,change TLS,users,3,51701.40,0.87ms,1.54ms,99,19.22,0
+A,main first,change TLS,handshake,3,8101.81,1.87ms,4.14ms,99,122.28,0
+A,main first,change TLS,bytes64k,3,30359.12,1.55ms,2.67ms,98,32.39,0
+A,main first,change TLS,file64k,3,22275.94,2.04ms,3.43ms,98,44.33,0
+A,main first,main-81588a2,json,3,159592.36,243.00us,713.00us,101,6.23,0
+A,main first,main-81588a2,users,3,54996.61,754.00us,2.11ms,101,18.04,0
+A,main first,main-81588a2,bytes64k,3,65503.84,604.00us,1.55ms,98,14.76,0
+A,main first,main-81588a2,file64k,3,51139.13,0.92ms,1.69ms,97,19.04,0
+A,main first,change,json,3,160631.45,244.00us,637.00us,101,6.19,0
+A,main first,change,users,3,56772.33,731.00us,2.18ms,98,17.40,0
+A,main first,change,bytes64k,3,65419.32,611.00us,1.47ms,98,14.72,0
+A,main first,change,file64k,3,49620.44,0.95ms,1.49ms,99,19.72,0
+A,main first,main-81588a2 TLS,json,4,147933.07,260.00us,709.00us,101,6.73,0
+A,main first,main-81588a2 TLS,users,4,47294.77,0.92ms,2.33ms,100,20.90,0
+A,main first,main-81588a2 TLS,handshake,4,8532.14,1.80ms,3.90ms,101,116.20,0
+A,main first,main-81588a2 TLS,bytes64k,4,30519.41,1.51ms,2.81ms,100,32.12,0
+A,main first,main-81588a2 TLS,file64k,4,23637.17,1.96ms,3.09ms,98,41.75,0
+A,main first,change TLS,json,4,138625.58,263.00us,820.00us,99,7.16,0
+A,main first,change TLS,users,4,52374.50,837.00us,1.72ms,99,19.01,0
+A,main first,change TLS,handshake,4,7937.59,1.81ms,4.21ms,97,122.57,0
+A,main first,change TLS,bytes64k,4,30126.43,1.53ms,2.90ms,98,32.50,0
+A,main first,change TLS,file64k,4,23707.73,1.95ms,3.02ms,98,41.66,0
+A,main first,main-81588a2,json,4,158454.17,248.00us,674.00us,101,6.25,0
+A,main first,main-81588a2,users,4,55555.83,770.00us,1.93ms,99,17.85,0
+A,main first,main-81588a2,bytes64k,4,65022.15,605.00us,1.51ms,98,14.86,0
+A,main first,main-81588a2,file64k,4,50987.58,0.93ms,1.45ms,100,19.30,0
+A,main first,change,json,4,152210.22,258.00us,793.00us,100,6.48,0
+A,main first,change,users,4,61670.50,694.00us,1.42ms,101,16.18,0
+A,main first,change,bytes64k,4,62922.80,619.00us,1.68ms,98,15.27,0
+A,main first,change,file64k,4,51939.28,0.92ms,1.30ms,100,18.92,0
+A,main first,main-81588a2 TLS,json,5,139255.50,275.00us,0.88ms,100,7.08,0
+A,main first,main-81588a2 TLS,users,5,46830.95,0.92ms,2.35ms,98,21.04,0
+A,main first,main-81588a2 TLS,handshake,5,7811.72,1.84ms,4.53ms,99,125.20,0
+A,main first,main-81588a2 TLS,bytes64k,5,29326.74,1.56ms,3.32ms,97,33.25,0
+A,main first,main-81588a2 TLS,file64k,5,22544.96,2.04ms,3.80ms,98,43.44,0
+A,main first,change TLS,json,5,144446.90,265.00us,835.00us,99,6.85,0
+A,main first,change TLS,users,5,52118.35,0.85ms,1.43ms,99,19.07,0
+A,main first,change TLS,handshake,5,7795.43,1.86ms,4.63ms,98,126.54,0
+A,main first,change TLS,bytes64k,5,30529.20,1.53ms,2.86ms,98,32.15,0
+A,main first,change TLS,file64k,5,22903.32,2.02ms,3.16ms,100,42.98,0
+A,main first,main-81588a2,json,5,156745.52,248.00us,738.00us,100,6.31,0
+A,main first,main-81588a2,users,5,54949.86,763.00us,2.02ms,101,18.02,0
+A,main first,main-81588a2,bytes64k,5,64311.11,607.00us,1.69ms,98,15.06,0
+A,main first,main-81588a2,file64k,5,50640.25,0.93ms,1.55ms,100,19.44,0
+A,main first,change,json,5,146123.42,271.00us,754.00us,100,6.75,0
+A,main first,change,users,5,58154.55,709.00us,1.63ms,99,17.06,0
+A,main first,change,bytes64k,5,65237.07,603.00us,1.51ms,98,14.85,0
+A,main first,change,file64k,5,49231.66,0.95ms,1.70ms,99,19.87,0
+A,main first,main-81588a2 TLS,json,6,143025.77,270.00us,814.00us,100,6.91,0
+A,main first,main-81588a2 TLS,users,6,47953.85,0.89ms,2.11ms,101,20.77,0
+A,main first,main-81588a2 TLS,handshake,6,8529.48,1.76ms,3.74ms,99,116.21,0
+A,main first,main-81588a2 TLS,bytes64k,6,31042.06,1.49ms,3.14ms,98,31.61,0
+A,main first,main-81588a2 TLS,file64k,6,21981.98,2.06ms,3.97ms,98,44.73,0
+A,main first,change TLS,json,6,147866.64,260.00us,712.00us,101,6.71,0
+A,main first,change TLS,users,6,51290.69,0.85ms,1.69ms,101,19.38,0
+A,main first,change TLS,handshake,6,8049.91,1.84ms,4.14ms,99,122.83,0
+A,main first,change TLS,bytes64k,6,30436.81,1.52ms,4.18ms,98,32.22,0
+A,main first,change TLS,file64k,6,22134.46,2.09ms,3.45ms,98,44.26,0
+A,main first,main-81588a2,json,6,148822.50,263.00us,754.00us,101,6.68,0
+A,main first,main-81588a2,users,6,55264.89,764.00us,1.90ms,99,18.01,0
+A,main first,main-81588a2,bytes64k,6,64919.44,614.00us,1.34ms,99,14.98,0
+A,main first,main-81588a2,file64k,6,50285.68,0.94ms,1.42ms,100,19.57,0
+A,main first,change,json,6,150585.21,261.00us,720.00us,101,6.60,0
+A,main first,change,users,6,58858.57,713.00us,1.60ms,99,16.88,0
+A,main first,change,bytes64k,6,63724.03,628.00us,1.43ms,99,15.26,0
+A,main first,change,file64k,6,49685.45,0.96ms,1.40ms,98,19.88,0
+B,main first,main-81588a2 TLS,handshake,1,8675.74,1.73ms,3.59ms,99,114.24,0
+B,main first,main-81588a2 TLS,file64k,1,23518.93,1.97ms,3.10ms,100,41.93,0
+B,main first,main-81588a2 TLS,json,1,144404.33,267.00us,1.93ms,100,6.79,0
+B,main first,change TLS,handshake,1,8497.94,1.80ms,3.89ms,99,116.37,0
+B,main first,change TLS,file64k,1,23139.75,1.96ms,3.59ms,99,42.75,0
+B,main first,change TLS,json,1,138597.43,272.00us,0.91ms,100,7.12,0
+B,main first,main-81588a2,file64k,1,50362.93,0.93ms,1.52ms,100,19.47,0
+B,main first,main-81588a2,json,1,161934.50,245.00us,607.00us,101,6.15,0
+B,main first,change,file64k,1,50946.50,0.93ms,1.40ms,100,19.32,0
+B,main first,change,json,1,152887.26,257.00us,668.00us,101,6.50,0
+B,main first,main-81588a2 TLS,handshake,2,8549.00,1.79ms,3.90ms,99,115.69,0
+B,main first,main-81588a2 TLS,file64k,2,23158.92,2.01ms,3.34ms,98,42.45,0
+B,main first,main-81588a2 TLS,json,2,142434.59,272.00us,796.00us,100,6.94,0
+B,main first,change TLS,handshake,2,8325.24,1.85ms,3.99ms,99,117.05,0
+B,main first,change TLS,file64k,2,21931.16,2.09ms,3.87ms,98,44.93,0
+B,main first,change TLS,json,2,144693.48,267.00us,705.00us,101,6.87,0
+B,main first,main-81588a2,file64k,2,51599.10,0.92ms,1.30ms,100,19.04,0
+B,main first,main-81588a2,json,2,161367.46,243.00us,685.00us,101,6.18,0
+B,main first,change,file64k,2,51871.27,0.90ms,1.37ms,100,19.01,0
+B,main first,change,json,2,146694.57,268.00us,787.00us,100,6.72,0
+B,main first,main-81588a2 TLS,handshake,3,8850.40,1.85ms,3.38ms,99,112.23,0
+B,main first,main-81588a2 TLS,file64k,3,23682.95,1.97ms,2.71ms,101,41.98,0
+B,main first,main-81588a2 TLS,json,3,143587.40,270.00us,727.00us,101,6.90,0
+B,main first,change TLS,handshake,3,8392.39,1.82ms,3.89ms,99,118.01,0
+B,main first,change TLS,file64k,3,23384.65,1.97ms,3.38ms,98,41.97,0
+B,main first,change TLS,json,3,143282.07,265.00us,1.24ms,100,6.90,0
+B,main first,main-81588a2,file64k,3,51881.17,0.92ms,1.13ms,100,19.05,0
+B,main first,main-81588a2,json,3,150383.72,261.00us,757.00us,100,6.57,0
+B,main first,change,file64k,3,52119.77,0.92ms,1.18ms,100,18.92,0
+B,main first,change,json,3,142750.59,266.00us,0.96ms,100,6.90,0
+B,main first,main-81588a2 TLS,handshake,4,8373.78,1.80ms,3.91ms,99,118.32,0
+B,main first,main-81588a2 TLS,file64k,4,22330.14,2.06ms,3.72ms,98,43.95,0
+B,main first,main-81588a2 TLS,json,4,144667.64,266.00us,719.00us,101,6.84,0
+B,main first,change TLS,handshake,4,8251.69,1.83ms,3.89ms,98,119.10,0
+B,main first,change TLS,file64k,4,22441.58,2.03ms,3.49ms,98,43.82,0
+B,main first,change TLS,json,4,143379.28,266.00us,764.00us,101,6.92,0
+B,main first,main-81588a2,file64k,4,49826.88,0.95ms,1.47ms,100,19.79,0
+B,main first,main-81588a2,json,4,157594.88,251.00us,662.00us,101,6.31,0
+B,main first,change,file64k,4,51256.21,0.92ms,1.62ms,99,19.05,0
+B,main first,change,json,4,154880.93,254.00us,775.00us,100,6.36,0
+B,main first,main-81588a2 TLS,handshake,5,8326.02,1.79ms,3.97ms,100,117.72,0
+B,main first,main-81588a2 TLS,file64k,5,23288.62,1.98ms,3.24ms,100,42.35,0
+B,main first,main-81588a2 TLS,json,5,143308.85,269.00us,730.00us,99,6.94,0
+B,main first,change TLS,handshake,5,8050.55,1.86ms,4.16ms,100,121.96,0
+B,main first,change TLS,file64k,5,22599.46,2.02ms,3.54ms,98,43.50,0
+B,main first,change TLS,json,5,148956.42,261.00us,644.00us,101,6.67,0
+B,main first,main-81588a2,file64k,5,51884.12,0.90ms,1.46ms,98,19.03,0
+B,main first,main-81588a2,json,5,150180.03,262.00us,728.00us,100,6.58,0
+B,main first,change,file64k,5,52148.13,0.91ms,1.26ms,100,18.95,0
+B,main first,change,json,5,150397.05,261.00us,847.00us,101,6.58,0
+B,main first,main-81588a2 TLS,handshake,6,7941.34,1.84ms,4.04ms,98,123.75,0
+B,main first,main-81588a2 TLS,file64k,6,23360.26,1.97ms,3.20ms,98,42.19,0
+B,main first,main-81588a2 TLS,json,6,140190.29,271.00us,0.95ms,100,7.01,0
+B,main first,change TLS,handshake,6,8043.78,1.88ms,4.12ms,99,122.94,0
+B,main first,change TLS,file64k,6,22284.27,2.04ms,3.70ms,100,44.00,0
+B,main first,change TLS,json,6,143432.39,267.00us,833.00us,98,6.89,0
+B,main first,main-81588a2,file64k,6,50123.38,0.94ms,1.48ms,100,19.56,0
+B,main first,main-81588a2,json,6,150370.21,262.00us,727.00us,101,6.59,0
+B,main first,change,file64k,6,51589.43,0.91ms,1.48ms,99,18.97,0
+B,main first,change,json,6,151208.17,262.00us,700.00us,101,6.55,0
+B,main first,main-81588a2 TLS,handshake,7,7934.80,1.86ms,4.36ms,98,124.34,0
+B,main first,main-81588a2 TLS,file64k,7,21508.59,2.07ms,8.47ms,97,44.91,0
+B,main first,main-81588a2 TLS,json,7,139606.17,275.00us,0.85ms,100,7.06,0
+B,main first,change TLS,handshake,7,7876.29,1.90ms,4.27ms,98,124.66,0
+B,main first,change TLS,file64k,7,22980.88,2.00ms,3.32ms,100,42.75,0
+B,main first,change TLS,json,7,142932.07,266.00us,0.93ms,100,6.90,0
+B,main first,main-81588a2,file64k,7,52154.51,0.91ms,1.29ms,100,18.91,0
+B,main first,main-81588a2,json,7,155408.73,253.00us,724.00us,100,6.35,0
+B,main first,change,file64k,7,51545.92,0.92ms,1.47ms,100,19.02,0
+B,main first,change,json,7,157380.54,247.00us,0.90ms,98,6.26,0
+B,main first,main-81588a2 TLS,handshake,8,8665.05,1.81ms,3.72ms,99,114.60,0
+B,main first,main-81588a2 TLS,file64k,8,22719.41,2.04ms,3.09ms,98,43.19,0
+B,main first,main-81588a2 TLS,json,8,140254.31,269.00us,0.87ms,101,7.09,0
+B,main first,change TLS,handshake,8,8564.52,1.83ms,3.82ms,99,115.73,0
+B,main first,change TLS,file64k,8,21762.74,2.09ms,3.55ms,100,45.23,0
+B,main first,change TLS,json,8,146760.02,263.00us,682.00us,99,6.76,0
+B,main first,main-81588a2,file64k,8,52422.11,0.91ms,1.37ms,100,18.70,0
+B,main first,main-81588a2,json,8,154556.11,255.00us,700.00us,100,6.39,0
+B,main first,change,file64k,8,50325.96,0.94ms,1.31ms,100,19.60,0
+B,main first,change,json,8,155517.01,252.00us,687.00us,101,6.38,0
+B,main first,main-81588a2 TLS,handshake,9,8738.18,1.81ms,3.63ms,99,113.43,0
+B,main first,main-81588a2 TLS,file64k,9,22673.28,2.00ms,4.54ms,97,43.10,0
+B,main first,main-81588a2 TLS,json,9,145194.82,266.00us,796.00us,100,6.81,0
+B,main first,change TLS,handshake,9,7966.28,1.91ms,4.03ms,98,123.87,0
+B,main first,change TLS,file64k,9,22653.48,2.01ms,3.51ms,98,43.58,0
+B,main first,change TLS,json,9,143307.49,273.00us,685.00us,101,6.94,0
+B,main first,main-81588a2,file64k,9,49749.62,0.92ms,7.66ms,98,19.57,0
+B,main first,main-81588a2,json,9,150529.09,259.00us,821.00us,100,6.56,0
+B,main first,change,file64k,9,49496.91,0.94ms,1.61ms,100,19.81,0
+B,main first,change,json,9,154803.65,255.00us,714.00us,101,6.41,0
+B,main first,main-81588a2 TLS,handshake,10,8433.35,1.84ms,3.81ms,99,117.86,0
+B,main first,main-81588a2 TLS,file64k,10,23209.85,1.97ms,3.48ms,98,42.45,0
+B,main first,main-81588a2 TLS,json,10,138980.80,273.00us,1.02ms,97,7.03,0
+B,main first,change TLS,handshake,10,8216.98,1.80ms,3.88ms,99,118.55,0
+B,main first,change TLS,file64k,10,22721.62,2.05ms,3.15ms,98,43.36,0
+B,main first,change TLS,json,10,142558.43,270.00us,723.00us,99,6.94,0
+B,main first,main-81588a2,file64k,10,50181.00,0.95ms,1.34ms,100,19.69,0
+B,main first,main-81588a2,json,10,160120.05,249.00us,612.00us,101,6.23,0
+B,main first,change,file64k,10,51169.22,0.94ms,1.24ms,100,19.27,0
+B,main first,change,json,10,159736.32,248.00us,612.00us,101,6.22,0
+C,change first,change TLS,handshake,1,8121.01,1.81ms,4.30ms,99,121.66,0
+C,change first,change TLS,file64k,1,22532.04,2.05ms,3.38ms,100,43.77,0
+C,change first,main-81588a2 TLS,handshake,1,8360.62,1.76ms,3.88ms,99,116.79,0
+C,change first,main-81588a2 TLS,file64k,1,23036.68,2.02ms,3.22ms,101,42.98,0
+C,change first,change TLS,handshake,2,8411.50,1.83ms,3.80ms,100,116.51,0
+C,change first,change TLS,file64k,2,24074.85,1.91ms,3.10ms,99,41.10,0
+C,change first,main-81588a2 TLS,handshake,2,8392.01,1.80ms,4.01ms,99,117.79,0
+C,change first,main-81588a2 TLS,file64k,2,22588.26,2.05ms,3.43ms,100,43.58,0
+C,change first,change TLS,handshake,3,8460.59,1.77ms,4.04ms,99,115.60,0
+C,change first,change TLS,file64k,3,23129.15,2.01ms,3.22ms,100,42.64,0
+C,change first,main-81588a2 TLS,handshake,3,8466.56,1.81ms,3.89ms,99,117.02,0
+C,change first,main-81588a2 TLS,file64k,3,22402.42,2.02ms,3.59ms,100,43.85,0
+C,change first,change TLS,handshake,4,8327.17,1.83ms,3.71ms,99,119.04,0
+C,change first,change TLS,file64k,4,22808.60,2.02ms,3.36ms,98,43.22,0
+C,change first,main-81588a2 TLS,handshake,4,8437.47,1.79ms,3.78ms,98,117.02,0
+C,change first,main-81588a2 TLS,file64k,4,23214.04,1.96ms,3.51ms,98,42.54,0
+C,change first,change TLS,handshake,5,8583.23,1.85ms,3.54ms,99,115.22,0
+C,change first,change TLS,file64k,5,22780.02,2.03ms,3.42ms,100,43.30,0
+C,change first,main-81588a2 TLS,handshake,5,8193.48,1.78ms,4.12ms,98,120.02,0
+C,change first,main-81588a2 TLS,file64k,5,21949.00,2.08ms,3.51ms,100,44.76,0
+C,change first,change TLS,handshake,6,8137.06,1.86ms,4.14ms,98,120.79,0
+C,change first,change TLS,file64k,6,22609.08,2.05ms,3.69ms,98,43.51,0
+C,change first,main-81588a2 TLS,handshake,6,8396.30,1.76ms,4.08ms,99,117.81,0
+C,change first,main-81588a2 TLS,file64k,6,23288.83,2.01ms,3.05ms,99,42.49,0
+C,change first,change TLS,handshake,7,8607.38,1.83ms,3.73ms,99,114.92,0
+C,change first,change TLS,file64k,7,23050.40,1.99ms,3.33ms,99,42.92,0
+C,change first,main-81588a2 TLS,handshake,7,8080.66,1.81ms,3.86ms,99,120.58,0
+C,change first,main-81588a2 TLS,file64k,7,23129.44,2.00ms,3.13ms,98,42.70,0
+C,change first,change TLS,handshake,8,8216.04,1.84ms,3.93ms,98,120.12,0
+C,change first,change TLS,file64k,8,22714.43,2.03ms,3.36ms,98,43.22,0
+C,change first,main-81588a2 TLS,handshake,8,8309.87,1.80ms,3.87ms,99,119.25,0
+C,change first,main-81588a2 TLS,file64k,8,22951.97,2.00ms,3.45ms,100,43.05,0
+C,change first,change TLS,handshake,9,8170.48,1.86ms,4.27ms,98,120.73,0
+C,change first,change TLS,file64k,9,23444.83,1.96ms,3.48ms,98,41.76,0
+C,change first,main-81588a2 TLS,handshake,9,8221.09,1.86ms,3.97ms,98,120.08,0
+C,change first,main-81588a2 TLS,file64k,9,22329.34,2.05ms,3.52ms,98,44.05,0
+C,change first,change TLS,handshake,10,8590.86,1.81ms,3.70ms,99,115.36,0
+C,change first,change TLS,file64k,10,23811.55,1.91ms,3.65ms,98,41.21,0
+C,change first,main-81588a2 TLS,handshake,10,8334.82,1.83ms,3.77ms,99,118.65,0
+C,change first,main-81588a2 TLS,file64k,10,23399.23,1.96ms,3.37ms,100,42.15,0
+D,main first,main-81588a2 TLS,handshake,1,8359.55,1.77ms,3.95ms,98,117.50,0
+D,main first,change TLS,handshake,1,8164.62,1.82ms,4.02ms,98,120.84,0
+D,change first,change TLS,handshake,1,8321.76,1.84ms,3.87ms,99,119.01,0
+D,change first,main-81588a2 TLS,handshake,1,8580.56,1.82ms,3.76ms,99,115.29,0
+D,main first,main-81588a2 TLS,handshake,2,8621.93,1.74ms,3.51ms,100,114.58,0
+D,main first,change TLS,handshake,2,8327.68,1.79ms,3.88ms,99,118.70,0
+D,change first,change TLS,handshake,2,8672.96,1.77ms,3.78ms,99,114.06,0
+D,change first,main-81588a2 TLS,handshake,2,8555.41,1.71ms,3.78ms,100,114.75,0
+D,main first,main-81588a2 TLS,handshake,3,8611.68,1.74ms,3.59ms,101,115.14,0
+D,main first,change TLS,handshake,3,8632.82,1.84ms,3.64ms,99,114.53,0
+D,change first,change TLS,handshake,3,8638.28,1.77ms,3.77ms,100,114.28,0
+D,change first,main-81588a2 TLS,handshake,3,8599.31,1.79ms,3.83ms,99,115.02,0
+D,main first,main-81588a2 TLS,handshake,4,8246.69,1.81ms,3.87ms,98,119.62,0
+D,main first,change TLS,handshake,4,8357.48,1.81ms,3.88ms,99,118.70,0
+D,change first,change TLS,handshake,4,8131.47,1.82ms,3.91ms,99,120.32,0
+D,change first,main-81588a2 TLS,handshake,4,8283.27,1.86ms,4.11ms,97,116.95,0
+D,main first,main-81588a2 TLS,handshake,5,8407.42,1.83ms,3.69ms,99,117.83,0
+D,main first,change TLS,handshake,5,8415.42,1.75ms,3.79ms,100,116.70,0
+D,change first,change TLS,handshake,5,8236.04,1.88ms,3.89ms,98,119.76,0
+D,change first,main-81588a2 TLS,handshake,5,8270.02,1.82ms,3.79ms,99,120.34,0
+D,main first,main-81588a2 TLS,handshake,6,8261.40,1.84ms,4.16ms,99,118.38,0
+D,main first,change TLS,handshake,6,8582.17,1.83ms,3.68ms,99,115.09,0
+D,change first,change TLS,handshake,6,8116.39,1.89ms,3.95ms,99,121.77,0
+D,change first,main-81588a2 TLS,handshake,6,8238.76,1.78ms,3.85ms,97,118.51,0
+D,main first,main-81588a2 TLS,handshake,7,8594.10,1.75ms,3.72ms,100,114.95,0
+D,main first,change TLS,handshake,7,8478.54,1.85ms,3.83ms,99,116.81,0
+D,change first,change TLS,handshake,7,8503.98,1.88ms,3.84ms,99,116.20,0
+D,change first,main-81588a2 TLS,handshake,7,8427.54,1.77ms,4.04ms,100,116.72,0
+D,main first,main-81588a2 TLS,handshake,8,8438.97,1.75ms,3.97ms,99,117.22,0
+D,main first,change TLS,handshake,8,7609.61,1.88ms,7.67ms,96,126.12,0
+D,change first,change TLS,handshake,8,8263.88,1.82ms,4.05ms,98,119.15,0
+D,change first,main-81588a2 TLS,handshake,8,8151.84,1.80ms,4.17ms,100,120.20,0
+D,main first,main-81588a2 TLS,handshake,9,8539.11,1.80ms,3.90ms,101,115.87,0
+D,main first,change TLS,handshake,9,8392.56,1.83ms,3.83ms,101,117.92,0
+D,change first,change TLS,handshake,9,8424.08,1.79ms,3.80ms,99,117.59,0
+D,change first,main-81588a2 TLS,handshake,9,8334.80,1.84ms,3.97ms,99,118.80,0
+D,main first,main-81588a2 TLS,handshake,10,8669.87,1.73ms,3.59ms,99,114.47,0
+D,main first,change TLS,handshake,10,8638.41,1.77ms,3.71ms,98,114.22,0
+D,change first,change TLS,handshake,10,7832.07,1.86ms,4.15ms,98,125.78,0
+D,change first,main-81588a2 TLS,handshake,10,8186.38,1.87ms,4.25ms,99,120.84,0
+D,main first,main-81588a2 TLS,handshake,11,8733.17,1.77ms,3.60ms,99,113.92,0
+D,main first,change TLS,handshake,11,8549.91,1.79ms,3.65ms,99,115.60,0
+D,change first,change TLS,handshake,11,8018.10,1.85ms,4.15ms,98,122.34,0
+D,change first,main-81588a2 TLS,handshake,11,8361.39,1.77ms,3.97ms,100,117.20,0
+D,main first,main-81588a2 TLS,handshake,12,8555.74,1.76ms,3.76ms,100,114.82,0
+D,main first,change TLS,handshake,12,8460.40,1.82ms,3.88ms,99,117.11,0
+D,change first,change TLS,handshake,12,8228.22,1.76ms,3.84ms,99,118.88,0
+D,change first,main-81588a2 TLS,handshake,12,8532.70,1.74ms,4.14ms,97,114.29,0
+E,"first version, change, main",first-version TLS,handshake,1,8607.52,1.73ms,3.54ms,100,113.81,0
+E,"first version, change, main",change TLS,handshake,1,8045.56,1.86ms,4.28ms,98,121.88,0
+E,"first version, change, main",main-81588a2 TLS,handshake,1,8435.56,1.80ms,4.04ms,98,116.43,0
+E,"change, main, first version",change TLS,handshake,1,8382.44,1.78ms,3.71ms,100,117.18,0
+E,"change, main, first version",main-81588a2 TLS,handshake,1,8630.32,1.84ms,3.67ms,100,113.81,0
+E,"change, main, first version",first-version TLS,handshake,1,8590.78,1.86ms,3.64ms,99,115.39,0
+E,"main, first version, change",main-81588a2 TLS,handshake,1,8403.50,1.73ms,4.12ms,99,115.94,0
+E,"main, first version, change",first-version TLS,handshake,1,8387.72,1.81ms,4.13ms,98,116.54,0
+E,"main, first version, change",change TLS,handshake,1,8561.55,1.82ms,3.73ms,100,114.44,0
+E,"first version, change, main",first-version TLS,handshake,2,8306.43,1.79ms,4.00ms,99,118.96,0
+E,"first version, change, main",change TLS,handshake,2,8185.96,1.81ms,3.94ms,99,121.01,0
+E,"first version, change, main",main-81588a2 TLS,handshake,2,8202.30,1.79ms,4.45ms,98,119.24,0
+E,"change, main, first version",change TLS,handshake,2,8460.34,1.81ms,3.83ms,99,116.93,0
+E,"change, main, first version",main-81588a2 TLS,handshake,2,8402.53,1.75ms,3.67ms,100,117.35,0
+E,"change, main, first version",first-version TLS,handshake,2,8490.31,1.80ms,3.71ms,99,116.76,0
+E,"main, first version, change",main-81588a2 TLS,handshake,2,8686.14,1.76ms,3.49ms,99,114.20,0
+E,"main, first version, change",first-version TLS,handshake,2,8393.98,1.85ms,3.97ms,99,117.80,0
+E,"main, first version, change",change TLS,handshake,2,8359.14,1.85ms,3.67ms,100,117.51,0
+E,"first version, change, main",first-version TLS,handshake,3,8542.14,1.72ms,3.95ms,98,114.93,0
+E,"first version, change, main",change TLS,handshake,3,8484.13,1.87ms,3.63ms,99,116.85,0
+E,"first version, change, main",main-81588a2 TLS,handshake,3,8426.95,1.74ms,3.74ms,99,117.53,0
+E,"change, main, first version",change TLS,handshake,3,8306.02,1.81ms,4.11ms,98,118.58,0
+E,"change, main, first version",main-81588a2 TLS,handshake,3,8471.42,1.83ms,3.84ms,99,116.78,0
+E,"change, main, first version",first-version TLS,handshake,3,8796.39,1.79ms,3.54ms,99,112.85,0
+E,"main, first version, change",main-81588a2 TLS,handshake,3,8307.38,1.86ms,3.87ms,99,118.91,0
+E,"main, first version, change",first-version TLS,handshake,3,8799.92,1.80ms,3.52ms,99,112.86,0
+E,"main, first version, change",change TLS,handshake,3,8292.55,1.81ms,4.15ms,99,119.20,0
+E,"first version, change, main",first-version TLS,handshake,4,8147.76,1.90ms,4.08ms,99,121.60,0
+E,"first version, change, main",change TLS,handshake,4,8312.32,1.83ms,3.89ms,99,118.92,0
+E,"first version, change, main",main-81588a2 TLS,handshake,4,8265.99,1.81ms,4.18ms,98,119.36,0
+E,"change, main, first version",change TLS,handshake,4,8059.06,1.89ms,4.07ms,101,122.84,0
+E,"change, main, first version",main-81588a2 TLS,handshake,4,8562.19,1.77ms,3.72ms,100,115.38,0
+E,"change, main, first version",first-version TLS,handshake,4,8520.77,1.78ms,3.65ms,98,115.49,0
+E,"main, first version, change",main-81588a2 TLS,handshake,4,8382.70,1.77ms,3.66ms,99,118.21,0
+E,"main, first version, change",first-version TLS,handshake,4,8573.66,1.76ms,3.73ms,98,115.14,0
+E,"main, first version, change",change TLS,handshake,4,8453.90,1.83ms,3.56ms,100,116.40,0
+E,"first version, change, main",first-version TLS,handshake,5,8670.02,1.79ms,3.65ms,99,114.49,0
+E,"first version, change, main",change TLS,handshake,5,8156.12,1.85ms,3.99ms,99,119.44,0
+E,"first version, change, main",main-81588a2 TLS,handshake,5,7534.15,1.78ms,9.43ms,96,127.23,0
+E,"change, main, first version",change TLS,handshake,5,8359.91,1.84ms,3.76ms,99,118.34,0
+E,"change, main, first version",main-81588a2 TLS,handshake,5,8480.64,1.86ms,3.79ms,99,117.13,0
+E,"change, main, first version",first-version TLS,handshake,5,8466.08,1.82ms,3.97ms,100,116.00,0
+E,"main, first version, change",main-81588a2 TLS,handshake,5,8469.19,1.78ms,3.75ms,98,116.56,0
+E,"main, first version, change",first-version TLS,handshake,5,8425.81,1.78ms,3.55ms,100,116.33,0
+E,"main, first version, change",change TLS,handshake,5,8631.01,1.77ms,3.55ms,99,114.76,0
+E,"first version, change, main",first-version TLS,handshake,6,8733.66,1.82ms,3.54ms,99,113.49,0
+E,"first version, change, main",change TLS,handshake,6,8410.41,1.85ms,3.69ms,99,117.83,0
+E,"first version, change, main",main-81588a2 TLS,handshake,6,8279.72,1.82ms,3.83ms,99,117.67,0
+E,"change, main, first version",change TLS,handshake,6,8500.33,1.82ms,3.76ms,99,116.35,0
+E,"change, main, first version",main-81588a2 TLS,handshake,6,8430.59,1.82ms,3.81ms,99,117.23,0
+E,"change, main, first version",first-version TLS,handshake,6,8506.81,1.89ms,3.70ms,98,115.56,0
+E,"main, first version, change",main-81588a2 TLS,handshake,6,8288.39,1.82ms,3.98ms,99,119.19,0
+E,"main, first version, change",first-version TLS,handshake,6,8683.33,1.77ms,3.44ms,101,114.01,0
+E,"main, first version, change",change TLS,handshake,6,8466.78,1.86ms,3.68ms,99,116.86,0
+E,"first version, change, main",first-version TLS,handshake,7,8434.22,1.79ms,3.80ms,98,117.04,0
+E,"first version, change, main",change TLS,handshake,7,8614.57,1.79ms,3.49ms,99,115.29,0
+E,"first version, change, main",main-81588a2 TLS,handshake,7,8262.00,1.75ms,4.07ms,100,118.65,0
+E,"change, main, first version",change TLS,handshake,7,8790.81,1.79ms,3.43ms,99,112.77,0
+E,"change, main, first version",main-81588a2 TLS,handshake,7,8523.26,1.77ms,3.72ms,98,115.75,0
+E,"change, main, first version",first-version TLS,handshake,7,8563.52,1.83ms,3.69ms,98,114.79,0
+E,"main, first version, change",main-81588a2 TLS,handshake,7,8485.71,1.78ms,3.75ms,99,116.87,0
+E,"main, first version, change",first-version TLS,handshake,7,8685.74,1.80ms,3.65ms,99,114.21,0
+E,"main, first version, change",change TLS,handshake,7,8467.29,1.86ms,3.56ms,99,116.98,0
+E,"first version, change, main",first-version TLS,handshake,8,8495.91,1.82ms,3.61ms,101,116.71,0
+E,"first version, change, main",change TLS,handshake,8,8457.38,1.81ms,3.80ms,101,117.04,0
+E,"first version, change, main",main-81588a2 TLS,handshake,8,8434.28,1.79ms,3.92ms,98,116.84,0
+E,"change, main, first version",change TLS,handshake,8,8471.95,1.80ms,3.79ms,99,115.46,0
+E,"change, main, first version",main-81588a2 TLS,handshake,8,8765.02,1.69ms,3.75ms,99,112.77,0
+E,"change, main, first version",first-version TLS,handshake,8,8715.18,1.84ms,3.45ms,99,114.00,0
+E,"main, first version, change",main-81588a2 TLS,handshake,8,8358.22,1.79ms,4.09ms,98,117.60,0
+E,"main, first version, change",first-version TLS,handshake,8,8723.22,1.75ms,3.62ms,98,113.12,0
+E,"main, first version, change",change TLS,handshake,8,8559.92,1.86ms,3.52ms,99,115.77,0

@@ -1,0 +1,9 @@
+10000 connections, 4 worker threads per server; load: 5000 busy connections
+
+server                 open     idle  pending   KiB per connection
+giong-http              1.4      1.4      6.1
+giong-http-epoll        1.6      1.7      6.1
+
+server              peak MiB     req/s   under load
+giong-http              14.1    160840
+giong-http-epoll        15.0    172624

@@ -3,6 +3,7 @@
 # throughput and for memory per connection and per stream.
 #
 #   bench/h2.sh [rounds] [seconds-per-measurement]
+#   PARTS=memory MEM_SERVERS=giong-http bench/h2.sh 3   # memory of giong-http only
 #
 # Servers (the same routes as everywhere in bench/):
 #   giong-http-tls  bench/giong-http with TLS_CERT and TLS_KEY: HTTPS, HTTP/2
@@ -34,7 +35,10 @@
 #                beyond h2-pending, per extra stream
 # Reported in KiB, the median of all rounds.
 #
-# Requires: h2load, curl (with HTTP/2), openssl, cargo, python3.
+# PARTS (default "throughput memory") picks the parts to run, MEM_SERVERS
+# (default "giong-http axum") the servers whose memory is measured.
+#
+# Requires: h2load (for throughput), curl (with HTTP/2), openssl, cargo, python3.
 # Results: bench/results/h2/ (or $OUT).
 set -euo pipefail
 cd "$(dirname "$0")"
@@ -50,15 +54,20 @@ MUX_CONNS=${MUX_CONNS:-3}
 MUX_STREAMS=${MUX_STREAMS:-100}
 MEM_CONNS=${MEM_CONNS:-5000}
 MEM_STREAMS=${MEM_STREAMS:-10}
+PARTS=${PARTS:-throughput memory}
+MEM_SERVERS=${MEM_SERVERS:-giong-http axum}
 OUT=${OUT:-results/h2}
 mkdir -p "$OUT"
 CSV="$OUT/raw.csv"
 MEM_CSV="$OUT/memory.csv"
 
+part() { [[ " $PARTS " == *" $1 "* ]]; }
+needs_axum() { part throughput || [[ " $MEM_SERVERS " == *" axum "* ]]; }
+
 echo "building..." >&2
 (cd giong-http && cargo build --release -q)
-(cd axum-tls && cargo build --release -q)
-(cd axum && cargo build --release -q --features h2 --target-dir target/h2)
+if part throughput; then (cd axum-tls && cargo build --release -q); fi
+if needs_axum; then (cd axum && cargo build --release -q --features h2 --target-dir target/h2); fi
 (cd hold && cargo build --release -q)
 
 TMP=$(mktemp -d)
@@ -107,6 +116,7 @@ stop() {
 
 echo "server,endpoint,round,rps,mean_ms,cpu,failed" > "$CSV"
 for round in $(seq 1 "$ROUNDS"); do
+  part throughput || break
   for s in "${NAMES[@]}"; do
     start "$s" 1 "$SERVER_CPU"
     for ep in json users json-mux; do
@@ -169,7 +179,8 @@ hold() {
 
 echo "server,round,idle,pending,pending_many" > "$MEM_CSV"
 for round in $(seq 1 "$ROUNDS"); do
-  for s in giong-http axum; do
+  part memory || break
+  for s in $MEM_SERVERS; do
     idle=$(hold "$s" h2-idle /json)
     pending=$(hold "$s" h2-pending:1 "/wait?ms=600000")
     many=$(hold "$s" "h2-pending:$MEM_STREAMS" "/wait?ms=600000")

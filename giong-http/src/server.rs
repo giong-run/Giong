@@ -24,7 +24,7 @@ use crate::budget::{self, Charge, FREE};
 use crate::chunked::{Decoder, Progress};
 use crate::h2::PREFACE;
 use crate::heap::HeapFuture;
-use crate::parse::{find_head_end, parse_head};
+use crate::parse::{find_head_end, parse_head, Head};
 use crate::request::{BodyBytes, Request};
 use crate::response::{Body, Response};
 use crate::trailers::Trailers;
@@ -702,9 +702,9 @@ impl Server {
     /// it, since the worker count is only known on the worker.
     ///
     /// What a worker holds is then about this limit plus what its
-    /// connections cost on their own (about 2 KiB each while idle over
-    /// HTTP/1.1, 4.5 KiB over HTTP/2 and 12.5 KiB over HTTPS, and up to the
-    /// 4 KiB above while a request arrives); see `docs/DEPLOYMENT.md` for
+    /// connections cost on their own (about 1.3 KiB each while idle over
+    /// HTTP/1.1, 3.2 KiB over HTTP/2, 5.2 KiB over HTTPS and 10 KiB over
+    /// HTTP/2 with TLS, and up to the 4 KiB above while a request arrives); see `docs/DEPLOYMENT.md` for
     /// sizing a container.
     pub fn max_buffered_request_bytes(mut self, bytes: usize) -> Self {
         self.cfg.max_buffered_request_bytes = BufferedLimit::bytes(bytes);
@@ -756,9 +756,9 @@ impl Server {
     /// (default: 10,000). Normally every worker makes its own call, so the
     /// limit applies per worker.
     ///
-    /// An idle connection costs a few KiB (about 2 KiB over HTTP/1.1, 4.5
-    /// KiB over HTTP/2, 12.5 KiB over HTTPS, plus the kernel's socket
-    /// buffers), so the default holds a worker's idle connections to tens
+    /// An idle connection costs a few KiB (about 1.3 KiB over HTTP/1.1, 3.2
+    /// KiB over HTTP/2, 5.2 KiB over HTTPS, 10 KiB over HTTP/2 with TLS,
+    /// plus the kernel's socket buffers), so the default holds a worker's idle connections to tens
     /// of MiB. The requests the connections are receiving have a bound of
     /// their own, shared by all of them:
     /// [`max_buffered_request_bytes`](Self::max_buffered_request_bytes).
@@ -1018,7 +1018,7 @@ impl Server {
                 // once, inside the HTTP state, and nothing else: an input the
                 // task captures, or a local of it that is borrowed, keeps its
                 // bytes in the task for as long as the connection lasts.
-                let handshake = HeapFuture::new(async move {
+                let handshake = HeapFuture::with(move || async move {
                     let tls = acceptor.accept(stream).await?;
                     let h2 = tls.alpn_protocol().as_deref() == Some(b"h2");
                     let peer = Transport::peer_addr(&tls);
@@ -1033,7 +1033,7 @@ impl Server {
                     if h2 {
                         // On the heap, so that HTTP/1.1 connections do not
                         // carry the larger HTTP/2 state.
-                        HeapFuture::new(serve_h2(tls, cfg, peer, handler, slot)).await;
+                        HeapFuture::with(move || serve_h2(tls, cfg, peer, handler, slot)).await;
                     } else {
                         Conn::new(tls, cfg, Some(slot)).serve(handler).await;
                     }
@@ -1696,15 +1696,29 @@ fn open_files_limits() -> Option<&'static (String, String)> {
 }
 
 /// An HTTP/2 connection chosen through ALPN: its own task body.
+///
+/// Not an `async fn`: one keeps its arguments twice (as received, and moved
+/// into its body), and the stream, a TLS session, is over a kilobyte.
 #[cfg(feature = "tls")]
-async fn serve_h2<T: Transport, H: Handler>(
+#[allow(clippy::manual_async_fn)]
+fn serve_h2<T: Transport, H: Handler>(
     stream: T,
     cfg: Config,
     peer: Option<SocketAddr>,
     handler: Rc<H>,
     slot: Slot,
-) {
-    crate::h2::serve(&stream, cfg, peer, &*handler, Vec::new(), Some(&slot)).await;
+) -> impl Future<Output = ()> {
+    async move {
+        crate::h2::serve(&stream, &cfg, &peer, &*handler, Vec::new(), Some(&slot)).await;
+    }
+}
+
+/// What is left to receive of a request's body.
+enum Wait {
+    /// The rest of a chunked body, decoded so far by this decoder.
+    Chunked(Decoder),
+    /// Until the read buffer holds this many bytes of body.
+    Length(usize),
 }
 
 /// Why a connection stops reading requests.
@@ -2048,32 +2062,14 @@ impl<T: Transport> Conn<T> {
     async fn run<H: Handler>(&mut self, handler: &H) {
         // Set when the connection closes with part of a request body unread.
         let mut linger = false;
-        loop {
+        // Why the connection stops reading requests. Nothing is awaited
+        // inside the `match` on `next_request`: the result it matches on (a
+        // request, 200 bytes) would be kept in the connection's future across
+        // that `.await`, beside every other state, idle or not.
+        let end = loop {
             let (req, streamed) = match self.next_request(handler).await {
                 Ok(next) => next,
-                Err(End::Close) => break,
-                Err(End::Http2) => {
-                    let input = self.buf[self.pos..].to_vec();
-                    self.release_read_buffer_all();
-                    self.charge.shrink_to(0);
-                    let h2 = crate::h2::serve(
-                        &self.stream,
-                        self.cfg,
-                        self.peer,
-                        handler,
-                        input,
-                        self._slot.as_ref(),
-                    );
-                    HeapFuture::new(h2).await;
-                    return;
-                }
-                Err(end @ (End::Status(_) | End::Busy)) => {
-                    self.write_refusal(end);
-                    if self.flush().await.is_ok() {
-                        self.lingering_close().await;
-                    }
-                    return;
-                }
+                Err(end) => break end,
             };
             // What the connection needs from the request, read in a block of
             // its own: a local that has been borrowed is kept in the
@@ -2090,6 +2086,9 @@ impl<T: Transport> Conn<T> {
             };
 
             let traced = self.traces != 0;
+            // Only small values cross an `.await` from here on: a local kept
+            // across more than one `.await` has its room in every state of
+            // this future, waiting for the next request included.
             let (resp, body_read) = match streamed {
                 None => {
                     // Poll the handler once before deciding what to do with
@@ -2105,7 +2104,7 @@ impl<T: Transport> Conn<T> {
                     let made = {
                         let mut trace = if traced { self.trace_handler() } else { None };
                         let made = catching(|| {
-                            HeapFuture::new(Caught {
+                            HeapFuture::with(|| Caught {
                                 fut: handler.call(req),
                                 trace: trace.take(),
                             })
@@ -2122,6 +2121,9 @@ impl<T: Transport> Conn<T> {
                             match first {
                                 Poll::Ready(answer) => answer,
                                 Poll::Pending => {
+                                    // Moved whole: matched and left in place,
+                                    // it would be kept across the waits.
+                                    drop(first);
                                     if self.flush().await.is_err() {
                                         return;
                                     }
@@ -2144,40 +2146,43 @@ impl<T: Transport> Conn<T> {
                     // requests go out first. On the heap like the handler's
                     // future, so that the rarer streaming paths do not make
                     // every connection larger.
-                    let answer = HeapFuture::new(async {
+                    let answer = HeapFuture::with(|| async {
                         self.flush().await?;
                         Ok::<_, End>(self.answer_streaming(handler, req, body).await)
                     });
                     match answer.await {
-                        Ok(answer) => answer,
+                        Ok(answered) => answered,
                         Err(_) => return,
                     }
                 }
             };
-
-            if traced {
-                self.trace_answered(resp.status());
-            }
-            // Decided after the handler ran: a shutdown may have begun meanwhile.
-            self.closing |= giong::is_shutting_down();
-            let streams = resp.is_streaming() && resp.sends_body(head_only);
-            // Without chunked encoding (HTTP/1.0), a streamed body ends when
-            // the connection does.
-            // After a 2xx to CONNECT, the client and the proxies on the way
-            // take what follows on the connection for a tunnel (RFC 9110,
-            // section 9.3.6), which the server has none of: what a proxy in
-            // front passes on blindly must not be read as requests it never
-            // saw.
-            let tunnel = connect && (200..300).contains(&resp.status());
-            let keep_alive = wants_keep_alive
-                && !self.closing
-                && body_read
-                && !(streams && minor == 0)
-                && !tunnel;
-            self.reserve_out();
-            let stream = {
+            // What the connection needs of the response, in a block of its
+            // own like the request's above: borrowed, `resp` would be kept
+            // in the connection's future across every later `.await`.
+            let (stream, keep_alive) = {
                 let mut resp = resp;
-                if streams {
+                if traced {
+                    self.trace_answered(resp.status());
+                }
+                // Decided after the handler ran: a shutdown may have begun
+                // meanwhile.
+                self.closing |= giong::is_shutting_down();
+                let streams = resp.is_streaming() && resp.sends_body(head_only);
+                // Without chunked encoding (HTTP/1.0), a streamed body ends
+                // when the connection does.
+                // After a 2xx to CONNECT, the client and the proxies on the
+                // way take what follows on the connection for a tunnel (RFC
+                // 9110, section 9.3.6), which the server has none of: what a
+                // proxy in front passes on blindly must not be read as
+                // requests it never saw.
+                let tunnel = connect && (200..300).contains(&resp.status());
+                let keep_alive = wants_keep_alive
+                    && !self.closing
+                    && body_read
+                    && !(streams && minor == 0)
+                    && !tunnel;
+                self.reserve_out();
+                let stream = if streams {
                     resp.write_head(&mut self.out, minor, keep_alive);
                     match resp.take_body() {
                         Body::Stream(body) => Some(body),
@@ -2195,10 +2200,11 @@ impl<T: Transport> Conn<T> {
                     // dropped here, which tells its sender.
                     resp.write_to(&mut self.out, minor, keep_alive, head_only);
                     None
-                }
+                };
+                (stream, keep_alive)
             };
             if let Some(body) = stream {
-                if HeapFuture::new(self.write_stream(&body, minor == 1))
+                if HeapFuture::with(|| self.write_stream(&body, minor == 1))
                     .await
                     .is_err()
                 {
@@ -2207,19 +2213,45 @@ impl<T: Transport> Conn<T> {
             }
             if !keep_alive {
                 linger = !body_read;
-                break;
+                break End::Close;
             }
             // Nothing may be appended after a separate body: send it now.
             let send_now = self.out.len() >= FLUSH_AT || !matches!(self.body, Body::Empty);
             if send_now && self.flush().await.is_err() {
                 return;
             }
-        }
-        if self.flush().await.is_ok() {
-            if linger {
-                self.lingering_close().await;
-            } else {
-                self.close_write().await;
+        };
+        match end {
+            End::Close => {
+                if self.flush().await.is_ok() {
+                    if linger {
+                        self.lingering_close().await;
+                    } else {
+                        self.close_write().await;
+                    }
+                }
+            }
+            End::Http2 => {
+                let input = self.buf[self.pos..].to_vec();
+                self.release_read_buffer_all();
+                self.charge.shrink_to(0);
+                HeapFuture::with(|| {
+                    crate::h2::serve(
+                        &self.stream,
+                        &self.cfg,
+                        &self.peer,
+                        handler,
+                        input,
+                        self._slot.as_ref(),
+                    )
+                })
+                .await;
+            }
+            End::Status(_) | End::Busy => {
+                self.write_refusal(end);
+                if self.flush().await.is_ok() {
+                    self.lingering_close().await;
+                }
             }
         }
     }
@@ -2562,26 +2594,17 @@ impl<T: Transport> Conn<T> {
             }
         }
 
-        let mut interim_sent = false;
-        let (body, total) = if head.chunked {
+        // The body, if there is none or all of it is in the read buffer;
+        // otherwise what is left to receive.
+        let at_hand = if head.chunked {
             let mut decoder = Decoder::new(self.cfg.max_body_size);
-            loop {
-                let data = &self.buf[self.pos + head.len..];
-                // The decoded body is held as well as the bytes it came from.
-                match decoder.feed(data).map_err(End::Status)? {
-                    Progress::Done(used) => {
-                        self.account(decoder.body.len())?;
-                        break (
-                            BodyBytes::Decoded(mem::take(&mut decoder.body)),
-                            head.len + used,
-                        );
-                    }
-                    Progress::NeedMore => {
-                        self.account(decoder.body.len())?;
-                        self.send_continue(&head, &mut interim_sent);
-                        self.read_more(false).await?;
-                    }
-                }
+            let data = &self.buf[self.pos + head.len..];
+            // The decoded body is held as well as the bytes it came from.
+            let progress = decoder.feed(data).map_err(End::Status)?;
+            self.account(decoder.body.len())?;
+            match progress {
+                Progress::Done(used) => Ok((BodyBytes::Decoded(decoder.body), head.len + used)),
+                Progress::NeedMore => Err(Wait::Chunked(decoder)),
             }
         } else {
             let len = head.content_length.unwrap_or(0);
@@ -2592,17 +2615,19 @@ impl<T: Transport> Conn<T> {
             // Refused before the body is read (and before `100 Continue`)
             // if it cannot fit in the worker's budget.
             self.admit(head.len + len)?;
-            if len >= RECV_INTO_AT {
-                self.body_into = true;
-                self.scanned = head.len + len;
+            if self.buf.len() - self.pos - head.len < len {
+                Err(Wait::Length(len))
+            } else {
+                let start = self.pos + head.len;
+                Ok((BodyBytes::InBuffer(start..start + len), head.len + len))
             }
-            while self.buf.len() - self.pos - head.len < len {
-                self.send_continue(&head, &mut interim_sent);
-                self.read_more(false).await?;
-            }
-            self.body_into = false;
-            let start = self.pos + head.len;
-            (BodyBytes::InBuffer(start..start + len), head.len + len)
+        };
+        // A body still on its way is received in a future on the heap: its
+        // states (the decoder of a chunked body above all) would otherwise
+        // be kept in every connection's future, idle or not.
+        let (body, total) = match at_hand {
+            Ok(at_hand) => at_hand,
+            Err(wait) => HeapFuture::with(|| self.read_body(&head, wait)).await?,
         };
 
         // What the request holds goes with it, and is given back when the
@@ -2628,6 +2653,36 @@ impl<T: Transport> Conn<T> {
         self.scanned = 0;
         self.deadline = None;
         Ok((req, None))
+    }
+
+    /// Receives the rest of the body of the request whose head is `head`,
+    /// from where `next_request` left it (`wait`).
+    async fn read_body(&mut self, head: &Head, wait: Wait) -> Result<(BodyBytes, usize), End> {
+        let mut interim_sent = false;
+        let len = match wait {
+            Wait::Chunked(mut decoder) => loop {
+                self.send_continue(head, &mut interim_sent);
+                self.read_more(false).await?;
+                let data = &self.buf[self.pos + head.len..];
+                let progress = decoder.feed(data).map_err(End::Status)?;
+                self.account(decoder.body.len())?;
+                if let Progress::Done(used) = progress {
+                    return Ok((BodyBytes::Decoded(decoder.body), head.len + used));
+                }
+            },
+            Wait::Length(len) => len,
+        };
+        if len >= RECV_INTO_AT {
+            self.body_into = true;
+            self.scanned = head.len + len;
+        }
+        while self.buf.len() - self.pos - head.len < len {
+            self.send_continue(head, &mut interim_sent);
+            self.read_more(false).await?;
+        }
+        self.body_into = false;
+        let start = self.pos + head.len;
+        Ok((BodyBytes::InBuffer(start..start + len), head.len + len))
     }
 
     /// Receives until the read buffer holds `want` bytes from `pos` (a
@@ -2724,6 +2779,9 @@ impl<T: Transport> Conn<T> {
             match received {
                 Some(received) => received,
                 None => {
+                    // Moved whole: matched and left in place, it would be
+                    // kept across the wait.
+                    drop(received);
                     // Shutting down: a request that was already on its way is
                     // still answered, then the connection closes.
                     self.closing = true;
@@ -2863,15 +2921,33 @@ impl<T: Transport> Conn<T> {
         // HTTP/2 and HTTP/3: a large body to a slow client may take longer
         // than the timeout in all, as long as the client keeps taking it.
         let idle = &self.cfg.write_timeout;
-        let wrote = match mem::take(&mut self.body) {
-            Body::Empty => until_stalled(idle, self.stream.write_all(out)).await,
-            Body::File(f) => {
-                let write = self
-                    .stream
-                    .write_all_with_file(out, &f.file, f.offset, f.len);
-                until_stalled(idle, write).await
+        // A body sent from where it is (a file, or 32 KiB and more) is
+        // written from the heap: its write futures are the largest, and
+        // inline they would make every connection's future larger, idle or
+        // not, for the rarer answers.
+        //
+        // No `match` on the body taken out of `self.body` around the plain
+        // write: the value matched would be kept across its `.await` too.
+        let wrote = if matches!(self.body, Body::Empty) {
+            until_stalled(idle, self.stream.write_all(out)).await
+        } else {
+            match mem::take(&mut self.body) {
+                Body::File(f) => {
+                    let stream = &self.stream;
+                    HeapFuture::with(|| {
+                        until_stalled(
+                            idle,
+                            stream.write_all_with_file(out, &f.file, f.offset, f.len),
+                        )
+                    })
+                    .await
+                }
+                body => {
+                    let stream = &self.stream;
+                    HeapFuture::with(|| until_stalled(idle, stream.write_all_with_body(out, body)))
+                        .await
+                }
             }
-            body => until_stalled(idle, self.stream.write_all_with_body(out, body)).await,
         };
         match wrote {
             Some((Ok(()), mut out)) => {

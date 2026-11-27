@@ -98,18 +98,20 @@ connections held, minus before, per connection. "Idle" is a keep-alive connectio
 has had one request answered, the usual state of a connection from a browser, an app or
 a pool; "pending" has a request whose handler is waiting (`/wait`, as for a database or
 another service). "Under load" is the peak while `wrk` keeps 5,000 connections busy.
-giong's two rows were measured again after the packed receive buffers below (0.5), the
-others are from 0.4's run on the same kind of VM.
+giong's two rows were measured again in 1.5.2, after a connection's future stopped keeping
+what it does not need while it waits (below; `main` before it: 2.2, 2.1 and 6.8 KiB on
+io_uring, [`bench/results/idle-conn-memory/`](../bench/results/idle-conn-memory/README.md)),
+the others are from 0.4's run on the same kind of VM.
 
 | Server | Open | Idle | Pending | Under load |
 |---|---|---|---|---|
-| **giong-http** | **1.9 KiB** | **2.0 KiB** | **6.4 KiB** | 15.7 MiB |
-| **giong-http** on epoll | 2.1 KiB | 2.1 KiB | **6.4 KiB** | **10.4 MiB** |
+| **giong-http** | **1.4 KiB** | **1.4 KiB** | **6.1 KiB** | **14.1 MiB** |
+| **giong-http** on epoll | 1.6 KiB | 1.7 KiB | **6.1 KiB** | 15.0 MiB |
 | Axum (Tokio + hyper) | 5.7 KiB | 20.4 KiB | 19.3 KiB | 115 MiB |
 | Raw Tokio, own parser | 12.9 KiB | 13.1 KiB | 12.9 KiB | 64 MiB |
 | Go `net/http` | 10.8 KiB | 18.9 KiB | 18.3 KiB | 155 MiB |
 
-- **An idle giong connection holds no buffer.** What it costs is its task (about 1.2 KB
+- **An idle giong connection holds no buffer.** What it costs is its task (1,008 bytes
   for giong-http's connection), the multishot receive, an idle timer and the socket. The
   kernel picks a receive buffer only when data arrives; the request and response buffers
   are taken from a per-worker pool for the length of a request. Hyper keeps an 8 KiB read
@@ -126,6 +128,19 @@ others are from 0.4's run on the same kind of VM.
   of every connection, was replaced by its unbuffered API in 1.5.2. 8,000 idle connections
   to one worker take 52.8 MiB of resident memory instead of 89.8 (`bench/tls-idle.sh`,
   [`bench/results/tls-idle/`](../bench/results/tls-idle/README.md)).
+- **A connection's future keeps across an `.await` only what waiting for the next request
+  needs** (1.5.2). rustc gives every local that lives across more than one `.await` its own
+  room in every state of the future, waiting included, so the request being answered, the
+  response being written, a body still on its way and the write of a file each made every
+  idle connection larger; they now live in states of their own, or in blocks the worker
+  reuses while they run. The connection's task went from 1,752 to 1,008 bytes over
+  HTTP/1.1 and from 3,480 to 2,696 over HTTPS: 1,318 bytes of heap per idle HTTP/1.1
+  connection instead of 2,062, 3,318 over HTTP/2 instead of 4,566, 5,285 over HTTPS
+  instead of 6,069 (io_uring), and 8,000 idle HTTP/2 connections over TLS take 81.2 MiB
+  instead of 104.4. Requests got cheaper too, because a handler's future is made in its
+  heap block instead of copied there: 1.5% fewer instructions per HTTP/1.1 request, 2.3%
+  through a `giong-web` router, 0.2–0.5% for the client, HTTPS and HTTP/2 cases
+  ([`bench/results/idle-conn-memory/`](../bench/results/idle-conn-memory/README.md)).
 - **"Pending" is mostly the request buffer**: 4 KiB, held while the handler runs, because
   the `Request` it was given points into it.
 - **Receive buffers are a cost per worker, not per connection**, and only as many are

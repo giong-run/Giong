@@ -1,0 +1,22 @@
+# Instructions per request of bench/giong-http's server (one worker, plain TCP, keep-alive),
+# counted by callgrind: `callgrind.sh <binary> <path> 2000` (300 requests of warm-up, counters
+# zeroed, 2,000 requests on one keep-alive connection one after another, counters dumped).
+# Two runs of each build, interleaved. main-81588a2 is main at 81588a2; change is the final
+# version of the change.
+build,path,run,instructions_per_request
+change,/json,1,6403.0
+main-81588a2,/json,1,6587.3
+change,/json,2,6406.0
+main-81588a2,/json,2,6590.3
+change,/file64k,1,5808.0
+main-81588a2,/file64k,1,5992.2
+change,/file64k,2,5808.0
+main-81588a2,/file64k,2,5995.3
+change,/bytes64k,1,5837.1
+main-81588a2,/bytes64k,1,6021.1
+change,/bytes64k,2,5836.9
+main-81588a2,/bytes64k,2,6021.3
+# handshake: `callgrind.sh <binary> handshake 500` (TLS, a new connection per request, each
+# offered the session of the one before; 100 connections of warm-up), one run of each.
+change,handshake,1,1286445.0
+main-81588a2,handshake,1,1287213.4
