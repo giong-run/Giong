@@ -367,7 +367,8 @@ impl UnixStream {
 
     /// Reads into `buf` with a one-off receive; see
     /// [`TcpStream::read`](super::TcpStream::read). Must not be mixed with
-    /// [`recv`](Self::recv) on one stream.
+    /// [`recv`](Self::recv) on one stream. To receive a large message into
+    /// your own buffer after `recv`, use [`recv_into`](Self::recv_into).
     ///
     /// Not cancel safe: if the future is dropped, bytes the receive had
     /// already taken from the socket are lost. [`recv`](Self::recv) is.
@@ -375,14 +376,50 @@ impl UnixStream {
         self.inner.read(buf).await
     }
 
-    /// Receives into the free capacity at the end of `buf`, after what
-    /// [`recv`](Self::recv) has already taken; `recv` may come before and
-    /// after it. For the crates of this workspace (giong-http reads large
-    /// request bodies with it), not part of the API.
+    /// Receives into the free capacity at the end of `buf` (from `buf.len()`
+    /// up to its capacity, 8 KiB being made free if there is none), returning
+    /// the vector with the bytes appended and how many there were. `Ok(0)`
+    /// means the peer closed the connection.
     ///
-    /// Not cancel safe: if the future is dropped, bytes the receive had
-    /// already taken from the socket are lost.
-    #[doc(hidden)]
+    /// For a large message whose size you know, such as an HTTP body of
+    /// 64 KiB or more after its head: [`recv`](Self::recv) hands out the
+    /// runtime's pool buffers of at most 16 KiB each (by default), which you
+    /// then copy into a buffer of your own, while `recv_into` has the kernel
+    /// write straight into yours, as large a piece as it holds. Reserve what
+    /// is still to come and call it until the message is complete. A server
+    /// that collects 1 MiB uploads this way spends about half the CPU on each
+    /// and moves 1.8 times as many bytes per second as one that copies them
+    /// out of `recv`'s buffers (`bench/results/public-recv-into`).
+    ///
+    /// Unlike [`read`](Self::read), it can be mixed with `recv` on one
+    /// stream, before or after it: it first hands over, in order, what the
+    /// pooled receive has already taken from the socket (as one append per
+    /// call), and the next `recv` starts the pooled receive again. After a
+    /// `recv_into`, the stream's pooled receives take one buffer at a time
+    /// until several small messages have come in a row, so that the next
+    /// large message is still in the socket when its head has been read.
+    ///
+    /// ```no_run
+    /// # use giong::net::UnixStream;
+    /// # async fn demo(stream: UnixStream, head: &[u8], body_len: usize) -> std::io::Result<()> {
+    /// // `head` came from `recv`; it ended with the first bytes of the body.
+    /// let mut body = Vec::with_capacity(body_len);
+    /// body.extend_from_slice(head);
+    /// while body.len() < body_len {
+    ///     let (res, buf) = stream.recv_into(body).await;
+    ///     body = buf;
+    ///     if res? == 0 {
+    ///         break; // the peer closed the connection early
+    ///     }
+    /// }
+    /// # Ok(())
+    /// # }
+    /// ```
+    ///
+    /// Not cancel safe, like `read`: if the future is dropped, bytes the
+    /// receive had already taken from the socket are lost. Wrap the whole
+    /// message in one [`timeout`](crate::time::timeout) and drop the stream
+    /// when it fires, rather than retrying a cancelled receive.
     pub async fn recv_into(&self, buf: Vec<u8>) -> (io::Result<usize>, Vec<u8>) {
         self.inner.recv_into(buf).await
     }
