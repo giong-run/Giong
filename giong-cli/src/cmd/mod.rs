@@ -11,6 +11,7 @@ use crate::report::{Failure, Report};
 
 pub mod ai;
 pub mod bench;
+pub mod cache;
 pub mod check;
 pub mod clean;
 pub mod dashboard;
@@ -70,6 +71,7 @@ pub const COMMANDS: &[&Command] = &[
     &dashboard::COMMAND,
     &top::COMMAND,
     &clean::COMMAND,
+    &cache::COMMAND,
     &mcp::COMMAND,
     &upgrade::COMMAND,
     &version::COMMAND,

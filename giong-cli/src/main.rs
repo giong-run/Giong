@@ -29,6 +29,7 @@ mod selfupdate;
 mod service;
 mod sha256;
 mod state;
+mod store;
 mod template;
 mod tmp;
 mod versions;

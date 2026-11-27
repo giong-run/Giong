@@ -19,7 +19,29 @@ fn walk(dir: &Path, out: &mut Vec<PathBuf>) {
     }
 }
 
+/// The minor version of the compiler building this (`rustc 1.89.0` -> 89).
+fn rustc_minor() -> Option<u32> {
+    let rustc = std::env::var_os("RUSTC").unwrap_or_else(|| "rustc".into());
+    let out = std::process::Command::new(rustc)
+        .arg("--version")
+        .output()
+        .ok()?;
+    let text = String::from_utf8(out.stdout).ok()?;
+    text.split_whitespace()
+        .nth(1)?
+        .split('.')
+        .nth(1)?
+        .parse()
+        .ok()
+}
+
 fn main() {
+    // File locks (std, Rust 1.89) guard the build store (src/store.rs); a
+    // giong built with an older compiler has the store turned off.
+    println!("cargo::rustc-check-cfg=cfg(giong_file_lock)");
+    if rustc_minor().is_some_and(|m| m >= 89) {
+        println!("cargo::rustc-cfg=giong_file_lock");
+    }
     let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("templates");
     println!("cargo:rerun-if-changed={}", root.display());
     let mut files = Vec::new();

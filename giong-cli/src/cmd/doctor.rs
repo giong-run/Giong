@@ -420,7 +420,7 @@ fn project_checks(p: &Project, r: &mut Report) {
                 format!("{} holds {:.1} GiB of builds", p.target_dir.display(), bytes as f64 / (1u64 << 30) as f64),
             )
             .detail("cargo never removes old builds; each toolchain update and changed dependency leaves the old ones")
-            .fix("giong clean"),
+            .fix("giong clean; giong cache share ~/code keeps one copy of each dependency build for all your projects"),
         );
     }
 }
