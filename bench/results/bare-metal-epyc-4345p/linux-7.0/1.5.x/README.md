@@ -36,7 +36,7 @@ requests per second and MB/s, lower for CPU, memory and latency. Losses are in b
 | Uploads in the lab (#510) | 1 MiB: 9.2 → 17.2 GB/s, level with Tokio (17.3) |
 | PR #499 | `/json` on one worker +7.4% (gap to Tokio −12.2% → −5.7%), four workers +5.4%; no tail loss once measured again |
 | Soaks | 3 h core (io_uring and epoll), 2 h HTTP/3, TLS and gRPC: all passed, descriptors back to their start |
-| **Losses** | giong-http on one worker −5.7% against Tokio's hand-rolled loop even with #499 (−12% without); QUIC request/response 498k against quinn's 680k; QUIC bulk 10.5 against 14.8 Gbit/s on one worker; lab uploads of 64 KiB 0.75 of Tokio; lab answers of 64 KiB p99 220 against 126 µs; lab `mixed` p99.9 505 against Glommio's 378 µs; lab 1–2 cores 5% behind Monoio; kTLS slower than userspace TLS for small answers; #180 `mixed` p50 +80% |
+| **Losses** | giong-http on one worker −5.7% against Tokio's hand-rolled loop even with #499 (−12% without); QUIC request/response 498k against quinn's 680k; QUIC bulk 10.5 against 14.8 Gbit/s on one worker; lab uploads of 64 KiB 0.75 of Tokio; lab answers of 64 KiB p99 220 against 126 µs; lab answers of 1 MiB on io_uring 0.96 of Glommio's throughput (giong on epoll the fastest); lab `mixed` p99.9 505 against Glommio's 378 µs; lab 1–2 cores 5% behind Monoio; kTLS slower than userspace TLS for small answers; #180 `mixed` p50 +80% |
 
 ## 1. Regression against 0.8.0 (`br-1/out/reg/`)
 
@@ -163,6 +163,8 @@ with #510.
   CPU 114 → 61 µs per upload, p99 2,036 → 1,006 µs (Tokio 1,749). **64 KiB uploads: 10,075 →
   11,267 MB/s, still 0.75 of Tokio's 15,072.**
 - **Answers of 64 KiB: p99 220 µs against Tokio's 126** at the same throughput (0.96).
+- **Answers of 1 MiB on io_uring: 8,303 req/s, 0.96 of Glommio's 8,660 (Tokio 8,507), and 0.93
+  of Tokio in `lab-ri/`.** giong on epoll was the fastest of all there (8,887).
 - **`mixed` (1 request in 20 computes for ~1 ms): p99.9 505 µs against Glommio's 378.**
 - Packet loss and added delay: level with the others.
 - The 30,000-connection point of `conns` is not usable: the connections did not finish opening

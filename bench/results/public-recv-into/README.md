@@ -33,8 +33,22 @@ No run had an error. 1 KiB uploads do not take the new path (the whole request
 fits in one receive), so that row is the same code; it is there to show nothing
 else moved.
 
-## Not measured yet
+## Bare metal
 
-The bare-metal lab (two EPYC 4345P over 25 GbE) gets the same scenario before the
-machines are returned; its rows go here and into `bench/lab`'s results when it
-has run.
+The lab's payload scenario (`bench/lab/lab.py --only payload`, SMT off, three rounds of 6 s)
+on the two EPYC 4345P machines over 25 GbE, Linux 7.0, on 2026-11-27: `main` is 14e0db9 and
+`branch` is 0a104a3, run six minutes apart, and Tokio ran with the branch. The data is in
+`../bare-metal-epyc-4345p/linux-7.0/1.5.x/br-1/out/lab-ri/` (branch and Tokio) and
+`lab-ri-main/` (main).
+
+| upload | main MB/s | branch MB/s | tokio MB/s | main CPU µs/req | branch CPU µs/req | tokio CPU µs/req |
+|---|---:|---:|---:|---:|---:|---:|
+| 1 MiB | 9,202 | **17,192 (1.87×)** | 17,324 | 114 | **61.0 (−46%)** | 60.5 |
+| 64 KiB | 10,075 | **11,267 (+12%)** | 15,072 | 6.5 | **5.8 (−11%)** | 4.3 |
+| 1 KiB | 503 | 507 | 471 | 2.0 | 2.0 | 2.2 |
+
+p99 at 1 MiB: 2,036 µs (main) against 1,006 µs (branch) and 1,749 µs (Tokio); at 64 KiB,
+199 against 138 µs (Tokio 81). No run had an error. 1 MiB uploads are now level with Tokio.
+**64 KiB uploads are still a loss: 0.75 of Tokio's throughput, with 5.8 against 4.3 µs of
+CPU per upload.** Of such a body, `bench/giong` still copies the first 16 KiB and the last
+up to 16 KiB out of pool buffers; only the middle goes through `recv_into`.
