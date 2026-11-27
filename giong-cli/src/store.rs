@@ -1991,7 +1991,7 @@ mod tests {
             f.units, 2,
             "base and top, never the other project's own crate"
         );
-        assert_eq!(f.from, vec![t.join("one")]);
+        assert_eq!(f.from, vec![fs::canonicalize(t.join("one")).unwrap()]);
         assert!(!three.join("build/app").exists());
         let rlib =
             |p: &Path| p.join("build/base/00000000000000a1/out/libbase-00000000000000a1.rlib");
@@ -2095,7 +2095,8 @@ mod tests {
         let three = t.join("three/target/debug");
         let f = fill(&store, &three, &wanted, || Some(1), &none).unwrap();
         assert_eq!(f.units, 3, "{f:?}");
-        assert_eq!(f.from, vec![t.join("one"), t.join("other")]);
+        let canon = |n: &str| fs::canonicalize(t.join(n)).unwrap();
+        assert_eq!(f.from, vec![canon("one"), canon("other")]);
         fs::remove_dir_all(&t).unwrap();
     }
 
