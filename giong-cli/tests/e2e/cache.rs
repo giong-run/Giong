@@ -1,6 +1,7 @@
 //! `giong cache` on real cargo builds: two projects with the same dependency
 //! (from a git repository on disk, so no network) end up with one copy of its
-//! build, and cargo sees both builds as fresh afterwards.
+//! build, and cargo sees both builds as fresh afterwards; a third project
+//! takes that build before its first one and compiles only its own crate.
 
 use std::path::Path;
 use std::process::Command;
@@ -180,6 +181,40 @@ fn two_projects_share_one_build_of_their_dependency() {
         status.dump()
     );
     assert_eq!(s["data"]["projects"].as_array().map(Vec::len), Some(2));
+
+    // A new project on the same dependency, never built: filled first, its
+    // first build compiles only its own crate, and the program runs.
+    t.write(
+        "three/Cargo.toml",
+        &format!(
+            "[package]\nname = \"three\"\nversion = \"0.1.0\"\nedition = \"2021\"\n\n\
+             [dependencies]\nshared-dep = {{ git = \"{url}\" }}\n\n[workspace]\n"
+        ),
+    );
+    t.write(
+        "three/src/main.rs",
+        "fn main() { println!(\"{}\", shared_dep::f9(6)); }\n",
+    );
+    let fill = giong(["cache", "fill", "--json"])
+        .dir(t.join("three"))
+        .env("GIONG_STORE_DIR", &store)
+        .env("CARGO_HOME", &home)
+        .env_remove("CARGO_TARGET_DIR")
+        .env_remove("CARGO_BUILD_BUILD_DIR")
+        .run();
+    let f = fill.report("cache");
+    assert!(
+        f["data"]["filled_units"].as_u64() >= Some(1),
+        "{}",
+        fill.dump()
+    );
+    assert_eq!(rebuilt(&t.join("three"), &home), vec!["three".to_string()]);
+    let run = cargo(&home)
+        .args(["run", "--quiet"])
+        .current_dir(t.join("three"))
+        .output()
+        .unwrap();
+    assert_eq!(String::from_utf8_lossy(&run.stdout).trim(), "9: 54");
 
     // Nothing to remove while both projects link the build.
     let gc = giong(["cache", "gc", "--budget", "off", "--json"])

@@ -315,6 +315,28 @@ struct Dev {
     /// The build store's pass over the last build (src/store.rs), running
     /// beside the service; stopped before the next build.
     store_pass: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>,
+    /// The Cargo.lock the dev build was last filled for (src/store.rs,
+    /// `fill`): filled again only when the dependencies change.
+    filled_for: Option<Vec<u8>>,
+}
+
+/// "shop", or "shop and 2 other projects".
+pub fn sources(from: &[PathBuf]) -> String {
+    let name = |p: &PathBuf| {
+        p.file_name()
+            .map(|n| n.to_string_lossy().into_owned())
+            .unwrap_or_else(|| p.display().to_string())
+    };
+    match from {
+        [] => "other projects".into(),
+        [one] => name(one),
+        [first, rest @ ..] => format!(
+            "{} and {} other project{}",
+            name(first),
+            rest.len(),
+            if rest.len() == 1 { "" } else { "s" }
+        ),
+    }
 }
 
 /// One pass of the build store over `profile`, and its hourly gc: says
@@ -460,6 +482,7 @@ impl Dev {
             report: Report::new("dev"),
             background: std::env::var_os(devctl::BACKGROUND_VAR).is_some_and(|v| v == "1"),
             store_pass: None,
+            filled_for: None,
             project,
         };
         // A stop asked of a runner that had already gone.
@@ -678,6 +701,7 @@ impl Dev {
     fn build_once(&mut self, changed_at: Instant) -> bool {
         // Cargo would wait for the store's pass to let go of its lock.
         self.stop_store_pass();
+        self.fill_from_store();
         // A failure before this change no longer says why nothing serves:
         // this build will (or it serves).
         self.failure = None;
@@ -1531,19 +1555,65 @@ impl Dev {
         }
     }
 
+    /// Whether the store is off, or inside the project: there it would be
+    /// watched, and each of its writes would look like a change and build
+    /// again (GIONG_HOME in the project, as in giong's own tests).
+    fn store_unwanted(&self) -> bool {
+        if store::turned_off() {
+            return true;
+        }
+        let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        store::default_root()
+            .is_some_and(|r| canonical(&r).starts_with(canonical(&self.project.root)))
+    }
+
+    /// Before a dev build whose dependencies changed (the first one too):
+    /// takes the dependency builds another project already made, so cargo
+    /// compiles only what is left (src/store.rs, `fill`). Release builds
+    /// are always cargo's own.
+    fn fill_from_store(&mut self) {
+        if self.release || self.store_unwanted() {
+            return;
+        }
+        let workspace = self.project.workspace_root();
+        let lock = fs::read(workspace.join("Cargo.lock")).ok();
+        if lock.is_some() && lock == self.filled_for {
+            return;
+        }
+        let Ok(store) = store::Store::open() else {
+            return;
+        };
+        let started = Instant::now();
+        let never = AtomicBool::new(false);
+        let filled = store::fill_project(&store, &self.project.build_dir, &workspace, &never);
+        self.filled_for = fs::read(workspace.join("Cargo.lock")).ok();
+        let Ok(filled) = filled else { return };
+        if filled.units == 0 {
+            return;
+        }
+        let from = sources(&filled.from);
+        self.say(
+            "store",
+            format!(
+                "took {} dependency builds from {} in {} ms: cargo compiles only what is left (giong cache)",
+                filled.units,
+                from,
+                started.elapsed().as_millis()
+            ),
+            json!({
+                "filled_units": filled.units,
+                "linked_files": filled.linked_files,
+                "copied_bytes": filled.copied_bytes,
+                "from": filled.from.iter().map(|p| p.display().to_string()).collect::<Vec<_>>(),
+            }),
+        );
+    }
+
     /// Shares the dependency builds of the build that now serves with the
     /// other projects on the machine, in the background (src/store.rs).
     fn start_store_pass(&mut self) {
         self.stop_store_pass();
-        if store::turned_off() {
-            return;
-        }
-        // A store inside the project (GIONG_HOME there) would be watched:
-        // each of its writes would look like a change and build again.
-        let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
-        let inside = store::default_root()
-            .is_some_and(|r| canonical(&r).starts_with(canonical(&self.project.root)));
-        if inside {
+        if self.store_unwanted() {
             return;
         }
         let profile = self
