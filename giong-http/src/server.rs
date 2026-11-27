@@ -2,11 +2,12 @@
 
 use std::borrow::Cow;
 use std::cell::{Cell, RefCell};
+use std::collections::hash_map::{Entry, HashMap};
 use std::fmt;
 use std::future::{poll_fn, Future};
 use std::io::{self, Write as _};
 use std::mem;
-use std::net::{Shutdown, SocketAddr};
+use std::net::{IpAddr, Shutdown, SocketAddr};
 use std::ops::Deref;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::pin::{pin, Pin};
@@ -593,6 +594,11 @@ pub struct Server {
     /// `Config`, which every connection carries: only the accept loop needs
     /// it.
     min_free_memory: u64,
+    /// `0` for none. Only the accept loop needs it.
+    max_connections_per_ip: u32,
+    /// `Duration::ZERO` for none. Only the accept loop needs it: a
+    /// connection keeps the deadline it gives in its `deadline`.
+    first_request_timeout: Duration,
 }
 
 impl Default for Server {
@@ -624,6 +630,8 @@ impl Server {
                 },
             },
             min_free_memory: u64::MAX,
+            max_connections_per_ip: 0,
+            first_request_timeout: Duration::ZERO,
         }
     }
 
@@ -794,6 +802,83 @@ impl Server {
         self
     }
 
+    /// Most connections one client address may have open at once on one
+    /// [`serve`](Self::serve) call (default: no limit). Normally every
+    /// worker makes its own call, so the limit applies per worker, as
+    /// [`max_connections`](Self::max_connections) does.
+    ///
+    /// [`max_connections`](Self::max_connections) keeps the connections of
+    /// a worker within what it can hold, but one client may take all of
+    /// them: connections that never send a request are not idle (their
+    /// client would not retry a request lost on them), so they are not
+    /// closed to make room, and each holds its place until
+    /// [`idle_timeout`](Self::idle_timeout), or
+    /// [`first_request_timeout`](Self::first_request_timeout) if sooner.
+    /// With this limit, a client that has `max` connections open has its
+    /// next one refused at once, before an idle connection is asked to
+    /// make room for it: plain HTTP/1.1 clients get `429 Too Many Requests`
+    /// with `Retry-After: 1`, `Connection: close` and `GIONG-E1124` in the
+    /// body, TLS clients a closed connection (before the handshake, which
+    /// is what costs). The other clients keep being served. Each worker
+    /// says on stderr, at most once a minute, how many connections it
+    /// refused and the last address refused.
+    ///
+    /// An IPv4 address counts as one client, and so does an IPv6 /64
+    /// network, the block one subscriber is usually given (an IPv4 address
+    /// mapped into IPv6 counts as that IPv4 address). Connections on a Unix
+    /// socket ([`serve_unix`](Self::serve_unix)) and HTTP/3 connections are
+    /// not counted, nor those handed to
+    /// [`serve_connection`](Self::serve_connection).
+    ///
+    /// Behind a load balancer or a reverse proxy, every connection comes
+    /// from the proxy's few addresses: leave this off there (the proxy is
+    /// where to limit clients), or set it above what the proxy opens. Many
+    /// people may also share one IPv4 address (carrier-grade NAT, an
+    /// office), so a public server should allow some hundreds: a browser
+    /// opens up to 6 HTTP/1.1 connections to a host, and one over HTTP/2.
+    /// `0` turns the limit off. With it on, the accept loop looks up each
+    /// new connection's address (one `getpeername` call) and keeps a count
+    /// per address that has connections open.
+    pub fn max_connections_per_ip(mut self, max: usize) -> Self {
+        self.max_connections_per_ip = u32::try_from(max).unwrap_or(u32::MAX);
+        self
+    }
+
+    /// How long a new connection may take, from the moment it is accepted,
+    /// to send the head of its first request (default: off, so the first
+    /// request waits like any other: [`idle_timeout`](Self::idle_timeout)
+    /// for its first byte, then [`request_timeout`](Self::request_timeout)).
+    ///
+    /// A connection that has sent no request holds a place under
+    /// [`max_connections`](Self::max_connections) that is never given to a
+    /// new client (see there), for 60 seconds by default and up to
+    /// [`request_timeout`](Self::request_timeout) more if it trickles a
+    /// head: the cheapest way for a crowd of clients to keep a server's
+    /// places taken. With a deadline of a few seconds each such connection
+    /// holds its place that long instead. Over TLS
+    /// ([`serve_tls`](Self::serve_tls)) the deadline counts from before the
+    /// handshake, which has its own limit (giong-tls's
+    /// `TlsAcceptor::handshake_timeout`, 10 seconds by default). A
+    /// connection that has sent nothing by then is closed; one in the
+    /// middle of a head gets `408 Request Timeout`. The body is not
+    /// counted: once the head is in, it has
+    /// [`request_timeout`](Self::request_timeout) as usual. HTTP/2 with
+    /// prior knowledge must have sent its preface by then; HTTP/2 chosen
+    /// through ALPN, and later requests on a connection, are not affected.
+    ///
+    /// Clients send their first request as soon as they connect; a
+    /// browser that opened a connection ahead of need (a preconnect) may
+    /// hold it unused for a while, and opens another if it was closed. Go's
+    /// `ReadHeaderTimeout` and ASP.NET Core's `RequestHeadersTimeout` (30
+    /// seconds by default) are the same limit. `Duration::ZERO` turns it
+    /// off. It applies to [`serve`](Self::serve),
+    /// [`serve_unix`](Self::serve_unix), [`serve_tls`](Self::serve_tls) and
+    /// [`serve_connection`](Self::serve_connection).
+    pub fn first_request_timeout(mut self, timeout: Duration) -> Self {
+        self.first_request_timeout = crate::bounded(timeout);
+        self
+    }
+
     /// Memory to keep free: while less than this is left to the process,
     /// new connections are refused (default: a tenth of the memory limit,
     /// between 16 and 256 MiB; see below). `0` turns the check off.
@@ -921,14 +1006,18 @@ impl Server {
     pub async fn serve<H: Handler>(&self, listener: TcpListener, handler: H) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
+        let first = self.first_request_timeout;
         let accept = || listener.accept();
         self.accept_loop(
             accept,
             fd_of,
+            tcp_peer_ip,
             |stream: TcpStream, slot| {
                 let _ = stream.set_nodelay(true);
                 drop(giong::spawn(
-                    Conn::new(stream, cfg, Some(slot)).serve(handler.clone()),
+                    Conn::new(stream, cfg, Some(slot))
+                        .first_request_by(first_deadline(first))
+                        .serve(handler.clone()),
                 ));
             },
             refuse,
@@ -954,13 +1043,17 @@ impl Server {
     pub async fn serve_unix<H: Handler>(&self, listener: UnixListener, handler: H) {
         let handler = Rc::new(handler);
         let cfg = self.cfg;
+        let first = self.first_request_timeout;
         let accept = || listener.accept();
         self.accept_loop(
             accept,
             fd_of,
+            |_: &UnixStream| None,
             |stream: UnixStream, slot| {
                 drop(giong::spawn(
-                    Conn::new(stream, cfg, Some(slot)).serve(handler.clone()),
+                    Conn::new(stream, cfg, Some(slot))
+                        .first_request_by(first_deadline(first))
+                        .serve(handler.clone()),
                 ));
             },
             refuse,
@@ -1003,14 +1096,18 @@ impl Server {
         } else {
             acceptor.alpn(&[b"http/1.1"])
         };
+        let first = self.first_request_timeout;
         let accept = || listener.accept();
         self.accept_loop(
             accept,
             fd_of,
+            tcp_peer_ip,
             |stream: TcpStream, slot| {
                 let _ = stream.set_nodelay(true);
                 let acceptor = acceptor.clone();
                 let handler = handler.clone();
+                // Counted from the accept, so the handshake is within it.
+                let first = first_deadline(first);
                 // The handshake, on the heap for its length only, holding what
                 // the connection needs (the acceptor and TCP stream for the
                 // handshake, then the rest), and reading the connection's address
@@ -1022,12 +1119,12 @@ impl Server {
                     let tls = acceptor.accept(stream).await?;
                     let h2 = tls.alpn_protocol().as_deref() == Some(b"h2");
                     let peer = Transport::peer_addr(&tls);
-                    io::Result::Ok((tls, h2, peer, cfg, slot, handler))
+                    io::Result::Ok((tls, h2, peer, cfg, slot, handler, first))
                 });
                 drop(giong::spawn(async move {
                     // A failed handshake (a port scan, a plain-HTTP client, an
                     // unknown protocol version) just ends the connection.
-                    let Ok((tls, h2, peer, cfg, slot, handler)) = handshake.await else {
+                    let Ok((tls, h2, peer, cfg, slot, handler, first)) = handshake.await else {
                         return;
                     };
                     if h2 {
@@ -1044,13 +1141,16 @@ impl Server {
                             Vec::new,
                         )));
                     } else {
-                        Conn::new(tls, cfg, Some(slot)).serve(handler).await;
+                        Conn::new(tls, cfg, Some(slot))
+                            .first_request_by(first)
+                            .serve(handler)
+                            .await;
                     }
                 }));
             },
             // Nothing can be said before the handshake, which is what
             // costs memory: just close.
-            drop,
+            |stream, _| drop(stream),
         )
         .await;
     }
@@ -1115,6 +1215,8 @@ impl Server {
             accept,
             // QUIC connections share the endpoint's socket.
             |_| -1,
+            // Not counted by `max_connections_per_ip`.
+            |_| None,
             |conn: giong_quic::Connection, slot| {
                 let handler = handler.clone();
                 drop(giong::spawn(async move {
@@ -1123,7 +1225,7 @@ impl Server {
                 }));
             },
             // Memory is low: H3_EXCESSIVE_LOAD (RFC 9114, section 8.1).
-            |conn: giong_quic::Connection| conn.close(0x107, b""),
+            |conn: giong_quic::Connection, _| conn.close(0x107, b""),
         )
         .await;
     }
@@ -1131,13 +1233,16 @@ impl Server {
     /// Accepts until a shutdown is requested, then for a moment longer.
     /// Waits for a free slot under `max_connections` before each accept, and
     /// hands a connection to `refuse` instead of `spawn` while memory is low
-    /// (`min_free_memory`).
+    /// (`min_free_memory`) or when its client's address has
+    /// `max_connections_per_ip` open (`peer_ip` gives the address, and is
+    /// only called with that limit on).
     async fn accept_loop<S, A>(
         &self,
         accept: impl Fn() -> A,
         fd: impl Fn(&S) -> i32,
+        peer_ip: impl Fn(&S) -> Option<IpAddr>,
         spawn: impl Fn(S, Slot),
-        refuse: impl Fn(S),
+        refuse: impl Fn(S, &'static [u8]),
     ) where
         A: Future<Output = io::Result<S>>,
     {
@@ -1145,22 +1250,42 @@ impl Server {
             u64::MAX => crate::memory::auto_reserve(),
             bytes => bytes,
         };
-        let spawn = |stream: S, mut slot: Slot| {
+        let max_per_ip = self.max_connections_per_ip;
+        // `None` for a connection refused before it had a slot.
+        let spawn = |stream: S, slot: Option<Slot>, ip: Option<IpAddr>| {
+            let Some(mut slot) = slot else {
+                refuse(stream, TOO_MANY_FROM_ADDRESS);
+                note_refused_address(max_per_ip, ip);
+                return;
+            };
             slot.set_fd(fd(&stream));
             if crate::memory::low(reserve) {
                 drop(slot);
-                refuse(stream);
+                refuse(stream, LOW_MEMORY);
                 note_refused_connection(reserve);
+            } else if !slot.count_ip(ip) {
+                drop(slot);
+                refuse(stream, TOO_MANY_FROM_ADDRESS);
+                note_refused_address(max_per_ip, ip);
             } else {
                 spawn(stream, slot);
             }
         };
-        let slots = Rc::new(Slots::new(self.cfg.max_connections));
+        let slots = Rc::new(Slots::new(self.cfg.max_connections, max_per_ip));
+        // The client's address, only for `max_connections_per_ip`.
+        let ip_of = |stream: &S| {
+            if max_per_ip == 0 {
+                None
+            } else {
+                peer_ip(stream)
+            }
+        };
         open_files_limits();
         // Below the limit, a slot first and then the connection. At the
         // limit, the connection first, so that an idle connection is asked
         // to make room only for a client that is there (one connection past
-        // the limit waits meanwhile, instead of in the listen queue).
+        // the limit waits meanwhile, instead of in the listen queue), and
+        // not for one past its address's share, which is refused first.
         //
         // Cancel safe: a slot taken by a dropped future is given back, and
         // `accept` itself loses no connection, except the one accepted at
@@ -1168,15 +1293,22 @@ impl Server {
         let next = || async {
             if slots.full() {
                 let stream = accept().await?;
-                Ok((stream, slots.take(true).await))
+                let ip = ip_of(&stream);
+                if slots.address_full(ip) {
+                    return Ok((stream, None, ip));
+                }
+                Ok((stream, Some(slots.take(true).await), ip))
             } else {
                 let slot = slots.take(false).await;
-                accept().await.map(|stream| (stream, slot))
+                accept().await.map(|stream| {
+                    let ip = ip_of(&stream);
+                    (stream, Some(slot), ip)
+                })
             }
         };
         while let Some(accepted) = giong::until_shutdown(next()).await {
             match accepted {
-                Ok((stream, slot)) => spawn(stream, slot),
+                Ok((stream, slot, ip)) => spawn(stream, slot, ip),
                 // For example EMFILE: back off instead of spinning.
                 Err(e) => {
                     if matches!(e.raw_os_error(), Some(EMFILE | ENFILE)) {
@@ -1191,7 +1323,7 @@ impl Server {
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
             match timeout(left, next()).await {
-                Ok(Ok((stream, slot))) => spawn(stream, slot),
+                Ok(Ok((stream, slot, ip))) => spawn(stream, slot, ip),
                 _ => break,
             }
         }
@@ -1204,7 +1336,9 @@ impl Server {
         T: Transport,
         H: Handler,
     {
-        Conn::new(stream, self.cfg, None).serve(handler)
+        Conn::new(stream, self.cfg, None)
+            .first_request_by(first_deadline(self.first_request_timeout))
+            .serve(handler)
     }
 }
 
@@ -1242,6 +1376,36 @@ struct Slots {
     next_idle: Cell<u32>,
     /// Connections asked to close that have not closed yet.
     evicting: Cell<usize>,
+    /// `max_connections_per_ip`, when it is on.
+    per_ip: Option<PerIp>,
+}
+
+/// The counts behind `Server::max_connections_per_ip`, in [`Slots`].
+struct PerIp {
+    max: u32,
+    /// Connections open by client, under [`ip_key`]; a client with none
+    /// has no entry. `HashMap`'s keyed hash, since clients choose their
+    /// addresses.
+    open: RefCell<HashMap<u64, u32>>,
+    /// Per place: the client its connection is counted under.
+    keys: RefCell<Vec<Option<u64>>>,
+}
+
+/// The client a connection is counted under by `max_connections_per_ip`:
+/// its IPv4 address, or the /64 network of its IPv6 address, the block one
+/// subscriber is usually given (an IPv4 address mapped into IPv6 is taken
+/// as that IPv4 address).
+fn ip_key(ip: IpAddr) -> u64 {
+    // IPv4 keys look like IPv6 networks in ff00::/8 (multicast), which no
+    // TCP client has.
+    const V4: u64 = 0xffff_ffff_0000_0000;
+    match ip {
+        IpAddr::V4(v4) => V4 | u64::from(u32::from(v4)),
+        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+            Some(v4) => V4 | u64::from(u32::from(v4)),
+            None => (u128::from(v6) >> 64) as u64,
+        },
+    }
 }
 
 /// One connection's entry in [`Slots`].
@@ -1259,7 +1423,7 @@ struct Place {
 const NO_PLACE: u32 = u32::MAX;
 
 impl Slots {
-    fn new(max: usize) -> Self {
+    fn new(max: usize, max_per_ip: u32) -> Self {
         Self {
             open: Cell::new(0),
             max,
@@ -1271,11 +1435,28 @@ impl Slots {
             free_from: Cell::new(0),
             next_idle: Cell::new(0),
             evicting: Cell::new(0),
+            per_ip: (max_per_ip > 0).then(|| PerIp {
+                max: max_per_ip,
+                open: RefCell::new(HashMap::new()),
+                keys: RefCell::new(Vec::new()),
+            }),
         }
     }
 
     fn full(&self) -> bool {
         self.open.get() >= self.max
+    }
+
+    /// The client at `ip` has `max_connections_per_ip` connections open.
+    fn address_full(&self, ip: Option<IpAddr>) -> bool {
+        match (&self.per_ip, ip) {
+            (Some(per_ip), Some(ip)) => per_ip
+                .open
+                .borrow()
+                .get(&ip_key(ip))
+                .is_some_and(|&n| n >= per_ip.max),
+            _ => false,
+        }
     }
 
     /// Waits until fewer than `max` connections are open, then takes a slot.
@@ -1373,10 +1554,14 @@ impl Slot {
     /// Records the connection's socket, accepted after the slot was taken,
     /// in the lowest free place.
     fn set_fd(&mut self, fd: i32) {
-        if fd < 0 {
+        let slots = &*self.slots;
+        // No socket to shut down: QUIC, which is not counted per address
+        // either, or a connection not on Unix, which gets a place only to
+        // be counted by `max_connections_per_ip` (`evict_one` does nothing
+        // there).
+        if fd < 0 && (cfg!(unix) || slots.per_ip.is_none()) {
             return;
         }
-        let slots = &*self.slots;
         let mut used = slots.used.borrow_mut();
         let mut word = slots.free_from.get();
         while word < used.len() && used[word] == u64::MAX {
@@ -1448,6 +1633,33 @@ impl Slot {
     pub(crate) fn allow_idle(&self) {
         self.ready.set(true);
     }
+
+    /// Counts the connection under its client's address for
+    /// `max_connections_per_ip`, unless the client has that many open
+    /// already: then `false`. Always `true` with the limit off, or without
+    /// an address (a Unix socket, or one that could not be read).
+    fn count_ip(&self, ip: Option<IpAddr>) -> bool {
+        let (Some(per_ip), Some(ip)) = (&self.slots.per_ip, ip) else {
+            return true;
+        };
+        if self.place == NO_PLACE {
+            return true;
+        }
+        let key = ip_key(ip);
+        let mut open = per_ip.open.borrow_mut();
+        let n = open.entry(key).or_insert(0);
+        if *n >= per_ip.max {
+            return false;
+        }
+        *n += 1;
+        let place = self.place as usize;
+        let mut keys = per_ip.keys.borrow_mut();
+        if keys.len() <= place {
+            keys.resize(place + 1, None);
+        }
+        keys[place] = Some(key);
+        true
+    }
 }
 
 impl Drop for Slot {
@@ -1455,6 +1667,21 @@ impl Drop for Slot {
         let slots = &*self.slots;
         if self.place != NO_PLACE {
             let place = self.place as usize;
+            if let Some(per_ip) = &slots.per_ip {
+                let key = per_ip
+                    .keys
+                    .borrow_mut()
+                    .get_mut(place)
+                    .and_then(Option::take);
+                if let Some(key) = key {
+                    if let Entry::Occupied(mut n) = per_ip.open.borrow_mut().entry(key) {
+                        *n.get_mut() -= 1;
+                        if *n.get() == 0 {
+                            n.remove();
+                        }
+                    }
+                }
+            }
             let (word, bit) = (place / 64, 1u64 << (place % 64));
             slots.used.borrow_mut()[word] &= !bit;
             slots.idle.borrow_mut()[word] &= !bit;
@@ -1585,6 +1812,9 @@ thread_local! {
     /// Accepts that failed for want of file descriptors since the worker
     /// last said so, and when it did.
     static OUT_OF_FILES: Cell<(u64, Option<Instant>)> = const { Cell::new((0, None)) };
+    /// Connections refused under `max_connections_per_ip` since the worker
+    /// last said so, and when it did.
+    static REFUSED_ADDRESS: Cell<(u64, Option<Instant>)> = const { Cell::new((0, None)) };
 }
 
 /// `accept` errors for want of file descriptors: the process's limit, and
@@ -1602,10 +1832,21 @@ const LOW_MEMORY: &[u8] = b"HTTP/1.1 503 Service Unavailable\r\n\
     GIONG-E1121: the server is low on memory and takes no new connections \
     (min_free_memory). Retry later.\n";
 
-/// Refuses a connection without TLS while memory is low: answers `503`,
-/// then closes, in a small task of its own that holds no read buffer until
-/// the answer is out.
-fn refuse<T: Transport>(stream: T) {
+/// The answer to a connection refused because its client's address has
+/// `max_connections_per_ip` connections open.
+const TOO_MANY_FROM_ADDRESS: &[u8] = b"HTTP/1.1 429 Too Many Requests\r\n\
+    retry-after: 1\r\n\
+    connection: close\r\n\
+    content-type: text/plain; charset=utf-8\r\n\
+    content-length: 115\r\n\
+    \r\n\
+    GIONG-E1124: this address has as many connections open as the server allows \
+    (max_connections_per_ip). Retry later.\n";
+
+/// Refuses a connection without TLS (low memory, or its address over
+/// `max_connections_per_ip`): sends `answer`, then closes, in a small task
+/// of its own that holds no read buffer until the answer is out.
+fn refuse<T: Transport>(stream: T, answer: &'static [u8]) {
     let busy = REFUSING.with(|n| {
         if n.get() >= MAX_REFUSING {
             return true;
@@ -1625,7 +1866,7 @@ fn refuse<T: Transport>(stream: T) {
         }
         let _done = Done;
         let answer = async {
-            let (res, _) = stream.write_all(LOW_MEMORY.to_vec()).await;
+            let (res, _) = stream.write_all(answer.to_vec()).await;
             if res.is_err() {
                 return;
             }
@@ -1661,6 +1902,44 @@ fn note_refused_connection(reserve: u64) {
             reserve >> 20
         );
     });
+}
+
+/// Notes a connection refused under `max_connections_per_ip`; at most once
+/// a minute per worker, says so on stderr, with the code, how many were
+/// refused and the last address.
+fn note_refused_address(max: u32, ip: Option<IpAddr>) {
+    let _ = REFUSED_ADDRESS.try_with(|refused| {
+        let (count, last) = refused.get();
+        let now = Instant::now();
+        if last.is_some_and(|last| now.duration_since(last) < Duration::from_secs(60)) {
+            refused.set((count + 1, last));
+            return;
+        }
+        refused.set((0, Some(now)));
+        let from = ip
+            .map(|ip| format!(", the last from {ip}"))
+            .unwrap_or_default();
+        eprintln!(
+            "giong-http: GIONG-E1124 refused {} connection(s) on this worker from addresses that \
+             had {max} open, its max_connections_per_ip{from}; see docs/errors/E1124.md",
+            count + 1,
+        );
+    });
+}
+
+/// The client's address of a TCP connection, for `max_connections_per_ip`.
+fn tcp_peer_ip(stream: &TcpStream) -> Option<IpAddr> {
+    stream.peer_addr().ok().map(|addr| addr.ip())
+}
+
+/// When a connection accepted now must have sent its first request's head,
+/// under `Server::first_request_timeout` (`ZERO` for none).
+fn first_deadline(timeout: Duration) -> Option<Instant> {
+    if timeout.is_zero() {
+        None
+    } else {
+        Some(Instant::now() + timeout)
+    }
 }
 
 /// Says on stderr, at most once a minute per worker, that connections wait
@@ -1847,8 +2126,14 @@ struct Conn<T> {
     body: Body,
     /// The server is shutting down: answer what arrives, then close.
     closing: bool,
-    /// Deadline for the request currently being received.
+    /// Deadline for the request currently being received. Set before the
+    /// first request under `Server::first_request_timeout`, and then the
+    /// only time it is set while the connection waits with nothing
+    /// received (see `read_more`).
     deadline: Option<Instant>,
+    /// `deadline` is `first_request_timeout`'s, which ends with the first
+    /// head: the body then has `request_timeout`.
+    head_deadline: bool,
     /// Nothing has been parsed yet: the connection may still turn out to be
     /// HTTP/2 with prior knowledge.
     first: bool,
@@ -1982,12 +2267,21 @@ impl<T: Transport> Conn<T> {
             body: Body::Empty,
             closing: false,
             deadline: None,
+            head_deadline: false,
             first: true,
             body_into: false,
             charge: Charge::none(),
             traces: TracesAt(0),
             _slot: slot,
         }
+    }
+
+    /// Gives the first request until `deadline` for its head
+    /// (`Server::first_request_timeout`).
+    fn first_request_by(mut self, deadline: Option<Instant>) -> Self {
+        self.head_deadline = deadline.is_some();
+        self.deadline = deadline;
+        self
     }
 
     /// Starts following a request whose first bytes are in, if it is not
@@ -2610,6 +2904,12 @@ impl<T: Transport> Conn<T> {
             let idle = data.is_empty() && blank_lines <= IDLE_BLANK_LINES;
             self.read_more(idle).await?;
         };
+        if self.head_deadline {
+            // The first request's head is in within `first_request_timeout`;
+            // its body gets `request_timeout`, as any other.
+            self.head_deadline = false;
+            self.deadline = None;
+        }
 
         if head.chunked || head.content_length.is_some_and(|len| len > 0) {
             let start = self.pos + head.len;
@@ -2827,7 +3127,14 @@ impl<T: Transport> Conn<T> {
             if let Some(slot) = &self._slot {
                 slot.set_idle(true);
             }
-            let recv = timeout(self.cfg.idle_timeout, self.stream.recv());
+            // Nothing of a request has arrived, so a deadline is
+            // `first_request_timeout`'s: the connection has sent nothing yet,
+            // and is closed without an answer when it passes.
+            let wait = match self.deadline {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                None => self.cfg.idle_timeout,
+            };
+            let recv = timeout(wait, self.stream.recv());
             let received = giong::until_shutdown(recv).await;
             if let Some(slot) = &self._slot {
                 slot.set_idle(false);
@@ -3088,7 +3395,7 @@ mod tests {
     #[test]
     fn connection_places_are_reused_whatever_the_descriptor() {
         giong::block_on(async {
-            let slots = Rc::new(Slots::new(1000));
+            let slots = Rc::new(Slots::new(1000, 0));
             let mut held = Vec::new();
             for i in 0..130 {
                 let mut slot = slots.take(false).await;
@@ -3131,6 +3438,53 @@ mod tests {
         });
     }
 
+    /// `max_connections_per_ip` counts the connections open per client,
+    /// gives a place back when its connection closes, and keeps no entry
+    /// for a client with none open.
+    #[test]
+    fn connections_are_counted_per_client_while_open() {
+        giong::block_on(async {
+            let slots = Rc::new(Slots::new(1000, 2));
+            let a: IpAddr = "203.0.113.7".parse().unwrap();
+            let b: IpAddr = "2001:db8::1".parse().unwrap();
+            let b_too: IpAddr = "2001:db8::2".parse().unwrap();
+            let open = |fd: i32, ip: IpAddr| {
+                let slots = slots.clone();
+                async move {
+                    let mut slot = slots.take(false).await;
+                    slot.set_fd(fd);
+                    let counted = slot.count_ip(Some(ip));
+                    (slot, counted)
+                }
+            };
+            let (a1, ok) = open(10, a).await;
+            assert!(ok);
+            let (a2, ok) = open(11, a).await;
+            assert!(ok);
+            assert!(slots.address_full(Some(a)));
+            let (a3, ok) = open(12, a).await;
+            assert!(!ok, "a third connection from one address");
+            drop(a3);
+            // Another client, as one IPv6 /64.
+            let (b1, ok) = open(13, b).await;
+            assert!(ok);
+            let (b2, ok) = open(14, b_too).await;
+            assert!(ok);
+            assert!(slots.address_full(Some(b)));
+            assert!(!slots.address_full(None));
+            // A place given back counts again.
+            drop(a1);
+            assert!(!slots.address_full(Some(a)));
+            let (a4, ok) = open(10, a).await;
+            assert!(ok);
+            drop((a2, a4, b1, b2));
+            let per_ip = slots.per_ip.as_ref().unwrap();
+            assert!(per_ip.open.borrow().is_empty());
+            assert!(per_ip.keys.borrow().iter().all(Option::is_none));
+            assert_eq!(slots.open.get(), 0);
+        });
+    }
+
     /// The accept loop looks for input waiting on a socket without taking
     /// it and without blocking.
     #[cfg(unix)]
@@ -3160,6 +3514,39 @@ mod tests {
             .unwrap();
         assert_eq!(length.parse::<usize>().unwrap(), body.len());
         assert!(body.starts_with("GIONG-E1121"));
+    }
+
+    /// The fixed refusal under `max_connections_per_ip` announces its own
+    /// length.
+    #[test]
+    fn the_address_limit_answer_announces_its_length() {
+        let text = std::str::from_utf8(TOO_MANY_FROM_ADDRESS).unwrap();
+        let (head, body) = text.split_once("\r\n\r\n").unwrap();
+        let length = head
+            .lines()
+            .find_map(|l| l.strip_prefix("content-length: "))
+            .unwrap();
+        assert_eq!(length.parse::<usize>().unwrap(), body.len());
+        assert!(head.starts_with("HTTP/1.1 429 "));
+        assert!(body.starts_with("GIONG-E1124"));
+    }
+
+    /// An IPv4 address is one client, an IPv6 /64 network another; an
+    /// IPv4-mapped IPv6 address is its IPv4 address; no two kinds meet.
+    #[test]
+    fn clients_are_counted_by_ipv4_address_and_ipv6_network() {
+        let key = |s: &str| ip_key(s.parse().unwrap());
+        assert_eq!(key("203.0.113.7"), key("::ffff:203.0.113.7"));
+        assert_ne!(key("203.0.113.7"), key("203.0.113.8"));
+        assert_eq!(
+            key("2001:db8:1:2::1"),
+            key("2001:db8:1:2:ffff:ffff:ffff:ffff")
+        );
+        assert_ne!(key("2001:db8:1:2::1"), key("2001:db8:1:3::1"));
+        assert_ne!(key("127.0.0.1"), key("::1"));
+        assert_ne!(key("0.0.0.0"), key("::"));
+        // The /64 an IPv4 key would stand for is multicast.
+        assert_eq!(key("203.0.113.7") >> 56, 0xff);
     }
 
     /// What an idle connection costs is mostly its task, the connection's
