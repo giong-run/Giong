@@ -8,6 +8,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+Safer paths and secrets, and faster gzip. `fs::Root` opens the paths that come from a
+request, an upload or a configuration file beneath a directory and never outside it
+(`GIONG-E0205`); on Linux the kernel itself refuses an escape (`openat2` with
+`RESOLVE_BENEATH`), so no check can be raced. The PostgreSQL, MySQL and Redis clients wipe
+the password, and everything they derive from it, from memory when they are done with it
+(the login packets as soon as they are sent, the `Config` copy when it is dropped).
+giong-web's new `fast-gzip` feature (off by default) gzips responses of up to 16 KiB with
+libdeflate: on an 8 KiB JSON response, 31% less server CPU per request and 46% more
+requests per second on one worker. No API is removed or changed.
+
 ## [1.5.3] - 2026-11-27
 
 Leaner HTTP/2, a fix for bodies that wait for `100 Continue`, and release binaries you can
