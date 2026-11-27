@@ -1,0 +1,33 @@
+# 2026-11-27T17:59:51Z Linux 6.18.44-fc-v880, 4 CPUs, rustc 1.100.0 (0ef1bc386 2026-11-09), cargo 1.100.0 (3acc79c0c 2026-11-05), giong 1.5.4
+build+test-build shop: 23.338514791 s, 315107682 bytes
+build+test-build billing: 23.619061260 s, 315282396 bytes
+build+test-build notes: 16.654932244 s, 307154001 bytes
+build+test-build orders: 16.744875324 s, 318135868 bytes
+build+test-build feed: 17.469800850 s, 280775140 bytes
+build+test-build search: 15.678841771 s, 314805930 bytes
+build+test-build jobs: 11.099447809 s, 198276294 bytes
+build+test-build mailer: 10.397407839 s, 191180752 bytes
+before: 2240718063 bytes in 8 target dirs
+8 build directories: 453 files (694.1 MiB) now linked to the store; 1.4 GiB on disk, was 2.1 GiB
+share took 1.070686503 s
+after: 1512893421 bytes (32.4% less)
+fresh check shop: 0 units rebuilt
+fresh check billing: 0 units rebuilt
+fresh check notes: 0 units rebuilt
+fresh check orders: 0 units rebuilt
+fresh check feed: 0 units rebuilt
+fresh check search: 0 units rebuilt
+fresh check jobs: 0 units rebuilt
+fresh check mailer: 0 units rebuilt
+Build store: <work>/store
+694.1 MiB saved: 252 files (543.0 MiB) shared by the projects instead of a copy each
+  <work>/jobs/target: 189.1 MiB, built just now
+  <work>/orders/target: 303.4 MiB, built just now
+  <work>/notes/target: 292.9 MiB, built just now
+  <work>/search/target: 300.2 MiB, built just now
+  <work>/billing/target: 300.7 MiB, built just now
+  <work>/mailer/target: 182.3 MiB, built just now
+  <work>/shop/target: 300.5 MiB, built just now
+  <work>/feed/target: 267.8 MiB, built just now
+8 projects use 1.4 GiB on disk, budget 30.0 GiB
+EXIT 0

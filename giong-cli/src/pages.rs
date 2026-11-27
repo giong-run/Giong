@@ -2973,6 +2973,7 @@ The project's build directory (`target/`) holds more than a few gigabytes. Cargo
 
 - `giong clean` removes the builds the current toolchain and lockfile no longer use, and says how much it freed.
 - `giong clean --all` removes the whole build directory (the next build starts from nothing).
+- `giong cache share ~/code` keeps one copy on disk of each dependency build that several projects have (hard links to `~/.giong/store`), and `giong cache gc` keeps the builds of all the projects under a budget. `giong dev` shares each build on its own.
 
 [All error codes](README.md)
 "#),
@@ -3182,6 +3183,31 @@ With `--lan`, `giong dev` keeps the address as written and the warning says that
 
 - Nothing to do if loopback is what you want; to silence the warning, set `LISTEN=127.0.0.1:8080` (your port) in `.env`.
 - To try the service from another device (a phone on the same Wi-Fi): `giong dev --lan`. Stop it when you are done.
+
+[All error codes](README.md)
+"#),
+    (5025, r#"# GIONG-E5025: the build store cannot share a build
+
+Raised by the `giong` command (giong-cli): `giong cache`. In JSON output: `"code": "GIONG-E5025"`.
+
+## What happened
+
+The build store (`~/.giong/store`, or `GIONG_STORE_DIR`) keeps one copy on disk of each dependency build that several projects have, as hard links. It could not be used, or it skipped a build directory. The message says which, and why:
+
+- `GIONG_STORE=off` turns it off.
+- The `giong` command was built with a Rust older than 1.89, which has no file locks (the store takes cargo's own lock on a build directory before it changes anything).
+- The store directory can be written by other users, so a file in it cannot stand in for one of your builds.
+- A build directory was built by cargo 1.99 or older (the store needs cargo's build-dir layout, cargo 1.100 and later), is in use by a cargo build, or its project has no `Cargo.lock`.
+- No hard link can be made: the store is on another drive than the project, or the file system has no hard links.
+
+Nothing is lost when a build is skipped: the project builds and runs as before, with its own copy of each dependency.
+
+## How to fix it
+
+- Build again with a current toolchain (`rustup update stable`), then `giong cache share`.
+- Put the store on the same drive as your projects: `GIONG_STORE_DIR=/path/on/that/drive/.giong-store`.
+- Make the store directory yours alone: `chmod go-w ~/.giong/store ~/.giong/store/objects`.
+- A build that was in use: run `giong cache share` again once it ends (`giong dev` does it after each build on its own).
 
 [All error codes](README.md)
 "#),

@@ -1,8 +1,11 @@
-//! The parent of a process on Windows, from a Toolhelp32 snapshot.
+//! The parent of a process on Windows, from a Toolhelp32 snapshot, and the
+//! identity and link count of a file.
 //!
 //! `giong dev status` and `stop` trust a service pid from `.giong/dev.json`
 //! only when the verified runner is its parent; Windows offers no command
 //! that tells a parent quickly, so this asks the system directly (#385).
+//! The build store (src/store.rs) needs to know which files are hard links
+//! of one another, which std tells only on Unix.
 //!
 //! With `noinherit`, one of the two modules of giong-cli that use `unsafe`;
 //! `[lints.rust] unsafe_code = "deny"` keeps it to them.
@@ -45,6 +48,41 @@ extern "system" {
     fn Process32FirstW(snapshot: *mut c_void, entry: *mut ProcessEntry) -> i32;
     fn Process32NextW(snapshot: *mut c_void, entry: *mut ProcessEntry) -> i32;
     fn CloseHandle(handle: *mut c_void) -> i32;
+    fn GetFileInformationByHandle(file: *mut c_void, info: *mut FileInformation) -> i32;
+}
+
+/// BY_HANDLE_FILE_INFORMATION, laid out as in fileapi.h.
+#[repr(C)]
+#[derive(Default)]
+struct FileInformation {
+    attributes: u32,
+    creation_time: [u32; 2],
+    last_access_time: [u32; 2],
+    last_write_time: [u32; 2],
+    volume_serial_number: u32,
+    file_size_high: u32,
+    file_size_low: u32,
+    number_of_links: u32,
+    file_index_high: u32,
+    file_index_low: u32,
+}
+
+const _: () = assert!(std::mem::size_of::<FileInformation>() == 52);
+
+/// The volume and file index of `path` (what an inode is on Unix) and how
+/// many hard links it has; `None` when the system does not say.
+pub fn file_id(path: &std::path::Path) -> Option<crate::store::FileId> {
+    use std::os::windows::io::AsRawHandle;
+    let file = std::fs::File::open(path).ok()?;
+    let mut info = FileInformation::default();
+    // SAFETY: the handle belongs to `file`, open for the whole call; `info`
+    // is a live, writable BY_HANDLE_FILE_INFORMATION the call fills.
+    let ok = unsafe { GetFileInformationByHandle(file.as_raw_handle().cast(), &mut info) };
+    (ok != 0).then(|| crate::store::FileId {
+        dev: u64::from(info.volume_serial_number),
+        ino: (u64::from(info.file_index_high) << 32) | u64::from(info.file_index_low),
+        links: u64::from(info.number_of_links),
+    })
 }
 
 /// The parent of `pid`, or `None` when `pid` does not run or the system
