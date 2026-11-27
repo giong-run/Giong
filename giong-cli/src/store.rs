@@ -1127,6 +1127,8 @@ pub struct Gc {
     pub trimmed: Vec<(PathBuf, u64, &'static str)>,
     /// Build directories that no longer exist, dropped from the registry.
     pub forgotten: Vec<PathBuf>,
+    /// Build directories over the budget left alone, and why.
+    pub skipped: Vec<(PathBuf, &'static str)>,
     pub cancelled: bool,
 }
 
@@ -1135,7 +1137,8 @@ pub struct Gc {
 /// what an older compiler built and incremental data unused for 14 days in
 /// every project, then the whole build of projects not built for
 /// [`IDLE_DAYS`] days, the longest idle first. Never `keep` (the project
-/// giong dev serves) and never a build directory cargo is using.
+/// giong dev serves), never a build directory cargo (of any version) is
+/// using, and only directories cargo marked as builds (its CACHEDIR.TAG).
 pub fn gc(
     store: &Store,
     budget: Option<u64>,
@@ -1201,10 +1204,17 @@ fn trim(
 ) {
     let dirs: Vec<PathBuf> = live.iter().map(|p| p.build_dir.clone()).collect();
     let mut used = g.used_before;
-    let candidates: Vec<&Known> = live
-        .iter()
-        .filter(|p| keep != Some(p.build_dir.as_path()))
-        .collect();
+    let mut candidates: Vec<&Known> = Vec::new();
+    for p in live.iter().filter(|p| keep != Some(p.build_dir.as_path())) {
+        if made_by_cargo(&p.build_dir) {
+            candidates.push(p);
+        } else {
+            g.skipped.push((
+                p.build_dir.clone(),
+                "no CACHEDIR.TAG from cargo in it, so it may not be only a build",
+            ));
+        }
+    }
     // 1. What no build of the current toolchain uses.
     let mut probes: HashMap<String, Option<u64>> = HashMap::new();
     for p in &candidates {
@@ -1274,10 +1284,11 @@ fn trim(
 /// (with `dry`, what would be).
 fn remove_locked(build_dir: &Path, paths: &[PathBuf], dry: bool) -> Option<u64> {
     let mut locks = Vec::new();
-    for profile in profiles(build_dir) {
+    for profile in locked_profiles(build_dir) {
+        // Any layout: a lock that cannot be taken (or a lock file gone
+        // meanwhile) leaves the whole build directory alone.
         match lock_profile(&profile) {
             Ok(l) => locks.push(l),
-            Err(Skip::OldLayout) => {}
             Err(_) => return None,
         }
     }
@@ -1296,6 +1307,39 @@ fn remove_locked(build_dir: &Path, paths: &[PathBuf], dry: bool) -> Option<u64> 
     let after = disk_used(paths);
     drop(locks);
     Some(before.saturating_sub(after))
+}
+
+/// The profile directories of `build_dir` that hold a lock file of any
+/// cargo (`.cargo-build-lock` from 1.100, `.cargo-lock` before), and the
+/// same under `<target-triple>/`.
+fn locked_profiles(build_dir: &Path) -> Vec<PathBuf> {
+    let has_lock =
+        |p: &Path| p.join(".cargo-build-lock").is_file() || p.join(".cargo-lock").is_file();
+    let mut out = Vec::new();
+    for e in entries(build_dir) {
+        let p = e.path();
+        if !real_dir(&p) {
+            continue;
+        }
+        if has_lock(&p) {
+            out.push(p);
+            continue;
+        }
+        for i in entries(&p) {
+            if real_dir(&i.path()) && has_lock(&i.path()) {
+                out.push(i.path());
+            }
+        }
+    }
+    out
+}
+
+/// Whether `dir` is a directory cargo made for builds: cargo writes a
+/// `CACHEDIR.TAG` with this signature in each. Anything else is never
+/// trimmed, whatever the project's configuration names.
+fn made_by_cargo(dir: &Path) -> bool {
+    fs::read_to_string(dir.join("CACHEDIR.TAG"))
+        .is_ok_and(|t| t.starts_with("Signature: 8a477f597d28d172789f06886806bc55"))
 }
 
 /// A size such as `30G`, `512M`, `2048` (bytes), or `off`.
@@ -1410,10 +1454,17 @@ mod tests {
         dir
     }
 
+    /// A profile directory as cargo 1.100 makes it, in a target directory
+    /// with cargo's CACHEDIR.TAG.
     fn profile(root: &Path) -> PathBuf {
         let p = root.join("target").join("debug");
         fs::create_dir_all(p.join("build")).unwrap();
         fs::write(p.join(".cargo-build-lock"), "").unwrap();
+        fs::write(
+            root.join("target").join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n# This file is a cache directory tag created by cargo.\n",
+        )
+        .unwrap();
         p
     }
 
@@ -1708,6 +1759,61 @@ mod tests {
         assert_eq!(g.unused_objects, 2);
         assert_eq!(g.forgotten.len(), 1);
         assert_eq!(usage(&store).objects, 0);
+        fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn gc_trims_only_what_cargo_made_and_nothing_cargo_is_using() {
+        if !lock::AVAILABLE {
+            return;
+        }
+        let t = temp("gc-odd");
+        let store = Store::open_at(&t.join("store")).unwrap();
+        // A project whose configured target directory is not a cargo build
+        // directory (no CACHEDIR.TAG): idle, over the budget, never emptied.
+        let odd = t.join("odd/out");
+        fs::create_dir_all(odd.join("debug/build")).unwrap();
+        fs::write(odd.join("debug/.cargo-build-lock"), "").unwrap();
+        fs::write(odd.join("notes.txt"), "mine").unwrap();
+        note_built(&store, &odd, &t.join("odd")).unwrap();
+        // An idle build an older cargo is building into right now (it holds
+        // `.cargo-lock`, the old layout's lock).
+        let old = t.join("old/target");
+        fs::create_dir_all(old.join("debug/deps")).unwrap();
+        fs::write(old.join("debug/deps/libx.rlib"), vec![1u8; 4096]).unwrap();
+        fs::write(old.join("debug/.cargo-lock"), "").unwrap();
+        fs::write(
+            old.join("CACHEDIR.TAG"),
+            "Signature: 8a477f597d28d172789f06886806bc55\n",
+        )
+        .unwrap();
+        note_built(&store, &old, &t.join("old")).unwrap();
+        update_registry(&store, |r| {
+            for p in &mut r.projects {
+                p.last_built = 0;
+            }
+        })
+        .unwrap();
+        let held = lock::try_exclusive(&old.join("debug/.cargo-lock"), false)
+            .unwrap()
+            .unwrap();
+        let none = AtomicBool::new(false);
+        let g = gc(&store, Some(1), None, false, &none);
+        assert!(odd.join("notes.txt").is_file());
+        assert!(odd.join("debug/build").is_dir());
+        assert_eq!(g.skipped.len(), 1, "{:?}", g.skipped);
+        assert!(g.skipped[0].0.ends_with("odd/out"));
+        assert!(
+            old.join("debug/deps/libx.rlib").is_file(),
+            "{:?}",
+            g.trimmed
+        );
+        // Once that build ends, the idle build goes.
+        drop(held);
+        let g = gc(&store, Some(1), None, false, &none);
+        assert!(!old.join("debug").exists(), "{:?}", g.trimmed);
+        assert!(old.join("CACHEDIR.TAG").is_file());
+        assert!(odd.join("notes.txt").is_file());
         fs::remove_dir_all(&t).unwrap();
     }
 

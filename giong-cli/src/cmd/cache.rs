@@ -311,6 +311,9 @@ fn gc(store: &Store, budget: Option<u64>, dry: bool) -> Report {
     for dir in &g.forgotten {
         r.line(format!("forgot {} (it no longer exists)", dir.display()));
     }
+    for (dir, why) in &g.skipped {
+        r.line(format!("left {} alone: {why}", dir.display()));
+    }
     r.line(match budget {
         Some(b) if g.used_before > b => format!(
             "the projects' builds use {}, over the {} budget{}",
@@ -332,6 +335,15 @@ fn gc(store: &Store, budget: Option<u64>, dry: bool) -> Report {
             human(g.used_before)
         ),
     });
+    r.data(
+        "skipped",
+        Value::Array(
+            g.skipped
+                .iter()
+                .map(|(d, why)| json!({"build_dir": d.display().to_string(), "reason": why}))
+                .collect(),
+        ),
+    );
     r.data("dry_run", json!(dry));
     r.data("unused_objects", json!(g.unused_objects));
     r.data("unused_bytes", json!(g.unused_bytes));
