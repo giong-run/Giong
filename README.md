@@ -904,6 +904,8 @@ younger than both, and one service runs on it so far.
   and cancellation, commit conventions, and how to make a first contribution.
 - [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md) — how we treat each other, and how to report a
   problem.
+- [SECURITY.md](SECURITY.md) — how to report a vulnerability, which versions get fixes, and
+  the threat model.
 - [ROADMAP.md](ROADMAP.md) — milestones and deliberate non-goals.
 - [AGENTS.md](AGENTS.md) — building, testing and changing giong, written for AI coding agents;
   [giong.run/llms.txt](https://giong.run/llms.txt) points a model at the docs.
