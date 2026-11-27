@@ -1,6 +1,6 @@
 #!/bin/bash
 # The one-machine part of the run, in tmux, after build.sh: bash local.sh <parts...>
-# On br-1 once run.sh is done: h2 tls fs mem httpc. On br-2 at the same time: spin placement lab.
+# On br-1 once run.sh is done: h2 tls fs mem httpc spin placement lab (br-2 soaks meanwhile).
 #
 #   h2         bench/h2.sh at main: HTTP/2 throughput and memory, giong-http against axum
 #   tls        bench/tls.sh at main: axum-tls, giong-http-tls, giong-http-ktls; json, users,

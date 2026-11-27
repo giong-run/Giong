@@ -50,6 +50,15 @@ if ! command -v wrk2 >/dev/null; then
     && cp /root/wrk2/wrk /usr/local/bin/wrk2) || echo "wrk2 did not build (see /root/r15/wrk2-build.log); gzip.sh falls back to wrk"
 fi
 
+# Non-interactive ssh commands (quic-2host.sh builds on br-2 over ssh) need cargo on PATH:
+# Ubuntu's .bashrc returns early for them, so the line goes first.
+grep -q 'cargo/env' /root/.bashrc 2>/dev/null || sed -i '1i [ -f /root/.cargo/env ] \&\& . /root/.cargo/env' /root/.bashrc
+# Vultr's image runs ufw with 22/tcp only: the benchmarks use TCP and UDP ports between the
+# machines over the private network (10.x).
+if command -v ufw >/dev/null && ufw status | grep -q 'Status: active'; then
+  ufw allow from 10.0.0.0/8 comment 'r15 private network' >/dev/null && echo "ufw: private network allowed"
+fi
+
 [ -d /root/giong/.git ] || git clone -q https://github.com/giong-run/Giong.git /root/giong
 [ -f /root/.ssh/id_ed25519 ] || ssh-keygen -q -t ed25519 -N "" -f /root/.ssh/id_ed25519
 grep -q "StrictHostKeyChecking" /root/.ssh/config 2>/dev/null || printf 'Host 10.* 192.168.* 172.*\n  StrictHostKeyChecking accept-new\n' >>/root/.ssh/config

@@ -14,8 +14,13 @@ The scripts come from this branch, cloned to `/root/b/run` on both machines.
 4. `build.sh` on both machines, at the same time. It makes the checkouts (main, v1.5.1, PR #487, PR #429, PR #180 and its base, PR #186) and puts the binaries in `/root/b/bins`.
 5. `run.sh` on br-1, in tmux. These are the two-machine parts: reg, ab, rate, gzip, h3, quic. They take about 4 hours.
 6. Then, at the same time:
-   - on br-1: `local.sh h2 tls fs mem httpc`;
-   - on br-2: `local.sh spin placement lab`. These parts turn SMT off while they run.
+   - on br-1: `local.sh h2 tls fs mem httpc spin placement lab`. The last three parts turn SMT off while they run;
+   - on br-2: `soak.sh core:0-3,8-11 core-epoll:4-7,12-15`, 3 hours of tests/soak.rs on io_uring and on epoll.
+7. Then, at the same time, 2 hours each (`SECS=7200`):
+   - on br-1: `soak.sh tls:0-3,8-11 grpc:4-7,12-15`;
+   - on br-2: `soak.sh h3:0-15`.
+
+A soak never runs on a machine that is measuring.
 
 Never change a NIC or boot setting on both machines at once, and never without the self-recovery reboot.
 
@@ -35,6 +40,7 @@ Never change a NIC or boot setting on both machines at once, and never without t
 | spin | PR #186's bench/spin.sh | The spin governor: is the p99 loss still there on bare metal? An opt-in eco mode ships only if it is gone. |
 | placement | PR #180's bench/placement.sh | Load-aware placement against its base. |
 | lab | bench/lab/lab.py | Every lab scenario: cores, conns, memory, payload, mixed, overload, loss, latency. |
+| soak | soak.sh | Do hours of churn leave descriptors, memory, timers or driver state behind on main? It runs tests/soak.rs on io_uring and on epoll, then the giong-tls, giong-grpc and HTTP/3 soaks. |
 
 `summarize.py` prints the summaries of ab, rate, gzip and h3. It reports medians over rounds with min and max. A row is marked as limited by the server (cores at least 95% busy), the load generator (at least 90% busy), the link (at least 23 Gbit/s) or neither.
 
