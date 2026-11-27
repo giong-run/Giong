@@ -2,6 +2,9 @@
 
 use std::cell::RefCell;
 
+#[cfg(feature = "fast-gzip")]
+use libdeflater::{CompressionLvl, Compressor};
+
 use miniz_oxide::deflate::core::{
     compress_to_output, create_comp_flags_from_zip_params, CompressorOxide, TDEFLFlush, TDEFLStatus,
 };
@@ -12,6 +15,8 @@ use crate::{Error, Middleware, Next, Req, Response};
 /// Input compressed between two chances for the worker's other tasks to
 /// run: about half a millisecond of work at level 1.
 const CHUNK: usize = 64 * 1024;
+#[cfg(feature = "fast-gzip")]
+const SMALL_BODY_LIMIT: usize = 16 * 1024;
 
 /// Compresses response bodies with gzip when the client accepts it.
 ///
@@ -40,6 +45,13 @@ const CHUNK: usize = 64 * 1024;
 /// Large bodies are compressed 64 KiB at a time, letting the worker's other
 /// connections run in between, so one big response does not hold up the
 /// others on its worker.
+///
+/// With the `fast-gzip` feature, a body of up to 16 KiB at level 1 (the
+/// default) is compressed by libdeflate, a C library, in one call: about a
+/// third less CPU per response than the pure Rust compressor, for the same
+/// size (an 8 KiB JSON body: 24 µs instead of 35 µs per request on one
+/// core, bench/results/web-fast-gzip). Larger bodies and other levels keep
+/// the pure Rust compressor.
 #[derive(Clone, Debug)]
 pub struct Compression {
     level: u8,
@@ -208,6 +220,34 @@ thread_local! {
     static COMPRESSORS: RefCell<Vec<(u8, Box<CompressorOxide>)>> = const { RefCell::new(Vec::new()) };
 }
 
+#[cfg(feature = "fast-gzip")]
+thread_local! {
+    /// libdeflate's level-1 compressor and the buffer it writes to, kept
+    /// between responses: the buffer grows once to the bound of the largest
+    /// body (about 16 KiB) instead of being allocated and zeroed for each.
+    /// Nothing yields or calls user code while they are borrowed.
+    static SMALL_GZIP: RefCell<(Compressor, Vec<u8>)> = RefCell::new((
+        Compressor::new(CompressionLvl::new(1).expect("libdeflate supports level 1")),
+        Vec::new(),
+    ));
+}
+
+/// `data` as a gzip member, by libdeflate in one call. `None` if it does
+/// not fit the bound libdeflate gives, which does not happen.
+#[cfg(feature = "fast-gzip")]
+fn gzip_small(data: &[u8]) -> Option<Vec<u8>> {
+    SMALL_GZIP.with(|cell| {
+        let (compressor, buf) = &mut *cell.borrow_mut();
+        let bound = compressor.gzip_compress_bound(data.len());
+        if buf.len() < bound {
+            buf.resize(bound, 0);
+        }
+        let len = compressor.gzip_compress(data, buf).ok()?;
+        // Exactly as long as it is: the response keeps no spare capacity.
+        Some(buf[..len].to_vec())
+    })
+}
+
 fn take_compressor(level: u8) -> Box<CompressorOxide> {
     let pooled = COMPRESSORS.with(|pool| {
         let mut pool = pool.borrow_mut();
@@ -233,8 +273,20 @@ fn give_compressor(level: u8, mut c: Box<CompressorOxide>) {
 
 /// `data` as a gzip member (RFC 1952), compressed `CHUNK` bytes at a time
 /// with a yield in between. `None` if the compressor fails, which it does
-/// not for valid settings.
+/// not for valid settings. Cancel safe: no I/O or externally visible state is
+/// changed before the compressed bytes are returned.
 pub(crate) async fn gzip(data: &[u8], level: u8) -> Option<Vec<u8>> {
+    #[cfg(feature = "fast-gzip")]
+    if level == 1 && data.len() <= SMALL_BODY_LIMIT {
+        if let Some(compressed) = gzip_small(data) {
+            return Some(compressed);
+        }
+    }
+    gzip_chunked(data, level).await
+}
+
+// Cancel safe: all compression state is owned by this future.
+async fn gzip_chunked(data: &[u8], level: u8) -> Option<Vec<u8>> {
     let mut c = take_compressor(level);
     let mut out = Vec::with_capacity(data.len() / 4 + 64);
     // Magic, deflate, no flags, no time, extra flags (2: best, 4: fastest),
@@ -338,7 +390,8 @@ impl Crc32 {
 #[cfg(any(test, fuzzing))]
 pub(crate) fn gunzip(gz: &[u8]) -> Vec<u8> {
     assert!(gz.len() >= 18, "{} bytes is too short for gzip", gz.len());
-    assert_eq!(&gz[..3], &[0x1f, 0x8b, 8]);
+    // Deflate, and no flags: the header is the 10 fixed bytes.
+    assert_eq!(&gz[..4], &[0x1f, 0x8b, 8, 0]);
     let body = &gz[10..gz.len() - 8];
     let data = miniz_oxide::inflate::decompress_to_vec(body).expect("valid deflate");
     let n = gz.len();
@@ -350,9 +403,168 @@ pub(crate) fn gunzip(gz: &[u8]) -> Vec<u8> {
     data
 }
 
+/// Panics unless `body` gzipped at `level` decompresses to `body`. With
+/// `fast-gzip`, a body libdeflate took is compressed by miniz_oxide too, and
+/// that is checked as well. For the tests and the fuzz targets.
+#[cfg(any(test, fuzzing))]
+pub(crate) async fn check_round_trip(body: &[u8], level: u8) {
+    let gz = gzip(body, level).await.expect("gzip");
+    assert!(
+        gunzip(&gz) == body,
+        "level {level}, {} bytes: the round trip differs",
+        body.len()
+    );
+    #[cfg(feature = "fast-gzip")]
+    if level == 1 && body.len() <= SMALL_BODY_LIMIT {
+        let gz = gzip_chunked(body, level).await.expect("gzip");
+        assert!(
+            gunzip(&gz) == body,
+            "miniz_oxide, {} bytes: the round trip differs",
+            body.len()
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "fast-gzip")]
+    #[test]
+    fn fast_gzip_keeps_bytes_and_cooperative_fallback_at_boundary() {
+        giong::block_on(async {
+            for size in [
+                0,
+                1,
+                1400,
+                2700,
+                SMALL_BODY_LIMIT,
+                SMALL_BODY_LIMIT + 1,
+                CHUNK + 1,
+            ] {
+                let body: Vec<u8> = (0..size).map(|n| (n % 251) as u8).collect();
+                for level in [1, 6, 9] {
+                    let compressed = gzip(&body, level).await.unwrap();
+                    assert_eq!(gunzip(&compressed), body);
+                    if size > SMALL_BODY_LIMIT || level != 1 {
+                        assert_eq!(compressed, gzip_chunked(&body, level).await.unwrap());
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(feature = "fast-gzip")]
+    #[test]
+    fn fast_gzip_after_dropping_a_large_compression() {
+        use std::{
+            future::{poll_fn, Future},
+            task::Poll,
+        };
+        giong::block_on(async {
+            let large = vec![b'A'; CHUNK * 3];
+            let mut pending = Box::pin(gzip(&large, 1));
+            // The large fallback yields after its first chunk. Drop it while
+            // suspended and verify that both compressor paths remain usable.
+            poll_fn(|cx| {
+                assert!(pending.as_mut().poll(cx).is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            drop(pending);
+            let small = b"subsequent independent response".repeat(64);
+            assert_eq!(gunzip(&gzip(&small, 1).await.unwrap()), small);
+            assert_eq!(gunzip(&gzip(&large, 1).await.unwrap()), large);
+        });
+    }
+
+    // Run manually on a pinned Linux core in release mode. Both paths use
+    // the same process, corpus, level and warm-up. No network or app data.
+    #[cfg(all(feature = "fast-gzip", target_os = "linux"))]
+    #[test]
+    #[ignore = "synthetic performance benchmark"]
+    fn fast_gzip_cpu_profile() {
+        use std::{hint::black_box, time::Instant};
+        fn ticks() -> (u64, u64) {
+            let stat = std::fs::read_to_string("/proc/self/stat").unwrap();
+            let f: Vec<_> = stat
+                .rsplit_once(')')
+                .unwrap()
+                .1
+                .split_whitespace()
+                .collect();
+            (f[11].parse().unwrap(), f[12].parse().unwrap())
+        }
+        let hz: f64 = std::env::var("GIONG_BENCH_HZ").unwrap().parse().unwrap();
+        let iterations = 10_000;
+        giong::block_on(async {
+            for size in [1400, 2700, 5000, 8192, SMALL_BODY_LIMIT] {
+                for corpus in ["html", "varied"] {
+                    let mut input = Vec::new();
+                    let mut x = 0x12345678u32;
+                    for n in 0..size {
+                        if corpus == "varied" {
+                            x ^= x << 13;
+                            x ^= x >> 17;
+                            x ^= x << 5;
+                            input.push(b' ' + (x % 95) as u8);
+                        } else {
+                            let template = b"<li class=card><h2>Product 0123456789</h2><p>Example response content, details and description.</p></li>";
+                            input.push(if n % 79 == 0 {
+                                b'0' + ((n / 79) % 10) as u8
+                            } else {
+                                template[n % template.len()]
+                            });
+                        }
+                    }
+                    let legacy = gzip_chunked(&input, 1).await.unwrap();
+                    let fast = gzip(&input, 1).await.unwrap();
+                    assert_eq!(gunzip(&legacy), input);
+                    assert_eq!(gunzip(&fast), input);
+                    for round in 0..6 {
+                        for fast_backend in if round % 2 == 0 {
+                            [false, true]
+                        } else {
+                            [true, false]
+                        } {
+                            for _ in 0..250 {
+                                let result = if fast_backend {
+                                    gzip(black_box(&input), 1).await
+                                } else {
+                                    gzip_chunked(black_box(&input), 1).await
+                                };
+                                black_box(result.unwrap());
+                            }
+                            let before = ticks();
+                            let begin = Instant::now();
+                            let mut times = Vec::with_capacity(iterations);
+                            let mut bytes = 0usize;
+                            for _ in 0..iterations {
+                                let started = Instant::now();
+                                let result = if fast_backend {
+                                    gzip(black_box(&input), 1).await
+                                } else {
+                                    gzip_chunked(black_box(&input), 1).await
+                                }
+                                .unwrap();
+                                times.push(started.elapsed().as_nanos());
+                                bytes += black_box(result.len());
+                            }
+                            let elapsed = begin.elapsed();
+                            let after = ticks();
+                            times.sort_unstable();
+                            println!("gzip_profile,{size},{corpus},{round},{},{iterations},{:.3},{:.3},{},{},{:.3}",
+                                if fast_backend {"fast"} else {"legacy"},
+                                elapsed.as_secs_f64()*1e6/iterations as f64,
+                                (after.0+after.1-before.0-before.1) as f64*1e6/hz/iterations as f64,
+                                times[iterations/2],times[iterations*99/100],
+                                bytes as f64/iterations as f64);
+                        }
+                    }
+                }
+            }
+        });
+    }
 
     #[test]
     fn the_crc_matches_the_standard_check_value() {

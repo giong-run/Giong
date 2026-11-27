@@ -4,7 +4,10 @@
 //! MIDDLEWARE=1 adds request ids, gzip and a timeout, as bench/axum does
 //! with tower-http's equivalents. TRACE=1 turns request tracing on
 //! (`Handle::set_request_tracing`), to measure what it costs
-//! (bench/request-tracing.sh).
+//! (bench/request-tracing.sh). `BENCH_HOST` (default 127.0.0.1) lets a load
+//! generator on another machine reach it. Built with `--features fast-gzip`,
+//! the gzip of small bodies goes through libdeflate
+//! (bench/results/web-fast-gzip).
 use std::hint::black_box;
 use std::time::Duration;
 
@@ -87,7 +90,8 @@ fn main() -> std::io::Result<()> {
                     .layer(Compression::new())
                     .layer(Timeout::new(Duration::from_secs(10)));
             }
-            let listener = TcpListener::bind("127.0.0.1:3011").expect("bind");
+            let host = std::env::var("BENCH_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+            let listener = TcpListener::bind(format!("{host}:3011")).expect("bind");
             Server::new().serve(listener, router.build(())).await;
         })
 }

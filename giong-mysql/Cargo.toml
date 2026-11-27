@@ -21,6 +21,9 @@ ring = "0.17"
 # TCP keepalive and TCP_USER_TIMEOUT on the connection, to notice a server
 # that vanished without closing. Already a dependency of giong.
 socket2 = { version = "0.6", features = ["all"] }
+# Wipes the password and what is derived from it when they are dropped.
+# Already compiled in through rustls.
+zeroize = "1"
 
 [dev-dependencies]
 libc = "0.2"

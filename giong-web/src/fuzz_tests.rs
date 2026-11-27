@@ -53,6 +53,36 @@ fn chosen_route_sets_agree_with_the_reference() {
     }
 }
 
+#[test]
+fn gzip_round_trips_random_bodies() {
+    let mut rng = Rng(0x6a09_e667_f3bc_c908);
+    for _ in 0..400 {
+        // A small alphabet compresses well, a large one hardly at all.
+        let alphabet = 1 + rng.below(256);
+        let len = rng.below(700) as usize;
+        let mut data: Vec<u8> = (0..len).map(|_| rng.below(alphabet) as u8).collect();
+        if let Some(pick) = data.first_mut() {
+            // Mostly few copies: debug builds compress slowly.
+            *pick = (*pick & 0x1f) | ((rng.below(8) as u8 / 3) << 5);
+        }
+        crate::fuzzing::check_gzip(&data);
+    }
+}
+
+#[test]
+fn the_gzip_fuzz_seeds_round_trip() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/fuzz/seeds/gzip");
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return; // The published crate leaves fuzz/ out.
+    };
+    let mut n = 0;
+    for entry in entries {
+        crate::fuzzing::check_gzip(&std::fs::read(entry.unwrap().path()).unwrap());
+        n += 1;
+    }
+    assert!(n >= 4, "{n} seeds");
+}
+
 #[cfg(feature = "serde")]
 #[test]
 fn every_request_gets_a_well_formed_answer() {

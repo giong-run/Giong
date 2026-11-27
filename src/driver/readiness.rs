@@ -310,6 +310,7 @@ unsafe fn run_blocking(io: Io) -> i32 {
         Io::OpenAt { path, flags, mode } => {
             retry(|| libc::openat(libc::AT_FDCWD, path, flags, mode) as isize)
         }
+        Io::OpenBeneath { dir, path, how } => retry(|| sys::open_beneath(dir, path, &*how)),
         // A close is never retried: after EINTR the descriptor is gone.
         Io::Close { fd } => match libc::close(fd) {
             0 => 0,
@@ -786,6 +787,7 @@ impl<P: Poller> Readiness<P> {
                 true
             }
             Io::OpenAt { .. }
+            | Io::OpenBeneath { .. }
             | Io::Statx { .. }
             | Io::Fsync { .. }
             | Io::Fallocate { .. }
@@ -811,7 +813,8 @@ impl<P: Poller> Readiness<P> {
             | Io::Write { fd, .. }
             | Io::Fsync { fd, .. }
             | Io::Fallocate { fd, .. }
-            | Io::Statx { dir: fd, .. } => fd,
+            | Io::Statx { dir: fd, .. }
+            | Io::OpenBeneath { dir: fd, .. } => fd,
             _ => -1,
         };
         if fd >= 0 {

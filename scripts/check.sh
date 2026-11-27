@@ -140,8 +140,23 @@ run_asan() {
     # 'static data an API takes); any other leak fails the run.
     # One round: the sanitizer finds what a test reaches, repeating adds
     # little (TSan repeats because races depend on timing).
-    echo "== AddressSanitizer + LeakSanitizer"
+    # The suppressions name functions, so LeakSanitizer must be able to turn
+    # addresses into names: without llvm-symbolizer every frame is a bare
+    # address, no suppression matches, and each test that leaks on purpose
+    # fails the run.
+    local symbolizer
+    symbolizer="${ASAN_SYMBOLIZER_PATH:-$(command -v llvm-symbolizer || true)}"
+    if [ -z "$symbolizer" ]; then
+        symbolizer="$(ls -d /usr/lib/llvm-*/bin/llvm-symbolizer 2>/dev/null | sort -V | tail -n 1)"
+    fi
+    if [ -z "$symbolizer" ] || [ ! -x "$symbolizer" ]; then
+        echo "llvm-symbolizer is not installed (apt install llvm), and LeakSanitizer needs it" \
+            "to match scripts/lsan.supp; or set ASAN_SYMBOLIZER_PATH" >&2
+        exit 2
+    fi
+    echo "== AddressSanitizer + LeakSanitizer (symbolizer: $symbolizer)"
     RUSTFLAGS="-Zsanitizer=address" \
+    ASAN_SYMBOLIZER_PATH="$symbolizer" \
     ASAN_OPTIONS="allocator_may_return_null=1 detect_leaks=1" \
     LSAN_OPTIONS="suppressions=$PWD/scripts/lsan.supp print_suppressions=0" \
     CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/asan" \

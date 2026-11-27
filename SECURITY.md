@@ -73,6 +73,11 @@ does giong promise, so that breaking that promise is a vulnerability?
   ring (including counters that lie) must not cause undefined behaviour in the safe
   receive path; it is reported (`GIONG-E0091`). `Receiver::recv_in_place` is `unsafe` and
   is for peers you trust.
+- **Paths opened through `giong::fs::Root`** (a request path, an upload's file name). Such a
+  path must not open, create, empty or stat anything that is not beneath the root's
+  directory: not with `..`, an absolute path, a symbolic link or junction, or a rename that
+  races the lookup. It is refused (`GIONG-E0205`). Paths given to `File::open` and the other
+  `fs` functions are opened as given.
 - **giong-mcp.** Reachable only as documented: a Unix socket of mode `0600`, or TCP with a
   bearer token (a server without one does not start unless the code opts out). Its tools
   look and change nothing in the service.
@@ -127,4 +132,9 @@ What is run, and how often, is listed in the README under
 - dependencies: `cargo deny` checks licenses and sources on every change and RustSec
   advisories every day (`deny.toml`, `.github/workflows/supply-chain.yml`);
 - releases: crates are published through crates.io Trusted Publishing from the release
-  workflow, whose actions are pinned by commit hash; binaries carry a `.sha256`.
+  workflow, whose actions are pinned by commit hash. Each release archive, and the `giong`
+  binary in it, has a `.sha256`, a signed build provenance attestation and a CycloneDX
+  SBOM; `gh attestation verify <file> --repo giong-run/Giong --signer-workflow
+  giong-run/Giong/.github/workflows/release.yml` shows it was built by the release workflow
+  from the tagged commit. The binary also lists the crates compiled into it (cargo
+  auditable), so `cargo audit bin` and other scanners can check it for advisories.

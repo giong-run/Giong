@@ -89,30 +89,51 @@ fn a_burst_of_balanced_jobs_spreads_over_every_worker() {
 #[test]
 fn a_worker_stuck_in_a_long_task_is_not_chosen() {
     const WORKERS: usize = 4;
+    // Worker 1 blocks its thread from when worker 0 is ready to look until
+    // worker 0 has looked, however late either thread starts: with a fixed
+    // 300 ms block, a worker 0 that started later than that never saw it
+    // (a loaded Windows runner, #502).
+    const LIMIT: Duration = Duration::from_secs(10);
     let rt = giong::Builder::new().workers(WORKERS).build().unwrap();
     let handle = rt.handle();
+    let ready = Arc::new(AtomicBool::new(false));
     let busy = Arc::new(AtomicBool::new(false));
+    let looked = Arc::new(AtomicBool::new(false));
     let chosen = Arc::new(Mutex::new(Vec::new()));
-    let (b, c) = (busy.clone(), chosen.clone());
+    let flags = (ready.clone(), busy.clone(), looked.clone());
+    let c = chosen.clone();
     rt.run(move |index| {
-        let (handle, busy, chosen) = (handle.clone(), b.clone(), c.clone());
+        let (handle, chosen) = (handle.clone(), c.clone());
+        let (ready, busy, looked) = (flags.0.clone(), flags.1.clone(), flags.2.clone());
         async move {
             match index {
                 1 => {
+                    let started = Instant::now();
+                    while !ready.load(Ordering::SeqCst) {
+                        assert!(started.elapsed() < LIMIT, "worker 0 never got ready");
+                        sleep(Duration::from_millis(1)).await;
+                    }
+                    // Stuck in a long task: the thread does not come back to
+                    // the runtime until worker 0 has made its choices.
                     busy.store(true, Ordering::SeqCst);
-                    std::thread::sleep(Duration::from_millis(300));
+                    let started = Instant::now();
+                    while !looked.load(Ordering::SeqCst) && started.elapsed() < LIMIT {
+                        std::thread::sleep(Duration::from_millis(1));
+                    }
                     busy.store(false, Ordering::SeqCst);
                 }
                 0 => {
+                    ready.store(true, Ordering::SeqCst);
                     let started = Instant::now();
                     while !busy.load(Ordering::SeqCst) {
-                        assert!(started.elapsed() < Duration::from_secs(10));
+                        assert!(started.elapsed() < LIMIT, "worker 1 never got stuck");
                         sleep(Duration::from_millis(1)).await;
                     }
                     for _ in 0..10 {
                         let w = handle.least_loaded_worker();
                         chosen.lock().unwrap().push(w);
                     }
+                    looked.store(true, Ordering::SeqCst);
                     while busy.load(Ordering::SeqCst) {
                         sleep(Duration::from_millis(5)).await;
                     }
