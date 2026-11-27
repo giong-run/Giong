@@ -25,8 +25,10 @@ tracing = ["dep:tracing"]
 # `Record::new` panics with GIONG-E1213. `giong dev --release` and
 # `--prod-like` turn it on.
 dev = ["giong/dev"]
-# Optional native backend for small level-one gzip bodies; other sizes/levels
-# retain the pure Rust cooperative compressor.
+# `middleware::Compression` gzips bodies of up to 16 KiB at level 1 (the
+# default) with libdeflate, about a third less CPU per response
+# (bench/results/web-fast-gzip). Larger bodies and other levels keep the pure
+# Rust compressor. libdeflate is C: building needs a C compiler.
 fast-gzip = ["dep:libdeflater"]
 
 [dependencies]
@@ -35,7 +37,8 @@ giong-http = { path = "../giong-http", version = "1.5.3" }
 # gzip for the Compression middleware. Already a dependency of giong-http's
 # client: the deflate implementation flate2 uses, in pure Rust.
 miniz_oxide = "0.9"
-libdeflater = { version = "=1.26.1", default-features = false, optional = true }
+# The `fast-gzip` feature: libdeflate, built from source by libdeflate-sys.
+libdeflater = { version = "1.26.1", default-features = false, optional = true }
 serde = { version = "1.0.200", optional = true }
 serde_json = { version = "1.0.100", optional = true }
 tracing = { version = "0.1.40", optional = true, default-features = false, features = ["std"] }

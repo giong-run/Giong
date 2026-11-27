@@ -9,11 +9,52 @@
 //!   valid status and headers, a problem+json body with a code for every
 //!   error, gzip that decodes to what the handler wrote, one log line that
 //!   is JSON and agrees with the response, and the request id sent back.
+//! * [`check_gzip`]: the input gzipped by [`Compression`]'s compressor
+//!   decompresses to the same bytes, with both compressors when the
+//!   `fast-gzip` feature is on.
+//!
+//! [`Compression`]: crate::middleware::Compression
+
+use std::future::Future;
+use std::pin::pin;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 /// Routes and a request from `data`; panics if the route table and the
 /// reference matcher disagree.
 pub fn check_routes(data: &[u8]) {
     crate::route::model::check(data);
+}
+
+/// The bytes after the first, repeated 1 to 128 times and gzipped at a
+/// level from 1 to 9 (the first byte picks both); panics unless they
+/// decompress to the same bytes. The copies let a short input reach the
+/// 16 KiB limit of the `fast-gzip` path and the 64 KiB chunks.
+pub fn check_gzip(data: &[u8]) {
+    let Some((&pick, bytes)) = data.split_first() else {
+        return;
+    };
+    let level = 1 + (pick & 0x0f) % 9;
+    let body = bytes.repeat(1 << (pick >> 5));
+    run(crate::middleware::check_round_trip(&body, level));
+}
+
+/// Runs `fut` to the end without a runtime: nothing it is given waits for
+/// I/O or a timer, and `yield_now` wakes itself.
+fn run<F: Future>(fut: F) -> F::Output {
+    fn clone(_: *const ()) -> RawWaker {
+        RawWaker::new(std::ptr::null(), &VTABLE)
+    }
+    fn noop(_: *const ()) {}
+    static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
+    // SAFETY: the vtable's functions do nothing with the null pointer.
+    let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
+    let mut cx = Context::from_waker(&waker);
+    let mut fut = pin!(fut);
+    loop {
+        if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return out;
+        }
+    }
 }
 
 #[cfg(feature = "serde")]
@@ -22,14 +63,12 @@ pub use app::check_request;
 #[cfg(feature = "serde")]
 pub(crate) mod app {
     use std::cell::RefCell;
-    use std::future::Future;
-    use std::pin::pin;
     use std::rc::Rc;
-    use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
 
+    use super::run;
     use crate::header::{is_token, is_value, list_contains};
     use crate::middleware::{Compression, Cors, Logger, RequestId};
     use crate::{json, App, Error, Req, Request, Response, Router, Sink};
@@ -131,25 +170,6 @@ pub(crate) mod app {
             )
             .layer(Compression::new().min_size(32))
             .build(())
-    }
-
-    /// Runs `fut` to the end without a runtime: nothing in the app above
-    /// waits for I/O or a timer, and `yield_now` wakes itself.
-    fn run<F: Future>(fut: F) -> F::Output {
-        fn clone(_: *const ()) -> RawWaker {
-            RawWaker::new(std::ptr::null(), &VTABLE)
-        }
-        fn noop(_: *const ()) {}
-        static VTABLE: RawWakerVTable = RawWakerVTable::new(clone, noop, noop, noop);
-        // SAFETY: the vtable's functions do nothing with the null pointer.
-        let waker = unsafe { Waker::from_raw(RawWaker::new(std::ptr::null(), &VTABLE)) };
-        let mut cx = Context::from_waker(&waker);
-        let mut fut = pin!(fut);
-        loop {
-            if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
-                return out;
-            }
-        }
     }
 
     /// `data` as a request; panics if the answer is not well formed.

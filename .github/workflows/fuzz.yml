@@ -3,7 +3,7 @@ name: Fuzz
 # Coverage-guided fuzzing with cargo-fuzz (libFuzzer) of everything that reads
 # bytes from the network: giong's DNS answers (and resolv.conf and hosts),
 # giong-http's server (HTTP/1.1, HTTP/2 and HPACK) and client, giong-web's
-# router and request handling, giong-mcp's request handling, giong-grpc's
+# router, request handling and response gzip, giong-mcp's request handling, giong-grpc's
 # message framing, gzip, timeouts, status messages, metadata and descriptors, the PostgreSQL,
 # MySQL and Redis protocol readers, and what giong-tls reads of the peer's
 # records around kernel TLS, giong-quic's packets and giong-proto's decoder
@@ -125,6 +125,7 @@ jobs:
           { "crate": "giong-redis", "target": "url" }
           { "crate": "giong-web", "target": "routes" }
           { "crate": "giong-web", "target": "request" }
+          { "crate": "giong-web", "target": "gzip" }
           { "crate": "giong-tls", "target": "ktls_records" }
           { "crate": "giong-mcp", "target": "request" }
           { "crate": "giong-quic", "target": "packet" }

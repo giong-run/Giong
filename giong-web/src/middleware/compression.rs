@@ -45,6 +45,13 @@ const SMALL_BODY_LIMIT: usize = 16 * 1024;
 /// Large bodies are compressed 64 KiB at a time, letting the worker's other
 /// connections run in between, so one big response does not hold up the
 /// others on its worker.
+///
+/// With the `fast-gzip` feature, a body of up to 16 KiB at level 1 (the
+/// default) is compressed by libdeflate, a C library, in one call: about a
+/// third less CPU per response than the pure Rust compressor, for the same
+/// size (an 8 KiB JSON body: 24 µs instead of 35 µs per request on one
+/// core, bench/results/web-fast-gzip). Larger bodies and other levels keep
+/// the pure Rust compressor.
 #[derive(Clone, Debug)]
 pub struct Compression {
     level: u8,
@@ -215,20 +222,29 @@ thread_local! {
 
 #[cfg(feature = "fast-gzip")]
 thread_local! {
-    // No yield or user callback while this worker-local compressor is borrowed.
-    static SMALL_GZIP: RefCell<Compressor> = RefCell::new(Compressor::new(
-        CompressionLvl::new(1).expect("libdeflate supports level 1")
+    /// libdeflate's level-1 compressor and the buffer it writes to, kept
+    /// between responses: the buffer grows once to the bound of the largest
+    /// body (about 16 KiB) instead of being allocated and zeroed for each.
+    /// Nothing yields or calls user code while they are borrowed.
+    static SMALL_GZIP: RefCell<(Compressor, Vec<u8>)> = RefCell::new((
+        Compressor::new(CompressionLvl::new(1).expect("libdeflate supports level 1")),
+        Vec::new(),
     ));
 }
 
+/// `data` as a gzip member, by libdeflate in one call. `None` if it does
+/// not fit the bound libdeflate gives, which does not happen.
 #[cfg(feature = "fast-gzip")]
 fn gzip_small(data: &[u8]) -> Option<Vec<u8>> {
-    SMALL_GZIP.with(|compressor| {
-        let mut compressor = compressor.borrow_mut();
-        let mut out = vec![0; compressor.gzip_compress_bound(data.len())];
-        let len = compressor.gzip_compress(data, &mut out).ok()?;
-        out.truncate(len);
-        Some(out)
+    SMALL_GZIP.with(|cell| {
+        let (compressor, buf) = &mut *cell.borrow_mut();
+        let bound = compressor.gzip_compress_bound(data.len());
+        if buf.len() < bound {
+            buf.resize(bound, 0);
+        }
+        let len = compressor.gzip_compress(data, buf).ok()?;
+        // Exactly as long as it is: the response keeps no spare capacity.
+        Some(buf[..len].to_vec())
     })
 }
 
@@ -374,7 +390,8 @@ impl Crc32 {
 #[cfg(any(test, fuzzing))]
 pub(crate) fn gunzip(gz: &[u8]) -> Vec<u8> {
     assert!(gz.len() >= 18, "{} bytes is too short for gzip", gz.len());
-    assert_eq!(&gz[..3], &[0x1f, 0x8b, 8]);
+    // Deflate, and no flags: the header is the 10 fixed bytes.
+    assert_eq!(&gz[..4], &[0x1f, 0x8b, 8, 0]);
     let body = &gz[10..gz.len() - 8];
     let data = miniz_oxide::inflate::decompress_to_vec(body).expect("valid deflate");
     let n = gz.len();
@@ -384,6 +401,28 @@ pub(crate) fn gunzip(gz: &[u8]) -> Vec<u8> {
     check.update(&data);
     assert_eq!((crc, size as usize), (check.value(), data.len()));
     data
+}
+
+/// Panics unless `body` gzipped at `level` decompresses to `body`. With
+/// `fast-gzip`, a body libdeflate took is compressed by miniz_oxide too, and
+/// that is checked as well. For the tests and the fuzz targets.
+#[cfg(any(test, fuzzing))]
+pub(crate) async fn check_round_trip(body: &[u8], level: u8) {
+    let gz = gzip(body, level).await.expect("gzip");
+    assert!(
+        gunzip(&gz) == body,
+        "level {level}, {} bytes: the round trip differs",
+        body.len()
+    );
+    #[cfg(feature = "fast-gzip")]
+    if level == 1 && body.len() <= SMALL_BODY_LIMIT {
+        let gz = gzip_chunked(body, level).await.expect("gzip");
+        assert!(
+            gunzip(&gz) == body,
+            "miniz_oxide, {} bytes: the round trip differs",
+            body.len()
+        );
+    }
 }
 
 #[cfg(test)]
