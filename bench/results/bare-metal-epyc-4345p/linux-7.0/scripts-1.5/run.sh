@@ -12,6 +12,7 @@
 #   gzip   gzip.sh: PR #429 with and without giong-web/fast-gzip
 #   h3     h3.sh: HTTP/3 requests, giong-http serve_h3 against h3 on quinn
 #   quic   bench/quic-2host.sh: QUIC streams, giong's engine against quinn (server on br-2)
+#   c1m    c1m.sh: a million held connections (not in the default list; needs build-late.sh)
 #
 # Results go to /root/r15/out/<part>; progress to /root/r15/progress.log.
 D=$(cd "$(dirname "$0")" && pwd)
@@ -39,6 +40,7 @@ for part in ${*:-reg ab rate gzip h3 quic}; do
     rate) OUT=$O/rate bash "$D/rate.sh" 3 10 >"$O/rate.log" 2>&1 ;;
     gzip) OUT=$O/gzip bash "$D/gzip.sh" 6 10 >"$O/gzip.log" 2>&1 ;;
     h3) OUT=$O/h3 bash "$D/h3.sh" 5 10 >"$O/h3.log" 2>&1 ;;
+    c1m) OUT=$O/c1m bash "$D/c1m.sh" >"$O/c1m.log" 2>&1 ;;
     quic)
       label=bare-metal-1.5-$(date -u +%Y%m%d)
       on_l "nstat -asz 'Udp*'" >"$O/quic-udp-before.txt" 2>&1

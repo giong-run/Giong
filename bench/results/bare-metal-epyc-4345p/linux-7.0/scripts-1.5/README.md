@@ -13,6 +13,7 @@ The scripts come from this branch, cloned to `/root/b/run` on both machines.
 3. `tune.sh` on br-2. Once ssh answers on both addresses, run `tune.sh confirm`. Then do the same on br-1. The script sets EPP to performance, loads the kernel TLS module, unloads irdma and sets 16 combined queues on the E810 ports, under a reboot in 10 minutes that `confirm` cancels.
 4. `build.sh` on both machines, at the same time. It makes the checkouts (main, v1.5.1, PR #487, PR #429, PR #180 and its base, PR #186) and puts the binaries in `/root/b/bins`.
 5. `run.sh` on br-1, in tmux. These are the two-machine parts: reg, ab, rate, gzip, h3, quic. They take about 4 hours.
+   Then `build-late.sh` on both machines (bench/h3, bench/c1m and the C1M servers), and `run.sh h3 c1m` on br-1.
 6. Then, at the same time:
    - on br-1: `local.sh h2 tls fs mem httpc spin placement lab`. The last three parts turn SMT off while they run;
    - on br-2: `soak.sh core:0-3,8-11 core-epoll:4-7,12-15`, 3 hours of tests/soak.rs on io_uring and on epoll.
@@ -34,6 +35,7 @@ Never change a NIC or boot setting on both machines at once, and never without t
 | gzip | gzip.sh | #428/#429 as a whole service: requests/s, CPU per request, latency at 50% and 80% load, and retained memory, with and without `giong-web/fast-gzip`. |
 | h3 | h3.sh, bench/h3 | HTTP/3 requests: giong-http's `serve_h3` against the h3 crate on quinn, both driven by a client on h3 and quinn. UDP drops are counted. |
 | quic | bench/quic-2host.sh | QUIC streams (rr, bulk, many): giong's engine against quinn. |
+| c1m | c1m.sh, bench/c1m | Can one server hold a million connections, and what does each cost? A million idle keep-alive connections over HTTP/1.1, h2c, HTTPS and h2 over TLS (main and PR #487): the server's memory and the whole machine's per connection, time to open them, CPU while they sit, and requests/s and p99 of a probe with and without them. |
 | h2, tls, fs | bench/h2.sh, bench/tls.sh, bench/fs.sh | The one-machine benchmarks of the regression pass. |
 | mem | bench/tls-idle.sh, bench/h2.sh memory | Memory per idle HTTPS and h2-over-TLS connection, and per h2 connection and stream: v1.5.1, main and PR #487. |
 | httpc | bench/http-client.sh | The HTTP client (#480): v1.5.1 against main. |

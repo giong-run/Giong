@@ -183,6 +183,16 @@ fn main() -> std::io::Result<()> {
     }) {
         builder = builder.recv_buffers(count, size);
     }
+    // BENCH_PORTS=FIRST-LAST: listen on every port of the range instead of 3009 (3010 with
+    // TLS), so that one client machine can hold more connections than one port leaves room
+    // for (bench/results/bare-metal-epyc-4345p/linux-7.0/scripts-1.5/c1m.sh).
+    let ports: Vec<u16> = match std::env::var("BENCH_PORTS").ok().and_then(|v| {
+        let (a, b) = v.split_once('-')?;
+        Some((a.parse::<u16>().ok()?, b.parse::<u16>().ok()?))
+    }) {
+        Some((first, last)) => (first..=last).collect(),
+        None => vec![if tls.is_some() { 3010 } else { 3009 }],
+    };
     let file = bench_file().to_path_buf();
     let ran = builder
         .shutdown_on_signals(true)
@@ -190,6 +200,7 @@ fn main() -> std::io::Result<()> {
         .build()?
         .run(move |_| {
             let tls = tls.clone();
+            let ports = ports.clone();
             async move {
                 // GIONG_LOG_DRIVER=1: say which driver and io_uring features
                 // each worker uses (bench/uring-features.sh records it).
@@ -220,15 +231,22 @@ fn main() -> std::io::Result<()> {
                 if let Some(n) = std::env::var("GIONG_IDLE_TIMEOUT_SECS").ok().and_then(|v| v.parse().ok()) {
                     server = server.idle_timeout(std::time::Duration::from_secs(n));
                 }
+                // Every port but the last is served by a task of its own.
+                let (last, others) = ports.split_last().expect("a port");
+                for &port in others {
+                    let listener = bind(bench_addr(port)).expect("bind");
+                    let (server, tls) = (server.clone(), tls.clone());
+                    drop(giong::spawn(async move {
+                        match tls {
+                            Some(acceptor) => server.serve_tls(listener, acceptor, handler).await,
+                            None => server.serve(listener, handler).await,
+                        }
+                    }));
+                }
+                let listener = bind(bench_addr(*last)).expect("bind");
                 match tls {
-                    Some(acceptor) => {
-                        let listener = bind(bench_addr(3010)).expect("bind");
-                        server.serve_tls(listener, acceptor, handler).await;
-                    }
-                    None => {
-                        let listener = bind(bench_addr(3009)).expect("bind");
-                        server.serve(listener, handler).await;
-                    }
+                    Some(acceptor) => server.serve_tls(listener, acceptor, handler).await,
+                    None => server.serve(listener, handler).await,
                 }
             }
         });

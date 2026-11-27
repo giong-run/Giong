@@ -43,3 +43,20 @@ performance() {
 # The interface that carries an address.
 iface_of() { ip -o -4 addr | awk -v a="$1" '{split($4, p, "/"); if (p[1] == a) print $2}'; }
 nic_bytes() { [ -n "$1" ] && [ -d /sys/class/net/"$1" ] || { echo 0; return; }; echo $(( $(cat /sys/class/net/"$1"/statistics/rx_bytes) + $(cat /sys/class/net/"$1"/statistics/tx_bytes) )); }
+# build <dir of a bench crate> <copy as, or "bin1 bin2"> [cargo args...]: a release build,
+# its binaries copied to /root/b/bins (build.sh, build-late.sh).
+BIN_DIR=$B/bins
+BLOG=$R15/build.log
+build() { # <dir of a bench crate> <copy as, or binaries to copy: "bin1 bin2"> [cargo args...]
+  local d=$1 as=$2; shift 2
+  local name; name=$(awk -F'"' '/^name *=/{print $2; exit}' "$d/Cargo.toml")
+  if (cd "$d" && cargo build --release -q "$@") >>"$BLOG" 2>&1; then
+    if [ -x "$d/target/release/$name" ]; then
+      cp "$d/target/release/$name" "$BIN_DIR/$as" && log "built $as from $d $*" || log "COPY FAILED: $as from $d"
+    else
+      local b; for b in $as; do cp "$d/target/release/$b" "$BIN_DIR/$b" && log "built $b from $d $*" || log "COPY FAILED: $b from $d"; done
+    fi
+  else
+    log "BUILD FAILED: $as from $d $* (see $BLOG)"
+  fi
+}

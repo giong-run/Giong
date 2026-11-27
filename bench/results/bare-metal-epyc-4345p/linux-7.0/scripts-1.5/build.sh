@@ -16,22 +16,8 @@
 #   run       this branch: these scripts and bench/lab/loadgen with --header
 . "$(dirname "$0")/env.sh"
 RUN_BRANCH=${RUN_BRANCH:-claude/project-thread-0t1y8n}
-BINS=$B/bins
-mkdir -p "$BINS"
-BLOG=$R15/build.log
-build() { # <dir of a bench crate> <copy as, or binaries to copy: "bin1 bin2"> [cargo args...]
-  local d=$1 as=$2; shift 2
-  local name; name=$(awk -F'"' '/^name *=/{print $2; exit}' "$d/Cargo.toml")
-  if (cd "$d" && cargo build --release -q "$@") >>"$BLOG" 2>&1; then
-    if [ -x "$d/target/release/$name" ]; then
-      cp "$d/target/release/$name" "$BINS/$as" && log "built $as from $d $*" || log "COPY FAILED: $as from $d"
-    else
-      local b; for b in $as; do cp "$d/target/release/$b" "$BINS/$b" && log "built $b from $d $*" || log "COPY FAILED: $b from $d"; done
-    fi
-  else
-    log "BUILD FAILED: $as from $d $* (see $BLOG)"
-  fi
-}
+BIN_DIR=$B/bins
+mkdir -p "$BIN_DIR"
 
 co "$B/run" "$RUN_BRANCH"
 build "$B/run/bench/lab/loadgen" lab-loadgen
@@ -69,5 +55,5 @@ git -C "$B/pr186" fetch -q origin 5a4cdb35c629c5c76604738feab3f9f32788d79a 2>/de
   for d in run main v151 pr487 pr429 pr180 pr180-base pr186; do
     [ -d "$B/$d/.git" ] && echo "$d $(git -C "$B/$d" rev-parse HEAD) $(git -C "$B/$d" log -1 --format=%s | cut -c1-80)"
   done
-  ls -l "$BINS"
+  ls -l "$BIN_DIR"
 } | tee "$R15/builds-$(hostname).txt"
