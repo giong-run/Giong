@@ -1947,6 +1947,44 @@ fn opens_beneath_a_root_release_their_descriptors() {
     assert_eq!(open_fds(&dir.path("public")), 0);
 }
 
+/// A root dropped while an open beneath it is still on its way keeps its
+/// directory open until that open is done. Closed at once, its number could
+/// be given to another directory first, and the open (here one that
+/// creates) would run beneath that one.
+#[test]
+#[cfg(unix)]
+#[cfg_attr(miri, ignore = "Miri has no openat2")]
+fn a_root_dropped_mid_open_keeps_its_directory_until_the_open_is_done() {
+    let dir = root_tree("root-dropped");
+    std::fs::create_dir(dir.path("other")).unwrap();
+    let public = dir.path("public");
+    giong::block_on(async {
+        for i in 0..20 {
+            let name = format!("new-{i}.txt");
+            let root = fs::Root::new(&public).await.unwrap();
+            let mut create = Box::pin(root.create(&name));
+            let _ = futures_poll_once(create.as_mut()).await;
+            drop(create);
+            drop(root);
+            assert!(
+                open_fds(&public) > 0,
+                "the directory closed before the open beneath it was done"
+            );
+            // The lowest free number: the root's, had it been closed.
+            let other = std::fs::File::open(dir.path("other")).unwrap();
+            giong::time::timeout(Duration::from_secs(1), async {
+                while open_fds(&public) > 0 {
+                    giong::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the directory should close once the open beneath it is done");
+            drop(other);
+            assert!(!dir.path("other").join(&name).exists(), "{name}");
+        }
+    });
+}
+
 /// Polls `fut` once and returns whether it finished, dropping nothing.
 async fn futures_poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> bool {
     let mut fut = Some(fut);

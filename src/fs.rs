@@ -48,6 +48,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -668,7 +669,11 @@ async fn close(fd: RawFd) -> io::Result<()> {
 /// one in each worker costs one open.
 pub struct Root {
     /// The directory, opened with `O_PATH` on Linux (no read access needed).
-    dir: File,
+    /// Each open beneath it holds a reference until the open is done, so a
+    /// root dropped meanwhile does not close it: the kernel looks the
+    /// descriptor up when the open runs, and the number could by then name
+    /// another directory.
+    dir: Rc<File>,
     path: PathBuf,
 }
 
@@ -697,7 +702,7 @@ impl Root {
         };
         let fd = path_op(path, io).await?;
         Ok(Self {
-            dir: File::from_fd(fd),
+            dir: Rc::new(File::from_fd(fd)),
             path: dir.to_path_buf(),
         })
     }
@@ -750,9 +755,15 @@ impl Root {
         #[cfg(not(target_os = "linux"))]
         {
             self.check(path)?;
-            statx(self.dir.fd, c_path(path)?, sys::AT_SYMLINK_NOFOLLOW_ANY)
+            let meta = statx(self.dir.fd, c_path(path)?, sys::AT_SYMLINK_NOFOLLOW_ANY)
                 .await
-                .map_err(|e| self.refused(path, e))
+                .map_err(|e| self.refused(path, e))?;
+            // `AT_SYMLINK_NOFOLLOW_ANY` refuses a link on the way but, like
+            // `AT_SYMLINK_NOFOLLOW`, describes one at the end of the path.
+            if meta.is_symlink() {
+                return Err(self.outside(path, "goes through a symbolic link"));
+            }
+            Ok(meta)
         }
     }
 
@@ -765,7 +776,7 @@ impl Root {
         let path = path.as_ref();
         let fd = self.open_beneath(path, ROOT_FLAGS, 0).await?;
         Ok(Root {
-            dir: File::from_fd(fd),
+            dir: Rc::new(File::from_fd(fd)),
             path: self.path.join(path),
         })
     }
@@ -804,9 +815,11 @@ impl Root {
                 how: how.as_ptr(),
             };
             // SAFETY: the operation's pointers are to the path and to `how`,
-            // both in `KernelBox`es.
-            let (res, _, back) = unsafe { Op::new(io, (name, how)) }.await;
-            (name, how) = back;
+            // both in `KernelBox`es. The directory goes with them, so that it
+            // stays open until the operation is done even if the root and
+            // this future are dropped.
+            let (res, _, back) = unsafe { Op::new(io, (name, how, Rc::clone(&self.dir))) }.await;
+            (name, how, _) = back;
             if res >= 0 {
                 return Ok(res);
             }

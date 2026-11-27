@@ -813,7 +813,8 @@ impl<P: Poller> Readiness<P> {
             | Io::Write { fd, .. }
             | Io::Fsync { fd, .. }
             | Io::Fallocate { fd, .. }
-            | Io::Statx { dir: fd, .. } => fd,
+            | Io::Statx { dir: fd, .. }
+            | Io::OpenBeneath { dir: fd, .. } => fd,
             _ => -1,
         };
         if fd >= 0 {
