@@ -16,7 +16,7 @@ with TLS and no store, gRPC, two workers), each built with `cargo build` and
 | Before | 2,240,718,035 bytes (2.09 GiB) |
 | After `giong cache share` | 1,512,893,393 bytes (1.41 GiB): **-32.4%** |
 
-- `giong cache share` took 1.2 s for the eight projects (no hashing: a file is compared byte
+- `giong cache share` took 1.1 s for the eight projects (no hashing: a file is compared byte
   for byte only with the one copy of the same unit already in the store).
 - Afterwards `cargo build` and `cargo test --no-run` rebuilt **0 units** in every project.
 - Build time does not change: the store saves disk, not compilation (see *What it does not
