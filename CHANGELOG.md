@@ -8,6 +8,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.5.4] - 2026-11-27
+
 Safer paths and secrets, and faster gzip. `fs::Root` opens the paths that come from a
 request, an upload or a configuration file beneath a directory and never outside it
 (`GIONG-E0205`); on Linux the kernel itself refuses an escape (`openat2` with
@@ -17,6 +19,43 @@ the password, and everything they derive from it, from memory when they are done
 giong-web's new `fast-gzip` feature (off by default) gzips responses of up to 16 KiB with
 libdeflate: on an 8 KiB JSON response, 31% less server CPU per request and 46% more
 requests per second on one worker. No API is removed or changed.
+
+### Added
+
+- **giong**: `fs::Root` opens paths beneath a directory and never outside it, for paths that
+  come from a request, an upload or a configuration file: `Root::new(dir)`, then `open`,
+  `create`, `read`, `metadata`, `open_root` (a root beneath it), or
+  `OpenOptions::open_in(&root, path)`. A path that is absolute, has a `..` component or goes
+  through a symbolic link (wherever it points) is refused with `GIONG-E0205`
+  (`Code::OutsideRoot`), and nothing is created or emptied. On Linux the kernel refuses it
+  during the open, so no check made beforehand can be raced: `openat2` with
+  `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS` and `RESOLVE_NO_MAGICLINKS`, as an io_uring
+  operation on the io_uring driver; where a seccomp filter hides `openat2`, a walk with
+  `O_NOFOLLOW` that refuses the same paths. macOS uses `O_NOFOLLOW_ANY`; Windows opens each
+  component without following reparse points, refuses symbolic links and junctions, and
+  checks where the file it opened is. Tokio and Node have nothing like it built in; Go
+  1.24's `os.Root` is the same idea.
+- **giong-web**: the `fast-gzip` feature (off by default) has `Compression` gzip bodies of
+  up to 16 KiB at level 1, the default, with libdeflate in one call. On an 8 KiB JSON
+  response, measured on bare metal: 31% less server CPU per request, 46% more requests per
+  second on one worker and 43.5% more on four, a lower p99 at every load, and 4% smaller
+  bodies. Responses without gzip are unchanged. Larger bodies and other levels keep the
+  pure Rust compressor. The binary grows by about 90 KiB and building needs a C compiler. A
+  new fuzz target checks both compressors against an independent decoder. Contributed by concacotdua
+  ([#429](https://github.com/giong-run/Giong/pull/429)).
+
+### Security
+
+- **giong-postgres**, **giong-mysql**, **giong-redis**: each `Config` wipes its copy of the
+  password from memory when it is dropped, and so is every copy the client makes while
+  logging in: the decoded URL, the packet or command that carries it (wiped once written),
+  and what is derived from it (the SCRAM salted password and keys, including the cached
+  ones, the MD5 hash PostgreSQL stores, and what MySQL's RSA login is built from before it
+  is encrypted, padding included). Each of those buffers is sized so that it never grows,
+  which would leave a copy behind in freed memory. A memory dump, or a bug that reads freed
+  memory, no longer finds the password there; copies outside the client (the string the
+  application passes in, the kernel's socket buffers) are not in its hands. Running queries
+  does not change.
 
 ## [1.5.3] - 2026-11-27
 
@@ -3988,7 +4027,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.3...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.4...HEAD
+[1.5.4]: https://github.com/giong-run/Giong/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/giong-run/Giong/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/giong-run/Giong/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/giong-run/Giong/compare/v1.5.0...v1.5.1
