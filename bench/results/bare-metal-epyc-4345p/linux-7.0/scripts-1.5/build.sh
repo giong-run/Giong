@@ -19,11 +19,15 @@ RUN_BRANCH=${RUN_BRANCH:-claude/project-thread-0t1y8n}
 BINS=$B/bins
 mkdir -p "$BINS"
 BLOG=$R15/build.log
-build() { # <dir of a bench crate> <copy as> [cargo args...]
+build() { # <dir of a bench crate> <copy as, or binaries to copy: "bin1 bin2"> [cargo args...]
   local d=$1 as=$2; shift 2
   local name; name=$(awk -F'"' '/^name *=/{print $2; exit}' "$d/Cargo.toml")
   if (cd "$d" && cargo build --release -q "$@") >>"$BLOG" 2>&1; then
-    cp "$d/target/release/$name" "$BINS/$as" && log "built $as from $d $*"
+    if [ -x "$d/target/release/$name" ]; then
+      cp "$d/target/release/$name" "$BINS/$as" && log "built $as from $d $*" || log "COPY FAILED: $as from $d"
+    else
+      local b; for b in $as; do cp "$d/target/release/$b" "$BINS/$b" && log "built $b from $d $*" || log "COPY FAILED: $b from $d"; done
+    fi
   else
     log "BUILD FAILED: $as from $d $* (see $BLOG)"
   fi
@@ -31,9 +35,12 @@ build() { # <dir of a bench crate> <copy as> [cargo args...]
 
 co "$B/run" "$RUN_BRANCH"
 build "$B/run/bench/lab/loadgen" lab-loadgen
+build "$B/run/bench/h3" "h3-server-giong h3-server-tokio h3-client"
 
 co "$B/main" main
-for c in giong-http giong tokio-raw monoio axum axum-tls giong-web hold quic; do
+# bench/quic builds here too, though quic-2host.sh runs its binaries from its own target.
+(cd "$B/main/bench/quic" && cargo build --release -q) >>"$BLOG" 2>&1 && log "built main bench/quic" || log "BUILD FAILED: main bench/quic"
+for c in giong-http giong tokio-raw monoio axum axum-tls giong-web hold; do
   [ -d "$B/main/bench/$c" ] && build "$B/main/bench/$c" "main-$c"
 done
 
