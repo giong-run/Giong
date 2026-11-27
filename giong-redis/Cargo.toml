@@ -17,6 +17,9 @@ giong-tls = { path = "../giong-tls", version = "1.5.3" }
 # TCP keepalive and TCP_USER_TIMEOUT on the connection, to notice a server
 # that vanished without closing. Already a dependency of giong.
 socket2 = { version = "0.6", features = ["all"] }
+# Wipes the password when it is dropped, and the command that carried it.
+# Already compiled in through rustls.
+zeroize = "1"
 
 [dev-dependencies]
 libc = "0.2"

@@ -510,6 +510,7 @@ dependencies = [
  "rcgen",
  "ring",
  "socket2",
+ "zeroize",
 ]
 
 [[package]]
@@ -522,6 +523,7 @@ dependencies = [
  "rcgen",
  "ring",
  "socket2",
+ "zeroize",
 ]
 
 [[package]]
@@ -551,6 +553,7 @@ dependencies = [
  "libc",
  "rcgen",
  "socket2",
+ "zeroize",
 ]
 
 [[package]]

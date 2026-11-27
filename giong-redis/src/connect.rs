@@ -13,6 +13,7 @@ use giong::net::{TcpStream, UnixStream};
 use giong::RecvBuf;
 use giong_tls::TlsStream;
 use socket2::{SockRef, TcpKeepalive};
+use zeroize::Zeroize;
 
 use crate::cmd::{cmd, Cmd};
 use crate::config::{Config, Host};
@@ -227,35 +228,60 @@ async fn open(config: &Config) -> Result<Startup, Error> {
     handshake(config, stream).await
 }
 
-/// `HELLO 3` with the credentials and the client name, then `SELECT`, sent
-/// together.
-async fn handshake(config: &Config, stream: Stream) -> Result<Startup, Error> {
-    let mut hello = cmd("HELLO").arg(3);
-    if let Some(password) = &config.password {
-        hello = hello
-            .arg("AUTH")
-            .arg(config.user.as_deref().unwrap_or("default"))
-            .arg(password.as_str());
-    } else if config.user.is_some() {
-        return Err(Error::config(
-            "a user name was given without a password; Redis logs in with both",
-        ));
-    }
+/// The bytes of `HELLO 3` (with the credentials and the client name) and
+/// `SELECT`. The password is in them: each buffer it goes through is sized
+/// so that it never moves (which would leave a copy behind), the command's
+/// own is wiped here, and the caller wipes the one returned once written.
+fn hello(config: &Config) -> Result<Vec<u8>, Error> {
+    // Checked before the password is in a buffer that would then need wiping.
     if let Some(name) = &config.client_name {
         if name.is_empty() || name.bytes().any(|b| b <= b' ' || b > b'~') {
             return Err(Error::config(format!(
                 "the client name {name:?} must be printable ASCII without spaces"
             )));
         }
+    }
+    if config.user.is_some() && config.password.is_none() {
+        return Err(Error::config(
+            "a user name was given without a password; Redis logs in with both",
+        ));
+    }
+    let user = config.user.as_deref().unwrap_or("default");
+    let name_len = config.client_name.as_ref().map_or(0, String::len);
+    let password_len = config.password.as_deref().map_or(0, str::len);
+    // 256 is more than the fixed arguments and the framing of all seven take.
+    let room = 256 + user.len() + password_len + name_len;
+    let mut hello = Cmd::with_capacity("HELLO", room).arg(3);
+    if let Some(password) = config.password.as_deref() {
+        hello = hello.arg("AUTH").arg(user).arg(password);
+    }
+    if let Some(name) = &config.client_name {
         hello = hello.arg("SETNAME").arg(name.as_str());
     }
-    let mut out = Vec::new();
-    hello.encode(&mut out);
+    debug_assert_eq!(
+        hello.capacity(),
+        room,
+        "the HELLO command outgrew its buffer"
+    );
     let select: Option<Cmd> = (config.database != 0).then(|| cmd("SELECT").arg(config.database));
+    let len = hello.encoded_len() + select.as_ref().map_or(0, Cmd::encoded_len);
+    let mut out = Vec::with_capacity(len);
+    hello.encode(&mut out);
+    hello.wipe();
     if let Some(s) = &select {
         s.encode(&mut out);
     }
-    let (written, _) = stream.write_all(out).await;
+    debug_assert_eq!(out.capacity(), len, "HELLO and SELECT outgrew their buffer");
+    Ok(out)
+}
+
+/// `HELLO 3` with the credentials and the client name, then `SELECT`, sent
+/// together.
+async fn handshake(config: &Config, stream: Stream) -> Result<Startup, Error> {
+    let out = hello(config)?;
+    let (written, mut out) = stream.write_all(out).await;
+    // It holds the password.
+    out.zeroize();
     written.map_err(|e| connect_error(config, "writing to the server failed", e))?;
 
     let mut buf = ReadBuf::new();
@@ -274,7 +300,7 @@ async fn handshake(config: &Config, stream: Stream) -> Result<Startup, Error> {
             )))
         }
     };
-    if select.is_some() {
+    if config.database != 0 {
         match read(config, &stream, &mut buf).await? {
             Value::Status(_) => {}
             Value::Error(e) => {
@@ -398,4 +424,34 @@ fn server_info(fields: Vec<(Value, Value)>) -> Server {
         }
     }
     server
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_hello_holding_the_password_never_moves_in_memory() {
+        // The debug assertions in `hello` fail if a buffer grew (and left a
+        // copy of the password behind): the longest arguments, a database.
+        for (user, password, name) in [
+            ("u", "p", "n"),
+            ("a-user", "secret", "app"),
+            (&*"u".repeat(300), &*"p".repeat(70_000), &*"n".repeat(500)),
+        ] {
+            let config = Config::new()
+                .user(user)
+                .password(password)
+                .client_name(name)
+                .database(15);
+            let out = hello(&config).unwrap();
+            let text = String::from_utf8(out).unwrap();
+            assert!(text.starts_with("*7\r\n$5\r\nHELLO\r\n$1\r\n3\r\n$4\r\nAUTH\r\n"));
+            assert!(text.contains(password) && text.ends_with("$6\r\nSELECT\r\n$2\r\n15\r\n"));
+        }
+        let out = hello(&Config::new()).unwrap();
+        assert_eq!(out, b"*2\r\n$5\r\nHELLO\r\n$1\r\n3\r\n");
+        assert!(hello(&Config::new().user("u")).is_err());
+        assert!(hello(&Config::new().password("p").client_name("a b")).is_err());
+    }
 }
