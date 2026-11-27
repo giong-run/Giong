@@ -16,7 +16,9 @@ test builds instead of 131.0 (-55%), and a second web + SQLite project 3.1 s ins
 instead of 6,387 for `/json`) and no allocation. On bare metal, one worker serves 488,417
 requests/s instead of 454,801 (+7.4%), and HTTP/2 over TLS 8.1% more. One loss is still
 open: on one worker, giong-http serves 5.7% fewer requests than a hand-rolled Tokio loop
-(518,001). No API is removed or changed.
+(518,001). Over HTTP/1.1, `min_body_rate` now credits the body bytes that arrive with the
+request head, so it no longer cuts a client that sent them together and keeps the rate. No
+API is removed or changed.
 
 ## [1.5.5] - 2026-11-27
 
