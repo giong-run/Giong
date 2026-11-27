@@ -8,6 +8,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.5.2] - 2026-11-27
+
 Leaner connections and a round of hardening. An idle TLS connection holds 5.2 KiB of heap
 instead of 10.8, an idle HTTP/1.1 connection 1,318 bytes instead of 2,062, and an HTTP/1.1
 client request with its response costs 7 allocations instead of 11. `Server::min_body_rate`,
@@ -16,6 +18,110 @@ longer cut after `request_timeout` while it keeps arriving; and every dependency
 supply-chain gate. Dev kit fixes: images from `giong image` run `giong new` services, `giong
 routes` and `giong openapi` work on new web projects, and `giong db migrate` and `giong bench`
 say what went wrong. No API is removed or changed.
+
+### Added
+
+- **giong-http**: `Server::min_body_rate(bytes_per_sec, grace)`, off by default: a request
+  body read as a stream that arrives slower on average than the rate once the grace period
+  is over is cut with `GIONG-E1112`, over HTTP/1.1, HTTP/2 and HTTP/3. Only the time the
+  server waits for the client counts, not the time a handler takes with a piece. Without
+  it, `request_timeout` bounds each piece but not the body, so one byte every 29 s held a
+  handler and its connection or stream for ever (the slow-POST form of slowloris;
+  [#267](https://github.com/giong-run/Giong/issues/267)).
+
+### Changed
+
+- **giong-http** (performance): the client does less per request. An HTTP/1.1 request and
+  its response cost 7 allocations instead of 11 and 8% fewer instructions (`bench/instr`'s
+  `http1-client`, client and server together); over HTTP/2, 14 allocations instead of 22 and
+  5% fewer instructions (`h2`), 6% fewer with ten streams in flight (`h2-streams`). The
+  pieces: HTTP/2 request fields borrow the request's headers instead of copying them, a
+  standard method is not copied, the request's description is made only when it times out,
+  the URL's host is shared with the origin its connection is looked up by, a response's
+  head and body share one allocation over HTTP/2, the URL is parsed with byte searches, and
+  each well-formed header line of a response is read in one pass. No API change; the same
+  heads and URLs are refused, with the same messages. Method and raw data:
+  `bench/results/http-client-cost/`.
+- **giong-http** (performance): an idle connection holds less memory. HTTP/1.1: 1,318 bytes
+  of heap instead of 2,062 (−36%, `bench/instr`'s `idle-http1`); HTTP/2: 3,318 instead of
+  4,566 (−27%, `idle-h2`); HTTPS: 5,285 instead of 6,069 (−13%, `idle-https`). 8,000 idle HTTPS
+  connections to one worker take 46.7 MiB of resident memory instead of 52.6, and over
+  HTTP/2 with TLS 81.2 MiB instead of 104.4 (−23%, `bench/tls-idle.sh`). A connection's
+  future keeps across an `.await` only what waiting for the next request needs: the request
+  being answered, the response being written and the receipt of a body still on its way
+  live in states of their own, and the rarer, larger waits (a body that is still arriving,
+  a file or large body sent from where it is, the HTTP/2 preface and the last close) run in
+  heap blocks the worker reuses, so that an idle connection is no longer as large as the
+  largest of them. Requests take fewer instructions as well, because a handler's future is
+  now made in its heap block instead of copied there, and the block is taken and given back
+  with less work: `http1` −1.5%, `web` −2.3%, `http1-client` −0.5%, `https` −0.4%, `h2`
+  −0.3%, `h2-streams` −0.2% (`bench/instr`, io_uring); in `bench/giong-http`, a JSON response
+  takes 2.8% fewer instructions and a 64 KiB body or file 3.1% fewer. Allocations are
+  unchanged. Method and raw data: `bench/results/idle-conn-memory/`.
+- **giong-tls** (performance): an idle TLS connection, rustls in the process, holds 6.1 KiB
+  of heap instead of 10.8 (−44%, `bench/instr`'s `idle-https`); 8,000 idle HTTPS connections
+  to one giong-http worker take 52.8 MiB of resident memory instead of 89.8. rustls now runs
+  through its unbuffered API: received bytes are processed from a scratch buffer each thread
+  shares, and a connection keeps bytes of its own only while it holds part of a record,
+  where rustls' buffered connection kept a 4 KiB receive buffer for the life of every
+  connection. Outgoing records go through scratch buffers each thread shares as well. HTTPS
+  requests take 1.1% fewer instructions, and `bench/tls.sh` measured no loss on any endpoint.
+  A client that sends 0-RTT data to an acceptor made with `TlsAcceptor::from_rustls` and a
+  `max_early_data_size` above 0 now gets a `GIONG-E2005`-coded refusal, as with kernel TLS,
+  where giong-tls never read that data. Method and raw data:
+  `bench/results/tls-idle/`.
+
+### Fixed
+
+- **giong-cli**: `giong bench` stops at once with `GIONG-E5063` when the service answers every
+  request with an error status, such as a 404 for a path it has no route for, and says to
+  give `--path`. `giong bench --against main` in a project from `giong new` asked for `/`,
+  which has no route there: it measured how fast the service says 404 through every round
+  (the probe even picked the rate from those answers) and printed a comparison of them before
+  reporting that 100% of requests failed.
+- **giong-cli**: `giong db migrate` on PostgreSQL reports a failed migration at a line inside
+  the file. psql names the line where the failing statement ends, so a last statement
+  without its `;` was reported one line past the end of the file, and one with an unclosed
+  parenthesis several lines past it (psql reads on to the end of the script).
+- **giong-http**: over HTTP/2, a request body read as a stream is no longer cut after
+  `request_timeout` while its pieces keep arriving: the timeout counts from the last piece,
+  as over HTTP/1.1 and HTTP/3 and as documented. Every giong-grpc client-streaming or
+  bidirectional call longer than 30 s was cut with `GIONG-E1112`
+  ([#470](https://github.com/giong-run/Giong/issues/470)).
+- **giong-cli**: an image from `giong image` now runs a service from `giong new` the way its
+  Dockerfile does. It sets `LISTEN=0.0.0.0:<port>`: without it the service listened on
+  `127.0.0.1` inside the container, so `docker run -p 8080:8080`, which `giong image` prints,
+  reached nothing. For a SQLite project (`DATABASE_URL=sqlite:...` in `.env.example`, the
+  default of `giong new`) it keeps the file in a `/data` volume owned by nonroot, with
+  `DATABASE_URL=sqlite:///data/<file>`: before, the service exited at start with
+  "Permission denied", since nonroot cannot write to `/app`. `docker run -e` still sets other
+  values.
+- **giong-cli**: `giong new rusqlite` is refused with `GIONG-E5030`, as `giong new serde` is.
+  The project it made depends on the `rusqlite` crate (SQLite is the default database), so
+  its own crate of the same name did not build: `error[E0464]: multiple candidates for
+  rmeta dependency rusqlite`.
+- **giong-cli**: `giong routes` and `giong openapi` work on a web project from `giong new`. The
+  template depended on giong-mcp without its `web` feature, which adds the routes tool they
+  ask, so both failed on every new project with `GIONG-E5058: the service's giong-mcp has no
+  routes tool`. The project already depends on giong-web, so the feature adds nothing to build.
+- **giong-cli**: a dependency version requirement whose last part is 4294967295 (such as
+  `^4294967295`) no longer overflows while `giong` checks the manifest: a panic in a debug
+  build and a wrong answer in a release one.
+
+### Security
+
+- **giong-cli**: the dashboard's send box reaches only this machine, as documented: it
+  accepted any host that began with `127.`, so a name such as `127.0.0.1.example.com` was
+  looked up in DNS and the request went to another machine. Only an IPv4 loopback address,
+  `localhost` or `[::1]` passes now.
+- **giong-cli**: `giong upgrade --self` and the install script refuse a redirect from an
+  https download to plain http and ask for TLS 1.2 or later, so a network in the middle can
+  never hand over another archive together with its matching `.sha256`. A mirror named
+  with `http://` in `GIONG_DOWNLOAD_URL` still works.
+- **all crates**: a supply-chain gate (`deny.toml`, cargo-deny): RustSec advisories are
+  checked every day and on every dependency change, licenses must be permissive and crates
+  come from crates.io only. The test client's `quinn-udp` moves to 0.5.16 for
+  RUSTSEC-2026-0538 (a development dependency only; no published crate used it).
 
 ## [1.5.1] - 2026-11-26
 
@@ -3794,7 +3900,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.1...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.2...HEAD
+[1.5.2]: https://github.com/giong-run/Giong/compare/v1.5.1...v1.5.2
 [1.5.1]: https://github.com/giong-run/Giong/compare/v1.5.0...v1.5.1
 [1.5.0]: https://github.com/giong-run/Giong/compare/v1.4.2...v1.5.0
 [1.4.2]: https://github.com/giong-run/Giong/compare/v1.4.1...v1.4.2
