@@ -7,7 +7,7 @@ use giong::error::{Code as ErrorCode, Error};
 
 /// Names a call's own machinery uses, which are not metadata: they are
 /// refused when metadata is built and left out when it is received.
-const RESERVED: [&str; 9] = [
+const RESERVED: [&str; 13] = [
     "accept-encoding",
     "connection",
     "content-encoding",
@@ -15,8 +15,12 @@ const RESERVED: [&str; 9] = [
     "content-type",
     "date",
     "host",
+    "keep-alive",
+    "proxy-connection",
     "te",
     "trailer",
+    "transfer-encoding",
+    "upgrade",
 ];
 
 /// The named values sent with a call: by the client before the request, by
@@ -72,7 +76,8 @@ impl Metadata {
             return Err(invalid(
                 format!("the metadata name {name} is used by gRPC or HTTP itself"),
                 "choose another name: names that start with `grpc-` and the fields that \
-                 frame the HTTP message are set by giong-grpc.",
+                 frame the HTTP message or belong to one connection are set by \
+                 giong-grpc.",
             ));
         }
         if !is_binary(name) {
@@ -324,6 +329,10 @@ mod tests {
             ("grpc-status", "0"),
             ("content-type", "text/plain"),
             ("te", "trailers"),
+            ("keep-alive", "timeout=5"),
+            ("proxy-connection", "close"),
+            ("transfer-encoding", "chunked"),
+            ("upgrade", "h2c"),
             ("x-a", "line\nbreak"),
             ("x-a", "caf\u{e9}"),
         ] {
