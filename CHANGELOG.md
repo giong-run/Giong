@@ -8,7 +8,7 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
-Leaner connections and a round of hardening. An idle TLS connection holds 6.1 KiB of heap
+Leaner connections and a round of hardening. An idle TLS connection holds 5.2 KiB of heap
 instead of 10.8, an idle HTTP/1.1 connection 1,318 bytes instead of 2,062, and an HTTP/1.1
 client request with its response costs 7 allocations instead of 11. `Server::min_body_rate`,
 off by default, cuts request bodies that trickle in; an HTTP/2 body streamed in pieces is no
