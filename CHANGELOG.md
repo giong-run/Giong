@@ -13,7 +13,9 @@ verify. An idle HTTP/2 connection holds 2,518 bytes of heap instead of 3,318, an
 instead of 9,683 over TLS: 8,000 idle HTTP/2 connections over TLS take 56.1 MiB instead of
 81.2, and an HTTPS request takes 2.9% fewer instructions. Over HTTP/2 and HTTP/3, a request
 body sent with `expect: 100-continue` is no longer cut while the handler works before
-reading it. Release binaries carry a signed build provenance attestation, a CycloneDX SBOM
+reading it. A server that faces clients directly can cap the connections one client address
+holds (`Server::max_connections_per_ip`) and give a new connection a deadline for its first
+request (`Server::first_request_timeout`), both off by default. Release binaries carry a signed build provenance attestation, a CycloneDX SBOM
 and the list of crates compiled into them, and `SECURITY.md` gives the threat model and how
 to report a vulnerability. No API is removed or changed.
 
