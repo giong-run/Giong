@@ -52,10 +52,10 @@ fi
 
 # Non-interactive ssh commands (quic-2host.sh builds on br-2 over ssh) need cargo on PATH:
 # Ubuntu's .bashrc returns early for them, so the line goes first.
-head -1 /root/.bashrc 2>/dev/null | grep -q 'cargo/env' || sed -i '1i [ -f /root/.cargo/env ] \&\& . /root/.cargo/env' /root/.bashrc
+[[ "$(head -1 /root/.bashrc 2>/dev/null)" == *cargo/env* ]] || sed -i '1i [ -f /root/.cargo/env ] \&\& . /root/.cargo/env' /root/.bashrc
 # Vultr's image runs ufw with 22/tcp only: the benchmarks use TCP and UDP ports between the
 # machines over the private network (10.x).
-if command -v ufw >/dev/null && ufw status | grep -q 'Status: active'; then
+if command -v ufw >/dev/null && [[ "$(ufw status 2>/dev/null)" == *"Status: active"* ]]; then
   ufw allow from 10.0.0.0/8 comment 'r15 private network' >/dev/null && echo "ufw: private network allowed"
 fi
 

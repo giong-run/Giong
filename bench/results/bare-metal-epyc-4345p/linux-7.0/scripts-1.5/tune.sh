@@ -18,13 +18,14 @@ case ${1:-apply} in
     for f in /sys/devices/system/cpu/cpu*/cpufreq/energy_performance_preference; do echo performance >"$f" 2>/dev/null; done
     modprobe tls
     shutdown -r +10 "self-recovery for the NIC change (tune.sh confirm cancels it)"
-    lsmod | grep -q '^irdma' && rmmod irdma
+    # Not `lsmod | grep -q`: under pipefail, grep's early exit kills lsmod (SIGPIPE, 141).
+    if grep -q '^irdma ' /proc/modules; then rmmod irdma || echo "rmmod irdma failed"; fi
     for i in $(ls /sys/class/net); do
       [ "$(ethtool -i "$i" 2>/dev/null | awk '/^driver/{print $2}')" = ice ] || continue
-      ethtool -L "$i" combined 16 || true
+      ethtool -L "$i" combined 16 || echo "$i: ethtool -L combined 16 failed"
     done
     {
-      echo "$(date -u +%FT%TZ) $(hostname) $(uname -r): EPP $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null), tls $(test -d /sys/module/tls && echo yes || echo no), irdma loaded: $(lsmod | grep -c '^irdma')"
+      echo "$(date -u +%FT%TZ) $(hostname) $(uname -r): EPP $(cat /sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference 2>/dev/null), tls $(test -d /sys/module/tls && echo yes || echo no), irdma loaded: $(grep -c '^irdma ' /proc/modules)"
       for i in $(ls /sys/class/net); do
         [ "$(ethtool -i "$i" 2>/dev/null | awk '/^driver/{print $2}')" = ice ] && echo "$i: $(ethtool -l "$i" | grep -A4 Current | grep Combined | tr -s '\t ' ' ')"
       done
