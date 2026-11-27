@@ -117,6 +117,10 @@ pub const CASES: &[Case] = &[
 
 type Idle = for<'a> fn(&'static str, usize) -> Pin<Box<dyn Future<Output = ()>>>;
 
+/// How many connections the idle client opens before it waits for the
+/// server to have accepted them (see [`idle`]).
+const IDLE_BATCH: usize = 32;
+
 pub struct IdleCase {
     pub name: &'static str,
     pub what: &'static str,
@@ -584,12 +588,25 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
     giong::time::sleep(Duration::from_millis(200)).await;
     let tasks0 = giong::observe::worker_stats().tasks;
     let (heap0, rss0, allocs0) = (crate::live_bytes(), crate::rss(), crate::allocations());
-    to_child
-        .write_all(b"go\n")
-        .expect("start the client process");
-    to_child.flush().expect("start the client process");
-    // Every connection has its task once the server has accepted it.
-    while giong::observe::worker_stats().tasks < tasks0 + n || !done.load(Ordering::Acquire) {
+    // The child opens IDLE_BATCH connections at a time and waits for a line
+    // before the next batch, sent once the server has accepted the batch
+    // (each accepted connection has its task). Without the pause, how many
+    // connections the server takes in one turn depends on how fast the
+    // runner is, and the driver's buffers sized by the largest such turn
+    // moved the io_uring `idle-http1` heap by 24.6 or 36.9 bytes per
+    // connection from one CI run to the next (#507).
+    let mut opened = 0;
+    while opened < n {
+        to_child
+            .write_all(b"go\n")
+            .expect("start the client process");
+        to_child.flush().expect("start the client process");
+        opened = (opened + IDLE_BATCH).min(n);
+        while giong::observe::worker_stats().tasks < tasks0 + opened {
+            giong::yield_now().await;
+        }
+    }
+    while !done.load(Ordering::Acquire) {
         giong::time::sleep(Duration::from_millis(5)).await;
     }
     giong::time::sleep(Duration::from_millis(200)).await;
@@ -612,9 +629,10 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
 }
 
 /// `bench-instr idle-client <http1|h2|https|h2-tls> <addr> <n> [root.der]`:
-/// the client end of [`idle`], in its own process. Waits for a line on stdin,
-/// opens `n` connections (each with one request but for `http1`),
-/// prints `done`, and keeps them open until stdin closes.
+/// the client end of [`idle`], in its own process. Opens `n` connections
+/// (each with one request but for `http1`), [`IDLE_BATCH`] at a time, each
+/// batch after a line on stdin, prints `done`, and keeps them open until
+/// stdin closes.
 pub fn idle_client(args: &[String]) {
     use std::io::{BufRead, Write};
     use std::sync::Arc;
@@ -648,9 +666,13 @@ pub fn idle_client(args: &[String]) {
     });
     let stdin = std::io::stdin();
     let mut line = String::new();
-    stdin.lock().read_line(&mut line).expect("wait for the start");
     let mut conns = Vec::with_capacity(n);
-    for _ in 0..n {
+    for i in 0..n {
+        if i % IDLE_BATCH == 0 {
+            // The parent's go-ahead for the next batch (see `idle`).
+            line.clear();
+            stdin.lock().read_line(&mut line).expect("wait for the start");
+        }
         let mut s = std::net::TcpStream::connect(addr).expect("connect");
         match proto.as_str() {
             "http1" => {}
