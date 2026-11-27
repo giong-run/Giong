@@ -4,7 +4,7 @@ Two identical Vultr bare-metal machines on Ubuntu 24.04 with a private network b
 
 ## Order
 
-The scripts come from this branch, cloned to `/root/b/run` on both machines.
+The scripts come from this branch, cloned to `/root/b/run` on both machines. `build.sh` leaves that checkout detached, so `git pull` does not work there; to take newer scripts, run `git -C /root/b/run fetch -q origin claude/project-thread-0t1y8n && git -C /root/b/run checkout -q --detach FETCH_HEAD` (what `co` in `env.sh` does).
 
 1. `setup.sh` on br-2, then on br-1. It installs packages, the HWE kernel (7.0) and rustc 1.97.0, pins the default boot entry to the running kernel, and does not reboot. Then:
    - exchange the root SSH keys it prints;
@@ -13,7 +13,7 @@ The scripts come from this branch, cloned to `/root/b/run` on both machines.
 3. `tune.sh` on br-2. Once ssh answers on both addresses, run `tune.sh confirm`. Then do the same on br-1. The script sets EPP to performance, loads the kernel TLS module, unloads irdma and sets 16 combined queues on the E810 ports, under a reboot in 10 minutes that `confirm` cancels.
 4. `build.sh` on both machines, at the same time. It makes the checkouts (main, v1.5.1, PR #487, PR #429, PR #180 and its base, PR #186) and puts the binaries in `/root/b/bins`.
 5. `run.sh` on br-1, in tmux. These are the two-machine parts: reg, ab, rate, gzip, h3, quic. They take about 4 hours.
-   Then `build-late.sh` on both machines (bench/h3, bench/c1m and the C1M servers), and `run.sh h3 c1m` on br-1.
+   Then update `/root/b/run` as above and run `build-late.sh` on both machines (bench/h3, bench/c1m and the C1M servers), and `run.sh h3 c1m` on br-1.
 6. Then, at the same time:
    - on br-1: `local.sh h2 tls fs mem httpc spin placement lab`. The last three parts turn SMT off while they run;
    - on br-2: `soak.sh core:0-3,8-11 core-epoll:4-7,12-15`, 3 hours of tests/soak.rs on io_uring and on epoll.
