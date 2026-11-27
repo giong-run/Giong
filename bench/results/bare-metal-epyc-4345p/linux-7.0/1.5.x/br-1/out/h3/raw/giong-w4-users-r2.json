@@ -1,0 +1,1 @@
+{"conns":64,"streams":8,"duration_s":10,"requests":3334671,"rps":333467.1,"p50_us":1120,"p90_us":2530,"p99_us":7441,"p999_us":29300,"max_us":92833,"errors":0,"connect_errors":0}

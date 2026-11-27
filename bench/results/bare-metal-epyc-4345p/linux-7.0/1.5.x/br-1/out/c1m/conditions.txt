@@ -1,0 +1,5 @@
+# settings before: br-1 nr_open=1048576 ct=262144 hs=262144; br-2 nr_open=1048576 ct=262144 hs=262144 range="32768 60999"
+# c1m.sh 2026-11-27T09:33:08Z: server br-1 7.0.0-44-generic, 8 workers on CPUs 0-7, 20 ports; c1m-hold on 10.40.96.4, 16 threads; 1000000 connections
+# during the run: fs.nr_open 2097152, nf_conntrack_max 4194304, br-2 ip_local_port_range '1024 65535', ulimit -n 2000000
+# main = /root/b/bins/c1m-main
+# pr487 = /root/b/bins/c1m-pr487

@@ -1,0 +1,37 @@
+2026-11-27T04:25:12Z checkout /root/b/run = claude/project-thread-0t1y8n at eb6c41e, tree 25b9d03
+2026-11-27T04:25:14Z built lab-loadgen from /root/b/run/bench/lab/loadgen 
+2026-11-27T04:25:17Z checkout /root/b/main = main at 14e0db9, tree e99357c
+2026-11-27T04:25:35Z built main-giong-http from /root/b/main/bench/giong-http 
+2026-11-27T04:25:43Z built main-giong from /root/b/main/bench/giong 
+2026-11-27T04:25:50Z built main-tokio-raw from /root/b/main/bench/tokio-raw 
+2026-11-27T04:25:57Z built main-monoio from /root/b/main/bench/monoio 
+2026-11-27T04:26:09Z built main-axum from /root/b/main/bench/axum 
+2026-11-27T04:26:29Z built main-axum-tls from /root/b/main/bench/axum-tls 
+2026-11-27T04:26:40Z built main-giong-web from /root/b/main/bench/giong-web 
+2026-11-27T04:26:40Z built main-hold from /root/b/main/bench/hold 
+2026-11-27T04:27:03Z checkout /root/b/v151 = v1.5.1 at 7f56de7, tree 5693772
+2026-11-27T04:27:20Z built v151-giong-http from /root/b/v151/bench/giong-http 
+2026-11-27T04:27:23Z checkout /root/b/pr487 = pull/487/head at ab4a345, tree dcbdda6
+2026-11-27T04:27:41Z built pr487-giong-http from /root/b/pr487/bench/giong-http 
+2026-11-27T04:27:44Z checkout /root/b/pr429 = pull/429/head at 03b79ca, tree 1a98a94
+2026-11-27T04:27:44Z pr429: bench/giong-web binds BENCH_HOST:3011 ( 1 file changed, 1 insertion(+), 1 deletion(-))
+2026-11-27T04:27:55Z built pr429-web-miniz from /root/b/pr429/bench/giong-web 
+2026-11-27T04:28:04Z built pr429-web-fast from /root/b/pr429/bench/giong-web --features giong-web/fast-gzip
+2026-11-27T04:28:07Z checkout /root/b/pr180 = pull/180/head at ba68648, tree bed99cc
+2026-11-27T04:28:10Z checkout /root/b/pr180-base = d4cc995ca82e886bffecf10d5c7676667ce4c374 at d4cc995, tree 6f71bd3
+2026-11-27T04:28:12Z checkout /root/b/pr186 = pull/186/head at 92dccf2, tree bbfe239
+2026-11-27T09:16:59Z build-late: run checkout at 985ac45
+2026-11-27T09:17:17Z built h3-server-giong from /root/b/run/bench/h3 
+2026-11-27T09:17:17Z built h3-server-tokio from /root/b/run/bench/h3 
+2026-11-27T09:17:17Z built h3-client from /root/b/run/bench/h3 
+2026-11-27T09:17:29Z built c1m-hold from /root/b/run/bench/c1m 
+2026-11-27T09:17:47Z built c1m-main from /root/b/run/bench/giong-http 
+2026-11-27T09:17:57Z built c1m-pr487 from /root/b/pr487/bench/giong-http 
+2026-11-27T10:19:28Z soak core: start on CPUs 0-3,8-11 (/root/b/main/target/release/deps/soak-2ab66950605ed482)
+2026-11-27T10:19:28Z soak core-epoll: start on CPUs 4-7,12-15 (/root/b/main/target/release/deps/soak-2ab66950605ed482)
+2026-11-27T13:19:34Z soak core-epoll: exit 0: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 10805.65s
+2026-11-27T13:19:37Z soak core: exit 0: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 1 filtered out; finished in 10808.50s
+2026-11-27T13:19:37Z soak: all done; 541 new kernel log lines
+2026-11-27T14:56:42Z soak h3: start on CPUs 0-15 (/root/b/main/target/release/deps/h3_soak-03467500af413b97)
+2026-11-27T16:56:44Z soak h3: exit 0: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7202.44s
+2026-11-27T16:56:44Z soak: all done; 361 new kernel log lines

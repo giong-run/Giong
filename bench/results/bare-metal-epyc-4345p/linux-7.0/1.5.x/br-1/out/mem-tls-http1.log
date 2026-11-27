@@ -1,0 +1,14 @@
+round 1/3: v1.5.1 8000,10.88,10.91,89.5
+round 1/3: main 8000,5.39,5.42,46.7
+round 1/3: pr487 8000,5.25,5.28,45.6
+round 2/3: v1.5.1 8000,10.89,10.92,89.6
+round 2/3: main 8000,5.39,5.42,46.7
+round 2/3: pr487 8000,5.25,5.28,45.6
+round 3/3: v1.5.1 8000,10.89,10.92,89.6
+round 3/3: main 8000,5.39,5.42,46.5
+round 3/3: pr487 8000,5.25,5.27,45.5
+8000 idle HTTPS connections (http/1.1), one worker; median of the rounds
+binary            anon KiB/conn  RSS KiB/conn  RSS after MiB
+v1.5.1                    10.89         10.92           89.6
+main                       5.39          5.42           46.7
+pr487                      5.25          5.28           45.6

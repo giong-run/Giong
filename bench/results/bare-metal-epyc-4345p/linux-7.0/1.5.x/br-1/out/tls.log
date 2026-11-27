@@ -1,0 +1,43 @@
+building...
+warning: struct `QuickField` is never constructed
+  --> /root/b/main/giong-http/src/parse.rs:86:19
+   |
+86 | pub(crate) struct QuickField {
+   |                   ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `quick_field` is never used
+   --> /root/b/main/giong-http/src/parse.rs:100:15
+    |
+100 | pub(crate) fn quick_field(head: &[u8], pos: usize) -> Option<QuickField> {
+    |               ^^^^^^^^^^^
+
+round 1/3: axum-tls done
+round 1/3: giong-http-tls done
+round 1/3: giong-http-ktls done
+round 2/3: axum-tls done
+round 2/3: giong-http-tls done
+round 2/3: giong-http-ktls done
+round 3/3: axum-tls done
+round 3/3: giong-http-tls done
+round 3/3: giong-http-ktls done
+endpoint     server            req/s median       min       max   p50 ms   p99 ms  cpu%   us/req  errors
+json         axum-tls                304212    302495    308205     0.16     0.17   102     3.28       0
+json         giong-http-tls          393228    392307    393680     0.10     0.21   102     2.54       0
+json         giong-http-ktls         332091    331658    332209     0.12     0.25   101     3.01       0
+
+users        axum-tls                 50553     49984     51015     0.99     0.99   102    19.82       0
+users        giong-http-tls          100712    100590    100746     0.40     0.80   102     9.93       0
+users        giong-http-ktls          95736     95647     96275     0.42     0.84   102    10.43       0
+
+handshake    axum-tls                 14633     14613     14666     1.58     2.64   102    68.21       0
+handshake    giong-http-tls           17217     17194     17241     0.85     1.47   102    58.05       0
+handshake    giong-http-ktls          15504     15452     15546     1.86     2.28   102    64.50       0
+
+bytes1m      giong-http-tls            5325      5234      5381     8.95     9.54   100   188.15       0
+bytes1m      giong-http-ktls           4153      4139      4206     9.83    19.94   101   240.32       0
+
+file1m       giong-http-tls            4734      4679      4762    10.11    10.73   102   211.67       0
+file1m       giong-http-ktls           6161      6071      6167     7.79     7.84   101   162.61       0
+

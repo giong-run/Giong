@@ -1,0 +1,12 @@
+date: 2026-11-27 17:12:44Z
+kernel: 7.0.0-44-generic
+cpu: AMD EPYC 4345P 8-Core Processor (8 CPUs)
+memory: MemTotal:       63355780 kB
+rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
+commit: 14e0db9
+rounds: 3, seconds per measurement: 6 (+2 warm-up)
+file descriptors: 1048576
+tokio: "1.54.1"
+monoio: "0.2.4"
+glommio: "0.9.0"
+giong: this commit (version = "1.5.1")

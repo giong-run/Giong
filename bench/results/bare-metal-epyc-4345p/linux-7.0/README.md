@@ -1,5 +1,8 @@
 # Bare metal, second rental (0.9): results
 
+The third rental (1.5.x, 2026-11-27) has its own write-up and raw data in `1.5.x/`
+(scripts in `scripts-1.5/`).
+
 Two Vultr bare-metal machines in Singapore, rented again for milestone 0.9 ("Bare metal
 and real use") on 2026-11-16. They are the same model as the first rental, but not the
 same physical machines. The folders `fs`, `ktls`, `run`, `scale`, `tls`, `workers`,

@@ -368,7 +368,9 @@ class Lab:
             print("  latency: tc netem is not available here (needs sch_netem)")
             return
         subprocess.run(["tc", "qdisc", "del", "dev", "lo", "root"])
-        for spec in (["delay", "1ms", "500us"], ["delay", "0ms", "10ms", "distribution", "pareto"]):
+        # tc refuses a distribution without a base delay ("distribution specified but no
+        # latency and jitter values"), so the spikes ride on 1 ms.
+        for spec in (["delay", "1ms", "500us"], ["delay", "1ms", "10ms", "distribution", "pareto"]):
             def run(s, l, t, spec=spec):
                 subprocess.run(["tc", "qdisc", "add", "dev", "lo", "root", "netem"] + spec, check=True)
                 try:

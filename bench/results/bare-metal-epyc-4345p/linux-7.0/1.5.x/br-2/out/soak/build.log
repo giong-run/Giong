@@ -1,0 +1,85 @@
+    Updating crates.io index
+   Compiling libc v0.2.191
+   Compiling io-uring v0.7.16
+   Compiling cfg-if v1.0.5
+   Compiling bitflags v2.13.2
+   Compiling socket2 v0.6.5
+   Compiling giong v1.5.1 (/root/b/main)
+    Finished `release` profile [optimized] target(s) in 11.47s
+    Finished `release` profile [optimized] target(s) in 0.01s
+ Downloading crates ...
+  Downloaded quinn v0.11.9
+  Downloaded zeroize v1.8.2
+  Downloaded tokio-util v0.7.19
+  Downloaded tokio v1.53.3
+   Compiling proc-macro2 v1.0.107
+   Compiling quote v1.0.47
+   Compiling unicode-ident v1.0.27
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.15
+   Compiling pin-project-lite v0.2.17
+   Compiling once_cell v1.21.4
+   Compiling zeroize v1.8.2
+   Compiling untrusted v0.9.0
+   Compiling slab v0.4.12
+   Compiling rand_core v0.10.1
+   Compiling bytes v1.12.1
+   Compiling getrandom v0.4.3
+   Compiling rustls v0.23.46
+   Compiling thiserror v2.0.21
+   Compiling getrandom v0.2.17
+   Compiling futures-core v0.3.34
+   Compiling subtle v2.6.1
+   Compiling cfg_aliases v0.2.2
+   Compiling rustls-pki-types v1.16.0
+   Compiling cc v1.11.1
+   Compiling cpufeatures v0.3.1
+   Compiling futures-sink v0.3.34
+   Compiling futures-io v0.3.34
+   Compiling rand_pcg v0.10.3
+   Compiling chacha20 v0.10.2
+   Compiling mio v1.2.5
+   Compiling rustc-hash v2.1.3
+   Compiling tracing-core v0.1.36
+   Compiling futures-channel v0.3.34
+   Compiling lru-slab v0.1.3
+   Compiling tinyvec v1.13.3
+   Compiling memchr v2.8.3
+   Compiling futures-task v0.3.34
+   Compiling quinn-udp v0.5.16
+   Compiling giong v1.5.1 (/root/b/main)
+   Compiling quinn v0.11.9
+   Compiling time-core v0.1.9
+   Compiling deranged v0.5.9
+   Compiling rand v0.10.4
+   Compiling itoa v1.0.19
+   Compiling num-conv v0.2.2
+   Compiling powerfmt v0.2.1
+   Compiling base64 v0.22.1
+   Compiling fastrand v2.5.0
+   Compiling adler2 v2.0.1
+   Compiling miniz_oxide v0.9.1
+   Compiling tracing v0.1.44
+   Compiling http v1.5.0
+   Compiling pem v3.0.6
+   Compiling syn v3.0.10
+   Compiling ring v0.17.14
+   Compiling time v0.3.55
+   Compiling yasna v0.5.2
+   Compiling thiserror-impl v2.0.21
+   Compiling futures-macro v0.3.34
+   Compiling tokio-macros v2.7.2
+   Compiling tokio v1.53.3
+   Compiling futures-util v0.3.34
+   Compiling futures-executor v0.3.34
+   Compiling futures v0.3.34
+   Compiling h3 v0.0.8
+   Compiling tokio-util v0.7.19
+   Compiling rustls-webpki v0.103.16
+   Compiling rcgen v0.13.2
+   Compiling quinn-proto v0.11.19
+   Compiling giong-tls v1.5.1 (/root/b/main/giong-tls)
+   Compiling giong-quic v1.5.1 (/root/b/main/giong-quic)
+   Compiling giong-http v1.5.1 (/root/b/main/giong-http)
+   Compiling h3-quinn v0.0.10
+    Finished `release` profile [optimized] target(s) in 26.13s
