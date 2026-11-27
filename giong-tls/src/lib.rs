@@ -106,7 +106,7 @@ pub mod fuzzing {
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::io;
 use std::mem;
 use std::net::Shutdown;
@@ -1582,14 +1582,17 @@ impl TlsStream {
     /// Writes all of `wire` to the socket and empties it, keeping its
     /// capacity for the rest of this write. A failure may have cut a record
     /// in two, so it marks the stream broken.
-    async fn send_wire(&self, wire: &mut Vec<u8>) -> io::Result<()> {
-        let (res, mut sent) = self.tcp.write_all(mem::take(wire)).await;
-        sent.clear();
-        *wire = sent;
-        if res.is_err() {
-            self.broken.set(true);
+    #[allow(clippy::manual_async_fn)]
+    fn send_wire<'a>(&'a self, wire: &'a mut Vec<u8>) -> impl Future<Output = io::Result<()>> + 'a {
+        async move {
+            let (res, mut sent) = self.tcp.write_all(mem::take(wire)).await;
+            sent.clear();
+            *wire = sent;
+            if res.is_err() {
+                self.broken.set(true);
+            }
+            res
         }
-        res
     }
 
     /// Encrypts all of `data` and sends it, in the process. The caller holds
@@ -1603,81 +1606,95 @@ impl TlsStream {
     /// response's head and body share one send; the caller passes `last`
     /// true for the final piece. Records the caller found queued (`carried`)
     /// are followed by a send in the same call.
-    async fn send_plain(&self, wire: &mut Vec<u8>, data: &[u8], last: bool) -> io::Result<()> {
-        let mut sent = 0;
-        while sent < data.len() {
-            let piece = &data[sent..data.len().min(sent + ENCRYPT_AT)];
-            let (carried, refused) = {
-                let mut conn = self.conn();
-                conn.write_tls(wire);
-                let carried = !wire.is_empty();
-                let refused = match conn.encrypt(piece, wire) {
-                    Ok(_) => {
-                        sent += piece.len();
-                        false
-                    }
-                    // The key has encrypted as many records as its cipher
-                    // allows and, on TLS 1.2, cannot be changed: rustls
-                    // queued close_notify, which goes out below, and
-                    // encrypts nothing more.
-                    Err(user::Refused::Exhausted) => {
-                        conn.write_tls(wire);
-                        true
-                    }
-                    Err(user::Refused::Closed) => {
-                        drop(conn);
-                        self.closed.set(Some(Code::TlsBroken));
-                        return Err(sending_closed(Code::TlsBroken));
-                    }
-                    Err(user::Refused::Tls(e)) => return Err(tls_error(e)),
+    #[allow(clippy::manual_async_fn)]
+    fn send_plain<'a>(
+        &'a self,
+        wire: &'a mut Vec<u8>,
+        data: &'a [u8],
+        last: bool,
+    ) -> impl Future<Output = io::Result<()>> + 'a {
+        async move {
+            let mut sent = 0;
+            while sent < data.len() {
+                let piece = &data[sent..data.len().min(sent + ENCRYPT_AT)];
+                let (carried, refused) = {
+                    let mut conn = self.conn();
+                    conn.write_tls(wire);
+                    let carried = !wire.is_empty();
+                    let refused = match conn.encrypt(piece, wire) {
+                        Ok(_) => {
+                            sent += piece.len();
+                            false
+                        }
+                        // The key has encrypted as many records as its cipher
+                        // allows and, on TLS 1.2, cannot be changed: rustls
+                        // queued close_notify, which goes out below, and
+                        // encrypts nothing more.
+                        Err(user::Refused::Exhausted) => {
+                            conn.write_tls(wire);
+                            true
+                        }
+                        Err(user::Refused::Closed) => {
+                            drop(conn);
+                            self.closed.set(Some(Code::TlsBroken));
+                            return Err(sending_closed(Code::TlsBroken));
+                        }
+                        Err(user::Refused::Tls(e)) => return Err(tls_error(e)),
+                    };
+                    (carried, refused)
                 };
-                (carried, refused)
-            };
-            let more = sent < data.len() || !last;
-            if !wire.is_empty() && (carried || refused || !more || wire.len() >= SEND_AT) {
-                self.send_wire(wire).await?;
+                let more = sent < data.len() || !last;
+                if !wire.is_empty() && (carried || refused || !more || wire.len() >= SEND_AT) {
+                    self.send_wire(wire).await?;
+                }
+                if carried {
+                    // Receivers waiting in `flush_tls` for these records.
+                    self.wake_waiters();
+                }
+                if refused {
+                    self.closed.set(Some(Code::TlsKeysExhausted));
+                    return Err(sending_closed(Code::TlsKeysExhausted));
+                }
             }
-            if carried {
-                // Receivers waiting in `flush_tls` for these records.
-                self.wake_waiters();
-            }
-            if refused {
-                self.closed.set(Some(Code::TlsKeysExhausted));
-                return Err(sending_closed(Code::TlsKeysExhausted));
-            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// One write in the process: `pieces` encrypted and sent in order,
     /// holding the send lock throughout, so that no other task's write comes
     /// between them.
-    async fn write_in_process(&self, pieces: &[&[u8]]) -> io::Result<()> {
-        let sending = self.lock_send().await;
-        if let Some(e) = self.cannot_send() {
-            sending.done();
-            return Err(e);
-        }
-        let mut wire = self.take_wire();
-        let mut res = Ok(());
-        for (i, piece) in pieces.iter().enumerate() {
-            res = self
-                .send_plain(&mut wire, piece, i + 1 == pieces.len())
-                .await;
-            if res.is_err() {
-                break;
+    #[allow(clippy::manual_async_fn)]
+    fn write_in_process<'a>(
+        &'a self,
+        pieces: &'a [&'a [u8]],
+    ) -> impl Future<Output = io::Result<()>> + 'a {
+        async move {
+            let sending = self.lock_send().await;
+            if let Some(e) = self.cannot_send() {
+                sending.done();
+                return Err(e);
             }
+            let mut wire = self.take_wire();
+            let mut res = Ok(());
+            for (i, piece) in pieces.iter().enumerate() {
+                res = self
+                    .send_plain(&mut wire, piece, i + 1 == pieces.len())
+                    .await;
+                if res.is_err() {
+                    break;
+                }
+            }
+            if res.is_ok() && !wire.is_empty() {
+                // Records of pieces that came before empty last ones.
+                res = self.send_wire(&mut wire).await;
+            }
+            self.keep_wire(wire);
+            // A failure on the socket has marked the stream broken already; one
+            // before anything was sent (rustls refusing the data, keys used up,
+            // a file read) leaves it whole.
+            sending.done();
+            res
         }
-        if res.is_ok() && !wire.is_empty() {
-            // Records of pieces that came before empty last ones.
-            res = self.send_wire(&mut wire).await;
-        }
-        self.keep_wire(wire);
-        // A failure on the socket has marked the stream broken already; one
-        // before anything was sent (rustls refusing the data, keys used up,
-        // a file read) leaves it whole.
-        sending.done();
-        res
     }
 
     /// Receives one chunk of TLS data, decrypts it into `plain`, and sends
