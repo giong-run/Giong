@@ -137,6 +137,14 @@
 # kind (the io_uring idle-http1 row keeps its midpoint between kernels, moved
 # by those 112). The h2 and h2-streams rows, within 0.02%, the resident-set
 # rows and the allocation rows are unchanged.
+# The instruction rows of http1, http1-client, https and web: the request
+# line and every well-formed header line are read in one pass over their
+# bytes, and only anything else with the checks one after the other
+# (changelog.d/perf-http-parse-head.md). Measured on the same VM against the
+# change before it, scripts/instr.py on both, 3 rounds
+# (bench/results/http-parse-head/): http1 -1.8% (io_uring) and -1.6%
+# (epoll), web -1.9% and -1.7%, http1-client -1.7% and -1.6%, https -1.1% and
+# -1.0%; every other row within 0.08%.
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1100.4,1
 io_uring,spawn,allocations,1.000,1
@@ -154,17 +162,17 @@ io_uring,udp-echo,instructions,3712.4,1
 io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,190.2,1
 io_uring,file-read,allocations,0.000,1
-io_uring,http1,instructions,6971.1,1
+io_uring,http1,instructions,6847.3,1
 io_uring,http1,allocations,0.000,1
-io_uring,http1-client,instructions,18669.5,1
+io_uring,http1-client,instructions,18357.1,1
 io_uring,http1-client,allocations,6.008,1
 io_uring,h2,instructions,27554.5,1
 io_uring,h2,allocations,13.001,1
 io_uring,h2-streams,instructions,217153.9,0.5
 io_uring,h2-streams,allocations,140.005,0.5
-io_uring,https,instructions,29535.4,1
+io_uring,https,instructions,29221.9,1
 io_uring,https,allocations,12.035,1
-io_uring,web,instructions,9858.1,1
+io_uring,web,instructions,9675.2,1
 io_uring,web,allocations,2.000,1
 io_uring,redis-get,instructions,7723.1,1
 io_uring,redis-get,allocations,2.000,1
@@ -200,17 +208,17 @@ epoll,udp-echo,instructions,4453.6,1
 epoll,udp-echo,allocations,1.000,1
 epoll,file-read,instructions,241.9,3
 epoll,file-read,allocations,0.016,1
-epoll,http1,instructions,7882.6,1
+epoll,http1,instructions,7758.4,1
 epoll,http1,allocations,0.000,1
-epoll,http1-client,instructions,19766.6,1
+epoll,http1-client,instructions,19446.6,1
 epoll,http1-client,allocations,6.000,1
 epoll,h2,instructions,28679.2,1
 epoll,h2,allocations,13.000,1
 epoll,h2-streams,instructions,218240.0,0.5
 epoll,h2-streams,allocations,140.003,0.5
-epoll,https,instructions,30624.1,1
+epoll,https,instructions,30310.4,1
 epoll,https,allocations,12.000,1
-epoll,web,instructions,10771.6,1
+epoll,web,instructions,10592.4,1
 epoll,web,allocations,2.000,1
 epoll,redis-get,instructions,8499.8,1
 epoll,redis-get,allocations,2.000,1
