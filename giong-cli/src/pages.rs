@@ -803,6 +803,29 @@ The length can be far more than the file holds: a sparse file (a disk image, a d
 
 [All error codes](README.md)
 "#),
+    (205, r#"# GIONG-E0205: the path leads outside the root
+
+Raised by `giong::fs::Root` (`open`, `create`, `read`, `metadata`, `open_root`) and `giong::fs::OpenOptions::open_in`. In code: `giong::error::Code::OutsideRoot`. The error's kind is `PermissionDenied`.
+
+## What happened
+
+A `Root` opens paths beneath one directory and nowhere else. The path it was given could have led outside, so nothing was opened (and nothing was created or emptied). The message says which of these it was:
+
+- **it is absolute** (`/etc/passwd`; on Windows also `C:\…`, `C:file`, `\\server\share` or `\file`): refused before the kernel is asked;
+- **it has a `..` component**, even one that would come back inside (`css/../a.txt`): refused before the kernel is asked, so that the same path is accepted or refused on every platform;
+- **it goes through a symbolic link** (on Windows also a junction), wherever the link points, inside the directory or out. Refusing every link, instead of checking where it leads, is what leaves nothing to race: a link checked first and opened second can be replaced in between. On Linux the kernel refuses it during the open (`openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`); `/proc`'s magic links, such as `/proc/self/fd/3` or `/proc/self/exe`, are links too;
+- **it leads outside the directory**: the kernel (`EXDEV`), or on Windows the file's final path, says so. With the checks above this should not happen; it is kept as a last line.
+
+A path that does not exist beneath the root is `NotFound`, as anywhere else, not this error.
+
+## How to fix it
+
+- If the path comes from a client (a URL, an upload's file name): this is the root doing its job. Answer `404 Not Found` (or `400`), and do not tell the client why.
+- If it is your own path: make it relative to the root, without `..`: `root.open("css/site.css")`, not `root.open("/srv/public/css/site.css")` or `root.open("../shared/logo.png")`.
+- To serve files from a directory that a link leads to, open a `Root` on that directory itself: `Root::new` follows links to reach the directory, and only what is beneath it is checked. A tree that needs links inside it (a release directory with `current -> releases/42`) can open its `Root` on the target.
+
+[All error codes](README.md)
+"#),
     (1101, r#"# GIONG-E1101: invalid HTTP request
 
 Raised by giong-http's client, before anything is sent. In code: `giong::error::Code::HttpClientRequest`.

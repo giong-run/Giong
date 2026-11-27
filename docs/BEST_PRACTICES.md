@@ -124,6 +124,11 @@ let hash = giong::spawn_compute(move || expensive(input)).await;
   says when it was cut. Raise `Builder::recv_buffers(count, size)` or use `read_from()` with
   a buffer of your own; do not mix the two on one socket.
 - **A `File` has no cursor**: every read and write names its offset.
+- **Open paths that come from outside through a `fs::Root`.** A request path, an upload's
+  name or a path in a config file joined to a directory can climb out with `..`, be
+  absolute, or follow a link someone left in the directory. `Root::new("public").await?`
+  once per worker, then `root.open(path)`: the kernel refuses all three during the open
+  (`GIONG-E0205`), so no check made beforehand can be raced.
 
 ## Errors
 

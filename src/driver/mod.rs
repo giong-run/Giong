@@ -450,6 +450,15 @@ pub(crate) enum Io {
         flags: i32,
         mode: u32,
     },
+    /// An open that stays beneath the directory `dir` (see `fs::Root`):
+    /// `openat2(2)` on Linux, with the flags, the mode and how the path is
+    /// resolved in `how`; `openat(2)` with `O_NOFOLLOW_ANY` on macOS.
+    #[cfg(unix)]
+    OpenBeneath {
+        dir: RawFile,
+        path: *const PathChar,
+        how: *const crate::sys::OpenHow,
+    },
     /// `close(2)`, reporting its result.
     Close { fd: RawFile },
     /// `statx(2)` on Linux, `fstatat(2)` elsewhere (see `sys::stat_at`).
@@ -508,6 +517,10 @@ impl Io {
     /// descriptor that whoever collects the result must close. When nobody
     /// does (the future was dropped), the driver closes it.
     pub(crate) fn result_is_fd(&self) -> bool {
+        #[cfg(unix)]
+        if matches!(self, Io::OpenBeneath { .. }) {
+            return true;
+        }
         matches!(self, Io::OpenAt { .. })
     }
 

@@ -2,7 +2,8 @@
 
 use std::io;
 use std::mem;
-use std::os::fd::{FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::Bell;
 
@@ -44,6 +45,159 @@ pub(crate) unsafe fn stat_at(
     out: *mut StatBuf,
 ) -> isize {
     libc::statx(dir, path, flags, mask, out) as isize
+}
+
+/// How [`open_beneath`] opens: the kernel's `struct open_how`, which
+/// io_uring's `OPENAT2` reads as well.
+pub(crate) type OpenHow = libc::open_how;
+
+/// How a path beneath a root is resolved: never above the directory, and
+/// through no symbolic link of any kind (the magic links of `/proc`
+/// included).
+const RESOLVE_BENEATH: u64 =
+    libc::RESOLVE_BENEATH | libc::RESOLVE_NO_SYMLINKS | libc::RESOLVE_NO_MAGICLINKS;
+
+/// The [`OpenHow`] of an `open(2)` with `flags` and `mode` beneath a root.
+pub(crate) fn open_how(flags: i32, mode: u32) -> OpenHow {
+    // SAFETY: all-zero is a valid `open_how` (plain integers).
+    let mut how: OpenHow = unsafe { mem::zeroed() };
+    how.flags = u64::from(flags as u32);
+    // `openat2` refuses a mode on an open that creates nothing, where
+    // `openat` ignores it.
+    let creates = flags & libc::O_CREAT != 0 || flags & libc::O_TMPFILE == libc::O_TMPFILE;
+    how.mode = if creates { u64::from(mode) } else { 0 };
+    how.resolve = RESOLVE_BENEATH;
+    how
+}
+
+/// Opens `path` beneath `dir` as `how` says; blocking, `-1` and `errno` on
+/// failure.
+///
+/// `openat2(2)` does it in one call. Where it is missing (a seccomp filter
+/// in a container may answer `ENOSYS`, or `EPERM` on older ones), the path
+/// is walked one component at a time with `O_NOFOLLOW`, which refuses the
+/// same paths: `fs::Root` has already refused `..` and absolute paths.
+///
+/// # Safety
+///
+/// `path` must be a valid C string.
+pub(crate) unsafe fn open_beneath(dir: RawFd, path: *const libc::c_char, how: &OpenHow) -> isize {
+    static NO_OPENAT2: AtomicBool = AtomicBool::new(false);
+    if !NO_OPENAT2.load(Ordering::Relaxed) {
+        let fd = libc::syscall(
+            libc::SYS_openat2,
+            dir,
+            path,
+            how as *const OpenHow,
+            mem::size_of::<OpenHow>(),
+        );
+        if fd >= 0 {
+            return fd as isize;
+        }
+        match *errno_location() {
+            libc::ENOSYS => NO_OPENAT2.store(true, Ordering::Relaxed),
+            // Refused by a filter, or by the file itself (`O_NOATIME` on
+            // another user's file): the walk gets the same answer then.
+            libc::EPERM => {}
+            _ => return -1,
+        }
+    }
+    open_walk(
+        dir,
+        std::ffi::CStr::from_ptr(path).to_bytes(),
+        how.flags as i32,
+        how.mode as u32,
+    )
+}
+
+/// [`open_beneath`] without `openat2`: one `openat` per component, each
+/// with `O_NOFOLLOW`, so that no symbolic link is followed.
+///
+/// # Safety
+///
+/// `dir` must be an open directory.
+pub(crate) unsafe fn open_walk(dir: RawFd, path: &[u8], flags: i32, mode: u32) -> isize {
+    fn fail(errno: i32) -> isize {
+        // SAFETY: the calling thread's `errno`.
+        unsafe { *errno_location() = errno };
+        -1
+    }
+    if path.is_empty() {
+        return fail(libc::ENOENT);
+    }
+    let parts: Vec<&[u8]> = path
+        .split(|&b| b == b'/')
+        .filter(|part| !part.is_empty() && *part != b".")
+        .collect();
+    let here: &[u8] = b".";
+    let (last, dirs) = match parts.split_last() {
+        Some((last, dirs)) => (*last, dirs),
+        // Only `.` components: the directory itself.
+        None => (here, &[][..]),
+    };
+    let mut name = Vec::new();
+    let c_name = |name: &mut Vec<u8>, part: &[u8]| {
+        name.clear();
+        name.extend_from_slice(part);
+        name.push(0);
+    };
+    // The descriptor of the directory reached so far, closed when the next
+    // one is open (or at the end).
+    let mut held: Option<OwnedFd> = None;
+    for part in dirs {
+        let at = held.as_ref().map_or(dir, |fd| fd.as_raw_fd());
+        c_name(&mut name, part);
+        let fd = libc::openat(
+            at,
+            name.as_ptr().cast(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            let errno = link_or_errno(at, &name);
+            drop(held);
+            return fail(errno);
+        }
+        held = Some(OwnedFd::from_raw_fd(fd));
+    }
+    let at = held.as_ref().map_or(dir, |fd| fd.as_raw_fd());
+    c_name(&mut name, last);
+    let mut last_flags = flags | libc::O_NOFOLLOW;
+    if path.ends_with(b"/") {
+        last_flags |= libc::O_DIRECTORY;
+    }
+    let fd = libc::openat(at, name.as_ptr().cast(), last_flags, mode);
+    if fd < 0 {
+        let errno = link_or_errno(at, &name);
+        drop(held);
+        return fail(errno);
+    }
+    if flags & libc::O_PATH != 0 {
+        // `O_PATH` with `O_NOFOLLOW` opens a link itself instead of
+        // refusing it, as `openat2` does.
+        let mut st: libc::stat = mem::zeroed();
+        if libc::fstat(fd, &mut st) == 0 && st.st_mode & libc::S_IFMT == libc::S_IFLNK {
+            libc::close(fd);
+            drop(held);
+            return fail(libc::ELOOP);
+        }
+    }
+    fd as isize
+}
+
+/// The `errno` of an `openat` of `name` in `at` with `O_NOFOLLOW` that just
+/// failed, as `ELOOP` when `name` is a symbolic link (an intermediate
+/// component gives `ENOTDIR` then), as `openat2` reports it.
+unsafe fn link_or_errno(at: RawFd, name: &[u8]) -> i32 {
+    let errno = *errno_location();
+    if errno == libc::ENOTDIR || errno == libc::ELOOP {
+        let mut st: libc::stat = mem::zeroed();
+        if libc::fstatat(at, name.as_ptr().cast(), &mut st, libc::AT_SYMLINK_NOFOLLOW) == 0
+            && st.st_mode & libc::S_IFMT == libc::S_IFLNK
+        {
+            return libc::ELOOP;
+        }
+    }
+    errno
 }
 
 impl Bell {
@@ -429,7 +583,88 @@ pub(crate) fn signal_range() -> (i32, i32) {
 
 #[cfg(test)]
 mod tests {
-    use super::{allowed_cpus, pin_to_cpu};
+    use super::{allowed_cpus, errno_location, open_beneath, open_how, open_walk, pin_to_cpu};
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+
+    /// The walk without `openat2` refuses what `openat2` refuses: a link
+    /// anywhere on the path, wherever it points; and opens the rest alike.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri has no openat or openat2")]
+    fn the_walk_without_openat2_refuses_what_openat2_refuses() {
+        let tmp = std::env::temp_dir().join(format!("giong-walk-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&tmp);
+        let public = tmp.join("public");
+        std::fs::create_dir_all(public.join("css")).unwrap();
+        std::fs::write(public.join("a.txt"), b"a").unwrap();
+        std::fs::write(public.join("css/site.css"), b"c").unwrap();
+        std::fs::write(tmp.join("secret"), b"s").unwrap();
+        for (name, target) in [
+            ("out", "../secret"),
+            ("in", "a.txt"),
+            ("styles", "css"),
+            ("dangling", "../created"),
+        ] {
+            std::os::unix::fs::symlink(target, public.join(name)).unwrap();
+        }
+        let dir = std::fs::File::open(&public).unwrap();
+        let read = libc::O_RDONLY | libc::O_CLOEXEC;
+        let create = libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_CLOEXEC;
+        let cases: &[(&[u8], i32, i32)] = &[
+            (b"a.txt", read, 0),
+            (b"./css//site.css", read, 0),
+            (b"css", read, 0),
+            (b"css/", read, 0),
+            (b".", read, 0),
+            (b"new", create, 0),
+            (b"a.txt", libc::O_PATH | libc::O_CLOEXEC, 0),
+            (b"a.txt/", read, libc::ENOTDIR),
+            (b"missing", read, libc::ENOENT),
+            (b"", read, libc::ENOENT),
+            (b"out", read, libc::ELOOP),
+            (b"in", read, libc::ELOOP),
+            (b"in", libc::O_PATH | libc::O_CLOEXEC, libc::ELOOP),
+            (b"styles/site.css", read, libc::ELOOP),
+            (b"styles", libc::O_PATH | libc::O_CLOEXEC, libc::ELOOP),
+            (b"dangling", create, libc::ELOOP),
+            (b"out", create, libc::ELOOP),
+        ];
+        for &(path, flags, errno) in cases {
+            let mut c_path = path.to_vec();
+            c_path.push(0);
+            let how = open_how(flags, 0o644);
+            // SAFETY: `dir` is an open directory and the paths are C strings.
+            let (walked, kernel) = unsafe {
+                let walked = open_walk(dir.as_raw_fd(), path, flags, 0o644);
+                let walked_errno = *errno_location();
+                let kernel = open_beneath(dir.as_raw_fd(), c_path.as_ptr().cast(), &how);
+                let kernel_errno = *errno_location();
+                (
+                    (
+                        walked >= 0,
+                        if walked >= 0 { 0 } else { walked_errno },
+                        walked,
+                    ),
+                    (
+                        kernel >= 0,
+                        if kernel >= 0 { 0 } else { kernel_errno },
+                        kernel,
+                    ),
+                )
+            };
+            for (fd_ok, _, fd) in [walked, kernel] {
+                if fd_ok {
+                    // SAFETY: a descriptor the open just returned.
+                    drop(unsafe { OwnedFd::from_raw_fd(fd as i32) });
+                }
+            }
+            let what = String::from_utf8_lossy(path);
+            assert_eq!(walked.1, errno, "walk of {what:?} with flags {flags:#x}");
+            assert_eq!(kernel.1, errno, "openat2 of {what:?} with flags {flags:#x}");
+        }
+        assert!(!tmp.join("created").exists());
+        assert_eq!(std::fs::read(tmp.join("secret")).unwrap(), b"s");
+        let _ = std::fs::remove_dir_all(&tmp);
+    }
 
     #[test]
     #[cfg_attr(miri, ignore = "sets the thread's CPU affinity")]
