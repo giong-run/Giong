@@ -24,19 +24,28 @@ jobs:
       - run: cargo test -p giong-cli --bin giong --locked --no-run
       - name: flood vs paced, 150 runs each, alternating
         run: |
+          set +e
           for i in $(seq 1 150); do
             cargo test -q -p giong-cli --bin giong --locked tmp_flood -- --ignored --nocapture 2>&1 | grep RESULT
             cargo test -q -p giong-cli --bin giong --locked closed_connections_reconnect -- --nocapture 2>&1 | grep RESULT
           done > results.txt
-          echo "flood failures: $(grep 'RESULT flood' results.txt | grep -vc 'failed=0 ')"
-          echo "paced failures: $(grep 'RESULT paced' results.txt | grep -vc 'failed=0 ')"
+          echo "lines: $(wc -l < results.txt)"
+          echo "flood runs: $(grep -c 'RESULT flood' results.txt), failures: $(grep 'RESULT flood' results.txt | grep -vc 'failed=0 ')"
+          echo "paced runs: $(grep -c 'RESULT paced' results.txt), failures: $(grep 'RESULT paced' results.txt | grep -vc 'failed=0 ')"
           grep -v 'failed=0 ' results.txt | head -20
           awk '/RESULT flood/{split($3,a,"=");s+=a[2];n++} END{print "flood mean connects", s/n}' results.txt
           awk '/RESULT paced/{split($3,a,"=");s+=a[2];n++} END{print "paced mean connects", s/n}' results.txt
+          head -3 results.txt
       - name: the whole giong-cli unit suite in parallel, 20 times, with the flood
+        if: always()
         run: |
-          f=0
+          set +e
+          f=0; n=0
           for i in $(seq 1 20); do
-            cargo test -q -p giong-cli --bin giong --locked -- --include-ignored 2>&1 | grep -E "RESULT flood" | grep -v 'failed=0 ' && f=$((f+1))
+            out=$(cargo test -q -p giong-cli --bin giong --locked -- --include-ignored --nocapture 2>&1)
+            r=$(echo "$out" | grep "RESULT flood")
+            echo "$r"
+            echo "$out" | grep -E "^test result|FAILED|panicked" | head -5
+            n=$((n+1)); echo "$r" | grep -q 'failed=0 ' || f=$((f+1))
           done
-          echo "flood failures with the suite beside it: $f / 20"
+          echo "flood failures with the suite beside it: $f / $n"
