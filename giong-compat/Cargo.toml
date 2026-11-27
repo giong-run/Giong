@@ -1,6 +1,6 @@
 [package]
 name = "giong-compat"
-version = "1.5.2"
+version = "1.5.3"
 edition = "2021"
 rust-version = "1.80"
 description = "Tokio and futures-io I/O traits for giong's streams, so transport-generic protocol crates run on giong"
@@ -22,9 +22,9 @@ futures-io = ["dep:futures-io"]
 tls = ["dep:giong-tls"]
 
 [dependencies]
-giong = { path = "..", version = "1.5.2" }
+giong = { path = "..", version = "1.5.3" }
 libc = "0.2.172"
-giong-tls = { path = "../giong-tls", version = "1.5.2", optional = true }
+giong-tls = { path = "../giong-tls", version = "1.5.3", optional = true }
 # The trait definitions only; the crate's default features (the runtime) stay
 # off.
 tokio = { version = "1.13", default-features = false, optional = true }
@@ -36,8 +36,8 @@ futures-io = { version = "0.3.31", optional = true }
 windows-sys = { version = "0.61", features = ["Win32_Networking_WinSock"] }
 
 [dev-dependencies]
-giong-http = { path = "../giong-http", version = "1.5.2", features = ["client"] }
-giong-tls = { path = "../giong-tls", version = "1.5.2", features = ["unstable-rustls"] }
+giong-http = { path = "../giong-http", version = "1.5.3", features = ["client"] }
+giong-tls = { path = "../giong-tls", version = "1.5.3", features = ["unstable-rustls"] }
 # Real crates that are generic over the transport, driven through `Compat`.
 # None of them gets a Tokio runtime: the tests run on giong only.
 bytes = "1.9"
