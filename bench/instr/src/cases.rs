@@ -139,6 +139,11 @@ pub const IDLE: &[IdleCase] = &[
         what: "heap and RSS per idle HTTPS (HTTP/1.1 over rustls) connection, after one request",
         run: |name, n| Box::pin(idle(name, n, Proto::Https)),
     },
+    IdleCase {
+        name: "idle-h2-tls",
+        what: "heap and RSS per idle HTTP/2-over-TLS (ALPN h2) connection, after one request",
+        run: |name, n| Box::pin(idle(name, n, Proto::H2Tls)),
+    },
 ];
 
 #[derive(Clone, Copy, PartialEq)]
@@ -146,6 +151,7 @@ enum Proto {
     Http1,
     Http2,
     Https,
+    H2Tls,
 }
 
 async fn spawn(m: &Meter) {
@@ -500,6 +506,7 @@ async fn web(m: &Meter) {
 /// For HTTPS the child does each handshake and one keep-alive request with
 /// rustls, then drops the client's TLS state and keeps only the socket (the
 /// server cannot tell, nothing is sent). Every count here is the server's.
+/// HTTP/2 over TLS is the same with ALPN `h2` and the request of `h2`.
 async fn idle(name: &'static str, n: usize, proto: Proto) {
     use std::io::{BufRead, Write};
     use std::process::{Command, Stdio};
@@ -509,7 +516,7 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
     let (listener, addr) = listen();
     // The test certificate, for the child, in a file of this process's own.
     let mut cert_file = None;
-    if proto == Proto::Https {
+    if matches!(proto, Proto::Https | Proto::H2Tls) {
         let key = rcgen::generate_simple_self_signed(vec!["localhost".to_string()]).expect("a key");
         let cert = key.cert.pem();
         let certs = giong_tls::Certificates::from_pem(
@@ -527,7 +534,7 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
             giong_tls::TlsConnector::with_root_pem(cert.as_bytes()).expect("the test root");
         let client = giong_http::client::Client::builder()
             .tls(connector)
-            .http2(false)
+            .http2(proto == Proto::H2Tls)
             .build();
         let url = format!("https://localhost:{}/json", addr.port());
         let resp = client.get(&url).send().await.expect("a response");
@@ -545,6 +552,7 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
         Proto::Http1 => "http1",
         Proto::Http2 => "h2",
         Proto::Https => "https",
+        Proto::H2Tls => "h2-tls",
     };
     let mut child = Command::new(std::env::current_exe().expect("this program's path"))
         .arg("idle-client")
@@ -603,21 +611,21 @@ async fn idle(name: &'static str, n: usize, proto: Proto) {
     }
 }
 
-/// `bench-instr idle-client <http1|h2|https> <addr> <n> [root.der]`: the
-/// client end of [`idle`], in its own process. Waits for a line on stdin,
-/// opens `n` connections (each with one request for `h2` and `https`),
+/// `bench-instr idle-client <http1|h2|https|h2-tls> <addr> <n> [root.der]`:
+/// the client end of [`idle`], in its own process. Waits for a line on stdin,
+/// opens `n` connections (each with one request but for `http1`),
 /// prints `done`, and keeps them open until stdin closes.
 pub fn idle_client(args: &[String]) {
     use std::io::{BufRead, Write};
     use std::sync::Arc;
 
     let (Some(proto), Some(addr), Some(n)) = (args.first(), args.get(1), args.get(2)) else {
-        eprintln!("usage: bench-instr idle-client <http1|h2|https> <addr> <n> [root.der]");
+        eprintln!("usage: bench-instr idle-client <http1|h2|https|h2-tls> <addr> <n> [root.der]");
         std::process::exit(2)
     };
     let addr: std::net::SocketAddr = addr.parse().expect("an address");
     let n: usize = n.parse().expect("a number of connections");
-    let tls = (proto == "https").then(|| {
+    let tls = (proto == "https" || proto == "h2-tls").then(|| {
         let der = std::fs::read(args.get(3).expect("the test root")).expect("read the test root");
         let mut roots = rustls::RootCertStore::empty();
         roots
@@ -631,7 +639,11 @@ pub fn idle_client(args: &[String]) {
         .with_root_certificates(roots)
         .with_no_client_auth();
         config.resumption = rustls::client::Resumption::disabled();
-        config.alpn_protocols = vec![b"http/1.1".to_vec()];
+        config.alpn_protocols = if proto == "h2-tls" {
+            vec![b"h2".to_vec()]
+        } else {
+            vec![b"http/1.1".to_vec()]
+        };
         Arc::new(config)
     });
     let stdin = std::io::stdin();
@@ -644,6 +656,7 @@ pub fn idle_client(args: &[String]) {
             "http1" => {}
             "h2" => h2_request(&mut s),
             "https" => tls_request(tls.clone().expect("the client config"), &mut s),
+            "h2-tls" => tls_h2_request(tls.clone().expect("the client config"), &mut s),
             other => panic!("unknown protocol {other}"),
         }
         conns.push(s);
@@ -666,8 +679,7 @@ pub fn idle_client(args: &[String]) {
 /// the server from falling behind: with thousands of prefaces queued, the
 /// receive buffer pool runs low and the driver copies data to the heap, by
 /// timing.
-fn h2_request(sock: &mut std::net::TcpStream) {
-    use std::io::{Read, Write};
+fn h2_request(sock: &mut (impl std::io::Read + std::io::Write)) {
     // HEADERS on stream 1, END_STREAM and END_HEADERS: :method GET,
     // :scheme http, :path / (static table entries 2, 6 and 4) and
     // :authority localhost (literal, not indexed, name from entry 1).
@@ -705,6 +717,15 @@ fn h2_request(sock: &mut std::net::TcpStream) {
         assert!(k > 0, "the server closed");
         got.extend_from_slice(&buf[..k]);
     }
+}
+
+/// A TLS handshake with ALPN `h2` and the request of [`h2_request`] over
+/// `sock`; the client's TLS state is then dropped.
+fn tls_h2_request(config: std::sync::Arc<rustls::ClientConfig>, sock: &mut std::net::TcpStream) {
+    let name = rustls::pki_types::ServerName::try_from("localhost").expect("a name");
+    let mut conn = rustls::ClientConnection::new(config, name).expect("a TLS client");
+    h2_request(&mut rustls::Stream::new(&mut conn, sock));
+    assert_eq!(conn.alpn_protocol(), Some(&b"h2"[..]), "the server did not pick h2");
 }
 
 /// A TLS handshake and one keep-alive `GET /json` over `sock`, read to the

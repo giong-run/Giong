@@ -54,7 +54,7 @@ pub use unix::UnixDatagram;
 pub use unix::{UnixListener, UnixSocketAddr, UnixStream};
 
 use std::cell::{Cell, OnceCell};
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::io;
 use std::marker::PhantomData;
 use std::mem::ManuallyDrop;
@@ -869,120 +869,140 @@ impl StreamSocket {
         })
     }
 
-    pub(crate) async fn write<B: IoBuf>(&self, buf: B) -> (io::Result<usize>, B) {
-        self.send_from(buf, 0).await
+    // The writes below are not `async fn`s: one keeps its arguments twice
+    // (as received, and moved into its body), and a write's future is kept
+    // in every future that waits for it, often for as long as a connection
+    // lives (an HTTP connection's, beside its idle state).
+
+    pub(crate) fn write<B: IoBuf>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (io::Result<usize>, B)> + '_ {
+        self.send_from(buf, 0)
     }
 
-    pub(crate) async fn write_all<B: IoBuf>(&self, mut buf: B) -> (io::Result<()>, B) {
-        let mut written = 0;
-        while written < buf.len() {
-            let (res, b) = self.send_from(buf, written).await;
-            buf = b;
-            match res {
-                Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), buf),
-                Ok(n) => written += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return (Err(e), buf),
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn write_all<B: IoBuf>(
+        &self,
+        mut buf: B,
+    ) -> impl Future<Output = (io::Result<()>, B)> + '_ {
+        async move {
+            let mut written = 0;
+            while written < buf.len() {
+                let (res, b) = self.send_from(buf, written).await;
+                buf = b;
+                match res {
+                    Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), buf),
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return (Err(e), buf),
+                }
             }
+            (Ok(()), buf)
         }
-        (Ok(()), buf)
     }
 
-    pub(crate) async fn write_vectored<B: IoBuf>(
+    pub(crate) fn write_vectored<B: IoBuf>(
         &self,
         bufs: Vec<B>,
-    ) -> (io::Result<usize>, Vec<B>) {
-        self.send_vectored_from(bufs, 0).await
+    ) -> impl Future<Output = (io::Result<usize>, Vec<B>)> + '_ {
+        self.send_vectored_from(bufs, 0)
     }
 
-    pub(crate) async fn write_all_vectored<B: IoBuf>(
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn write_all_vectored<B: IoBuf>(
         &self,
         mut bufs: Vec<B>,
-    ) -> (io::Result<()>, Vec<B>) {
-        let total: usize = bufs.iter().map(IoBuf::len).sum();
-        let mut written = 0;
-        while written < total {
-            let (res, b) = self.send_vectored_from(bufs, written).await;
-            bufs = b;
-            match res {
-                Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), bufs),
-                Ok(n) => written += n,
-                Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
-                Err(e) => return (Err(e), bufs),
+    ) -> impl Future<Output = (io::Result<()>, Vec<B>)> + '_ {
+        async move {
+            let total: usize = bufs.iter().map(IoBuf::len).sum();
+            let mut written = 0;
+            while written < total {
+                let (res, b) = self.send_vectored_from(bufs, written).await;
+                bufs = b;
+                match res {
+                    Ok(0) => return (Err(io::ErrorKind::WriteZero.into()), bufs),
+                    Ok(n) => written += n,
+                    Err(e) if e.kind() == io::ErrorKind::Interrupted => {}
+                    Err(e) => return (Err(e), bufs),
+                }
             }
+            (Ok(()), bufs)
         }
-        (Ok(()), bufs)
     }
 
     /// One `sendmsg` of the bytes of `bufs`, taken as one sequence, from
     /// `offset` on.
-    async fn send_vectored_from<B: IoBuf>(
+    #[allow(clippy::manual_async_fn)]
+    fn send_vectored_from<B: IoBuf>(
         &self,
         bufs: Vec<B>,
         offset: usize,
-    ) -> (io::Result<usize>, Vec<B>) {
-        let mut iov: Vec<crate::sys::IoVec> = pieces_from(&bufs, offset)
-            .map(|(buf, skip)| {
-                // SAFETY: `skip < len`, so the pointer stays within the
-                // buffer.
-                crate::sys::io_vec(unsafe { buf.as_ptr().add(skip) }, buf.len() - skip)
-            })
-            .collect();
-        // A send on Windows takes at most `STREAM_SEND_MAX` bytes: a longer
-        // one is cut there, a short write.
-        #[cfg(windows)]
-        {
-            let mut room = STREAM_SEND_MAX;
-            let mut keep = 0;
-            for v in iov.iter_mut() {
-                if room == 0 {
-                    break;
+    ) -> impl Future<Output = (io::Result<usize>, Vec<B>)> + '_ {
+        async move {
+            let mut iov: Vec<crate::sys::IoVec> = pieces_from(&bufs, offset)
+                .map(|(buf, skip)| {
+                    // SAFETY: `skip < len`, so the pointer stays within the
+                    // buffer.
+                    crate::sys::io_vec(unsafe { buf.as_ptr().add(skip) }, buf.len() - skip)
+                })
+                .collect();
+            // A send on Windows takes at most `STREAM_SEND_MAX` bytes: a longer
+            // one is cut there, a short write.
+            #[cfg(windows)]
+            {
+                let mut room = STREAM_SEND_MAX;
+                let mut keep = 0;
+                for v in iov.iter_mut() {
+                    if room == 0 {
+                        break;
+                    }
+                    let len = crate::sys::io_vec_parts(v).1.min(room);
+                    v.len = len as u32;
+                    room -= len;
+                    keep += 1;
                 }
-                let len = crate::sys::io_vec_parts(v).1.min(room);
-                v.len = len as u32;
-                room -= len;
-                keep += 1;
+                iov.truncate(keep);
             }
-            iov.truncate(keep);
-        }
-        if iov.is_empty() {
-            return (Ok(0), bufs);
-        }
-        let hold = self.vectored_hold(&bufs, offset, &mut iov);
-        // SAFETY: all-zero is a valid `msghdr` (null pointers, zero
-        // lengths).
-        let msg: KernelBox<crate::sys::MsgHdr> = KernelBox::new(unsafe { std::mem::zeroed() });
-        // SAFETY: `msg` owns a live `msghdr` nothing else uses yet. The
-        // iovec array is a `Vec`'s heap buffer, which moving the `Vec` does
-        // not move or reborrow.
-        unsafe {
-            crate::sys::msg_set_iov(msg.as_ptr(), iov.as_mut_ptr(), iov.len());
-        }
-        let io = Io::SendMsg {
-            fd: self.sock.as_raw_fd(),
-            msg: msg.as_ptr(),
-            flags: crate::sys::MSG_NOSIGNAL as u32,
-            zero_copy: hold.is_some(),
-        };
-        let in_flight = SendInFlight::new(self);
-        // The header, the iovec array (on the heap) and the buffers all stay
-        // where they are while the kernel reads them, even if this future is
-        // dropped: `Op` keeps them until the operation completes, and the
-        // driver keeps the hold of a zero-copy send until the kernel lets go
-        // of its bytes. A zero-copy send the socket refuses is sent again
-        // with a copy by `Op` itself, so that this future, which every
-        // vectored write awaits, keeps nothing else across the send.
-        //
-        // SAFETY: the header is in a `KernelBox`, the iovec array is a
-        // `Vec`'s heap buffer, and the bytes are `IoBuf`s: none of them
-        // moves with the tuple. The hold owns what a zero-copy send reads
-        // after its result.
-        let (res, _, (bufs, _, _)) = unsafe { Op::with_hold(io, (bufs, iov, msg), hold) }.await;
-        in_flight.finish();
-        if res < 0 {
-            (Err(send_err(res)), bufs)
-        } else {
-            (Ok(res as usize), bufs)
+            if iov.is_empty() {
+                return (Ok(0), bufs);
+            }
+            let hold = self.vectored_hold(&bufs, offset, &mut iov);
+            // SAFETY: all-zero is a valid `msghdr` (null pointers, zero
+            // lengths).
+            let msg: KernelBox<crate::sys::MsgHdr> = KernelBox::new(unsafe { std::mem::zeroed() });
+            // SAFETY: `msg` owns a live `msghdr` nothing else uses yet. The
+            // iovec array is a `Vec`'s heap buffer, which moving the `Vec` does
+            // not move or reborrow.
+            unsafe {
+                crate::sys::msg_set_iov(msg.as_ptr(), iov.as_mut_ptr(), iov.len());
+            }
+            let io = Io::SendMsg {
+                fd: self.sock.as_raw_fd(),
+                msg: msg.as_ptr(),
+                flags: crate::sys::MSG_NOSIGNAL as u32,
+                zero_copy: hold.is_some(),
+            };
+            let in_flight = SendInFlight::new(self);
+            // The header, the iovec array (on the heap) and the buffers all stay
+            // where they are while the kernel reads them, even if this future is
+            // dropped: `Op` keeps them until the operation completes, and the
+            // driver keeps the hold of a zero-copy send until the kernel lets go
+            // of its bytes. A zero-copy send the socket refuses is sent again
+            // with a copy by `Op` itself, so that this future, which every
+            // vectored write awaits, keeps nothing else across the send.
+            //
+            // SAFETY: the header is in a `KernelBox`, the iovec array is a
+            // `Vec`'s heap buffer, and the bytes are `IoBuf`s: none of them
+            // moves with the tuple. The hold owns what a zero-copy send reads
+            // after its result.
+            let (res, _, (bufs, _, _)) = unsafe { Op::with_hold(io, (bufs, iov, msg), hold) }.await;
+            in_flight.finish();
+            if res < 0 {
+                (Err(send_err(res)), bufs)
+            } else {
+                (Ok(res as usize), bufs)
+            }
         }
     }
 
@@ -1258,44 +1278,51 @@ impl StreamSocket {
         Ok(())
     }
 
-    async fn send_from<B: IoBuf>(&self, buf: B, offset: usize) -> (io::Result<usize>, B) {
-        debug_assert!(offset <= buf.len());
-        let len = (buf.len() - offset).min(STREAM_SEND_MAX) as u32;
-        let hold = self.send_hold(&buf, len as usize);
-        // SAFETY: `offset <= len`, so the pointer stays within the buffer.
-        let ptr = unsafe { buf.as_ptr().add(offset) };
-        if hold.is_none() {
-            // SAFETY: `ptr` points at `len` initialised bytes of `buf`.
-            let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
-            if let Some(res) = self.send_now(bytes) {
-                return if res < 0 {
-                    (Err(send_err(res)), buf)
-                } else {
-                    (Ok(res as usize), buf)
-                };
+    #[allow(clippy::manual_async_fn)]
+    fn send_from<B: IoBuf>(
+        &self,
+        buf: B,
+        offset: usize,
+    ) -> impl Future<Output = (io::Result<usize>, B)> + '_ {
+        async move {
+            debug_assert!(offset <= buf.len());
+            let len = (buf.len() - offset).min(STREAM_SEND_MAX) as u32;
+            let hold = self.send_hold(&buf, len as usize);
+            // SAFETY: `offset <= len`, so the pointer stays within the buffer.
+            let ptr = unsafe { buf.as_ptr().add(offset) };
+            if hold.is_none() {
+                // SAFETY: `ptr` points at `len` initialised bytes of `buf`.
+                let bytes = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+                if let Some(res) = self.send_now(bytes) {
+                    return if res < 0 {
+                        (Err(send_err(res)), buf)
+                    } else {
+                        (Ok(res as usize), buf)
+                    };
+                }
             }
-        }
-        let io = Io::Send {
-            fd: self.sock.as_raw_fd(),
-            buf: ptr,
-            len,
-            flags: crate::sys::MSG_NOSIGNAL,
-            zero_copy: hold.is_some(),
-        };
-        let in_flight = SendInFlight::new(self);
-        // The hold moves into the send, and a zero-copy send the socket
-        // refuses is sent again with a copy by `Op` itself, so that this
-        // future, which every write awaits, is the size of a plain send's.
-        //
-        // SAFETY: `ptr` points into `buf`, an `IoBuf`, whose bytes stay put
-        // when it moves. The hold owns what a zero-copy send reads after its
-        // result.
-        let (res, _, buf) = unsafe { Op::with_hold(io, buf, hold) }.await;
-        in_flight.finish();
-        if res < 0 {
-            (Err(send_err(res)), buf)
-        } else {
-            (Ok(res as usize), buf)
+            let io = Io::Send {
+                fd: self.sock.as_raw_fd(),
+                buf: ptr,
+                len,
+                flags: crate::sys::MSG_NOSIGNAL,
+                zero_copy: hold.is_some(),
+            };
+            let in_flight = SendInFlight::new(self);
+            // The hold moves into the send, and a zero-copy send the socket
+            // refuses is sent again with a copy by `Op` itself, so that this
+            // future, which every write awaits, is the size of a plain send's.
+            //
+            // SAFETY: `ptr` points into `buf`, an `IoBuf`, whose bytes stay put
+            // when it moves. The hold owns what a zero-copy send reads after its
+            // result.
+            let (res, _, buf) = unsafe { Op::with_hold(io, buf, hold) }.await;
+            in_flight.finish();
+            if res < 0 {
+                (Err(send_err(res)), buf)
+            } else {
+                (Ok(res as usize), buf)
+            }
         }
     }
 

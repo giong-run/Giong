@@ -111,7 +111,7 @@ the others are from 0.4's run on the same kind of VM.
 | Raw Tokio, own parser | 12.9 KiB | 13.1 KiB | 12.9 KiB | 64 MiB |
 | Go `net/http` | 10.8 KiB | 18.9 KiB | 18.3 KiB | 155 MiB |
 
-- **An idle giong connection holds no buffer.** What it costs is its task (1,008 bytes
+- **An idle giong connection holds no buffer.** What it costs is its task (936 bytes
   for giong-http's connection), the multishot receive, an idle timer and the socket. The
   kernel picks a receive buffer only when data arrives; the request and response buffers
   are taken from a per-worker pool for the length of a request. Hyper keeps an 8 KiB read
@@ -122,11 +122,11 @@ the others are from 0.4's run on the same kind of VM.
   `.await` cost 43 KiB per idle connection. Each wrapper that took a future by value
   (spawn, `timeout`, `until_shutdown`) also kept two copies of it; an idle giong-http
   connection took 10.9 KiB, one with a pending request 15.0 KiB.
-- **An idle HTTPS connection holds no buffer either** (rustls in the process): 6.1 KiB of
+- **An idle HTTPS connection holds no buffer either** (rustls in the process): 5.0 KiB of
   heap, mostly its task with the TLS state and rustls' own allocations for the keys; it was
   10.8 KiB until rustls' buffered connection, which keeps a 4 KiB receive buffer for the life
   of every connection, was replaced by its unbuffered API in 1.5.2. 8,000 idle connections
-  to one worker take 52.8 MiB of resident memory instead of 89.8 (`bench/tls-idle.sh`,
+  to one worker take 45.7 MiB of resident memory instead of 89.8 (`bench/tls-idle.sh`,
   [`bench/results/tls-idle/`](../bench/results/tls-idle/README.md)).
 - **A connection's future keeps across an `.await` only what waiting for the next request
   needs** (1.5.2). rustc gives every local that lives across more than one `.await` its own
@@ -141,6 +141,18 @@ the others are from 0.4's run on the same kind of VM.
   heap block instead of copied there: 1.5% fewer instructions per HTTP/1.1 request, 2.3%
   through a `giong-web` router, 0.2–0.5% for the client, HTTPS and HTTP/2 cases
   ([`bench/results/idle-conn-memory/`](../bench/results/idle-conn-memory/README.md)).
+- **An HTTP/2 connection goes on in a task of its own** (1.5.2). The task that accepts a
+  connection reads its first bytes and serves HTTP/1.1; once TLS picks `h2` or the HTTP/2
+  preface arrives, it spawns the HTTP/2 loop and ends, where it used to stay beside the
+  HTTP/2 state for the life of the connection. With smaller futures for a TLS receive (136
+  bytes instead of 640: it no longer holds room for the handshake's sends) and for writes
+  (their arguments kept once), an idle HTTP/2 connection holds 2,518 bytes of heap instead
+  of 3,318 (−24%), 6,397 over TLS instead of 9,683 (−34%), an HTTPS one 5,141 instead of
+  5,285 and an HTTP/1.1 one 1,262 instead of 1,318 (io_uring). 8,000 idle HTTP/2
+  connections over TLS take 56.1 MiB instead of 81.2, and 5,000 over plain HTTP/2 2.66 KiB
+  each instead of 3.48. Requests got cheaper as well: 2.9% fewer instructions per HTTPS
+  request, 1.1% for ten HTTP/2 streams, 0.2–0.6% for the other HTTP and database cases
+  ([`bench/results/h2-idle-memory/`](../bench/results/h2-idle-memory/README.md)).
 - **"Pending" is mostly the request buffer**: 4 KiB, held while the handler runs, because
   the `Request` it was given points into it.
 - **Receive buffers are a cost per worker, not per connection**, and only as many are

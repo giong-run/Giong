@@ -2586,269 +2586,273 @@ enum Wake<R, W> {
 /// connection's place under `max_connections`, if it has one: it is marked
 /// idle while no stream is open, so that the accept loop may close it.
 ///
-/// `cfg` and `peer` are borrowed: an `async fn` keeps its arguments twice
-/// (as received, and moved into its body), and this future lives as long
-/// as the connection.
-pub(crate) async fn serve<T: Transport, H: Handler>(
-    io: &T,
-    cfg: &Config,
-    peer: &Option<SocketAddr>,
-    handler: &H,
+/// Not an `async fn`, and `cfg` and `peer` are borrowed: an `async fn`
+/// keeps its arguments twice (as received, and moved into its body), and
+/// this future lives as long as the connection.
+#[allow(clippy::manual_async_fn)]
+pub(crate) fn serve<'a, T: Transport, H: Handler>(
+    io: &'a T,
+    cfg: &'a Config,
+    peer: &'a Option<SocketAddr>,
+    handler: &'a H,
     mut input: Vec<u8>,
-    slot: Option<&crate::server::Slot>,
-) {
-    let mut s = Session::new(*cfg, *peer);
-    s.start();
-    if let Some(slot) = slot {
-        slot.allow_idle();
-    }
+    slot: Option<&'a crate::server::Slot>,
+) -> impl Future<Output = ()> + 'a {
+    async move {
+        let mut s = Session::new(*cfg, *peer);
+        s.start();
+        if let Some(slot) = slot {
+            slot.allow_idle();
+        }
 
-    // The client's preface, within the request timeout.
-    let preface_deadline = Instant::now() + cfg.request_timeout;
-    while input.len() < PREFACE.len() {
-        if !PREFACE.starts_with(&input) {
-            break;
+        // The client's preface, within the request timeout.
+        let preface_deadline = Instant::now() + cfg.request_timeout;
+        while input.len() < PREFACE.len() {
+            if !PREFACE.starts_with(&input) {
+                break;
+            }
+            let left = preface_deadline.saturating_duration_since(Instant::now());
+            // On the heap, like the write below: over TLS this receive is
+            // larger than any state of the loop that follows.
+            match HeapFuture::with(move || giong::time::timeout(left, io.recv())).await {
+                Ok(Ok(chunk)) if !chunk.is_empty() => input.extend_from_slice(&chunk),
+                _ => return,
+            }
         }
-        let left = preface_deadline.saturating_duration_since(Instant::now());
-        // On the heap, like the write below: over TLS this receive is
-        // larger than any state of the loop that follows.
-        match HeapFuture::with(move || giong::time::timeout(left, io.recv())).await {
-            Ok(Ok(chunk)) if !chunk.is_empty() => input.extend_from_slice(&chunk),
-            _ => return,
+        if !input.starts_with(PREFACE) {
+            s.fail(protocol(
+                "the connection did not start with the HTTP/2 preface",
+            ));
+            let out = mem::take(&mut s.out);
+            // On the heap: inline, this write would be kept beside every state
+            // of the connection's future, as large as the largest of them.
+            let _ = HeapFuture::with(move || {
+                giong::time::timeout(cfg.write_timeout, io.write_all(out))
+            })
+            .await;
+            return;
         }
-    }
-    if !input.starts_with(PREFACE) {
-        s.fail(protocol(
-            "the connection did not start with the HTTP/2 preface",
-        ));
-        let out = mem::take(&mut s.out);
-        // On the heap: inline, this write would be kept beside every state
-        // of the connection's future, as large as the largest of them.
-        let _ =
-            HeapFuture::with(move || giong::time::timeout(cfg.write_timeout, io.write_all(out)))
-                .await;
-        return;
-    }
-    input.drain(..PREFACE.len());
+        input.drain(..PREFACE.len());
 
-    let mut tasks: Vec<Option<HeapFuture<_>>> = Vec::new();
-    let mut traces = Traces(0);
-    let mut polls: Vec<usize> = Vec::new();
-    // Handlers woken while handlers wait for the client to take responses.
-    let mut parked: Vec<usize> = Vec::new();
-    let mut recv = pin!(Some(io.recv()));
-    let mut write = pin!(None);
-    let mut write_deadline: Option<Instant> = None;
-    // The bytes of the write in flight that count against the budget for
-    // responses (`Session::take_out`).
-    let mut writing = 0;
-    let mut timer = pin!(sleep_until(Instant::now() + cfg.idle_timeout));
-    let mut shutdown = pin!(giong::until_shutdown(std::future::pending::<()>()));
-    let mut shutting_down = false;
-    if false {
-        // Names the type of the write future for `write`.
-        write.set(Some(io.write_all(Vec::new())));
-    }
+        let mut tasks: Vec<Option<HeapFuture<_>>> = Vec::new();
+        let mut traces = Traces(0);
+        let mut polls: Vec<usize> = Vec::new();
+        // Handlers woken while handlers wait for the client to take responses.
+        let mut parked: Vec<usize> = Vec::new();
+        let mut recv = pin!(Some(io.recv()));
+        let mut write = pin!(None);
+        let mut write_deadline: Option<Instant> = None;
+        // The bytes of the write in flight that count against the budget for
+        // responses (`Session::take_out`).
+        let mut writing = 0;
+        let mut timer = pin!(sleep_until(Instant::now() + cfg.idle_timeout));
+        let mut shutdown = pin!(giong::until_shutdown(std::future::pending::<()>()));
+        let mut shutting_down = false;
+        if false {
+            // Names the type of the write future for `write`.
+            write.set(Some(io.write_all(Vec::new())));
+        }
 
-    loop {
-        // Frames received.
-        if !input.is_empty() && !s.failed() && !s.paused() {
-            let used = s.receive(&input, handler);
-            input.drain(..used);
-            if input.is_empty() && input.capacity() > 0 {
-                give_buffer(mem::take(&mut input));
-            }
-        }
-        stop_handlers(&mut s, &mut tasks, &mut traces);
-        // Handlers to start, each polled at once, so that its answer counts
-        // against the budget for responses before the next one starts.
-        while let Some((slot, req)) = s.next_start() {
-            if tasks.len() <= slot {
-                tasks.resize_with(slot + 1, || None);
-            }
-            if RequestTrace::is_on() {
-                start_trace(&mut traces, slot);
-            }
-            match catching(|| HeapFuture::with(move || handler.call(req))) {
-                Ok(task) => {
-                    tasks[slot] = Some(task);
-                    poll_handler(&mut s, &mut tasks, &mut traces, slot);
-                }
-                Err(()) => {
-                    if traces.is_some() {
-                        trace_answered(&mut traces, slot, 500);
-                    }
-                    s.handler_panicked(slot);
-                }
-            }
-            s.service(slot);
-            stop_handlers(&mut s, &mut tasks, &mut traces);
-        }
-        // Then the woken ones, unless handlers wait. A handler that sends a
-        // streamed body piece by piece is woken as soon as its piece is
-        // taken: it goes on in the same turn, for a few rounds, so that
-        // its small pieces leave in one DATA frame and one write instead
-        // of one each.
-        let mut rounds = 0;
         loop {
-            if !s.handlers_wait() {
-                polls.append(&mut parked);
+            // Frames received.
+            if !input.is_empty() && !s.failed() && !s.paused() {
+                let used = s.receive(&input, handler);
+                input.drain(..used);
+                if input.is_empty() && input.capacity() > 0 {
+                    give_buffer(mem::take(&mut input));
+                }
             }
-            polls.sort_unstable();
-            polls.dedup();
-            for slot in mem::take(&mut polls) {
-                if s.handlers_wait() {
-                    parked.push(slot);
-                } else {
-                    poll_handler(&mut s, &mut tasks, &mut traces, slot);
+            stop_handlers(&mut s, &mut tasks, &mut traces);
+            // Handlers to start, each polled at once, so that its answer counts
+            // against the budget for responses before the next one starts.
+            while let Some((slot, req)) = s.next_start() {
+                if tasks.len() <= slot {
+                    tasks.resize_with(slot + 1, || None);
+                }
+                if RequestTrace::is_on() {
+                    start_trace(&mut traces, slot);
+                }
+                match catching(|| HeapFuture::with(move || handler.call(req))) {
+                    Ok(task) => {
+                        tasks[slot] = Some(task);
+                        poll_handler(&mut s, &mut tasks, &mut traces, slot);
+                    }
+                    Err(()) => {
+                        if traces.is_some() {
+                            trace_answered(&mut traces, slot, 500);
+                        }
+                        s.handler_panicked(slot);
+                    }
                 }
                 s.service(slot);
                 stop_handlers(&mut s, &mut tasks, &mut traces);
             }
-            rounds += 1;
-            if rounds >= ROUNDS_PER_TURN
-                || s.handlers_wait()
-                || s.failed()
-                || !s.wakers.drain(&mut polls)
-            {
+            // Then the woken ones, unless handlers wait. A handler that sends a
+            // streamed body piece by piece is woken as soon as its piece is
+            // taken: it goes on in the same turn, for a few rounds, so that
+            // its small pieces leave in one DATA frame and one write instead
+            // of one each.
+            let mut rounds = 0;
+            loop {
+                if !s.handlers_wait() {
+                    polls.append(&mut parked);
+                }
+                polls.sort_unstable();
+                polls.dedup();
+                for slot in mem::take(&mut polls) {
+                    if s.handlers_wait() {
+                        parked.push(slot);
+                    } else {
+                        poll_handler(&mut s, &mut tasks, &mut traces, slot);
+                    }
+                    s.service(slot);
+                    stop_handlers(&mut s, &mut tasks, &mut traces);
+                }
+                rounds += 1;
+                if rounds >= ROUNDS_PER_TURN
+                    || s.handlers_wait()
+                    || s.failed()
+                    || !s.wakers.drain(&mut polls)
+                {
+                    break;
+                }
+            }
+            s.fill();
+            stop_handlers(&mut s, &mut tasks, &mut traces);
+
+            if write.is_none() && !s.out.is_empty() {
+                let (out, counted) = s.take_out();
+                writing = counted;
+                write.set(Some(io.write_all(out)));
+                write_deadline = Some(Instant::now() + cfg.write_timeout);
+            }
+            if s.finished() && write.is_none() {
                 break;
             }
-        }
-        s.fill();
-        stop_handlers(&mut s, &mut tasks, &mut traces);
-
-        if write.is_none() && !s.out.is_empty() {
-            let (out, counted) = s.take_out();
-            writing = counted;
-            write.set(Some(io.write_all(out)));
-            write_deadline = Some(Instant::now() + cfg.write_timeout);
-        }
-        if s.finished() && write.is_none() {
-            break;
-        }
-        let idle = write.is_none() && s.open_streams() == 0;
-        if idle {
-            // Idle: hand the buffers back, and the memory for streams once
-            // the session has (see `release_streams`).
-            s.release();
-            if !s.keeps_streams() && tasks.capacity() > 0 {
-                tasks = Vec::new();
-                traces.clear();
-            }
-        }
-        if let Some(slot) = slot {
-            slot.set_idle(idle);
-        }
-
-        // Streams woken while the others were polled: let the rest of the
-        // worker run first, then poll them.
-        if s.wakers.drain(&mut polls) {
-            giong::yield_now().await;
-            continue;
-        }
-        if (!parked.is_empty() || s.starts_waiting()) && !s.handlers_wait() {
-            // The client took enough of the responses meanwhile.
-            continue;
-        }
-
-        let deadline = [s.next_deadline(), write_deadline]
-            .into_iter()
-            .flatten()
-            .min()
-            .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
-        if timer.deadline() != deadline {
-            timer.as_mut().get_mut().reset(deadline);
-        }
-        let reading = !s.failed() && !s.paused() && !s.finished();
-        let woke = poll_fn(|cx| {
-            if let Some(w) = write.as_mut().as_pin_mut() {
-                if let Poll::Ready(done) = w.poll(cx) {
-                    return Poll::Ready(Wake::Wrote(done));
+            let idle = write.is_none() && s.open_streams() == 0;
+            if idle {
+                // Idle: hand the buffers back, and the memory for streams once
+                // the session has (see `release_streams`).
+                s.release();
+                if !s.keeps_streams() && tasks.capacity() > 0 {
+                    tasks = Vec::new();
+                    traces.clear();
                 }
             }
-            if reading {
-                if let Some(r) = recv.as_mut().as_pin_mut() {
-                    if let Poll::Ready(got) = r.poll(cx) {
-                        return Poll::Ready(Wake::Read(got));
+            if let Some(slot) = slot {
+                slot.set_idle(idle);
+            }
+
+            // Streams woken while the others were polled: let the rest of the
+            // worker run first, then poll them.
+            if s.wakers.drain(&mut polls) {
+                giong::yield_now().await;
+                continue;
+            }
+            if (!parked.is_empty() || s.starts_waiting()) && !s.handlers_wait() {
+                // The client took enough of the responses meanwhile.
+                continue;
+            }
+
+            let deadline = [s.next_deadline(), write_deadline]
+                .into_iter()
+                .flatten()
+                .min()
+                .unwrap_or_else(|| Instant::now() + Duration::from_secs(3600));
+            if timer.deadline() != deadline {
+                timer.as_mut().get_mut().reset(deadline);
+            }
+            let reading = !s.failed() && !s.paused() && !s.finished();
+            let woke = poll_fn(|cx| {
+                if let Some(w) = write.as_mut().as_pin_mut() {
+                    if let Poll::Ready(done) = w.poll(cx) {
+                        return Poll::Ready(Wake::Wrote(done));
                     }
                 }
-            }
-            if s.wakers.take(cx.waker(), &mut polls) {
-                return Poll::Ready(Wake::Streams);
-            }
-            if !shutting_down && shutdown.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Wake::Shutdown);
-            }
-            if timer.as_mut().poll(cx).is_ready() {
-                return Poll::Ready(Wake::Timer);
-            }
-            Poll::Pending
-        })
-        .await;
-        match woke {
-            Wake::Wrote((Ok(()), mut buf)) => {
-                write.set(None);
-                s.wrote(mem::take(&mut writing));
-                write_deadline = None;
-                buf.clear();
-                if s.out.is_empty() {
-                    give_buffer(mem::replace(&mut s.out, buf));
-                } else {
-                    give_buffer(buf);
+                if reading {
+                    if let Some(r) = recv.as_mut().as_pin_mut() {
+                        if let Poll::Ready(got) = r.poll(cx) {
+                            return Poll::Ready(Wake::Read(got));
+                        }
+                    }
                 }
-            }
-            Wake::Wrote((Err(_), _)) => return,
-            Wake::Read(Ok(chunk)) if !chunk.is_empty() => {
-                if input.is_empty() && !s.failed() && !s.paused() {
-                    // Frames straight from the received buffer; only a
-                    // partial frame at its end is copied.
-                    let used = s.receive(&chunk, handler);
-                    if used < chunk.len() {
+                if s.wakers.take(cx.waker(), &mut polls) {
+                    return Poll::Ready(Wake::Streams);
+                }
+                if !shutting_down && shutdown.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Wake::Shutdown);
+                }
+                if timer.as_mut().poll(cx).is_ready() {
+                    return Poll::Ready(Wake::Timer);
+                }
+                Poll::Pending
+            })
+            .await;
+            match woke {
+                Wake::Wrote((Ok(()), mut buf)) => {
+                    write.set(None);
+                    s.wrote(mem::take(&mut writing));
+                    write_deadline = None;
+                    buf.clear();
+                    if s.out.is_empty() {
+                        give_buffer(mem::replace(&mut s.out, buf));
+                    } else {
+                        give_buffer(buf);
+                    }
+                }
+                Wake::Wrote((Err(_), _)) => return,
+                Wake::Read(Ok(chunk)) if !chunk.is_empty() => {
+                    if input.is_empty() && !s.failed() && !s.paused() {
+                        // Frames straight from the received buffer; only a
+                        // partial frame at its end is copied.
+                        let used = s.receive(&chunk, handler);
+                        if used < chunk.len() {
+                            if input.capacity() == 0 {
+                                input = take_buffer();
+                            }
+                            input.extend_from_slice(&chunk[used..]);
+                        }
+                    } else {
                         if input.capacity() == 0 {
                             input = take_buffer();
                         }
-                        input.extend_from_slice(&chunk[used..]);
+                        input.extend_from_slice(&chunk);
                     }
-                } else {
-                    if input.capacity() == 0 {
-                        input = take_buffer();
+                    drop(chunk);
+                    recv.set(Some(io.recv()));
+                }
+                // The client closed its side: answer what was asked.
+                Wake::Read(Ok(_)) => {
+                    recv.set(None);
+                    s.on_eof();
+                }
+                // The connection broke.
+                Wake::Read(Err(_)) => return,
+                Wake::Streams => {}
+                Wake::Shutdown => {
+                    shutting_down = true;
+                    s.go_away();
+                }
+                Wake::Timer => {
+                    let now = Instant::now();
+                    if write_deadline.is_some_and(|d| d <= now) {
+                        // The client does not read.
+                        return;
                     }
-                    input.extend_from_slice(&chunk);
+                    s.on_timer(now);
                 }
-                drop(chunk);
-                recv.set(Some(io.recv()));
-            }
-            // The client closed its side: answer what was asked.
-            Wake::Read(Ok(_)) => {
-                recv.set(None);
-                s.on_eof();
-            }
-            // The connection broke.
-            Wake::Read(Err(_)) => return,
-            Wake::Streams => {}
-            Wake::Shutdown => {
-                shutting_down = true;
-                s.go_away();
-            }
-            Wake::Timer => {
-                let now = Instant::now();
-                if write_deadline.is_some_and(|d| d <= now) {
-                    // The client does not read.
-                    return;
-                }
-                s.on_timer(now);
             }
         }
-    }
 
-    // Every stream is finished, or the connection failed: the GOAWAY is
-    // out. Close our side, and read what is still on its way for a moment
-    // so that the client does not get a reset instead of the GOAWAY.
-    drop(tasks);
-    recv.set(None);
-    // On the heap, like the preface's receive: once per connection, and
-    // inline its states would be kept beside every state of the loop.
-    HeapFuture::with(move || close_and_linger(io, cfg.write_timeout)).await;
+        // Every stream is finished, or the connection failed: the GOAWAY is
+        // out. Close our side, and read what is still on its way for a moment
+        // so that the client does not get a reset instead of the GOAWAY.
+        drop(tasks);
+        recv.set(None);
+        // On the heap, like the preface's receive: once per connection, and
+        // inline its states would be kept beside every state of the loop.
+        HeapFuture::with(move || close_and_linger(io, cfg.write_timeout)).await;
+    }
 }
 
 /// Closes our side of the connection, and reads what is still on its way
