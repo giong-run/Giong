@@ -186,7 +186,7 @@ impl Conn {
         let connect_timeout = config.connect_timeout;
         let connect = async {
             let tcp = match &route.proxy {
-                None => TcpStream::connect((origin.host.as_str(), origin.port))
+                None => TcpStream::connect((&*origin.host, origin.port))
                     .await
                     .map_err(|e| {
                         Error::io(
@@ -275,12 +275,8 @@ impl Conn {
         // What has been received already. Over TLS this decrypts it: session
         // tickets are taken in and produce no data.
         let mut recv = pin!(self.stream.recv());
-        let waker = Waker::from(Arc::new(Noop));
-        if recv
-            .as_mut()
-            .poll(&mut Context::from_waker(&waker))
-            .is_ready()
-        {
+        let ready = NOOP.with(|waker| recv.as_mut().poll(&mut Context::from_waker(waker)));
+        if ready.is_ready() {
             // Data, the end of the stream, or an error.
             return true;
         }
@@ -523,6 +519,12 @@ async fn recv_part(
 
 /// Wakes nobody: for looking at what a stream holds without waiting.
 struct Noop;
+
+thread_local! {
+    /// A [`Noop`] waker made once per thread, not once per idle connection
+    /// checked.
+    static NOOP: Waker = Waker::from(Arc::new(Noop));
+}
 
 impl Wake for Noop {
     fn wake(self: Arc<Self>) {}

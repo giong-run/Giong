@@ -1,0 +1,5 @@
+case           A req/s   B req/s  change A user us B user us  change A cpu us B cpu us  change
+https-users      66328     67995   +2.5%     5.971     5.907   -1.1%   14.877   14.566   -2.1%
+https-json       85920     85970   +0.1%     3.147     2.941   -6.6%   11.541   11.584   +0.4%
+
+Medians of the rounds; A is the first tree, B the second.

@@ -6,3 +6,5 @@
 #
 # ISSUE  TEST NAME (a Python regular expression, matched against the whole name libtest
 #        prints under "failures:")
+482 a_write_fails_with_the_code_after_two_seconds
+483 soak

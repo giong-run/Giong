@@ -267,7 +267,7 @@ fn write_head(out: &mut Vec<u8>, req: &Request<'_>) {
     );
     Encoder::field(b":path", req.path.as_bytes(), Index::Yes, &mut block);
     for (name, value) in req.fields {
-        let index = match name.as_str() {
+        let index = match &**name {
             "authorization" | "cookie" | "proxy-authorization" => Index::Never,
             _ => Index::Yes,
         };
