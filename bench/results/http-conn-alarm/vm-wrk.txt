@@ -1,0 +1,6 @@
+before /json rps=164,250 user=0.864us sys=5.156us total=6.021us busy=1.00
+change /json rps=157,383 user=0.698us sys=5.522us total=6.221us busy=0.99
+before /json rps=150,360 user=0.895us sys=5.690us total=6.585us busy=1.00
+change /json rps=151,446 user=0.848us sys=5.641us total=6.489us busy=0.99
+before /json rps=150,746 user=0.876us sys=5.667us total=6.543us busy=1.00
+change /json rps=152,460 user=0.777us sys=5.677us total=6.454us busy=1.00

@@ -52,13 +52,13 @@ instructions per request.
 | `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,196 | 4,134 |
 | `udp-echo` | a 64-byte datagram to an echo task and back | 3,712 | 4,454 |
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 190 | 242 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 7,439 | 8,348 |
-| `http1-client` | giong-http client and server, HTTP/1.1 | 19,134 | 20,225 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 6,971 | 7,883 |
+| `http1-client` | giong-http client and server, HTTP/1.1 | 18,670 | 19,767 |
 | `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 27,555 | 28,679 |
 | `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 217,154 | 218,240 |
-| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 30,012 | 31,099 |
-| `web` | a giong-web router with a path parameter, raw client | 10,326 | 11,233 |
-| `redis-get` | giong-redis `GET` against a fake server | 7,745 | 8,522 |
+| `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 29,535 | 30,624 |
+| `web` | a giong-web router with a path parameter, raw client | 9,858 | 10,772 |
+| `redis-get` | giong-redis `GET` against a fake server | 7,723 | 8,500 |
 | `postgres-query` | giong-postgres query, one parameter, one row, fake server | 9,542 | 10,368 |
 | `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,034 | 13,861 |
 
@@ -177,10 +177,10 @@ moves bytes to the heap depending on timing, which made the heap per connection 
 
 | case | heap per connection | resident set per connection |
 |---|---:|---:|
-| `idle-http1` (io_uring / epoll) | 1,262 / 1,329 bytes | 1,356 / 1,442 bytes |
-| `idle-h2` (io_uring / epoll) | 2,510 / 2,527 bytes | 2,845 / 2,798 bytes |
-| `idle-https` (io_uring / epoll) | 5,141 / 5,158 bytes | 5,550 / 5,458 bytes |
-| `idle-h2-tls` (io_uring / epoll) | 6,389 / 6,406 bytes | 6,978 / 6,865 bytes |
+| `idle-http1` (io_uring / epoll) | 1,150 / 1,217 bytes | 1,356 / 1,442 bytes |
+| `idle-h2` (io_uring / epoll) | 2,398 / 2,415 bytes | 2,845 / 2,798 bytes |
+| `idle-https` (io_uring / epoll) | 5,029 / 5,046 bytes | 5,550 / 5,458 bytes |
+| `idle-h2-tls` (io_uring / epoll) | 6,277 / 6,294 bytes | 6,978 / 6,865 bytes |
 
 The instruction counts above were measured on a 4-vCPU Xeon VM (Linux 6.18), last on 2026-11-27,
 and are the same on CI's runners. The memory is from the CI run of the change that moved an
@@ -194,8 +194,10 @@ request needs, 2,062, 4,566 and 6,069 for the first three
 change that moved rustls to its unbuffered API, which leaves an idle connection no receive
 buffer, `idle-https` was 10,834 bytes
 ([`bench/results/tls-idle/`](../results/tls-idle/README.md)). The `idle-h2` and `idle-h2-tls`
-heap rows are 8 bytes lower since a shutdown signal holds no reference to the runtime (measured
-on the same kind of VM, 2026-11-27). What CI compares against is `baseline.csv`.
+heap rows are 8 bytes lower since a shutdown signal holds no reference to the runtime, and every
+heap row 112 bytes lower since a connection's timeouts are one alarm and the connections of a
+worker share the server's settings (both measured on the same kind of VM, 2026-11-27; the
+resident-set column is still the CI run's). What CI compares against is `baseline.csv`.
 
 ## When the check fails
 

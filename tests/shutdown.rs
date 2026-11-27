@@ -2,6 +2,7 @@
 //! tasks finish after its main future is done.
 
 use std::cell::Cell;
+use std::future::poll_fn;
 use std::io::{Read, Write};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -9,7 +10,7 @@ use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
 use giong::net::TcpListener;
-use giong::time::sleep;
+use giong::time::{sleep, Alarm, Rang};
 
 /// Sets its flag when dropped, to observe a task being torn down.
 struct OnDrop(Rc<Cell<bool>>);
@@ -123,6 +124,34 @@ fn draining_resolves_the_shutdown_signal() {
         })
         .unwrap();
     assert_eq!(released.get(), 2);
+    assert!(start.elapsed() < Duration::from_secs(5));
+}
+
+/// An armed `Alarm` (giong-http's per-connection timeouts) goes off at a
+/// shutdown, as the shutdown signal does; after it, `poll_deadline` waits
+/// for the deadline alone.
+#[test]
+fn draining_sets_off_an_armed_alarm() {
+    let rang = Rc::new(Cell::new(None));
+    let r = rang.clone();
+    let start = Instant::now();
+    with_grace(Duration::from_secs(30))
+        .block_on(async move {
+            giong::spawn(async move {
+                let mut alarm = Alarm::new();
+                let far = Instant::now() + Duration::from_secs(60);
+                let first = poll_fn(|cx| alarm.poll_until(far, cx)).await;
+                assert_eq!(first, Rang::Shutdown);
+                let linger = Instant::now() + Duration::from_millis(20);
+                let second = poll_fn(|cx| alarm.poll_deadline(linger, cx)).await;
+                assert!(Instant::now() >= linger);
+                r.set(Some((first, second)));
+            });
+            // Let the task arm its alarm first.
+            sleep(Duration::from_millis(20)).await;
+        })
+        .unwrap();
+    assert_eq!(rang.get(), Some((Rang::Shutdown, Rang::Deadline)));
     assert!(start.elapsed() < Duration::from_secs(5));
 }
 

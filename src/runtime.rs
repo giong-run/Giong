@@ -776,6 +776,11 @@ impl Worker {
         for waker in waiters {
             waker.wake();
         }
+        // An armed `time::Alarm` goes off at shutdown too.
+        let alarms = self.timers.borrow().alarm_wakers();
+        for waker in alarms {
+            waker.wake();
+        }
     }
 
     /// The event loop: run tasks → enter the kernel → fire timers → repeat.
@@ -1204,6 +1209,12 @@ impl Worker {
                 now
             }
         }
+    }
+
+    /// `true` once a [`ShutdownSignal`] polled on this worker resolves: the
+    /// runtime is shutting down, or the worker is draining its tasks.
+    pub(crate) fn shutting_down(&self) -> bool {
+        self.rt.shutdown.load(Ordering::SeqCst) || self.draining.get()
     }
 
     /// Reads the clock again and keeps the new time for the rest of the turn.
