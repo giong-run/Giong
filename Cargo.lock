@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "io-uring",
  "libc",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "giong-cli"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "giong",
  "giong-mcp",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "giong-compat"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "bytes",
  "futures-io",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "giong-grpc"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "giong",
  "giong-grpc-build",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "giong-grpc-build"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "prost",
  "prost-types",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "bytes",
  "giong",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "giong-mcp"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "giong",
  "giong-http",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "giong-mysql"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "giong",
  "giong-tls",
@@ -514,7 +514,7 @@ dependencies = [
 
 [[package]]
 name = "giong-postgres"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "giong",
  "giong-tls",
@@ -526,11 +526,11 @@ dependencies = [
 
 [[package]]
 name = "giong-proto"
-version = "1.5.2"
+version = "1.5.3"
 
 [[package]]
 name = "giong-quic"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "bytes",
  "giong",
@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "giong-redis"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "giong",
  "giong-tls",
@@ -555,7 +555,7 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "giong",
  "giong-tls",
@@ -570,7 +570,7 @@ dependencies = [
 
 [[package]]
 name = "giong-web"
-version = "1.5.2"
+version = "1.5.3"
 dependencies = [
  "giong",
  "giong-http",

@@ -1,6 +1,6 @@
 [package]
 name = "giong-quic"
-version = "1.5.2"
+version = "1.5.3"
 edition = "2021"
 # Above giong's 1.80: quinn-proto (the engine) fixes a remote memory
 # exhaustion in 0.11.15 (GHSA-4w2j-m93h-cj5j), and from that version on it
@@ -22,7 +22,7 @@ categories = ["network-programming", "asynchronous"]
 default = []
 
 [dependencies]
-giong = { path = "..", version = "1.5.2", features = ["unstable-udp-offload"] }
+giong = { path = "..", version = "1.5.3", features = ["unstable-udp-offload"] }
 quinn-proto = { version = "0.11.15", default-features = false, features = ["rustls-ring"] }
 rustls = { version = "0.23.33", default-features = false, features = ["ring", "std"] }
 bytes = "1"

@@ -113,8 +113,8 @@ Other status codes: `408` the request was too slow, `413` the body is too large,
 Turn on the `tls` feature to get `Server::serve_tls`, which uses the [`giong-tls`](../giong-tls/README.md) crate (rustls, TLS 1.2 and 1.3):
 
 ```toml
-giong-http = { version = "1.5.2", features = ["tls"] }
-giong-tls = "1.5.2"
+giong-http = { version = "1.5.3", features = ["tls"] }
+giong-tls = "1.5.3"
 ```
 
 ```rust,no_run
@@ -222,8 +222,8 @@ for the same handlers, on Linux and macOS. It needs Rust 1.85, and may change be
 stabilised; the default build does not have it.
 
 ```toml
-giong-http = { version = "1.5.2", features = ["unstable-http3", "client"] }
-giong-quic = "1.5.2"
+giong-http = { version = "1.5.3", features = ["unstable-http3", "client"] }
+giong-quic = "1.5.3"
 ```
 
 ```rust,ignore
@@ -267,7 +267,7 @@ async fn serve(tls: rustls::ServerConfig) -> std::io::Result<()> {
 The `client` feature adds an HTTP/1.1 and HTTP/2 client, `giong_http::client` (HTTPS included, through giong-tls):
 
 ```toml
-giong-http = { version = "1.5.2", features = ["client"] }
+giong-http = { version = "1.5.3", features = ["client"] }
 ```
 
 ```rust,no_run
