@@ -28,8 +28,8 @@ requests per second and MB/s, lower for CPU, memory and latency. Losses are in b
 | | result |
 |---|---|
 | Regression against 0.8.0 | giong moved −4.3% to +2.7% and giong-http −2.7% to +4.4% across 1–16 workers, while Tokio, run alongside, moved −4.6% to +2.4% (−4.0% at eight workers, where giong moved −4.3%): machine differences, no regression |
-| HTTP/2 over TLS, one core | 1.66M req/s, **4.8×** axum-tls (347k); `json-mux` 2.42M, 7.0× |
-| Idle memory per connection | HTTPS 10.92 → 5.28 KiB (**−52%** since v1.5.1), h2 over TLS 17.51 → 6.62 KiB (**−62%**), h2c 4.68 → 2.66 KiB (9× less than axum) |
+| HTTP/2 over TLS, one core | 1.66M req/s, 4.8× axum-tls (347k); `json-mux` 2.42M, 7.0× |
+| Idle memory per connection | HTTPS 10.92 → 5.28 KiB (−52% since v1.5.1), h2 over TLS 17.51 → 6.62 KiB (−62%), h2c 4.68 → 2.66 KiB (9× less than axum) |
 | A million connections | 1,000,000 held over HTTP/1.1, h2c, HTTPS and h2 over TLS, 0 errors; 1.32 / 2.55 / 5.17 / 6.46 KiB per connection on the server |
 | HTTP/3 | 396k req/s on one worker against 308k for quinn; 1.37M on four against 816k |
 | Whole-service gzip (#500) | `/users` +46% req/s, −31% CPU per request |
