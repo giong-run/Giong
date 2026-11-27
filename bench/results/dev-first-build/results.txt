@@ -1,0 +1,20 @@
+# 2026-11-27T18:28:01Z Linux 6.18.44-fc-v880, 4 CPUs, rustc 1.100.0 (0ef1bc386 2026-11-09), cargo 1.100.0 (3acc79c0c 2026-11-05), giong 1.5.4
+cargo shop: fill 0 s (0 units), first build 10.759462292 s (46 compiled), first test build 11.329020820 s (20 compiled), edit rebuild .219807090 s
+cargo billing: fill 0 s (0 units), first build 12.079897942 s (46 compiled), first test build 11.505950146 s (20 compiled), edit rebuild .227003045 s
+cargo notes: fill 0 s (0 units), first build 10.990719155 s (48 compiled), first test build 5.126962088 s (8 compiled), edit rebuild .250169209 s
+cargo orders: fill 0 s (0 units), first build 10.848981602 s (49 compiled), first test build 5.291442800 s (8 compiled), edit rebuild .256832104 s
+cargo feed: fill 0 s (0 units), first build 12.255659475 s (47 compiled), first test build 5.008082931 s (8 compiled), edit rebuild .290242818 s
+cargo search: fill 0 s (0 units), first build 14.396110763 s (75 compiled), first test build .734169524 s (3 compiled), edit rebuild .255332864 s
+cargo jobs: fill 0 s (0 units), first build 9.945489060 s (36 compiled), first test build .678872964 s (3 compiled), edit rebuild .227379771 s
+cargo mailer: fill 0 s (0 units), first build 9.462544267 s (36 compiled), first test build .610729189 s (3 compiled), edit rebuild .213611089 s
+cargo disk: 2236521382 bytes in 8 target dirs
+giong shop: fill .027005005 s (0 units), first build 12.367031520 s (46 compiled), first test build 11.533245930 s (20 compiled), edit rebuild .325674853 s
+giong billing: fill .130880831 s (70 units), first build 1.242288649 s (2 compiled), first test build 1.741609963 s (5 compiled), edit rebuild .240604457 s
+giong notes: fill .137443671 s (58 units), first build 2.309547913 s (3 compiled), first test build 1.708290887 s (5 compiled), edit rebuild .288274650 s
+giong orders: fill .115225071 s (59 units), first build 2.251422830 s (3 compiled), first test build 1.868870955 s (5 compiled), edit rebuild .263200656 s
+giong feed: fill .110445852 s (58 units), first build 3.803385406 s (5 compiled), first test build 4.948486060 s (8 compiled), edit rebuild .275731172 s
+giong search: fill .152923748 s (56 units), first build 9.082766206 s (43 compiled), first test build .718192926 s (3 compiled), edit rebuild .271912057 s
+giong jobs: fill .142116924 s (64 units), first build 2.024383424 s (3 compiled), first test build .655103556 s (3 compiled), edit rebuild .209708577 s
+giong mailer: fill .115065437 s (65 units), first build .866087330 s (2 compiled), first test build .608776873 s (3 compiled), edit rebuild .213990352 s
+giong disk: 1316209512 bytes in 8 target dirs
+EXIT 0
