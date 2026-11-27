@@ -119,6 +119,10 @@ let hash = giong::spawn_compute(move || expensive(input)).await;
 
 - **`recv()` lends a buffer from the worker's pool.** Copy what you need and drop it; do not
   hold it across an `.await`. An empty buffer means the peer closed the connection.
+- **A large message whose size you know goes straight into your own buffer** with
+  `recv_into`, after its head came through `recv()`: reserve what is still to come and call
+  it until the message is complete, instead of copying it out of 16 KiB pool buffers. A
+  1 MiB upload costs about half the CPU that way.
 - **Writes take their buffer by value and hand it back**:
   `let (result, buf) = stream.write_all(buf).await;`. Reuse `buf` for the next write.
 - **Bytes that cannot change go out without a copy.** TCP sends of 16 KiB or more from
