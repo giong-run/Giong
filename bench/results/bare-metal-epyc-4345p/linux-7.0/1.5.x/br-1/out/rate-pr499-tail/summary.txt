@@ -1,0 +1,14 @@
+Closed loop (64 connections per worker): requests/s, median over rounds (min-max), gain over one worker
+  /json   main         4 workers   1,532,788 (1,498,946-1,543,581)  x1.00  p99 281 us  2.60 us/req  server 0.96 load 0.42 3.6 Gbit/s  errors 0  [server]
+  /json   pr499        4 workers   1,615,935 (1,590,868-1,649,266)  x1.00  p99 269 us  2.47 us/req  server 0.96 load 0.45 3.8 Gbit/s  errors 0  [server]
+
+Open loop: p99 in microseconds at each offered rate (median over rounds); '!' = answered under 99% of offered
+  /json
+         req/s         main x4        pr499 x4
+       700,000             300             297
+     1,000,000             323             310
+     1,200,000         324,796         395,313
+
+Highest sustained rate: answered at least 99% of offered, with p99 at most 5 ms (medians)
+  /json   main         4 workers   1,000,000 req/s  p50 197 p99 323 p99.9 358 us  server 0.67  2.54 us/req
+  /json   pr499        4 workers   1,000,000 req/s  p50 184 p99 310 p99.9 350 us  server 0.65  2.40 us/req

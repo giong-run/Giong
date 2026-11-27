@@ -1,0 +1,4 @@
+# ab-net.sh 2026-11-27T05:07:51Z: server br-1 7.0.0-44-generic on CPUs 0-7, load from 10.40.96.4 with 16 threads, 10 s per measurement after 2 s of warm-up, 64 connections per worker
+# v1.5.1 = /root/b/bins/v151-giong-http ()
+# main = /root/b/bins/main-giong-http ()
+# pr487 = /root/b/bins/pr487-giong-http ()

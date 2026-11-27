@@ -1,0 +1,5 @@
+# h3.sh 2026-11-27T09:18:08Z: server br-1 7.0.0-44-generic on CPUs 0-7, client on 10.40.96.4 with 16 threads, 10 s per measurement after 2 s of warm-up
+# bench/h3 from 985ac45 (bench: C1M, a million held connections over HTTP/1.1, h2c, H)
+# rmem_max 4194304, wmem_max 4194304; br-2: 4194304 4194304
+# giong = /root/b/bins/h3-server-giong
+# quinn = /root/b/bins/h3-server-tokio

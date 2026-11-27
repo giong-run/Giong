@@ -46,7 +46,7 @@ The lab needs `cargo`, `python3` and `taskset`. The `loss` scenario needs root, 
 | mixed | open loop, 1 request in 20 computes for ~1 ms (`/compute?n=27`): latency of the short `/json` requests | 1, 2 cores | cloud VM |
 | overload | 1,000 connections offered 600,000 req/s: answers per second, CPU µs per answer, errors, peak memory; then 20,000 req/s again: did latency recover? | 1 core | cloud VM |
 | loss | open loop at 20,000 req/s with 0.1% and 1% of packets dropped both ways (iptables) | | root |
-| latency | delay of 1 ms ± 0.5 ms, and Pareto spikes (tc netem) | | needs sch_netem (not on the cloud VM) |
+| latency | delay of 1 ms ± 0.5 ms, and 1 ms with 10 ms of Pareto-distributed jitter for spikes (tc netem) | | needs sch_netem (not on the cloud VM) |
 | soak | hours at steady load: memory and latency drift | | `--only soak`, on a dedicated machine |
 
 When a machine cannot run a row (too few CPUs, too few file descriptors, or no netem), the lab skips it and says why.

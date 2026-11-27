@@ -1,0 +1,211 @@
+2026-11-27T04:25:12Z checkout /root/b/run = claude/project-thread-0t1y8n at eb6c41e, tree 25b9d03
+2026-11-27T04:25:15Z built lab-loadgen from /root/b/run/bench/lab/loadgen 
+2026-11-27T04:25:18Z checkout /root/b/main = main at 14e0db9, tree e99357c
+2026-11-27T04:25:36Z built main-giong-http from /root/b/main/bench/giong-http 
+2026-11-27T04:25:44Z built main-giong from /root/b/main/bench/giong 
+2026-11-27T04:25:51Z built main-tokio-raw from /root/b/main/bench/tokio-raw 
+2026-11-27T04:25:57Z built main-monoio from /root/b/main/bench/monoio 
+2026-11-27T04:26:09Z built main-axum from /root/b/main/bench/axum 
+2026-11-27T04:26:29Z built main-axum-tls from /root/b/main/bench/axum-tls 
+2026-11-27T04:26:40Z built main-giong-web from /root/b/main/bench/giong-web 
+2026-11-27T04:26:40Z built main-hold from /root/b/main/bench/hold 
+2026-11-27T04:27:03Z checkout /root/b/v151 = v1.5.1 at 7f56de7, tree 5693772
+2026-11-27T04:27:20Z built v151-giong-http from /root/b/v151/bench/giong-http 
+2026-11-27T04:27:23Z checkout /root/b/pr487 = pull/487/head at ab4a345, tree dcbdda6
+2026-11-27T04:27:41Z built pr487-giong-http from /root/b/pr487/bench/giong-http 
+2026-11-27T04:27:44Z checkout /root/b/pr429 = pull/429/head at 03b79ca, tree 1a98a94
+2026-11-27T04:27:44Z pr429: bench/giong-web binds BENCH_HOST:3011 ( 1 file changed, 1 insertion(+), 1 deletion(-))
+2026-11-27T04:27:55Z built pr429-web-miniz from /root/b/pr429/bench/giong-web 
+2026-11-27T04:28:04Z built pr429-web-fast from /root/b/pr429/bench/giong-web --features giong-web/fast-gzip
+2026-11-27T04:28:08Z checkout /root/b/pr180 = pull/180/head at ba68648, tree bed99cc
+2026-11-27T04:28:10Z checkout /root/b/pr180-base = d4cc995ca82e886bffecf10d5c7676667ce4c374 at d4cc995, tree 6f71bd3
+2026-11-27T04:28:13Z checkout /root/b/pr186 = pull/186/head at 92dccf2, tree bbfe239
+2026-11-27T04:28:28Z part reg: start
+2026-11-27T04:39:01Z reg: workers exit 0
+2026-11-27T05:07:51Z reg: uring-features exit 0
+2026-11-27T05:07:51Z part reg: done
+2026-11-27T05:07:51Z part ab: start
+2026-11-27T05:13:51Z ab-net round 1/5, 1 worker(s) done
+2026-11-27T05:19:52Z ab-net round 1/5, 4 worker(s) done
+2026-11-27T05:25:52Z ab-net round 2/5, 1 worker(s) done
+2026-11-27T05:31:53Z ab-net round 2/5, 4 worker(s) done
+2026-11-27T05:37:53Z ab-net round 3/5, 1 worker(s) done
+2026-11-27T05:43:54Z ab-net round 3/5, 4 worker(s) done
+2026-11-27T05:49:54Z ab-net round 4/5, 1 worker(s) done
+2026-11-27T05:55:54Z ab-net round 4/5, 4 worker(s) done
+2026-11-27T06:01:54Z ab-net round 5/5, 1 worker(s) done
+2026-11-27T06:07:55Z ab-net round 5/5, 4 worker(s) done
+2026-11-27T06:07:55Z part ab: done
+2026-11-27T06:07:55Z part rate: start
+2026-11-27T06:13:06Z rate round 1/3, 1 worker(s) done
+2026-11-27T06:19:21Z rate round 1/3, 2 worker(s) done
+2026-11-27T06:26:38Z rate round 1/3, 4 worker(s) done
+2026-11-27T06:34:46Z rate round 1/3, 8 worker(s) done
+2026-11-27T06:39:58Z rate round 2/3, 1 worker(s) done
+2026-11-27T06:46:12Z rate round 2/3, 2 worker(s) done
+2026-11-27T06:53:30Z rate round 2/3, 4 worker(s) done
+2026-11-27T07:01:38Z rate round 2/3, 8 worker(s) done
+2026-11-27T07:06:49Z rate round 3/3, 1 worker(s) done
+2026-11-27T07:13:03Z rate round 3/3, 2 worker(s) done
+2026-11-27T07:20:21Z rate round 3/3, 4 worker(s) done
+2026-11-27T07:28:29Z rate round 3/3, 8 worker(s) done
+2026-11-27T07:28:29Z part rate: done
+2026-11-27T07:28:29Z part gzip: start
+2026-11-27T07:31:22Z gzip round 1/6, 1 worker(s) done
+2026-11-27T07:34:10Z gzip round 1/6, 4 worker(s) done
+2026-11-27T07:36:57Z gzip round 2/6, 1 worker(s) done
+2026-11-27T07:39:45Z gzip round 2/6, 4 worker(s) done
+2026-11-27T07:42:32Z gzip round 3/6, 1 worker(s) done
+2026-11-27T07:45:20Z gzip round 3/6, 4 worker(s) done
+2026-11-27T07:48:07Z gzip round 4/6, 1 worker(s) done
+2026-11-27T07:50:55Z gzip round 4/6, 4 worker(s) done
+2026-11-27T07:53:42Z gzip round 5/6, 1 worker(s) done
+2026-11-27T07:56:30Z gzip round 5/6, 4 worker(s) done
+2026-11-27T07:59:17Z gzip round 6/6, 1 worker(s) done
+2026-11-27T08:02:05Z gzip round 6/6, 4 worker(s) done
+2026-11-27T08:02:05Z part gzip: done
+2026-11-27T08:02:05Z part h3: start
+2026-11-27T08:02:05Z part h3: done
+2026-11-27T08:02:05Z part quic: start
+2026-11-27T08:18:21Z quic exit 0
+2026-11-27T08:18:21Z part quic: done
+2026-11-27T09:16:59Z build-late: run checkout at 985ac45
+2026-11-27T09:17:17Z built h3-server-giong from /root/b/run/bench/h3 
+2026-11-27T09:17:17Z built h3-server-tokio from /root/b/run/bench/h3 
+2026-11-27T09:17:17Z built h3-client from /root/b/run/bench/h3 
+2026-11-27T09:17:29Z built c1m-hold from /root/b/run/bench/c1m 
+2026-11-27T09:17:47Z built c1m-main from /root/b/run/bench/giong-http 
+2026-11-27T09:17:57Z built c1m-pr487 from /root/b/pr487/bench/giong-http 
+2026-11-27T09:18:08Z part h3: start
+2026-11-27T09:19:38Z h3 round 1/5, 1 worker(s) done
+2026-11-27T09:21:08Z h3 round 1/5, 4 worker(s) done
+2026-11-27T09:22:38Z h3 round 2/5, 1 worker(s) done
+2026-11-27T09:24:08Z h3 round 2/5, 4 worker(s) done
+2026-11-27T09:25:38Z h3 round 3/5, 1 worker(s) done
+2026-11-27T09:27:08Z h3 round 3/5, 4 worker(s) done
+2026-11-27T09:28:38Z h3 round 4/5, 1 worker(s) done
+2026-11-27T09:30:08Z h3 round 4/5, 4 worker(s) done
+2026-11-27T09:31:38Z h3 round 5/5, 1 worker(s) done
+2026-11-27T09:33:08Z h3 round 5/5, 4 worker(s) done
+2026-11-27T09:33:08Z part h3: done
+2026-11-27T09:33:08Z part c1m: start
+2026-11-27T09:33:22Z c1m main-http1: opening 1000000 connections to ports 3100-3119
+2026-11-27T09:36:57Z c1m main-http1: main,http1,1000000,1000000,0,162.6,6152,1.39,1362,5243,5.37,3101,3.18,1000164,0,1000117,0.00,1.0018e+06,55,131,1.03685e+06,55,128,0
+2026-11-27T09:37:46Z c1m main-h2c: opening 1000000 connections to ports 3200-3219
+2026-11-27T09:40:57Z c1m main-h2c: main,h2c,1000000,1000000,0,138.1,7243,3.36,3292,7147,7.32,2965,3.04,1000163,0,1072253,0.00,1.04228e+06,54,128,1.03151e+06,54,130,0
+2026-11-27T09:41:46Z c1m main-https: opening 1000000 connections to ports 3300-3319
+2026-11-27T09:45:18Z c1m main-https: main,https,1000000,1000000,0,159.4,6274,5.31,5195,8850,9.06,2833,2.90,1000163,0,1000127,0.00,949955,59,129,951330,59,130,0
+2026-11-27T09:46:05Z c1m main-h2tls: opening 1000000 connections to ports 3400-3419
+2026-11-27T09:49:38Z c1m main-h2tls: main,h2tls,1000000,1000000,0,159.3,6278,9.68,9460,13172,13.49,3023,3.10,1000163,0,1000138,0.00,901114,60,134,941070,59,131,0
+2026-11-27T09:50:27Z c1m pr487-http1: opening 1000000 connections to ports 3500-3519
+2026-11-27T09:53:37Z c1m pr487-http1: pr487,http1,1000000,1000000,0,138.3,7233,1.32,1301,4967,5.09,2844,2.91,1000163,0,1000140,0.00,1.03669e+06,55,129,1.08137e+06,53,126,0
+2026-11-27T09:54:26Z c1m pr487-h2c: opening 1000000 connections to ports 3600-3619
+2026-11-27T09:57:40Z c1m pr487-h2c: pr487,h2c,1000000,1000000,0,141.2,7084,2.55,2498,6203,6.35,2958,3.03,1000165,0,1000149,0.00,1.04173e+06,54,129,1.03179e+06,55,129,0
+2026-11-27T09:58:28Z c1m pr487-https: opening 1000000 connections to ports 3700-3719
+2026-11-27T10:02:08Z c1m pr487-https: pr487,https,1000000,1000000,0,167.2,5980,5.17,5058,8697,8.91,3072,3.15,1000163,0,1000115,0.00,917700,60,133,954123,59,129,0
+2026-11-27T10:02:56Z c1m pr487-h2tls: opening 1000000 connections to ports 3800-3819
+2026-11-27T10:06:24Z c1m pr487-h2tls: pr487,h2tls,1000000,1000000,0,156.1,6407,6.46,6316,9943,10.18,2843,2.91,1000166,0,1000127,0.00,919886,60,132,944287,60,129,0
+2026-11-27T10:08:08Z c1m: settings restored
+2026-11-27T10:08:08Z part c1m: done
+2026-11-27T10:11:33Z gzip round 1/6, 1 worker(s) done
+2026-11-27T10:12:57Z gzip round 2/6, 1 worker(s) done
+2026-11-27T10:14:20Z gzip round 3/6, 1 worker(s) done
+2026-11-27T10:15:44Z gzip round 4/6, 1 worker(s) done
+2026-11-27T10:17:08Z gzip round 5/6, 1 worker(s) done
+2026-11-27T10:18:32Z gzip round 6/6, 1 worker(s) done
+2026-11-27T10:19:16Z local part h2: start on br-1
+2026-11-27T10:25:39Z h2 exit 0
+2026-11-27T10:25:39Z local part h2: done
+2026-11-27T10:25:39Z local part tls: start on br-1
+2026-11-27T10:30:35Z tls exit 0
+2026-11-27T10:30:35Z local part tls: done
+2026-11-27T10:30:35Z local part fs: start on br-1
+2026-11-27T10:31:31Z fs exit 0
+2026-11-27T10:31:31Z local part fs: done
+2026-11-27T10:31:31Z local part mem: start on br-1
+2026-11-27T10:32:29Z mem: tls-idle http/1.1 exit 0
+2026-11-27T10:33:27Z mem: tls-idle h2 exit 0
+2026-11-27T10:40:10Z mem: h2.sh memory at v151 exit 0
+2026-11-27T10:41:19Z mem: h2.sh memory at main exit 0
+2026-11-27T10:42:39Z mem: h2.sh memory at pr487 exit 0
+2026-11-27T10:42:39Z local part mem: done
+2026-11-27T10:42:39Z local part httpc: start on br-1
+2026-11-27T10:50:32Z httpc at v151 exit 0
+2026-11-27T10:58:23Z httpc at main exit 0
+2026-11-27T10:58:23Z local part httpc: done
+2026-11-27T10:58:23Z local part spin: start on br-1
+2026-11-27T10:58:23Z SMT off: 8 CPUs online
+2026-11-27T11:10:55Z spin blocking exit 0
+2026-11-27T11:23:19Z spin busy exit 0
+2026-11-27T11:23:19Z SMT on: 16 CPUs online
+2026-11-27T11:23:19Z local part spin: done
+2026-11-27T11:23:19Z local part placement: start on br-1
+2026-11-27T11:23:19Z SMT off: 8 CPUs online
+2026-11-27T11:27:22Z placement exit 0
+2026-11-27T11:27:22Z SMT on: 16 CPUs online
+2026-11-27T11:27:22Z local part placement: done
+2026-11-27T11:27:22Z local part lab: start on br-1
+2026-11-27T11:27:22Z SMT off: 8 CPUs online
+2026-11-27T11:43:49Z lab exit 1
+2026-11-27T11:43:49Z SMT on: 16 CPUs online
+2026-11-27T11:43:49Z local part lab: done
+2026-11-27T11:47:27Z SMT off: 8 CPUs online
+2026-11-27T11:47:27Z lab-rest try 1: --only memory,payload,mixed,overload,loss,latency --runtimes giong,giong-epoll,tokio,monoio,glommio --out /root/r15/out/lab-rest
+2026-11-27T13:23:51Z lab-rest try 1 exit 1
+2026-11-27T13:23:51Z lab-rest: failed for another reason, see lab-rest-try1.log
+2026-11-27T13:23:51Z lab-rest: finished
+2026-11-27T13:23:51Z SMT on: 16 CPUs online
+2026-11-27T14:05:37Z checkout /root/b/mainnow = main at f265c0c, tree bec9427
+2026-11-27T14:05:54Z built mainnow-giong-http from /root/b/mainnow/bench/giong-http 
+2026-11-27T14:05:57Z checkout /root/b/pr499 = pull/499/head at 97fe233, tree f9ee7bc
+2026-11-27T14:06:15Z built pr499-giong-http from /root/b/pr499/bench/giong-http 
+2026-11-27T14:06:32Z chain: rate-pr499 start
+2026-11-27T14:09:50Z rate round 1/3, 1 worker(s) done
+2026-11-27T14:14:11Z rate round 1/3, 4 worker(s) done
+2026-11-27T14:17:18Z rate round 2/3, 1 worker(s) done
+2026-11-27T14:21:39Z rate round 2/3, 4 worker(s) done
+2026-11-27T14:24:56Z rate round 3/3, 1 worker(s) done
+2026-11-27T14:29:18Z rate round 3/3, 4 worker(s) done
+2026-11-27T14:29:18Z chain: rate-pr499 exit 0
+2026-11-27T14:29:18Z chain: ab-h2-pr499 start
+2026-11-27T14:32:34Z tail-after-soak: waiting (br-1 done lines 0, br-2 1)
+2026-11-27T14:33:47Z ab-net round 1/6, 1 worker(s) done
+2026-11-27T14:38:17Z ab-net round 2/6, 1 worker(s) done
+2026-11-27T14:42:47Z ab-net round 3/6, 1 worker(s) done
+2026-11-27T14:47:16Z ab-net round 4/6, 1 worker(s) done
+2026-11-27T14:51:46Z ab-net round 5/6, 1 worker(s) done
+2026-11-27T14:56:16Z ab-net round 6/6, 1 worker(s) done
+2026-11-27T14:56:16Z chain: ab-h2-pr499 exit 0
+2026-11-27T14:56:16Z chain: soak3 started on br-2
+2026-11-27T14:56:16Z chain: soak2 started on br-1
+2026-11-27T14:56:35Z soak tls: start on CPUs 0-3,8-11 (/root/b/main/target/release/deps/soak-176aac8512931c4d)
+2026-11-27T14:57:03Z soak grpc: start on CPUs 4-7,12-15 (/root/b/main/target/release/deps/soak-1962e9795e63c2af)
+2026-11-27T16:56:37Z soak tls: exit 0: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7202.53s
+2026-11-27T16:57:06Z soak grpc: exit 0: test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 7203.29s
+2026-11-27T16:57:06Z soak: all done; 363 new kernel log lines
+2026-11-27T16:57:18Z chain: rate-pr499-tail start
+2026-11-27T16:58:48Z rate round 1/6, 4 worker(s) done
+2026-11-27T17:00:17Z rate round 2/6, 4 worker(s) done
+2026-11-27T17:01:46Z rate round 3/6, 4 worker(s) done
+2026-11-27T17:03:15Z rate round 4/6, 4 worker(s) done
+2026-11-27T17:04:45Z rate round 5/6, 4 worker(s) done
+2026-11-27T17:06:14Z rate round 6/6, 4 worker(s) done
+2026-11-27T17:06:14Z chain: rate-pr499-tail exit 0
+2026-11-27T17:06:30Z upload-ri: start
+2026-11-27T17:06:33Z checkout /root/b/ri = feat/public-recv-into at 0a104a3, tree 4b082d2
+2026-11-27T17:06:33Z SMT off: 8 CPUs
+2026-11-27T17:12:44Z lab-ri exit 0
+2026-11-27T17:15:40Z lab-ri-main exit 0
+2026-11-27T17:15:40Z SMT on: 16 CPUs
+2026-11-27T17:15:40Z upload-ri: done
+2026-11-27T17:16:03Z bisect-users: start
+2026-11-27T17:16:06Z checkout /root/b/bis-d3df66ee77ce23e367b8d64b7479e53f2718c127 = d3df66ee77ce23e367b8d64b7479e53f2718c127 at d3df66e, tree d4f770b
+2026-11-27T17:16:26Z checkout /root/b/bis-78b15cce69f14dced2b19b9c7ac90d8bfc19a7f5 = 78b15cce69f14dced2b19b9c7ac90d8bfc19a7f5 at 78b15cc, tree 59c011d
+2026-11-27T17:16:47Z checkout /root/b/bis-d81d526e1e30a0a34df3ad9534bed7a6a2f53915 = d81d526e1e30a0a34df3ad9534bed7a6a2f53915 at d81d526, tree b5de17d
+2026-11-27T17:18:21Z ab-net round 1/6, 1 worker(s) done
+2026-11-27T17:19:36Z ab-net round 2/6, 1 worker(s) done
+2026-11-27T17:20:51Z ab-net round 3/6, 1 worker(s) done
+2026-11-27T17:22:07Z ab-net round 4/6, 1 worker(s) done
+2026-11-27T17:23:22Z ab-net round 5/6, 1 worker(s) done
+2026-11-27T17:24:37Z ab-net round 6/6, 1 worker(s) done
+2026-11-27T17:24:37Z bisect-users: exit 0

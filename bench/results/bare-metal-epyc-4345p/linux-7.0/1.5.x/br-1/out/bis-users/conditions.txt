@@ -1,0 +1,6 @@
+# ab-net.sh 2026-11-27T17:17:05Z: server br-1 7.0.0-44-generic on CPUs 0-7, load from 10.40.96.4 with 16 threads, 10 s per measurement after 2 s of warm-up, 64 connections per worker
+# base = /root/b/bis-d3df66ee77ce23e367b8d64b7479e53f2718c127/bench/giong-http/target/release/bench-giong-http (d3df66e chore(release): giong 1.5.3 (#497))
+# step1 = /root/b/bis-78b15cce69f14dced2b19b9c7ac90d8bfc19a7f5/bench/giong-http/target/release/bench-giong-http (78b15cc perf(http): answer a JSON request with no allocation and 13% fewer instructions)
+# step2 = /root/b/bis-d81d526e1e30a0a34df3ad9534bed7a6a2f53915/bench/giong-http/target/release/bench-giong-http (d81d526 perf(http): one timer per connection, not one per request)
+# pr499 = /root/b/bins/pr499-giong-http ()
+# main = /root/b/bins/mainnow-giong-http ()

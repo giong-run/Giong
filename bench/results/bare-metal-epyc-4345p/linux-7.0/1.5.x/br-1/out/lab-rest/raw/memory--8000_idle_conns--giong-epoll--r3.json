@@ -1,0 +1,7 @@
+{
+ "conns": 8000,
+ "held": 8000,
+ "rss_before_kib": 2588,
+ "rss_held_kib": 75272,
+ "kib_per_conn": 9.085
+}

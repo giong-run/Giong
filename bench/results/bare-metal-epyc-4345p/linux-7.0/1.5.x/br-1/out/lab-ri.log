@@ -1,0 +1,134 @@
+== payload
+  payload {'point': 'answer 1 KB', 'runtime': 'giong', 'rps': 499850.5, 'goodput_rps': 499853.2, 'p50_us': 31.8, 'p99_us': 34.7, 'p999_us': 62.8, 'max_us': 1259.7, 'errors': 0, 'unfinished': 5, 'cpu_us_per_req': 2.001, 'payload_mb_s': 511.8, 'server_hwm_kib': 3208}
+  payload {'point': 'answer 1 KB', 'runtime': 'tokio', 'rps': 450963.3, 'goodput_rps': 450966.0, 'p50_us': 37.2, 'p99_us': 41.6, 'p999_us': 42.9, 'max_us': 1268.8, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 2.217, 'payload_mb_s': 461.8, 'server_hwm_kib': 3396}
+  payload {'point': 'answer 1 KB', 'runtime': 'giong', 'rps': 503219.7, 'goodput_rps': 503222.3, 'p50_us': 31.7, 'p99_us': 34.4, 'p999_us': 60.8, 'max_us': 78.2, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 1.987, 'payload_mb_s': 515.3, 'server_hwm_kib': 3192}
+  payload {'point': 'answer 1 KB', 'runtime': 'tokio', 'rps': 455296.3, 'goodput_rps': 455299.0, 'p50_us': 37.0, 'p99_us': 41.1, 'p999_us': 42.4, 'max_us': 61.6, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 2.196, 'payload_mb_s': 466.2, 'server_hwm_kib': 3476}
+  payload {'point': 'answer 1 KB', 'runtime': 'giong', 'rps': 483814.7, 'goodput_rps': 483817.3, 'p50_us': 33.2, 'p99_us': 35.5, 'p999_us': 36.5, 'max_us': 73.1, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 2.067, 'payload_mb_s': 495.4, 'server_hwm_kib': 3208}
+  payload {'point': 'answer 1 KB', 'runtime': 'tokio', 'rps': 453653.5, 'goodput_rps': 453656.2, 'p50_us': 37.0, 'p99_us': 41.3, 'p999_us': 42.6, 'max_us': 102.4, 'errors': 0, 'unfinished': 7, 'cpu_us_per_req': 2.204, 'payload_mb_s': 464.5, 'server_hwm_kib': 3436}
+  payload {'point': 'answer 16 KB', 'runtime': 'giong', 'rps': 345206.3, 'goodput_rps': 345209.0, 'p50_us': 46.2, 'p99_us': 49.0, 'p999_us': 77.1, 'max_us': 134.2, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 2.897, 'payload_mb_s': 5655.9, 'server_hwm_kib': 3612}
+  payload {'point': 'answer 16 KB', 'runtime': 'tokio', 'rps': 324154.5, 'goodput_rps': 324157.2, 'p50_us': 52.1, 'p99_us': 57.2, 'p999_us': 59.0, 'max_us': 100.9, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 3.085, 'payload_mb_s': 5310.9, 'server_hwm_kib': 3704}
+  payload {'point': 'answer 16 KB', 'runtime': 'giong', 'rps': 335405.7, 'goodput_rps': 335408.3, 'p50_us': 47.5, 'p99_us': 50.6, 'p999_us': 91.4, 'max_us': 108.2, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 2.981, 'payload_mb_s': 5495.3, 'server_hwm_kib': 3600}
+  payload {'point': 'answer 16 KB', 'runtime': 'tokio', 'rps': 321724.3, 'goodput_rps': 321727.0, 'p50_us': 52.6, 'p99_us': 57.7, 'p999_us': 59.3, 'max_us': 72.2, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 3.108, 'payload_mb_s': 5271.1, 'server_hwm_kib': 3628}
+  payload {'point': 'answer 16 KB', 'runtime': 'giong', 'rps': 345810.8, 'goodput_rps': 345813.5, 'p50_us': 46.2, 'p99_us': 49.3, 'p999_us': 87.8, 'max_us': 1277.1, 'errors': 0, 'unfinished': 8, 'cpu_us_per_req': 2.892, 'payload_mb_s': 5665.8, 'server_hwm_kib': 3584}
+  payload {'point': 'answer 16 KB', 'runtime': 'tokio', 'rps': 324006.7, 'goodput_rps': 324009.3, 'p50_us': 52.1, 'p99_us': 57.5, 'p999_us': 59.3, 'max_us': 1283.3, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 3.086, 'payload_mb_s': 5308.5, 'server_hwm_kib': 3752}
+  payload {'point': 'answer 64 KB', 'runtime': 'giong', 'rps': 139386.3, 'goodput_rps': 139389.0, 'p50_us': 113.4, 'p99_us': 216.6, 'p999_us': 224.8, 'max_us': 1429.6, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 7.174, 'payload_mb_s': 9134.8, 'server_hwm_kib': 5164}
+  payload {'point': 'answer 64 KB', 'runtime': 'tokio', 'rps': 145077.5, 'goodput_rps': 145080.2, 'p50_us': 117.0, 'p99_us': 125.7, 'p999_us': 128.3, 'max_us': 1335.3, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 6.893, 'payload_mb_s': 9507.8, 'server_hwm_kib': 5280}
+  payload {'point': 'answer 64 KB', 'runtime': 'giong', 'rps': 139912.3, 'goodput_rps': 139915.0, 'p50_us': 113.4, 'p99_us': 219.6, 'p999_us': 223.7, 'max_us': 234.9, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 7.147, 'payload_mb_s': 9169.3, 'server_hwm_kib': 5176}
+  payload {'point': 'answer 64 KB', 'runtime': 'tokio', 'rps': 145001.3, 'goodput_rps': 145004.0, 'p50_us': 117.0, 'p99_us': 126.2, 'p999_us': 128.3, 'max_us': 136.8, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 6.908, 'payload_mb_s': 9502.8, 'server_hwm_kib': 5228}
+  payload {'point': 'answer 64 KB', 'runtime': 'giong', 'rps': 139354.5, 'goodput_rps': 139357.2, 'p50_us': 111.4, 'p99_us': 222.7, 'p999_us': 226.8, 'max_us': 1427.6, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 7.176, 'payload_mb_s': 9132.7, 'server_hwm_kib': 5164}
+  payload {'point': 'answer 64 KB', 'runtime': 'tokio', 'rps': 144869.7, 'goodput_rps': 144872.3, 'p50_us': 117.0, 'p99_us': 126.2, 'p999_us': 128.8, 'max_us': 1328.9, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 6.903, 'payload_mb_s': 9494.2, 'server_hwm_kib': 5272}
+  payload {'point': 'answer 1024 KB', 'runtime': 'giong', 'rps': 8127.5, 'goodput_rps': 8130.2, 'p50_us': 1994.8, 'p99_us': 2093.1, 'p999_us': 2105.3, 'max_us': 4524.7, 'errors': 0, 'unfinished': 16, 'cpu_us_per_req': 122.793, 'payload_mb_s': 8522.3, 'server_hwm_kib': 36016}
+  payload {'point': 'answer 1024 KB', 'runtime': 'tokio', 'rps': 8680.7, 'goodput_rps': 8683.3, 'p50_us': 1978.4, 'p99_us': 2105.3, 'p999_us': 2138.1, 'max_us': 2237.9, 'errors': 0, 'unfinished': 15, 'cpu_us_per_req': 115.164, 'payload_mb_s': 9102.4, 'server_hwm_kib': 36120}
+  payload {'point': 'answer 1024 KB', 'runtime': 'giong', 'rps': 7803.2, 'goodput_rps': 7805.8, 'p50_us': 2052.1, 'p99_us': 2121.7, 'p999_us': 2138.1, 'max_us': 3994.0, 'errors': 0, 'unfinished': 16, 'cpu_us_per_req': 128.11, 'payload_mb_s': 8182.2, 'server_hwm_kib': 35996}
+  payload {'point': 'answer 1024 KB', 'runtime': 'tokio', 'rps': 8415.7, 'goodput_rps': 8418.3, 'p50_us': 2027.5, 'p99_us': 2154.5, 'p999_us': 2187.3, 'max_us': 3368.4, 'errors': 0, 'unfinished': 15, 'cpu_us_per_req': 118.789, 'payload_mb_s': 8824.5, 'server_hwm_kib': 36124}
+  payload {'point': 'answer 1024 KB', 'runtime': 'giong', 'rps': 7669.2, 'goodput_rps': 7671.8, 'p50_us': 2084.9, 'p99_us': 2138.1, 'p999_us': 3858.4, 'max_us': 4526.4, 'errors': 0, 'unfinished': 16, 'cpu_us_per_req': 130.348, 'payload_mb_s': 8041.7, 'server_hwm_kib': 36012}
+  payload {'point': 'answer 1024 KB', 'runtime': 'tokio', 'rps': 8419.2, 'goodput_rps': 8421.8, 'p50_us': 2019.3, 'p99_us': 2154.5, 'p999_us': 2465.8, 'max_us': 3303.0, 'errors': 0, 'unfinished': 16, 'cpu_us_per_req': 118.739, 'payload_mb_s': 8828.2, 'server_hwm_kib': 36080}
+  payload {'point': 'upload 1 KB', 'runtime': 'giong', 'rps': 495111.3, 'goodput_rps': 495114.0, 'p50_us': 32.2, 'p99_us': 34.9, 'p999_us': 36.5, 'max_us': 1241.8, 'errors': 0, 'unfinished': 8, 'cpu_us_per_req': 2.02, 'payload_mb_s': 507.0, 'server_hwm_kib': 3220}
+  payload {'point': 'upload 1 KB', 'runtime': 'tokio', 'rps': 460320.3, 'goodput_rps': 460323.0, 'p50_us': 36.5, 'p99_us': 40.6, 'p999_us': 41.9, 'max_us': 86.8, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 2.172, 'payload_mb_s': 471.4, 'server_hwm_kib': 3428}
+  payload {'point': 'upload 1 KB', 'runtime': 'giong', 'rps': 484512.2, 'goodput_rps': 484514.8, 'p50_us': 32.9, 'p99_us': 35.5, 'p999_us': 36.7, 'max_us': 79.1, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 2.06, 'payload_mb_s': 496.1, 'server_hwm_kib': 3224}
+  payload {'point': 'upload 1 KB', 'runtime': 'tokio', 'rps': 459108.0, 'goodput_rps': 459110.7, 'p50_us': 36.7, 'p99_us': 40.8, 'p999_us': 41.9, 'max_us': 1249.9, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 2.178, 'payload_mb_s': 470.1, 'server_hwm_kib': 3352}
+  payload {'point': 'upload 1 KB', 'runtime': 'giong', 'rps': 504957.2, 'goodput_rps': 504959.8, 'p50_us': 31.4, 'p99_us': 47.0, 'p999_us': 62.3, 'max_us': 1285.9, 'errors': 0, 'unfinished': 7, 'cpu_us_per_req': 1.98, 'payload_mb_s': 517.1, 'server_hwm_kib': 3196}
+  payload {'point': 'upload 1 KB', 'runtime': 'tokio', 'rps': 461364.2, 'goodput_rps': 461366.8, 'p50_us': 36.5, 'p99_us': 40.6, 'p999_us': 41.9, 'max_us': 1266.4, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 2.164, 'payload_mb_s': 472.4, 'server_hwm_kib': 3372}
+  payload {'point': 'upload 64 KB', 'runtime': 'giong', 'rps': 170698.0, 'goodput_rps': 170700.7, 'p50_us': 115.5, 'p99_us': 137.7, 'p999_us': 155.1, 'max_us': 158.3, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 5.868, 'payload_mb_s': 11186.9, 'server_hwm_kib': 5688}
+  payload {'point': 'upload 64 KB', 'runtime': 'tokio', 'rps': 229409.3, 'goodput_rps': 229412.0, 'p50_us': 73.5, 'p99_us': 80.6, 'p999_us': 82.7, 'max_us': 91.7, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 4.352, 'payload_mb_s': 15034.6, 'server_hwm_kib': 4576}
+  payload {'point': 'upload 64 KB', 'runtime': 'giong', 'rps': 171917.7, 'goodput_rps': 171920.3, 'p50_us': 125.2, 'p99_us': 142.8, 'p999_us': 143.9, 'max_us': 148.4, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 5.817, 'payload_mb_s': 11266.8, 'server_hwm_kib': 5860}
+  payload {'point': 'upload 64 KB', 'runtime': 'tokio', 'rps': 229982.3, 'goodput_rps': 229985.0, 'p50_us': 73.5, 'p99_us': 80.6, 'p999_us': 82.7, 'max_us': 96.5, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 4.348, 'payload_mb_s': 15072.1, 'server_hwm_kib': 4568}
+  payload {'point': 'upload 64 KB', 'runtime': 'giong', 'rps': 182611.7, 'goodput_rps': 182614.3, 'p50_us': 89.9, 'p99_us': 94.5, 'p999_us': 95.5, 'max_us': 105.4, 'errors': 0, 'unfinished': 11, 'cpu_us_per_req': 5.476, 'payload_mb_s': 11967.6, 'server_hwm_kib': 5760}
+  payload {'point': 'upload 64 KB', 'runtime': 'tokio', 'rps': 230583.3, 'goodput_rps': 230586.0, 'p50_us': 73.0, 'p99_us': 80.6, 'p999_us': 82.7, 'max_us': 105.3, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 4.337, 'payload_mb_s': 15111.5, 'server_hwm_kib': 4644}
+  payload {'point': 'upload 1024 KB', 'runtime': 'giong', 'rps': 16711.5, 'goodput_rps': 16714.2, 'p50_us': 956.4, 'p99_us': 976.9, 'p999_us': 1298.4, 'max_us': 1639.8, 'errors': 0, 'unfinished': 13, 'cpu_us_per_req': 59.829, 'payload_mb_s': 17523.3, 'server_hwm_kib': 22500}
+  payload {'point': 'upload 1024 KB', 'runtime': 'tokio', 'rps': 16485.2, 'goodput_rps': 16487.8, 'p50_us': 927.7, 'p99_us': 1724.4, 'p999_us': 2121.7, 'max_us': 3718.3, 'errors': 0, 'unfinished': 10, 'cpu_us_per_req': 60.651, 'payload_mb_s': 17286.0, 'server_hwm_kib': 20108}
+  payload {'point': 'upload 1024 KB', 'runtime': 'giong', 'rps': 16260.0, 'goodput_rps': 16262.7, 'p50_us': 985.1, 'p99_us': 1005.6, 'p999_us': 1026.0, 'max_us': 1873.7, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 61.49, 'payload_mb_s': 17049.8, 'server_hwm_kib': 23508}
+  payload {'point': 'upload 1024 KB', 'runtime': 'tokio', 'rps': 16545.0, 'goodput_rps': 16547.7, 'p50_us': 927.7, 'p99_us': 1749.0, 'p999_us': 2187.3, 'max_us': 4634.4, 'errors': 0, 'unfinished': 11, 'cpu_us_per_req': 60.431, 'payload_mb_s': 17348.7, 'server_hwm_kib': 20072}
+  payload {'point': 'upload 1024 KB', 'runtime': 'giong', 'rps': 16395.8, 'goodput_rps': 16398.5, 'p50_us': 972.8, 'p99_us': 1224.7, 'p999_us': 1380.4, 'max_us': 1800.8, 'errors': 0, 'unfinished': 9, 'cpu_us_per_req': 60.981, 'payload_mb_s': 17192.2, 'server_hwm_kib': 22484}
+  payload {'point': 'upload 1024 KB', 'runtime': 'tokio', 'rps': 16521.3, 'goodput_rps': 16524.0, 'p50_us': 927.7, 'p99_us': 1749.0, 'p999_us': 2203.6, 'max_us': 3590.2, 'errors': 0, 'unfinished': 13, 'cpu_us_per_req': 60.518, 'payload_mb_s': 17323.8, 'server_hwm_kib': 20200}
+# Benchmark lab results
+
+Medians of all rounds (min to max in brackets). For each point, **bold** marks the best
+runtime on that metric; the last column says whether giong (io_uring) is ahead, level
+(within 3%) or behind the best of the others. Raw data: `raw.csv` and `raw/`.
+
+On a shared cloud VM the tail (p99.9) moves by several times between rounds, as the
+ranges show: a single stall of the VM lands there. Treat tail rows from a cloud VM as
+indicative and decide on a bare-metal run.
+
+## Where giong stands
+
+| scenario | point | metric | giong | best other | ratio | |
+|---|---|---|---:|---|---:|---|
+| payload | answer 1 KB | payload_mb_s | 511.8 | tokio 464.5 | 1.10 | ahead |
+| payload | answer 16 KB | payload_mb_s | 5,655.9 | tokio 5,308.5 | 1.07 | ahead |
+| payload | answer 64 KB | payload_mb_s | 9,134.8 | tokio 9,502.8 | 0.96 | behind |
+| payload | answer 1024 KB | payload_mb_s | 8,182.2 | tokio 8,828.2 | 0.93 | behind |
+| payload | upload 1 KB | payload_mb_s | 507.0 | tokio 471.4 | 1.08 | ahead |
+| payload | upload 64 KB | payload_mb_s | 11,266.8 | tokio 15,072.1 | 0.75 | behind |
+| payload | upload 1024 KB | payload_mb_s | 17,192.2 | tokio 17,323.8 | 0.99 | level |
+
+Higher is better for req/s and MB/s, lower for latency and memory.
+
+## payload: answer 1 KB
+
+| runtime | req/s | p50 us | p99 us | p99.9 us | CPU us/req | payload MB/s | peak KiB | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| giong | **499,850 (483,815 to 503,220)** | **31.8 (31.7 to 33.2)** | **34.7 (34.4 to 35.5)** | 60.8 (36.5 to 62.8) | **2.0 (2.0 to 2.1)** | **512 (495 to 515)** | **3,208 (3,192 to 3,208)** | 0.0 |
+| tokio | 453,654 (450,963 to 455,296) | 37.0 (37.0 to 37.2) | 41.3 (41.1 to 41.6) | **42.6 (42.4 to 42.9)** | 2.2 (2.2 to 2.2) | 464 (462 to 466) | 3,436 (3,396 to 3,476) | 0.0 |
+
+## payload: answer 16 KB
+
+| runtime | req/s | p50 us | p99 us | p99.9 us | CPU us/req | payload MB/s | peak KiB | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| giong | **345,206 (335,406 to 345,811)** | **46.2 (46.2 to 47.5)** | **49.3 (49.0 to 50.6)** | 87.8 (77.1 to 91.4) | **2.9 (2.9 to 3.0)** | **5,656 (5,495 to 5,666)** | **3,600 (3,584 to 3,612)** | 0.0 |
+| tokio | 324,007 (321,724 to 324,154) | 52.1 (52.1 to 52.6) | 57.5 (57.2 to 57.7) | **59.3 (59.0 to 59.3)** | 3.1 (3.1 to 3.1) | 5,308 (5,271 to 5,311) | 3,704 (3,628 to 3,752) | 0.0 |
+
+## payload: answer 64 KB
+
+| runtime | req/s | p50 us | p99 us | p99.9 us | CPU us/req | payload MB/s | peak KiB | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| giong | 139,386 (139,354 to 139,912) | **113 (111 to 113)** | 220 (217 to 223) | 225 (224 to 227) | 7.2 (7.1 to 7.2) | 9,135 (9,133 to 9,169) | **5,164 (5,164 to 5,176)** | 0.0 |
+| tokio | **145,001 (144,870 to 145,078)** | 117 | **126 (126 to 126)** | **128 (128 to 129)** | **6.9 (6.9 to 6.9)** | **9,503 (9,494 to 9,508)** | 5,272 (5,228 to 5,280) | 0.0 |
+
+## payload: answer 1024 KB
+
+| runtime | req/s | p50 us | p99 us | p99.9 us | CPU us/req | payload MB/s | peak KiB | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| giong | 7,803 (7,669 to 8,128) | 2,052 (1,995 to 2,085) | **2,122 (2,093 to 2,138)** | **2,138 (2,105 to 3,858)** | 128 (123 to 130) | 8,182 (8,042 to 8,522) | **36,012 (35,996 to 36,016)** | 0.0 |
+| tokio | **8,419 (8,416 to 8,681)** | **2,019 (1,978 to 2,028)** | 2,154 (2,105 to 2,154) | 2,187 (2,138 to 2,466) | **119 (115 to 119)** | **8,828 (8,824 to 9,102)** | 36,120 (36,080 to 36,124) | 0.0 |
+
+## payload: upload 1 KB
+
+| runtime | req/s | p50 us | p99 us | p99.9 us | CPU us/req | payload MB/s | peak KiB | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| giong | **495,111 (484,512 to 504,957)** | **32.2 (31.4 to 32.9)** | **35.5 (34.9 to 47.0)** | **36.7 (36.5 to 62.3)** | **2.0 (2.0 to 2.1)** | **507 (496 to 517)** | **3,220 (3,196 to 3,224)** | 0.0 |
+| tokio | 460,320 (459,108 to 461,364) | 36.5 (36.5 to 36.7) | 40.6 (40.6 to 40.8) | 41.9 | 2.2 (2.2 to 2.2) | 471 (470 to 472) | 3,372 (3,352 to 3,428) | 0.0 |
+
+## payload: upload 64 KB
+
+| runtime | req/s | p50 us | p99 us | p99.9 us | CPU us/req | payload MB/s | peak KiB | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| giong | 171,918 (170,698 to 182,612) | 116 (90 to 125) | 138 (94 to 143) | 144 (96 to 155) | 5.8 (5.5 to 5.9) | 11,267 (11,187 to 11,968) | 5,760 (5,688 to 5,860) | 0.0 |
+| tokio | **229,982 (229,409 to 230,583)** | **73.5 (73.0 to 73.5)** | **80.6** | **82.7** | **4.3 (4.3 to 4.4)** | **15,072 (15,035 to 15,112)** | **4,576 (4,568 to 4,644)** | 0.0 |
+
+## payload: upload 1024 KB
+
+| runtime | req/s | p50 us | p99 us | p99.9 us | CPU us/req | payload MB/s | peak KiB | errors |
+|---|---:|---:|---:|---:|---:|---:|---:|---:|
+| giong | 16,396 (16,260 to 16,712) | 973 (956 to 985) | **1,006 (977 to 1,225)** | **1,298 (1,026 to 1,380)** | 61.0 (59.8 to 61.5) | 17,192 (17,050 to 17,523) | 22,500 (22,484 to 23,508) | 0.0 |
+| tokio | **16,521 (16,485 to 16,545)** | **928** | 1,749 (1,724 to 1,749) | 2,187 (2,122 to 2,204) | **60.5 (60.4 to 60.7)** | **17,324 (17,286 to 17,349)** | **20,108 (20,072 to 20,200)** | 0.0 |
+
+## The matrix
+
+| scenario | rows | where |
+|---|---|---|
+| cores | 1 core | cloud |
+| cores | 2 cores | cloud |
+| cores | 4, 8, 16+ cores | bare-metal (needs 2N CPUs: N for the server, N for the load) |
+| conns | 100, 1k, 8k connections | cloud (the VM allows 20,000 file descriptors) |
+| conns | 30k, 100k connections | bare-metal (needs 2N file descriptors) |
+| memory | 1k, 8k idle connections | cloud |
+| memory | 30k, 100k idle connections | bare-metal (needs 2N file descriptors) |
+| payload | answers 1 KB, 16 KB, 64 KB, 1 MB; uploads 1 KB, 64 KB, 1 MB | cloud |
+| mixed | 5% compute (~1 ms) among /json, 1 and 2 cores | cloud |
+| overload | open loop past capacity, then recovery | cloud |
+| loss | 0.1% and 1% packet loss | root (iptables) |
+| latency | delay 1 ms +- 0.5 ms, spikes | netem (not on the cloud VM: no sch_netem) |
+| soak | hours at steady load | bare-metal or a dedicated VM (long) |
+

@@ -1,0 +1,9 @@
+base: base; medians over rounds (min-max); change against the base
+workers case            build           req/s (min-max)              change   p50 us   p99 us  us/req  change srv busy  load errors  limited by
+      1 http:users      base          109,618 108,779-111,340                    582      736    9.12             0.97  0.06      0  server
+      1 http:users      step1         111,238 110,831-112,910         +1.5%      572      768    9.00   -1.4%     0.97  0.06      0  server
+      1 http:users      step2         112,105 110,021-112,825         +2.3%      568      764    8.92   -2.2%     0.97  0.06      0  server
+      1 http:users      pr499         111,456 110,868-112,229         +1.7%      572      763    8.98   -1.6%     0.97  0.06      0  server
+      1 http:users      main          110,768 109,859-111,124         +1.0%      576      762    9.03   -1.0%     0.97  0.06      0  server
+
+p99 is '-' for h2load cases (h2load reports a mean, shown as p50).

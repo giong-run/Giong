@@ -1,5 +1,7 @@
 # Scripts of the 1.5.x bare-metal run
 
+The results of the run, with its raw data, are in `../1.5.x/`.
+
 Two identical Vultr bare-metal machines on Ubuntu 24.04 with a private network between them: br-1 runs the servers, br-2 the load generators. Every script logs to `/root/r15/` on its machine and writes results to `/root/r15/out/<part>/` (raw data, conditions, a summary).
 
 ## Order

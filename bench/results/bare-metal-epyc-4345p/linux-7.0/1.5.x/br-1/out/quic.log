@@ -1,0 +1,82 @@
+round 1 rr quinn x1: req_s=701473 gbit_s=0.561 p50_us=177 p99_us=305 srv_cpu_pct=98.7 srv_us_per_req=1.41 srv_ns_per_kib=14407.0 cli_cpu_pct=564.6 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=650
+round 1 rr quinn x4: req_s=683475 gbit_s=0.547 p50_us=182 p99_us=322 srv_cpu_pct=99.4 srv_us_per_req=1.45 srv_ns_per_kib=14891.7 cli_cpu_pct=543.4 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=980
+round 1 rr giong x1: req_s=497892 gbit_s=0.398 p50_us=105 p99_us=263 srv_cpu_pct=61.9 srv_us_per_req=1.24 srv_ns_per_kib=12729.6 cli_cpu_pct=416.1 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=808
+round 1 rr giong x4: req_s=676275 gbit_s=0.541 p50_us=100 p99_us=254 srv_cpu_pct=90.5 srv_us_per_req=1.34 srv_ns_per_kib=13702.0 cli_cpu_pct=561.2 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=1368
+round 1 rr giong-epoll x1: req_s=551915 gbit_s=0.442 p50_us=113 p99_us=267 srv_cpu_pct=65.4 srv_us_per_req=1.18 srv_ns_per_kib=12132.8 cli_cpu_pct=452.4 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=382
+round 1 rr giong-epoll x4: req_s=633500 gbit_s=0.507 p50_us=106 p99_us=255 srv_cpu_pct=86.1 srv_us_per_req=1.36 srv_ns_per_kib=13916.2 cli_cpu_pct=520.3 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=217
+round 1 bulk quinn x1: req_s=111 gbit_s=14.952 p50_us=34368 p99_us=47600 srv_cpu_pct=88.9 srv_us_per_req=7980.25 srv_ns_per_kib=487.1 cli_cpu_pct=111.9 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=160
+round 1 bulk quinn x4: req_s=119 gbit_s=15.958 p50_us=32929 p99_us=41348 srv_cpu_pct=93.8 srv_us_per_req=7888.98 srv_ns_per_kib=481.5 cli_cpu_pct=137.3 errors=0 cli_lost_packets=88 cli_congestion_events=2 cli_max_rtt_us=297
+round 1 bulk giong x1: req_s=80 gbit_s=10.750 p50_us=47820 p99_us=88361 srv_cpu_pct=80.9 srv_us_per_req=10099.88 srv_ns_per_kib=616.4 cli_cpu_pct=102.6 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=141
+round 1 bulk giong x4: req_s=115 gbit_s=15.434 p50_us=33313 p99_us=58069 srv_cpu_pct=110.6 srv_us_per_req=9617.39 srv_ns_per_kib=587.0 cli_cpu_pct=138.8 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=111
+round 1 bulk giong-epoll x1: req_s=65 gbit_s=8.764 p50_us=61014 p99_us=83943 srv_cpu_pct=69.7 srv_us_per_req=10673.81 srv_ns_per_kib=651.5 cli_cpu_pct=90.2 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=136
+round 1 bulk giong-epoll x4: req_s=104 gbit_s=13.998 p50_us=39536 p99_us=62602 srv_cpu_pct=106.7 srv_us_per_req=10230.11 srv_ns_per_kib=624.4 cli_cpu_pct=139.9 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=157
+round 1 many quinn x1: req_s=329215 gbit_s=2.697 p50_us=1704 p99_us=29793 srv_cpu_pct=100.0 srv_us_per_req=3.04 srv_ns_per_kib=3037.5 cli_cpu_pct=280.1 errors=0 cli_lost_packets=452051 cli_congestion_events=171122 cli_max_rtt_us=497
+round 1 many quinn x4: req_s=335853 gbit_s=2.751 p50_us=1821 p99_us=29766 srv_cpu_pct=100.1 srv_us_per_req=2.98 srv_ns_per_kib=2980.3 cli_cpu_pct=280.7 errors=0 cli_lost_packets=575060 cli_congestion_events=207725 cli_max_rtt_us=506
+round 1 many giong x1: req_s=440434 gbit_s=3.608 p50_us=548 p99_us=55206 srv_cpu_pct=100.0 srv_us_per_req=2.27 srv_ns_per_kib=2270.4 cli_cpu_pct=345.3 errors=0 cli_lost_packets=332357 cli_congestion_events=133990 cli_max_rtt_us=1803
+round 1 many giong x4: req_s=1370860 gbit_s=11.230 p50_us=296 p99_us=1897 srv_cpu_pct=345.4 srv_us_per_req=2.52 srv_ns_per_kib=2519.5 cli_cpu_pct=1025.0 errors=0 cli_lost_packets=166529 cli_congestion_events=59892 cli_max_rtt_us=1747
+round 1 many giong-epoll x1: req_s=439806 gbit_s=3.603 p50_us=609 p99_us=33844 srv_cpu_pct=99.9 srv_us_per_req=2.27 srv_ns_per_kib=2271.2 cli_cpu_pct=333.7 errors=0 cli_lost_packets=500113 cli_congestion_events=194786 cli_max_rtt_us=2655
+round 1 many giong-epoll x4: req_s=1449353 gbit_s=11.873 p50_us=352 p99_us=1520 srv_cpu_pct=347.0 srv_us_per_req=2.39 srv_ns_per_kib=2394.1 cli_cpu_pct=1033.9 errors=0 cli_lost_packets=150958 cli_congestion_events=52014 cli_max_rtt_us=2179
+round 2 rr quinn x1: req_s=679838 gbit_s=0.544 p50_us=184 p99_us=315 srv_cpu_pct=99.4 srv_us_per_req=1.46 srv_ns_per_kib=14971.0 cli_cpu_pct=545.8 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=724
+round 2 rr quinn x4: req_s=693213 gbit_s=0.555 p50_us=178 p99_us=336 srv_cpu_pct=98.8 srv_us_per_req=1.43 srv_ns_per_kib=14593.6 cli_cpu_pct=559.7 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=588
+round 2 rr giong x1: req_s=385843 gbit_s=0.309 p50_us=108 p99_us=270 srv_cpu_pct=46.4 srv_us_per_req=1.20 srv_ns_per_kib=12314.1 cli_cpu_pct=321.1 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=340
+round 2 rr giong x4: req_s=372654 gbit_s=0.298 p50_us=108 p99_us=272 srv_cpu_pct=48.2 srv_us_per_req=1.29 srv_ns_per_kib=13244.6 cli_cpu_pct=318.4 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=367
+round 2 rr giong-epoll x1: req_s=623112 gbit_s=0.498 p50_us=115 p99_us=265 srv_cpu_pct=70.4 srv_us_per_req=1.13 srv_ns_per_kib=11568.6 cli_cpu_pct=504.1 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=700
+round 2 rr giong-epoll x4: req_s=611276 gbit_s=0.489 p50_us=112 p99_us=262 srv_cpu_pct=77.4 srv_us_per_req=1.27 srv_ns_per_kib=12965.6 cli_cpu_pct=494.1 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=387
+round 2 bulk quinn x1: req_s=111 gbit_s=14.844 p50_us=34841 p99_us=50133 srv_cpu_pct=86.5 srv_us_per_req=7820.98 srv_ns_per_kib=477.4 cli_cpu_pct=111.8 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=455
+round 2 bulk quinn x4: req_s=114 gbit_s=15.247 p50_us=33734 p99_us=48687 srv_cpu_pct=90.3 srv_us_per_req=7948.94 srv_ns_per_kib=485.2 cli_cpu_pct=120.1 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=158
+round 2 bulk giong x1: req_s=78 gbit_s=10.496 p50_us=48931 p99_us=95360 srv_cpu_pct=78.1 srv_us_per_req=9987.21 srv_ns_per_kib=609.6 cli_cpu_pct=98.4 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=118
+round 2 bulk giong x4: req_s=115 gbit_s=15.380 p50_us=32513 p99_us=61875 srv_cpu_pct=113.0 srv_us_per_req=9860.38 srv_ns_per_kib=601.8 cli_cpu_pct=143.9 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=116
+round 2 bulk giong-epoll x1: req_s=67 gbit_s=8.952 p50_us=59435 p99_us=85210 srv_cpu_pct=69.4 srv_us_per_req=10404.80 srv_ns_per_kib=635.1 cli_cpu_pct=90.4 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=148
+round 2 bulk giong-epoll x4: req_s=68 gbit_s=9.126 p50_us=58362 p99_us=86437 srv_cpu_pct=70.4 srv_us_per_req=10352.94 srv_ns_per_kib=631.9 cli_cpu_pct=92.2 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=130
+round 2 many quinn x1: req_s=336091 gbit_s=2.753 p50_us=1743 p99_us=29786 srv_cpu_pct=100.0 srv_us_per_req=2.98 srv_ns_per_kib=2975.3 cli_cpu_pct=281.7 errors=0 cli_lost_packets=564296 cli_congestion_events=202721 cli_max_rtt_us=532
+round 2 many quinn x4: req_s=346651 gbit_s=2.840 p50_us=1691 p99_us=29664 srv_cpu_pct=100.0 srv_us_per_req=2.88 srv_ns_per_kib=2884.5 cli_cpu_pct=290.4 errors=0 cli_lost_packets=445579 cli_congestion_events=162797 cli_max_rtt_us=477
+round 2 many giong x1: req_s=418997 gbit_s=3.432 p50_us=581 p99_us=55200 srv_cpu_pct=100.1 srv_us_per_req=2.39 srv_ns_per_kib=2388.8 cli_cpu_pct=329.1 errors=0 cli_lost_packets=421534 cli_congestion_events=167252 cli_max_rtt_us=1426
+round 2 many giong x4: req_s=1564773 gbit_s=12.819 p50_us=289 p99_us=1075 srv_cpu_pct=373.7 srv_us_per_req=2.39 srv_ns_per_kib=2388.0 cli_cpu_pct=1173.4 errors=0 cli_lost_packets=138624 cli_congestion_events=50666 cli_max_rtt_us=1726
+round 2 many giong-epoll x1: req_s=460101 gbit_s=3.769 p50_us=590 p99_us=54818 srv_cpu_pct=99.9 srv_us_per_req=2.17 srv_ns_per_kib=2171.2 cli_cpu_pct=346.5 errors=0 cli_lost_packets=385258 cli_congestion_events=152764 cli_max_rtt_us=4521
+round 2 many giong-epoll x4: req_s=1474840 gbit_s=12.082 p50_us=366 p99_us=771 srv_cpu_pct=343.4 srv_us_per_req=2.33 srv_ns_per_kib=2328.1 cli_cpu_pct=1051.6 errors=0 cli_lost_packets=103221 cli_congestion_events=34564 cli_max_rtt_us=1293
+round 3 rr quinn x1: req_s=680349 gbit_s=0.544 p50_us=183 p99_us=319 srv_cpu_pct=98.2 srv_us_per_req=1.44 srv_ns_per_kib=14779.5 cli_cpu_pct=548.4 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=453
+round 3 rr quinn x4: req_s=676564 gbit_s=0.541 p50_us=184 p99_us=325 srv_cpu_pct=99.5 srv_us_per_req=1.47 srv_ns_per_kib=15059.5 cli_cpu_pct=546.8 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=829
+round 3 rr giong x1: req_s=679603 gbit_s=0.544 p50_us=110 p99_us=260 srv_cpu_pct=75.4 srv_us_per_req=1.11 srv_ns_per_kib=11360.0 cli_cpu_pct=554.7 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=925
+round 3 rr giong x4: req_s=511924 gbit_s=0.410 p50_us=91 p99_us=254 srv_cpu_pct=72.2 srv_us_per_req=1.41 srv_ns_per_kib=14441.4 cli_cpu_pct=432.2 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=658
+round 3 rr giong-epoll x1: req_s=749273 gbit_s=0.599 p50_us=123 p99_us=270 srv_cpu_pct=83.4 srv_us_per_req=1.11 srv_ns_per_kib=11397.5 cli_cpu_pct=574.4 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=509
+round 3 rr giong-epoll x4: req_s=211974 gbit_s=0.170 p50_us=105 p99_us=26332 srv_cpu_pct=32.3 srv_us_per_req=1.52 srv_ns_per_kib=15603.0 cli_cpu_pct=180.5 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=287
+round 3 bulk quinn x1: req_s=106 gbit_s=14.214 p50_us=35877 p99_us=54572 srv_cpu_pct=84.2 srv_us_per_req=7950.90 srv_ns_per_kib=485.3 cli_cpu_pct=106.5 errors=0 cli_lost_packets=8 cli_congestion_events=0 cli_max_rtt_us=201
+round 3 bulk quinn x4: req_s=125 gbit_s=16.844 p50_us=31290 p99_us=39945 srv_cpu_pct=95.3 srv_us_per_req=7593.63 srv_ns_per_kib=463.5 cli_cpu_pct=129.3 errors=0 cli_lost_packets=2 cli_congestion_events=0 cli_max_rtt_us=276
+round 3 bulk giong x1: req_s=62 gbit_s=8.388 p50_us=61853 p99_us=110782 srv_cpu_pct=62.0 srv_us_per_req=9920.00 srv_ns_per_kib=605.5 cli_cpu_pct=84.3 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=159
+round 3 bulk giong x4: req_s=144 gbit_s=19.368 p50_us=27258 p99_us=40995 srv_cpu_pct=136.2 srv_us_per_req=9438.67 srv_ns_per_kib=576.1 cli_cpu_pct=186.9 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=143
+round 3 bulk giong-epoll x1: req_s=69 gbit_s=9.314 p50_us=55313 p99_us=89146 srv_cpu_pct=72.1 srv_us_per_req=10389.05 srv_ns_per_kib=634.1 cli_cpu_pct=92.1 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=145
+round 3 bulk giong-epoll x4: req_s=127 gbit_s=17.072 p50_us=30724 p99_us=49802 srv_cpu_pct=128.6 srv_us_per_req=10110.06 srv_ns_per_kib=617.1 cli_cpu_pct=167.9 errors=0 cli_lost_packets=0 cli_congestion_events=0 cli_max_rtt_us=128
+round 3 many quinn x1: req_s=327467 gbit_s=2.683 p50_us=1823 p99_us=29891 srv_cpu_pct=100.1 srv_us_per_req=3.06 srv_ns_per_kib=3056.6 cli_cpu_pct=276.5 errors=0 cli_lost_packets=551364 cli_congestion_events=200013 cli_max_rtt_us=548
+round 3 many quinn x4: req_s=341149 gbit_s=2.795 p50_us=1776 p99_us=29737 srv_cpu_pct=100.1 srv_us_per_req=2.93 srv_ns_per_kib=2934.2 cli_cpu_pct=288.5 errors=0 cli_lost_packets=600250 cli_congestion_events=213762 cli_max_rtt_us=491
+round 3 many giong x1: req_s=428918 gbit_s=3.514 p50_us=568 p99_us=55099 srv_cpu_pct=100.1 srv_us_per_req=2.33 srv_ns_per_kib=2333.6 cli_cpu_pct=336.1 errors=0 cli_lost_packets=417632 cli_congestion_events=165989 cli_max_rtt_us=1855
+round 3 many giong x4: req_s=1502973 gbit_s=12.312 p50_us=303 p99_us=974 srv_cpu_pct=380.1 srv_us_per_req=2.53 srv_ns_per_kib=2528.9 cli_cpu_pct=1133.5 errors=0 cli_lost_packets=80932 cli_congestion_events=30293 cli_max_rtt_us=2496
+round 3 many giong-epoll x1: req_s=421757 gbit_s=3.455 p50_us=585 p99_us=55229 srv_cpu_pct=99.8 srv_us_per_req=2.37 srv_ns_per_kib=2366.2 cli_cpu_pct=318.6 errors=0 cli_lost_packets=442643 cli_congestion_events=170908 cli_max_rtt_us=2316
+round 3 many giong-epoll x4: req_s=1398326 gbit_s=11.455 p50_us=348 p99_us=1684 srv_cpu_pct=330.9 srv_us_per_req=2.37 srv_ns_per_kib=2366.3 cli_cpu_pct=994.4 errors=0 cli_lost_packets=161812 cli_congestion_events=57511 cli_max_rtt_us=1849
+median of rounds (min-max in brackets)
+
+rr
+server                                 req_s                    gbit_s                    p99_us               srv_cpu_pct            srv_us_per_req            srv_ns_per_kib
+quinn x1          6.803e+05 [6.8e+05-7.01e+05]       0.544 [0.544-0.561]             315 [305-319]          98.7 [98.2-99.4]          1.44 [1.41-1.46]1.478e+04 [1.44e+04-1.5e+04]
+quinn x4          6.835e+05 [6.77e+05-6.93e+05]       0.547 [0.541-0.555]             325 [322-336]          99.4 [98.8-99.5]          1.45 [1.43-1.47]1.489e+04 [1.46e+04-1.51e+04]
+giong x1          4.979e+05 [3.86e+05-6.8e+05]       0.398 [0.309-0.544]             263 [260-270]          61.9 [46.4-75.4]           1.2 [1.11-1.24]1.231e+04 [1.14e+04-1.27e+04]
+giong x4          5.119e+05 [3.73e+05-6.76e+05]        0.41 [0.298-0.541]             254 [254-272]          72.2 [48.2-90.5]          1.34 [1.29-1.41]1.37e+04 [1.32e+04-1.44e+04]
+giong-epoll x1    6.231e+05 [5.52e+05-7.49e+05]       0.498 [0.442-0.599]             267 [265-270]          70.4 [65.4-83.4]          1.13 [1.11-1.18]1.157e+04 [1.14e+04-1.21e+04]
+giong-epoll x4    6.113e+05 [2.12e+05-6.34e+05]        0.489 [0.17-0.507]        262 [255-2.63e+04]          77.4 [32.3-86.1]          1.36 [1.27-1.52]1.392e+04 [1.3e+04-1.56e+04]
+
+bulk
+server                                 req_s                    gbit_s                    p99_us               srv_cpu_pct            srv_us_per_req            srv_ns_per_kib
+quinn x1                       111 [106-111]           14.84 [14.2-15]5.013e+04 [4.76e+04-5.46e+04]          86.5 [84.2-88.9]  7951 [7.82e+03-7.98e+03]           485.3 [477-487]
+quinn x4                       119 [114-125]         15.96 [15.2-16.8]4.135e+04 [3.99e+04-4.87e+04]          93.8 [90.3-95.3]  7889 [7.59e+03-7.95e+03]           481.5 [464-485]
+giong x1                          78 [62-80]          10.5 [8.39-10.8]9.536e+04 [8.84e+04-1.11e+05]            78.1 [62-80.9]  9987 [9.92e+03-1.01e+04]           609.6 [606-616]
+giong x4                       115 [115-144]         15.43 [15.4-19.4]5.807e+04 [4.1e+04-6.19e+04]             113 [111-136]  9617 [9.44e+03-9.86e+03]             587 [576-602]
+giong-epoll x1                    67 [65-69]         8.952 [8.76-9.31]8.521e+04 [8.39e+04-8.91e+04]          69.7 [69.4-72.1]1.04e+04 [1.04e+04-1.07e+04]           635.1 [634-652]
+giong-epoll x4                  104 [68-127]            14 [9.13-17.1]6.26e+04 [4.98e+04-8.64e+04]          106.7 [70.4-129]1.023e+04 [1.01e+04-1.04e+04]           624.4 [617-632]
+
+many
+server                                 req_s                    gbit_s                    p99_us               srv_cpu_pct            srv_us_per_req            srv_ns_per_kib
+quinn x1          3.292e+05 [3.27e+05-3.36e+05]         2.697 [2.68-2.75]2.979e+04 [2.98e+04-2.99e+04]             100 [100-100]          3.04 [2.98-3.06]  3038 [2.98e+03-3.06e+03]
+quinn x4          3.411e+05 [3.36e+05-3.47e+05]         2.795 [2.75-2.84]2.974e+04 [2.97e+04-2.98e+04]           100.1 [100-100]          2.93 [2.88-2.98]  2934 [2.88e+03-2.98e+03]
+giong x1          4.289e+05 [4.19e+05-4.4e+05]         3.514 [3.43-3.61]5.52e+04 [5.51e+04-5.52e+04]           100.1 [100-100]          2.33 [2.27-2.39]  2334 [2.27e+03-2.39e+03]
+giong x4          1.503e+06 [1.37e+06-1.56e+06]         12.31 [11.2-12.8]        1075 [974-1.9e+03]           373.7 [345-380]          2.52 [2.39-2.53]  2520 [2.39e+03-2.53e+03]
+giong-epoll x1    4.398e+05 [4.22e+05-4.6e+05]         3.603 [3.46-3.77]5.482e+04 [3.38e+04-5.52e+04]          99.9 [99.8-99.9]          2.27 [2.17-2.37]  2271 [2.17e+03-2.37e+03]
+giong-epoll x4    1.449e+06 [1.4e+06-1.47e+06]         11.87 [11.5-12.1]       1520 [771-1.68e+03]           343.4 [331-347]          2.37 [2.33-2.39]  2366 [2.33e+03-2.39e+03]

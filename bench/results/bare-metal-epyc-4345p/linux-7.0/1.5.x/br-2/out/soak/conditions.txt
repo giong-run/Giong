@@ -1,0 +1,2 @@
+# soak.sh 2026-11-27T10:19:17Z on br-2 7.0.0-44-generic: main 14e0db989168040cf82353934a64bc9fd3401a2f, GIONG_SOAK_SECS=10800, core:0-3,8-11 core-epoll:4-7,12-15
+# soak.sh 2026-11-27T14:56:16Z on br-2 7.0.0-44-generic: main 14e0db989168040cf82353934a64bc9fd3401a2f, GIONG_SOAK_SECS=7200, h3:0-15

@@ -1,0 +1,4 @@
+# rate.sh 2026-11-27T06:07:55Z: server br-1 7.0.0-44-generic on CPUs 0-7 (enp1s0f1np1, 25000Mb/s), loadgen on 10.40.96.4 with 16 threads, 10 s per measurement after 2 s of warm-up, 64 connections per worker
+# giong-http = /root/b/bins/main-giong-http:3009
+# tokio-raw = /root/b/bins/main-tokio-raw:3005
+# rates: 25000 50000 100000 200000 300000 400000 500000 700000 1000000 1400000 2000000 2600000 3200000

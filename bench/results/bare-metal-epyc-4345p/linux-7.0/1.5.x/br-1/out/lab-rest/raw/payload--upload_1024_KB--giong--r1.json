@@ -1,0 +1,43 @@
+{
+ "conns": 16,
+ "threads": 7,
+ "rate": 0,
+ "duration_s": 6,
+ "requests": 52040,
+ "rps": 8673.3,
+ "goodput_rps": 8676.0,
+ "errors": 0,
+ "connect_errors": 0,
+ "unfinished": 10,
+ "non_2xx": 0,
+ "mb_in_per_s": 1.23,
+ "latency": {
+  "count": 52040,
+  "p50_us": 1839.1,
+  "p90_us": 1904.6,
+  "p99_us": 2154.5,
+  "p999_us": 2957.3,
+  "p9999_us": 3219.5,
+  "max_us": 3463.2
+ },
+ "paths": [
+  {
+   "path": "/upload",
+   "requests": 52040,
+   "latency": {
+    "count": 52040,
+    "p50_us": 1839.1,
+    "p90_us": 1904.6,
+    "p99_us": 2154.5,
+    "p999_us": 2957.3,
+    "p9999_us": 3219.5,
+    "max_us": 3463.2
+   }
+  }
+ ],
+ "server_cpu_s": 6.0,
+ "server_rss_kib": 27840,
+ "server_hwm_kib": 27840,
+ "cpu_us_per_req": 115.26,
+ "payload_mb_s": 9094.6
+}
