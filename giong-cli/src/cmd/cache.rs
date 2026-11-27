@@ -1,8 +1,9 @@
 //! `giong cache`: the build store, which keeps one copy on disk of each
 //! dependency build for every project on the machine (see src/store.rs).
 //!
-//! `giong dev` shares each project's dependency builds after it builds;
-//! `giong cache share` does it for projects already built (any cargo
+//! `giong dev` shares each project's dependency builds after it builds, and
+//! before a dev build takes the ones another project already made;
+//! `giong cache share` and `giong cache fill` do the same by hand (any cargo
 //! project, giong or not), `giong cache gc` frees what nothing uses and keeps
 //! the builds under a budget, and `giong cache` says what the store saves.
 
@@ -24,14 +25,18 @@ pub const COMMAND: Command = Command {
     summary: "keep one copy of each dependency build for all your projects",
     usage: "giong cache [status]\n\
             giong cache share [dir...]\n\
+            giong cache fill\n\
             giong cache gc [--budget SIZE] [--dry-run]\n\n\
             Rust projects each build their own copy of every dependency, and cargo never removes \
             one. The build store keeps one copy on disk: files a dependency's build wrote that are \
             byte for byte the same in several projects become hard links to one file in \
             ~/.giong/store. Each project keeps its own target/, so cargo works as before. giong \
-            dev shares each build on its own. status: what the store saves. share: share the \
-            builds of this project, or of every cargo project under the directories given \
-            (giong cache share ~/code). gc: remove what no project uses, and keep the builds of \
+            dev shares each build on its own, and before a dev build takes the dependency builds \
+            another project already made, so a new project compiles only its own code. status: \
+            what the store saves. share: share the builds of this project, or of every cargo \
+            project under the directories given (giong cache share ~/code). fill: give this \
+            project's dev build (target/debug) the dependency builds another project made; cargo \
+            checks each one and builds again what differs. Release builds are never filled. gc: remove what no project uses, and keep the builds of \
             the projects giong knows under the budget (GIONG_STORE_BUDGET, default 30G): what an \
             older Rust built first, then whole builds of projects not built for 14 days. \
             GIONG_STORE=off turns the store off; GIONG_STORE_DIR moves it (it must be on the \
@@ -57,12 +62,12 @@ fn run(args: &Args) -> Result<Report, Failure> {
         None => ("status", &[][..]),
         Some((v, rest)) => (v.as_str(), rest),
     };
-    let known = matches!(verb, "status" | "gc") && rest.is_empty() || verb == "share";
+    let known = matches!(verb, "status" | "gc" | "fill") && rest.is_empty() || verb == "share";
     if !known {
         return Err(Failure::new(
             Code::USAGE,
             format!("giong cache {} is not a command", args.words.join(" ")),
-            "giong cache status, giong cache share [dir...] or giong cache gc",
+            "giong cache status, giong cache share [dir...], giong cache fill or giong cache gc",
         ));
     }
     // Checked before the store is opened (and made): a mistake writes nothing.
@@ -79,6 +84,7 @@ fn run(args: &Args) -> Result<Report, Failure> {
     let store = Store::open().map_err(|u| Failure::new(Code::STORE_UNUSABLE, u.why(), u.fix()))?;
     match verb {
         "share" => share(&store, rest),
+        "fill" => fill(&store),
         "gc" => Ok(gc(&store, budget, args.has("dry-run"))),
         _ => Ok(status(&store)),
     }
@@ -287,6 +293,49 @@ fn share(store: &Store, dirs: &[String]) -> Result<Report, Failure> {
     r.data("linked_files", json!(linked));
     r.data("linked_bytes", json!(linked_bytes));
     r.data("profiles", Value::Array(rows));
+    Ok(r)
+}
+
+fn fill(store: &Store) -> Result<Report, Failure> {
+    let p = Project::here()?;
+    let mut r = Report::new("cache");
+    let never = AtomicBool::new(false);
+    match store::fill_project(store, &p.build_dir, &p.workspace_root(), &never) {
+        Ok(f) => {
+            if f.units > 0 {
+                r.line(format!(
+                    "{} dependency builds taken from {} ({} files linked, {} copied): cargo \
+                     compiles only what is left",
+                    f.units,
+                    super::dev::sources(&f.from),
+                    f.linked_files,
+                    human(f.copied_bytes)
+                ));
+            } else {
+                r.line(
+                    "no other project has built these dependencies with this compiler yet \
+                     (giong dev and giong cache share record the projects built)"
+                        .to_string(),
+                );
+            }
+            r.data("filled_units", json!(f.units));
+            r.data("linked_files", json!(f.linked_files));
+            r.data("copied_bytes", json!(f.copied_bytes));
+            let from: Vec<String> = f.from.iter().map(|p| p.display().to_string()).collect();
+            r.data("from", json!(from));
+        }
+        Err(skip) => r.push(
+            Finding::new(
+                Code::STORE_UNUSABLE,
+                Severity::Info,
+                format!("{} was not filled: {}", p.build_dir.display(), skip.why()),
+            )
+            .fix(match skip {
+                store::Skip::Busy => "run giong cache fill again once the build ends",
+                _ => "check that cargo generate-lockfile works in the project",
+            }),
+        ),
+    }
     Ok(r)
 }
 

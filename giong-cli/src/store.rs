@@ -45,6 +45,11 @@
 //! copy), never object files or debug information a linker may update.
 //! Only cargo's build-dir layout (cargo 1.100 and later) is handled.
 //!
+//! Before a dev build, [`fill`] gives a project the dependency units another
+//! project already built, so cargo compiles only what is left: cargo names
+//! each unit's directory after its own hash of everything that makes it and
+//! checks the fingerprint inside, so it builds again whatever differs.
+//!
 //! An object nothing links to any more is removed by [`gc`], which also keeps
 //! the builds of the projects giong knows under a size budget.
 
@@ -359,6 +364,8 @@ struct Unit {
     local: Vec<Value>,
     /// The files cargo compares times of.
     outputs: Vec<PathBuf>,
+    /// cargo's hash of the compiler that built it.
+    rustc: Option<u64>,
 }
 
 /// A real directory (not a link): giong never follows a link in a build
@@ -452,6 +459,7 @@ fn read_unit(dir: &Path, package: &str, hash: &str) -> Option<Unit> {
         deps,
         local,
         outputs,
+        rustc: v["rustc"].as_u64(),
     })
 }
 
@@ -687,6 +695,24 @@ pub fn share(
         return Err(Skip::OldLayout);
     }
     let _cargo = lock_profile(profile)?;
+    share_locked(store, profile, local_packages, cancel).map(|s| s.pass)
+}
+
+/// A profile directory after [`share_locked`]: its units, and the height of
+/// each one whose outputs now carry the shared time.
+struct Shared {
+    pass: Pass,
+    units: Vec<Unit>,
+    height: Vec<Option<u64>>,
+}
+
+/// [`share`], with cargo's locks on `profile` held by the caller.
+fn share_locked(
+    store: &Store,
+    profile: &Path,
+    local_packages: &HashSet<String>,
+    cancel: &AtomicBool,
+) -> Result<Shared, Skip> {
     let _store_lock = lock::shared(&store.lock_path()).map_err(|e| Skip::Io(e.to_string()))?;
     let units = scan(profile);
     let mut pass = Pass {
@@ -764,6 +790,12 @@ pub fn share(
         timed[i] = ok;
     }
     let objects = store.objects();
+    let mut shared_height = vec![None; units.len()];
+    for &i in &order {
+        if timed[i] {
+            shared_height[i] = height[i];
+        }
+    }
     for &i in &order {
         if !timed[i] {
             continue;
@@ -777,7 +809,11 @@ pub fn share(
         for o in &u.outputs {
             if cancel.load(Ordering::Relaxed) {
                 pass.cancelled = true;
-                return Ok(pass);
+                return Ok(Shared {
+                    pass,
+                    units,
+                    height: shared_height,
+                });
             }
             let Ok(own) = fs::symlink_metadata(o) else {
                 continue;
@@ -797,7 +833,356 @@ pub fn share(
             }
         }
     }
-    Ok(pass)
+    Ok(Shared {
+        pass,
+        units,
+        height: shared_height,
+    })
+}
+
+/// What [`fill`] did.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct Filled {
+    /// The projects the units came from, the one that gave most first.
+    pub from: Vec<PathBuf>,
+    /// Units added to the project's build directory.
+    pub units: usize,
+    /// Files linked to the other project's (no disk).
+    pub linked_files: u64,
+    /// Bytes copied (build-script output and cargo's own small files).
+    pub copied_bytes: u64,
+    /// Stopped early because a build wanted the directory.
+    pub cancelled: bool,
+}
+
+/// The dependencies a project's Cargo.lock names, as (name, version): the
+/// packages from a registry or git.
+pub fn locked_dependencies(project_root: &Path) -> Option<HashSet<(String, String)>> {
+    let text = fs::read_to_string(project_root.join("Cargo.lock")).ok()?;
+    Some(
+        crate::lockfile::parse_lock(&text)
+            .into_iter()
+            .filter(|p| p.source != crate::lockfile::Source::Path)
+            .map(|p| (p.name, p.version.to_string()))
+            .collect(),
+    )
+}
+
+/// Fills a project's dev build directory (`profile`, its `debug`) with the
+/// dependency builds another project on this machine already made, before
+/// cargo builds it: cargo then finds them fresh and compiles only what is
+/// left. A project's first build then takes seconds instead of minutes.
+///
+/// Why cargo can use them: a unit's directory is named after cargo's own
+/// hash of everything that makes it (package and version, features,
+/// profile, target, compiler, flags, and the same of its dependencies), and
+/// cargo compares the fingerprint inside with the one it computes before
+/// using it; anything that differs, cargo builds again. Only units the
+/// store can share are taken (from a registry or git, with every
+/// dependency such a unit too, and the shared times already set). A crate
+/// is compiled against the exact bytes of its dependencies, so a unit is
+/// added only when each of its dependencies comes with it from the same
+/// project or is already the same bytes here. The project with most of the
+/// packages goes first; others fill in packages still missing. Libraries are hard
+/// links (on Windows, programs and DLLs are copied); build-script output
+/// and cargo's own files are copied, since a build may write into them.
+/// Units the project has are never touched. `wanted` is the project's
+/// [`locked_dependencies`]; `rustc` gives the fingerprint hash of its
+/// compiler, when known (asked only once there is a project to fill from).
+pub fn fill(
+    store: &Store,
+    profile: &Path,
+    wanted: &HashSet<(String, String)>,
+    rustc: impl FnOnce() -> Option<u64>,
+    cancel: &AtomicBool,
+) -> Result<Filled, Skip> {
+    let names: HashSet<&str> = wanted.iter().map(|(n, _)| n.as_str()).collect();
+    if names.is_empty() {
+        return Ok(Filled::default());
+    }
+    let build = profile.join("build");
+    fs::create_dir_all(&build).map_err(|e| Skip::Io(format!("{}: {e}", build.display())))?;
+    let lock_file = profile.join(".cargo-build-lock");
+    let _own = match lock::try_exclusive(&lock_file, true) {
+        Ok(Some(f)) => f,
+        Ok(None) => return Err(Skip::Busy),
+        Err(e) => return Err(Skip::Io(format!("{}: {e}", lock_file.display()))),
+    };
+    let own_meta =
+        fs::symlink_metadata(&build).map_err(|e| Skip::Io(format!("{}: {e}", build.display())))?;
+    let here = fs::canonicalize(profile).unwrap_or_else(|_| profile.to_path_buf());
+    // The projects that have most of these packages built, most recent first.
+    let mut candidates: Vec<(usize, u64, PathBuf, PathBuf)> = Vec::new();
+    for p in registry(store).projects {
+        let source = p.build_dir.join("debug");
+        if !is_new_layout(&source) || fs::canonicalize(&source).is_ok_and(|s| s == here) {
+            continue;
+        }
+        let score = entries(&source.join("build"))
+            .iter()
+            .filter(|e| names.contains(e.file_name().to_string_lossy().as_ref()))
+            .count();
+        if score > 0 {
+            candidates.push((score, p.last_built, source, p.root));
+        }
+    }
+    candidates.sort_by_key(|a| std::cmp::Reverse((a.0, a.1)));
+    let mut rustc = Some(rustc);
+    let mut compiler = None;
+    let mut filled = Filled::default();
+    for (_, _, source, root) in candidates.into_iter().take(MAX_SOURCES) {
+        // Only a project that has a package nothing here was built for yet.
+        let missing = names
+            .iter()
+            .filter(|n| !real_dir(&build.join(n)))
+            .filter(|n| real_dir(&source.join("build").join(n)))
+            .count();
+        if missing == 0 {
+            continue;
+        }
+        let Some(local) = local_packages(&root) else {
+            continue;
+        };
+        let _theirs = match lock_profile(&source) {
+            Ok(l) => l,
+            Err(_) => continue, // building, or gone: try the next one
+        };
+        let shared = share_locked(store, &source, &local, cancel)?;
+        if shared.pass.cancelled {
+            filled.cancelled = true;
+            break;
+        }
+        if let Some(ask) = rustc.take() {
+            compiler = ask();
+        }
+        let got = copy_units(&shared, &build, &own_meta, wanted, compiler, cancel);
+        if got.units > 0 {
+            filled.from.push(root);
+        }
+        filled.units += got.units;
+        filled.linked_files += got.linked_files;
+        filled.copied_bytes += got.copied_bytes;
+        if got.cancelled {
+            filled.cancelled = true;
+            break;
+        }
+    }
+    Ok(filled)
+}
+
+/// How many other projects one [`fill`] takes builds from at most.
+const MAX_SOURCES: usize = 8;
+
+/// [`fill`] for the dev build of the workspace at `root` (where its
+/// Cargo.lock is or will be; build directory `build_dir`). A workspace
+/// cargo has not resolved yet gets its Cargo.lock first (`cargo
+/// generate-lockfile`, what its first build would do); an existing one is
+/// never touched.
+pub fn fill_project(
+    store: &Store,
+    build_dir: &Path,
+    root: &Path,
+    cancel: &AtomicBool,
+) -> Result<Filled, Skip> {
+    if !root.join("Cargo.lock").is_file() {
+        let mut cmd = crate::project::cargo();
+        cmd.arg("generate-lockfile")
+            .current_dir(root)
+            .env("CARGO_TERM_COLOR", "never");
+        crate::host::run_once_within(&mut cmd, LOCK_TIMEOUT)
+            .map_err(|_| Skip::Io("cargo generate-lockfile failed".into()))?;
+    }
+    let wanted = locked_dependencies(root).unwrap_or_default();
+    let compiler = || crate::cmd::clean::current_rustc_hash(root).ok().flatten();
+    fill(store, &build_dir.join("debug"), &wanted, compiler, cancel)
+}
+
+/// How long `cargo generate-lockfile` may take (it may fetch the index).
+const LOCK_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Adds the units of `shared` (another project's profile directory) that
+/// `fill` may take to the build directory `build`.
+fn copy_units(
+    shared: &Shared,
+    build: &Path,
+    own_meta: &fs::Metadata,
+    wanted: &HashSet<(String, String)>,
+    rustc: Option<u64>,
+    cancel: &AtomicBool,
+) -> Filled {
+    let units = &shared.units;
+    let by_fp: HashMap<&str, usize> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| (u.fingerprint.as_str(), i))
+        .collect();
+    let dest = |u: &Unit| build.join(&u.package).join(&u.hash);
+    let here: Vec<bool> = units.iter().map(|u| real_dir(&dest(u))).collect();
+    let mut take: Vec<bool> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| {
+            shared.height[i].is_some()
+                && !here[i]
+                && wanted.iter().any(|(n, _)| *n == u.package)
+                && !matches!((rustc, u.rustc), (Some(a), Some(b)) if a != b)
+                && unit_version(u, &by_fp, units)
+                    .map_or(true, |v| wanted.contains(&(u.package.clone(), v)))
+        })
+        .collect();
+    // A unit's dependencies come with it, or are the same bytes here.
+    let same_here: Vec<bool> = units
+        .iter()
+        .enumerate()
+        .map(|(i, u)| here[i] && (u.run || same_outputs(u, &dest(u))))
+        .collect();
+    loop {
+        let mut changed = false;
+        for i in 0..units.len() {
+            if !take[i] {
+                continue;
+            }
+            let deps_ok = units[i].deps.iter().all(|d| {
+                by_fp
+                    .get(d.as_str())
+                    .is_some_and(|&j| take[j] || same_here[j])
+            });
+            if !deps_ok {
+                take[i] = false;
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+    let mut order: Vec<usize> = (0..units.len()).filter(|&i| take[i]).collect();
+    order.sort_by_key(|&i| shared.height[i]);
+    let mut filled = Filled::default();
+    for i in order {
+        if cancel.load(Ordering::Relaxed) {
+            filled.cancelled = true;
+            break;
+        }
+        let u = &units[i];
+        let final_dir = dest(u);
+        let tmp = build
+            .join(&u.package)
+            .join(format!(".{}{TMP_SUFFIX}", u.hash));
+        let _ = fs::remove_dir_all(&tmp);
+        let mut linked = 0;
+        let mut copied = 0;
+        let ok = fs::create_dir_all(build.join(&u.package)).is_ok()
+            && copy_tree(&u.dir, &tmp, own_meta, &mut linked, &mut copied).is_ok()
+            && fs::rename(&tmp, &final_dir).is_ok();
+        if ok {
+            filled.units += 1;
+            filled.linked_files += linked;
+            filled.copied_bytes += copied;
+        } else {
+            let _ = fs::remove_dir_all(&tmp);
+        }
+    }
+    filled
+}
+
+/// The version of the package a unit belongs to, from the Cargo.toml of
+/// the sources its dep-info names (a build script's run: its build
+/// script's), when it can be read.
+fn unit_version(u: &Unit, by_fp: &HashMap<&str, usize>, units: &[Unit]) -> Option<String> {
+    let root = if u.run {
+        u.deps
+            .iter()
+            .filter_map(|d| by_fp.get(d.as_str()).map(|&i| &units[i]))
+            .filter(|d| !d.run && d.package == u.package)
+            .find_map(package_root)?
+    } else {
+        package_root(u)?
+    };
+    let manifest = fs::read_to_string(root.join("Cargo.toml")).ok()?;
+    let mut in_package = false;
+    for line in manifest.lines() {
+        let line = line.trim();
+        if line.starts_with('[') {
+            in_package = line == "[package]";
+            continue;
+        }
+        if !in_package {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix("version") {
+            let value = rest.trim_start().strip_prefix('=')?.trim();
+            return Some(value.trim_matches('"').to_string());
+        }
+    }
+    None
+}
+
+/// Whether the build directory `dir` holds the same outputs as unit `u`:
+/// the same files (linked to one object), or the same bytes.
+fn same_outputs(u: &Unit, dir: &Path) -> bool {
+    !u.outputs.is_empty()
+        && u.outputs.iter().all(|o| {
+            let Some(name) = o.file_name() else {
+                return false;
+            };
+            let mine = dir.join("out").join(name);
+            let (Ok(a), Ok(b)) = (fs::symlink_metadata(o), fs::symlink_metadata(&mine)) else {
+                return false;
+            };
+            if !a.is_file() || !b.is_file() || a.len() != b.len() {
+                return false;
+            }
+            let same_file = matches!(
+                (file_id(o, &a), file_id(&mine, &b)),
+                (Some(x), Some(y)) if x.dev == y.dev && x.ino == y.ino
+            );
+            same_file || same_bytes(o, &mine).unwrap_or(false)
+        })
+}
+
+/// Copies the unit directory `from` to `to`: what rustc writes as a hard
+/// link (a copy when no link can be made), everything else as a copy with
+/// its time. A link anywhere, or a file another user could have written,
+/// refuses the unit.
+fn copy_tree(
+    from: &Path,
+    to: &Path,
+    own: &fs::Metadata,
+    linked: &mut u64,
+    copied: &mut u64,
+) -> io::Result<()> {
+    fs::create_dir(to)?;
+    for e in entries(from) {
+        let src = e.path();
+        let dst = to.join(e.file_name());
+        let meta = fs::symlink_metadata(&src)?;
+        if meta.is_dir() {
+            copy_tree(&src, &dst, own, linked, copied)?;
+            continue;
+        }
+        if !meta.is_file() || !trusted(&meta, own) {
+            return Err(io::Error::other(format!(
+                "{} is not a plain file of yours",
+                src.display()
+            )));
+        }
+        if src
+            .file_name()
+            .is_some_and(|n| n.to_string_lossy().ends_with(TMP_SUFFIX))
+        {
+            continue;
+        }
+        if rustc_writes(&src) && fs::hard_link(&src, &dst).is_ok() {
+            *linked += 1;
+            continue;
+        }
+        fs::copy(&src, &dst)?;
+        let f = OpenOptions::new().write(true).open(&dst)?;
+        f.set_modified(meta.modified()?)?;
+        *copied += meta.len();
+    }
+    Ok(())
 }
 
 /// The files a build writes by renaming a new file over the old one, so a
@@ -1577,6 +1962,178 @@ mod tests {
         let u = usage(&store);
         assert_eq!(u.objects, 2);
         assert_eq!(u.saved_bytes, 70 * 1024);
+        fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn a_new_project_takes_another_ones_dependency_builds() {
+        if !lock::AVAILABLE {
+            return;
+        }
+        let t = temp("fill");
+        let store = Store::open_at(&t.join("store")).unwrap();
+        let (one, _) = two_projects(&t);
+        fs::write(
+            t.join("one/Cargo.lock"),
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n\n\
+             [[package]]\nname = \"base\"\nversion = \"1.0.0\"\nsource = \"registry+x\"\n\n\
+             [[package]]\nname = \"top\"\nversion = \"1.0.0\"\nsource = \"registry+x\"\n",
+        )
+        .unwrap();
+        note_built(&store, &t.join("one/target"), &t.join("one")).unwrap();
+        let wanted: HashSet<(String, String)> = locked_dependencies(&t.join("one")).unwrap();
+        assert_eq!(wanted.len(), 2, "{wanted:?}");
+        let none = AtomicBool::new(false);
+        // A project cargo has not built yet: no target/ at all.
+        let three = t.join("three/target/debug");
+        let f = fill(&store, &three, &wanted, || Some(1), &none).unwrap();
+        assert_eq!(
+            f.units, 2,
+            "base and top, never the other project's own crate"
+        );
+        assert_eq!(f.from, vec![t.join("one")]);
+        assert!(!three.join("build/app").exists());
+        let rlib =
+            |p: &Path| p.join("build/base/00000000000000a1/out/libbase-00000000000000a1.rlib");
+        let (a, b) = (
+            fs::metadata(rlib(&one)).unwrap(),
+            fs::metadata(rlib(&three)).unwrap(),
+        );
+        assert_eq!(
+            file_id(&rlib(&one), &a).map(|i| (i.dev, i.ino)),
+            file_id(&rlib(&three), &b).map(|i| (i.dev, i.ino)),
+            "a library is a link"
+        );
+        // cargo's own files are copies with the same content and times.
+        let fp = "build/top/00000000000000b2/fingerprint/lib-top";
+        assert_eq!(
+            fs::read(one.join(fp)).unwrap(),
+            fs::read(three.join(fp)).unwrap()
+        );
+        let rmeta = "build/top/00000000000000b2/out/libtop-00000000000000b2.rmeta";
+        assert_eq!(mtime(&three.join(rmeta)), BASE_MTIME + 1);
+        assert!(three.join(".cargo-build-lock").is_file());
+        // Again: nothing to add.
+        let again = fill(&store, &three, &wanted, || Some(1), &none).unwrap();
+        assert_eq!(again.units, 0);
+        // Another compiler built them: cargo could not use them.
+        let four = t.join("four/target/debug");
+        let other = fill(&store, &four, &wanted, || Some(2), &none).unwrap();
+        assert_eq!(other.units, 0);
+        // A project with its own build of base, other bytes: top was
+        // compiled against the other project's base, so it is not taken.
+        let five = profile(&t.join("five"));
+        unit(
+            &five,
+            "base",
+            "00000000000000a1",
+            "lib-base",
+            1,
+            &[],
+            json!([{"Precalculated": "1.0.0"}]),
+            &[
+                (
+                    "libbase-00000000000000a1.rlib",
+                    vec![9u8; 40 * 1024].as_slice(),
+                ),
+                ("libbase-00000000000000a1.rmeta", b"m".as_slice()),
+            ],
+        );
+        let mixed = fill(&store, &five, &wanted, || Some(1), &none).unwrap();
+        assert_eq!(mixed.units, 0, "{mixed:?}");
+        // The same bytes: top is taken.
+        fs::copy(
+            rlib(&one),
+            five.join("build/base/00000000000000a1/out/libbase-00000000000000a1.rlib"),
+        )
+        .unwrap();
+        let same = fill(&store, &five, &wanted, || Some(1), &none).unwrap();
+        assert_eq!(same.units, 1);
+        // Packages the project does not lock are left out.
+        let only_base: HashSet<(String, String)> =
+            [("base".to_string(), "1.0.0".to_string())].into();
+        let six = t.join("six/target/debug");
+        let f = fill(&store, &six, &only_base, || Some(1), &none).unwrap();
+        assert_eq!(f.units, 1);
+        assert!(!six.join("build/top").exists());
+        fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn other_projects_fill_in_what_the_first_one_lacks() {
+        if !lock::AVAILABLE {
+            return;
+        }
+        let t = temp("fill-more");
+        let store = Store::open_at(&t.join("store")).unwrap();
+        two_projects(&t);
+        let lock = "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n";
+        fs::write(t.join("one/Cargo.lock"), lock).unwrap();
+        note_built(&store, &t.join("one/target"), &t.join("one")).unwrap();
+        let other = profile(&t.join("other"));
+        unit(
+            &other,
+            "extra",
+            "00000000000000e5",
+            "lib-extra",
+            5,
+            &[],
+            json!([{"Precalculated": "2.0.0"}]),
+            &[(
+                "libextra-00000000000000e5.rlib",
+                vec![5u8; 20 * 1024].as_slice(),
+            )],
+        );
+        fs::write(t.join("other/Cargo.lock"), lock).unwrap();
+        note_built(&store, &t.join("other/target"), &t.join("other")).unwrap();
+        let wanted: HashSet<(String, String)> =
+            [("base", "1.0.0"), ("top", "1.0.0"), ("extra", "2.0.0")]
+                .iter()
+                .map(|(n, v)| (n.to_string(), v.to_string()))
+                .collect();
+        let none = AtomicBool::new(false);
+        let three = t.join("three/target/debug");
+        let f = fill(&store, &three, &wanted, || Some(1), &none).unwrap();
+        assert_eq!(f.units, 3, "{f:?}");
+        assert_eq!(f.from, vec![t.join("one"), t.join("other")]);
+        fs::remove_dir_all(&t).unwrap();
+    }
+
+    #[test]
+    fn a_busy_project_is_not_filled() {
+        if !lock::AVAILABLE {
+            return;
+        }
+        let t = temp("fill-busy");
+        let store = Store::open_at(&t.join("store")).unwrap();
+        two_projects(&t);
+        fs::write(
+            t.join("one/Cargo.lock"),
+            "[[package]]\nname = \"app\"\nversion = \"0.1.0\"\n",
+        )
+        .unwrap();
+        note_built(&store, &t.join("one/target"), &t.join("one")).unwrap();
+        let wanted: HashSet<(String, String)> = [("base".to_string(), "1.0.0".to_string())].into();
+        let three = profile(&t.join("three"));
+        let held = lock::try_exclusive(&three.join(".cargo-build-lock"), false).unwrap();
+        let none = AtomicBool::new(false);
+        assert_eq!(
+            fill(&store, &three, &wanted, || None, &none),
+            Err(Skip::Busy)
+        );
+        drop(held);
+        // The other project busy: nothing to take from, nothing changes.
+        let theirs =
+            lock::try_exclusive(&t.join("one/target/debug/.cargo-build-lock"), false).unwrap();
+        assert_eq!(
+            fill(&store, &three, &wanted, || None, &none).unwrap().units,
+            0
+        );
+        drop(theirs);
+        assert_eq!(
+            fill(&store, &three, &wanted, || None, &none).unwrap().units,
+            1
+        );
         fs::remove_dir_all(&t).unwrap();
     }
 

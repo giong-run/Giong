@@ -33,6 +33,14 @@ pub fn find_manifest_dir(start: &Path) -> Option<PathBuf> {
 }
 
 impl Project {
+    /// The workspace root cargo names (where Cargo.lock is), else `root`.
+    pub fn workspace_root(&self) -> PathBuf {
+        self.metadata["workspace_root"]
+            .as_str()
+            .map(PathBuf::from)
+            .unwrap_or_else(|| self.root.clone())
+    }
+
     /// The project around the current directory, read with `cargo metadata`.
     pub fn here() -> Result<Project, Failure> {
         let cwd = std::env::current_dir().map_err(|e| {
