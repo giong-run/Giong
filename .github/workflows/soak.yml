@@ -200,10 +200,12 @@ jobs:
       # The sanitizers' shadow memory and the runner's address-space
       # randomisation, as for ThreadSanitizer.
       - run: sudo sysctl vm.mmap_rnd_bits=28
-      - name: "net: install redis-server, load tls"
+      # llvm: llvm-symbolizer, without which LeakSanitizer prints addresses
+      # instead of function names and no line of scripts/lsan.supp matches.
+      - name: "net: install redis-server and llvm, load tls"
         uses: ./.github/actions/apt-install
         with:
-          packages: redis-server
+          packages: redis-server llvm
           stop-services: redis-server
           modules: tls
       - name: AddressSanitizer
