@@ -164,7 +164,12 @@ impl App {
                 sleep(Duration::from_millis(query_number(&req, "ms") as u64)).await;
                 panic!("handler panic (expected by this test)");
             }
-            "/pipe" | "/pipe-slow" => {
+            "/pipe" | "/pipe-slow" | "/pipe-late" => {
+                if req.path() == "/pipe-late" {
+                    // Work before the body is asked for (an authorization
+                    // check, say).
+                    sleep(Duration::from_millis(query_number(&req, "ms") as u64)).await;
+                }
                 let body = req.body_stream().expect("a streamed body");
                 let mut total = 0;
                 let mut first = true;
@@ -1668,6 +1673,41 @@ fn a_trickling_streamed_body_is_cut_once_it_falls_below_the_minimum_rate() {
     );
     // Only that stream: the connection still answers.
     assert_eq!(c.request("GET", "/", &[], b"").text(), "hello");
+}
+
+#[test]
+fn a_body_waiting_for_100_continue_has_no_timeout_until_the_handler_asks() {
+    // The client waits for `100 Continue`, which goes out when the handler
+    // asks for the body: the time before that is the handler's, not the
+    // client's, for the request timeout and for the minimum rate alike.
+    let servers = [
+        Server::new().request_timeout(Duration::from_millis(300)),
+        Server::new().min_body_rate(1000, Duration::from_millis(200)),
+    ];
+    for server in servers {
+        let server = TestServer::start(server);
+        let mut c = server.client();
+        let id = c.open(
+            "POST",
+            "/pipe-late?ms=700",
+            &[("expect", "100-continue"), ("content-length", "3")],
+            false,
+        );
+        loop {
+            c.frame().unwrap();
+            if c.replies.get(&id).is_some_and(|r| !r.headers.is_empty()) {
+                break;
+            }
+        }
+        assert_eq!(
+            c.replies[&id].header(":interim"),
+            Some("100"),
+            "{}",
+            c.replies[&id].text()
+        );
+        c.send_body(id, b"xyz", true);
+        assert_eq!(c.reply(id).unwrap().text(), "read 3");
+    }
 }
 
 #[test]

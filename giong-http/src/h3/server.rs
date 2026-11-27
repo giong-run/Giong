@@ -929,14 +929,37 @@ async fn exchange<H: Handler>(
         let mut clock = RateClock::default();
         loop {
             let (wait, by_rate) = min_rate.wait(&clock, request_timeout);
-            let start = min_rate.is_on().then(Instant::now);
-            let received = timeout(wait, body_piece(r, &mut st, max_head)).await;
-            if let Some(start) = start {
+            // The wait counts from when the handler has asked for the body:
+            // until then a client that sent `expect: 100-continue` waits
+            // for the `100 Continue` that asking sends, and the time is the
+            // handler's (as over HTTP/1.1). The body is read meanwhile, so
+            // that a reset stream is seen at once.
+            let asked_at = Cell::new(None);
+            let received = {
+                let expiry = async {
+                    pipe.asked().await;
+                    let at = Instant::now();
+                    asked_at.set(Some(at));
+                    giong::time::sleep_until(at + wait).await;
+                };
+                let mut next = pin!(body_piece(r, &mut st, max_head));
+                let mut expiry = pin!(expiry);
+                poll_fn(|cx| {
+                    if let Poll::Ready(got) = next.as_mut().poll(cx) {
+                        return Poll::Ready(Ok(got));
+                    }
+                    expiry.as_mut().poll(cx).map(Err)
+                })
+                .await
+            };
+            if min_rate.is_on() {
                 let n = match &received {
                     Ok(Ok(Some(piece))) => piece.len(),
                     _ => 0,
                 };
-                clock.waited += start.elapsed();
+                if let Some(at) = asked_at.get() {
+                    clock.waited += at.elapsed();
+                }
                 clock.got += n as u64;
             }
             let piece = match received {

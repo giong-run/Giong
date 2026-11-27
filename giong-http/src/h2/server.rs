@@ -1842,8 +1842,12 @@ impl Session {
                 st.recv = Recv::Done;
                 st.deadline = None;
             } else if pending.is_empty() && !st.remote_done {
-                // The handler waits for the client.
-                if st.deadline.is_none() {
+                // The handler waits for the client, once it has asked for
+                // the body: until then a client that sent `expect:
+                // 100-continue` waits for the server, and the time is the
+                // handler's (as over HTTP/1.1, whose body is not read
+                // before the handler asks).
+                if st.deadline.is_none() && pipe.poll_asked(&waker) {
                     let now = Instant::now();
                     let (wait, _) = min_rate.wait(clock, request_timeout);
                     st.deadline = Some(now + wait);
