@@ -260,8 +260,6 @@ pub(crate) fn header_lines(block: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])>
         })
 }
 
-/// Parses a complete head (`head` ends with the empty line). On failure returns
-/// the status code to answer with.
 /// Reads a request line in one pass over its bytes, if it is the common
 /// kind: a method of at most 32 token bytes, a target of visible ASCII but
 /// `#`, `HTTP/1.1` or `HTTP/1.0`, single spaces and CRLF. Returns where the
@@ -346,6 +344,8 @@ fn request_line(head: &[u8]) -> Result<(usize, usize, usize, u8), u16> {
     Ok((sp1, sp2, line_end, minor))
 }
 
+/// Parses a complete head (`head` ends with the empty line). On failure returns
+/// the status code to answer with.
 pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
     debug_assert!(head.ends_with(b"\r\n\r\n"));
     let (sp1, sp2, line_end, minor) = match quick_request_line(head) {
