@@ -105,6 +105,11 @@ let hash = giong::spawn_compute(move || expensive(input)).await;
   for the service rather than turning them off: `Server::request_timeout`, `idle_timeout`,
   `max_head_size`, `max_body_size`, `max_connections` (10,000 per `serve` call) and
   `min_free_memory`, which refuses new work before the process runs out of memory.
+- **Facing clients directly, cap each client.** With no load balancer in front, one client
+  can open every connection a worker allows, and connections that send nothing hold their
+  places for `idle_timeout`. `Server::max_connections_per_ip(256)` and
+  `first_request_timeout(Duration::from_secs(10))` bound both; behind a load balancer
+  every connection comes from it, so cap clients there instead.
 - **Give streamed uploads a minimum rate.** `request_timeout` bounds each piece of a body
   read as a stream, not the whole body, so a client sending a byte every 29 s holds its
   handler for ever. `Server::min_body_rate(240, Duration::from_secs(10))` cuts such a
@@ -124,6 +129,11 @@ let hash = giong::spawn_compute(move || expensive(input)).await;
   says when it was cut. Raise `Builder::recv_buffers(count, size)` or use `read_from()` with
   a buffer of your own; do not mix the two on one socket.
 - **A `File` has no cursor**: every read and write names its offset.
+- **Open paths that come from outside through a `fs::Root`.** A request path, an upload's
+  name or a path in a config file joined to a directory can climb out with `..`, be
+  absolute, or follow a link someone left in the directory. `Root::new("public").await?`
+  once per worker, then `root.open(path)`: the kernel refuses all three during the open
+  (`GIONG-E0205`), so no check made beforehand can be raced.
 
 ## Errors
 

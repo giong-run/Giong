@@ -62,7 +62,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "io-uring",
  "libc",
@@ -72,12 +72,13 @@ dependencies = [
 
 [[package]]
 name = "giong-mysql"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-tls",
  "ring",
  "socket2",
+ "zeroize",
 ]
 
 [[package]]
@@ -90,13 +91,14 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "libc",
  "rustls",
  "rustls-pki-types",
  "rustls-webpki",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

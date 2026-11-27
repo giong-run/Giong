@@ -8,7 +8,16 @@ powershell -c "irm https://giong.run/install.ps1 | iex"     # Windows
 cargo install giong-cli --locked                            # anywhere Rust runs
 ```
 
-The install scripts download the prebuilt binary of the latest release from GitHub, check its SHA-256 and put it in `~/.giong/bin` (`%USERPROFILE%\.giong\bin` on Windows) without asking for root; where no binary is published they build it with cargo. `GIONG_VERSION=1.5.0` picks a version, `GIONG_INSTALL=/path` another folder, `GIONG_DOWNLOAD_URL` a mirror of the release downloads. Then:
+The install scripts download the prebuilt binary of the latest release from GitHub, check its SHA-256 and put it in `~/.giong/bin` (`%USERPROFILE%\.giong\bin` on Windows) without asking for root; where no binary is published they build it with cargo. `GIONG_VERSION=1.5.0` picks a version, `GIONG_INSTALL=/path` another folder, `GIONG_DOWNLOAD_URL` a mirror of the release downloads.
+
+Each release archive, and the binary in it, has a signed [build provenance attestation](https://docs.github.com/en/actions/security-guides/using-artifact-attestations-to-establish-provenance-for-builds) saying which workflow built it from which commit, and a CycloneDX SBOM (`giong-<version>-<target>.cdx.json` on the Release) listing every crate compiled in. With the GitHub CLI, check an installed command or a downloaded archive:
+
+```sh
+gh attestation verify ~/.giong/bin/giong --repo giong-run/Giong \
+  --signer-workflow giong-run/Giong/.github/workflows/release.yml
+```
+
+The binary also carries that list of crates itself ([cargo auditable](https://github.com/rust-secure-code/cargo-auditable), a few hundred bytes), so `cargo audit bin ~/.giong/bin/giong`, Trivy, Grype or osv-scanner can check it for known advisories. Then:
 
 ```sh
 giong new api    # a users API on SQLite that builds and passes its tests now, nothing to install

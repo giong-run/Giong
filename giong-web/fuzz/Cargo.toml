@@ -9,7 +9,8 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
-giong-web = { path = "..", features = ["serde"] }
+# fast-gzip: the gzip target checks libdeflate as well as miniz_oxide.
+giong-web = { path = "..", features = ["serde", "fast-gzip"] }
 # The app in giong-web's src/fuzzing.rs derives its types.
 serde = { version = "1", features = ["derive"] }
 
@@ -26,6 +27,13 @@ bench = false
 [[bin]]
 name = "request"
 path = "fuzz_targets/request.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "gzip"
+path = "fuzz_targets/gzip.rs"
 test = false
 doc = false
 bench = false

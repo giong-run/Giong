@@ -803,6 +803,29 @@ The length can be far more than the file holds: a sparse file (a disk image, a d
 
 [All error codes](README.md)
 "#),
+    (205, r#"# GIONG-E0205: the path leads outside the root
+
+Raised by `giong::fs::Root` (`open`, `create`, `read`, `metadata`, `open_root`) and `giong::fs::OpenOptions::open_in`. In code: `giong::error::Code::OutsideRoot`. The error's kind is `PermissionDenied`.
+
+## What happened
+
+A `Root` opens paths beneath one directory and nowhere else. The path it was given could have led outside, so nothing was opened (and nothing was created or emptied). The message says which of these it was:
+
+- **it is absolute** (`/etc/passwd`; on Windows also `C:\…`, `C:file`, `\\server\share` or `\file`): refused before the kernel is asked;
+- **it has a `..` component**, even one that would come back inside (`css/../a.txt`): refused before the kernel is asked, so that the same path is accepted or refused on every platform;
+- **it goes through a symbolic link** (on Windows also a junction), wherever the link points, inside the directory or out. Refusing every link, instead of checking where it leads, is what leaves nothing to race: a link checked first and opened second can be replaced in between. On Linux the kernel refuses it during the open (`openat2` with `RESOLVE_BENEATH` and `RESOLVE_NO_SYMLINKS`); `/proc`'s magic links, such as `/proc/self/fd/3` or `/proc/self/exe`, are links too;
+- **it leads outside the directory**: the kernel (`EXDEV`), or on Windows the file's final path, says so. With the checks above this should not happen; it is kept as a last line.
+
+A path that does not exist beneath the root is `NotFound`, as anywhere else, not this error.
+
+## How to fix it
+
+- If the path comes from a client (a URL, an upload's file name): this is the root doing its job. Answer `404 Not Found` (or `400`), and do not tell the client why.
+- If it is your own path: make it relative to the root, without `..`: `root.open("css/site.css")`, not `root.open("/srv/public/css/site.css")` or `root.open("../shared/logo.png")`.
+- To serve files from a directory that a link leads to, open a `Root` on that directory itself: `Root::new` follows links to reach the directory, and only what is beneath it is checked. A tree that needs links inside it (a release directory with `current -> releases/42`) can open its `Root` on the target.
+
+[All error codes](README.md)
+"#),
     (1101, r#"# GIONG-E1101: invalid HTTP request
 
 Raised by giong-http's client, before anything is sent. In code: `giong::error::Code::HttpClientRequest`.
@@ -1175,7 +1198,7 @@ giong-http: GIONG-E1121 refused 812 connection(s) on this worker: less than 51 M
 
 Before it takes on a new connection, the server checks how much memory is left to the process: the smaller of what its cgroup allows (a container's memory limit, systemd's `MemoryMax`: `memory.max`, or `memory.high` if lower, less what the cgroup uses apart from page cache the kernel can reclaim) and what the machine has (`MemAvailable`; on macOS, which has no cgroups, its free and inactive pages). Less than `Server::min_free_memory` was left, so the server accepted the connection and closed it at once. The connections it already had are served as before, and new ones are taken on again as soon as memory is freed.
 
-Every connection costs memory even while idle (about 1.3 KiB over HTTP/1.1, 3.2 KiB over HTTP/2, 5.2 KiB over HTTPS, 10 KiB over HTTP/2 with TLS, and about 4 KiB of kernel socket memory, which a cgroup v2 limit counts). Without this check, enough connections fill the memory the process may use and the kernel's out-of-memory killer ends it, with every connection it holds. The default reserve is a tenth of the memory limit (of the machine's memory without a cgroup limit), at least 16 MiB and at most 256 MiB.
+Every connection costs memory even while idle (about 1.2 KiB over HTTP/1.1, 2.5 KiB over HTTP/2, 5.0 KiB over HTTPS, 6.2 KiB over HTTP/2 with TLS, and about 4 KiB of kernel socket memory, which a cgroup v2 limit counts). Without this check, enough connections fill the memory the process may use and the kernel's out-of-memory killer ends it, with every connection it holds. The default reserve is a tenth of the memory limit (of the machine's memory without a cgroup limit), at least 16 MiB and at most 256 MiB.
 
 ## How to fix it
 
@@ -1230,6 +1253,29 @@ On Linux, giong raises the soft limit to the hard one when a runtime is built (`
 - To stop accepting before the limit, lower `Server::max_connections` (per worker) so that the workers' connections and the program's other files fit under it: new clients then wait in the listen queue by design, and the program's own files (database connections, log files) still open.
 - If the descriptors are not connections (a leak: files or sockets the program opens and never closes), find them: `ls -l /proc/<pid>/fd`, or giong-mcp's `overview`, which warns when four fifths of the limit are open.
 - `ENFILE`: the machine as a whole is out of file descriptors; raise `fs.file-max`, or find the process that holds them.
+
+[All error codes](README.md)
+"#),
+    (1124, r#"# GIONG-E1124: connection refused: the client's address has too many connections open
+
+Sent by giong-http's server in the body of a `429 Too Many Requests` (with `Retry-After: 1` and `Connection: close`) to a new connection without TLS; a new TLS connection is closed before its handshake instead, since nothing can be said to it before. In code: `giong::error::Code::HttpServerAddressLimit`. Each worker also says on stderr, at most once a minute, how many connections it refused and the last address refused:
+
+```text
+giong-http: GIONG-E1124 refused 3120 connection(s) on this worker from addresses that had 64 open, its max_connections_per_ip, the last from 203.0.113.7; see docs/errors/E1124.md
+```
+
+## What happened
+
+The server was given `Server::max_connections_per_ip`, and a client that already had that many connections open on the worker opened another. An IPv4 address counts as one client, and so does an IPv6 /64 network (an IPv4 address mapped into IPv6 counts as that IPv4 address). The connection was refused before an idle connection was asked to make room for it; the client's other connections, and every other client, are served as before. Like `max_connections`, the limit applies to each `serve` call, normally one per worker.
+
+Without the limit, one client can take every place under `max_connections`: a connection that has not sent a request is never closed to make room for a new client, since its client would not retry a request lost on it, so connections that send nothing keep new clients waiting in the listen queue until `idle_timeout` (or `first_request_timeout`) closes them.
+
+## How to fix it
+
+- If the client is yours: it opens more connections than it needs. Reuse connections (HTTP keep-alive, one HTTP/2 connection), or bound its pool.
+- If many people share the address (carrier-grade NAT, an office, a VPN exit): raise the limit. A browser opens up to 6 HTTP/1.1 connections to a host, and one over HTTP/2.
+- If every connection comes from a load balancer or a reverse proxy: the limit counts the proxy, not the clients behind it. Turn it off (`max_connections_per_ip(0)`) and limit clients at the proxy, or set it above what the proxy opens.
+- If the connections are an attack, the refusals are the intended outcome. `Server::first_request_timeout` frees the places of connections that send nothing sooner; block the address at the firewall or the load balancer if it keeps coming.
 
 [All error codes](README.md)
 "#),

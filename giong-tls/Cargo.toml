@@ -1,6 +1,6 @@
 [package]
 name = "giong-tls"
-version = "1.5.1"
+version = "1.5.4"
 edition = "2021"
 rust-version = "1.80"
 description = "TLS for the giong thread-per-core runtime, built on rustls"
@@ -27,7 +27,7 @@ unstable-rustls = []
 post-quantum = ["rustls/aws_lc_rs", "rustls/prefer-post-quantum"]
 
 [dependencies]
-giong = { path = "..", version = "1.5.1" }
+giong = { path = "..", version = "1.5.4" }
 libc = "0.2.172"
 rustls = { version = "0.23.33", default-features = false, features = ["ring", "std", "tls12"] }
 # `CertificateDer`, the one type from outside the crate in the stable API:

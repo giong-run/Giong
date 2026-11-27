@@ -293,6 +293,10 @@ codes! {
     /// whole file (its length, which may be that of a sparse file, is more
     /// than the allocator gives). Nothing is kept; the process goes on.
     FileTooLarge = 204, OutOfMemory, "file too large to read into memory";
+    /// A [`Root`](crate::fs::Root) was asked for a path that is absolute,
+    /// has a `..` component or goes through a symbolic link. Nothing was
+    /// opened.
+    OutsideRoot = 205, PermissionDenied, "the path leads outside the root";
 
     // ------------------------------------------------- giong-http client
     /// The URL, a header, the method or the client's settings are not
@@ -379,6 +383,13 @@ codes! {
     /// waits in the listen queue; each worker says so on stderr, at most
     /// once a minute.
     HttpServerOutOfFiles = 1123, Other, "connection not accepted: the server is out of file descriptors";
+    /// The server refused a new connection: its client's address (an IPv4
+    /// address, or an IPv6 /64 network) had `Server::max_connections_per_ip`
+    /// connections open on the worker already. Answered with `429 Too Many
+    /// Requests` and `Retry-After: 1` (this code in the body) on a
+    /// connection without TLS; a TLS connection is closed before its
+    /// handshake. Each worker says so on stderr, at most once a minute.
+    HttpServerAddressLimit = 1124, ConnectionRefused, "connection refused: the client's address has too many connections open";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with

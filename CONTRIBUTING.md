@@ -238,6 +238,8 @@ and a pull request title in the commit convention, since both feed the release n
 Please do not open a public issue for a vulnerability such as a memory-safety bug that
 can be triggered remotely. Report it privately at
 <https://github.com/giong-run/Giong/security/advisories/new> so it can be fixed before it is disclosed.
+[SECURITY.md](SECURITY.md) says what to put in the report, which versions get fixes, and the
+threat model: what giong defends against and what is not a vulnerability.
 
 ## Conduct
 

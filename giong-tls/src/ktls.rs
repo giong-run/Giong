@@ -2208,16 +2208,6 @@ impl TlsStream {
         }
     }
 
-    /// Sends the `KeyUpdate` the peer asked for, if it is still owed and
-    /// the stream can still send. The caller holds the send lock.
-    async fn pay_key_update(&self) -> io::Result<()> {
-        let owed = self.kernel_mut().key_update_owed;
-        if owed && self.cannot_send().is_none() {
-            self.update_sending_keys().await?;
-        }
-        Ok(())
-    }
-
     /// Sends a `KeyUpdate` (not asking for one back) and switches the
     /// kernel to the next sending key. The caller holds the send lock. On
     /// failure the stream cannot send any more: the peer may already expect
@@ -2315,43 +2305,52 @@ impl TlsStream {
     }
 
     /// `write_all` once the kernel encrypts.
-    pub(crate) async fn kernel_write_all<B: giong::IoBuf>(&self, buf: B) -> (io::Result<()>, B) {
-        let sending = self.lock_send().await;
-        if let Err(e) = self.before_kernel_send(buf.len()).await {
-            // Nothing of `buf` was sent; a failed key update has already
-            // marked the stream broken.
-            sending.done();
-            return (Err(e), buf);
-        }
-        let (res, buf) = self.tcp.write_all(buf).await;
-        match res {
-            Ok(()) => {
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn kernel_write_all<B: giong::IoBuf>(
+        &self,
+        buf: B,
+    ) -> impl Future<Output = (io::Result<()>, B)> + '_ {
+        async move {
+            let sending = self.lock_send().await;
+            if let Err(e) = self.before_kernel_send(buf.len()).await {
+                // Nothing of `buf` was sent; a failed key update has already
+                // marked the stream broken.
                 sending.done();
-                (Ok(()), buf)
+                return (Err(e), buf);
             }
-            // Part of `buf` may be gone: the stream is cut, as in process.
-            Err(e) => (Err(kernel_error(e)), buf),
+            let (res, buf) = self.tcp.write_all(buf).await;
+            match res {
+                Ok(()) => {
+                    sending.done();
+                    (Ok(()), buf)
+                }
+                // Part of `buf` may be gone: the stream is cut, as in process.
+                Err(e) => (Err(kernel_error(e)), buf),
+            }
         }
     }
 
     /// `write_all_vectored` once the kernel encrypts.
-    pub(crate) async fn kernel_write_all_vectored<B: giong::IoBuf>(
+    #[allow(clippy::manual_async_fn)]
+    pub(crate) fn kernel_write_all_vectored<B: giong::IoBuf>(
         &self,
         bufs: Vec<B>,
-    ) -> (io::Result<()>, Vec<B>) {
-        let len = bufs.iter().map(giong::IoBuf::len).sum();
-        let sending = self.lock_send().await;
-        if let Err(e) = self.before_kernel_send(len).await {
-            sending.done();
-            return (Err(e), bufs);
-        }
-        let (res, bufs) = self.tcp.write_all_vectored(bufs).await;
-        match res {
-            Ok(()) => {
+    ) -> impl Future<Output = (io::Result<()>, Vec<B>)> + '_ {
+        async move {
+            let len = bufs.iter().map(giong::IoBuf::len).sum();
+            let sending = self.lock_send().await;
+            if let Err(e) = self.before_kernel_send(len).await {
                 sending.done();
-                (Ok(()), bufs)
+                return (Err(e), bufs);
             }
-            Err(e) => (Err(kernel_error(e)), bufs),
+            let (res, bufs) = self.tcp.write_all_vectored(bufs).await;
+            match res {
+                Ok(()) => {
+                    sending.done();
+                    (Ok(()), bufs)
+                }
+                Err(e) => (Err(kernel_error(e)), bufs),
+            }
         }
     }
 
@@ -2390,11 +2389,18 @@ impl TlsStream {
     /// the cipher's limit: a key update where the kernel can take new keys,
     /// `close_notify` and an error elsewhere (as rustls does for TLS 1.2).
     /// The caller holds the send lock.
+    ///
+    /// The sends it may make are rare (the peer asks for a key update, or a
+    /// key has encrypted millions of records) and boxed: inline, each would
+    /// make every write's future as large as itself, and a write's future is
+    /// kept beside the idle state of whatever waits for it.
     async fn before_kernel_send(&self, len: usize) -> io::Result<()> {
         if let Some(e) = self.cannot_send() {
             return Err(e);
         }
-        self.pay_key_update().await?;
+        if self.kernel_mut().key_update_owed {
+            Box::pin(self.update_sending_keys()).await?;
+        }
         let add = records_for(len);
         let fd = self.tcp.as_raw_fd();
         let near_limit = {
@@ -2417,6 +2423,12 @@ impl TlsStream {
         if !near_limit {
             return Ok(());
         }
+        Box::pin(self.at_record_limit(add)).await
+    }
+
+    /// The rest of [`before_kernel_send`](Self::before_kernel_send) when the
+    /// next `add` records would reach the cipher's limit under one key.
+    async fn at_record_limit(&self, add: u64) -> io::Result<()> {
         if self.kernel_mut().can_update_keys {
             self.update_sending_keys().await?;
             self.kernel_mut().sent_since = add;

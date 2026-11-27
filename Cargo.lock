@@ -397,7 +397,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "io-uring",
  "libc",
@@ -408,7 +408,7 @@ dependencies = [
 
 [[package]]
 name = "giong-cli"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-mcp",
@@ -420,7 +420,7 @@ dependencies = [
 
 [[package]]
 name = "giong-compat"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "bytes",
  "futures-io",
@@ -447,7 +447,7 @@ dependencies = [
 
 [[package]]
 name = "giong-grpc"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-grpc-build",
@@ -459,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "giong-grpc-build"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "prost",
  "prost-types",
@@ -468,7 +468,7 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "bytes",
  "giong",
@@ -489,7 +489,7 @@ dependencies = [
 
 [[package]]
 name = "giong-mcp"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-http",
@@ -502,7 +502,7 @@ dependencies = [
 
 [[package]]
 name = "giong-mysql"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-tls",
@@ -510,11 +510,12 @@ dependencies = [
  "rcgen",
  "ring",
  "socket2",
+ "zeroize",
 ]
 
 [[package]]
 name = "giong-postgres"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-tls",
@@ -522,15 +523,16 @@ dependencies = [
  "rcgen",
  "ring",
  "socket2",
+ "zeroize",
 ]
 
 [[package]]
 name = "giong-proto"
-version = "1.5.1"
+version = "1.5.4"
 
 [[package]]
 name = "giong-quic"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "bytes",
  "giong",
@@ -544,18 +546,19 @@ dependencies = [
 
 [[package]]
 name = "giong-redis"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-tls",
  "libc",
  "rcgen",
  "socket2",
+ "zeroize",
 ]
 
 [[package]]
 name = "giong-tls"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-tls",
@@ -570,10 +573,11 @@ dependencies = [
 
 [[package]]
 name = "giong-web"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-http",
+ "libdeflater",
  "miniz_oxide",
  "serde",
  "serde_json",
@@ -793,6 +797,24 @@ name = "libc"
 version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
+
+[[package]]
+name = "libdeflate-sys"
+version = "1.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d7870e5fbd2766179a937c725fb11f4ca0ef025d982beb61bd3ce755425bd19c"
+dependencies = [
+ "cc",
+]
+
+[[package]]
+name = "libdeflater"
+version = "1.26.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0cbb8285d2e2bd4b8d4155840ae81929354b4ba0d7b3c272c84761ffa2141e1f"
+dependencies = [
+ "libdeflate-sys",
+]
 
 [[package]]
 name = "log"

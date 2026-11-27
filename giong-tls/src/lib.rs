@@ -106,7 +106,7 @@ pub mod fuzzing {
 use std::cell::{Cell, RefCell, RefMut};
 use std::collections::HashSet;
 use std::ffi::OsStr;
-use std::future::poll_fn;
+use std::future::{poll_fn, Future};
 use std::io;
 use std::mem;
 use std::net::Shutdown;
@@ -1582,14 +1582,17 @@ impl TlsStream {
     /// Writes all of `wire` to the socket and empties it, keeping its
     /// capacity for the rest of this write. A failure may have cut a record
     /// in two, so it marks the stream broken.
-    async fn send_wire(&self, wire: &mut Vec<u8>) -> io::Result<()> {
-        let (res, mut sent) = self.tcp.write_all(mem::take(wire)).await;
-        sent.clear();
-        *wire = sent;
-        if res.is_err() {
-            self.broken.set(true);
+    #[allow(clippy::manual_async_fn)]
+    fn send_wire<'a>(&'a self, wire: &'a mut Vec<u8>) -> impl Future<Output = io::Result<()>> + 'a {
+        async move {
+            let (res, mut sent) = self.tcp.write_all(mem::take(wire)).await;
+            sent.clear();
+            *wire = sent;
+            if res.is_err() {
+                self.broken.set(true);
+            }
+            res
         }
-        res
     }
 
     /// Encrypts all of `data` and sends it, in the process. The caller holds
@@ -1603,85 +1606,100 @@ impl TlsStream {
     /// response's head and body share one send; the caller passes `last`
     /// true for the final piece. Records the caller found queued (`carried`)
     /// are followed by a send in the same call.
-    async fn send_plain(&self, wire: &mut Vec<u8>, data: &[u8], last: bool) -> io::Result<()> {
-        let mut sent = 0;
-        while sent < data.len() {
-            let piece = &data[sent..data.len().min(sent + ENCRYPT_AT)];
-            let (carried, refused) = {
-                let mut conn = self.conn();
-                conn.write_tls(wire);
-                let carried = !wire.is_empty();
-                let refused = match conn.encrypt(piece, wire) {
-                    Ok(_) => {
-                        sent += piece.len();
-                        false
-                    }
-                    // The key has encrypted as many records as its cipher
-                    // allows and, on TLS 1.2, cannot be changed: rustls
-                    // queued close_notify, which goes out below, and
-                    // encrypts nothing more.
-                    Err(user::Refused::Exhausted) => {
-                        conn.write_tls(wire);
-                        true
-                    }
-                    Err(user::Refused::Closed) => {
-                        drop(conn);
-                        self.closed.set(Some(Code::TlsBroken));
-                        return Err(sending_closed(Code::TlsBroken));
-                    }
-                    Err(user::Refused::Tls(e)) => return Err(tls_error(e)),
+    #[allow(clippy::manual_async_fn)]
+    fn send_plain<'a>(
+        &'a self,
+        wire: &'a mut Vec<u8>,
+        data: &'a [u8],
+        last: bool,
+    ) -> impl Future<Output = io::Result<()>> + 'a {
+        async move {
+            let mut sent = 0;
+            while sent < data.len() {
+                let piece = &data[sent..data.len().min(sent + ENCRYPT_AT)];
+                let (carried, refused) = {
+                    let mut conn = self.conn();
+                    conn.write_tls(wire);
+                    let carried = !wire.is_empty();
+                    let refused = match conn.encrypt(piece, wire) {
+                        Ok(_) => {
+                            sent += piece.len();
+                            false
+                        }
+                        // The key has encrypted as many records as its cipher
+                        // allows and, on TLS 1.2, cannot be changed: rustls
+                        // queued close_notify, which goes out below, and
+                        // encrypts nothing more.
+                        Err(user::Refused::Exhausted) => {
+                            conn.write_tls(wire);
+                            true
+                        }
+                        Err(user::Refused::Closed) => {
+                            drop(conn);
+                            self.closed.set(Some(Code::TlsBroken));
+                            return Err(sending_closed(Code::TlsBroken));
+                        }
+                        Err(user::Refused::Tls(e)) => return Err(tls_error(e)),
+                    };
+                    (carried, refused)
                 };
-                (carried, refused)
-            };
-            let more = sent < data.len() || !last;
-            if !wire.is_empty() && (carried || refused || !more || wire.len() >= SEND_AT) {
-                self.send_wire(wire).await?;
+                let more = sent < data.len() || !last;
+                if !wire.is_empty() && (carried || refused || !more || wire.len() >= SEND_AT) {
+                    self.send_wire(wire).await?;
+                }
+                if carried {
+                    // Receivers waiting in `flush_tls` for these records.
+                    self.wake_waiters();
+                }
+                if refused {
+                    self.closed.set(Some(Code::TlsKeysExhausted));
+                    return Err(sending_closed(Code::TlsKeysExhausted));
+                }
             }
-            if carried {
-                // Receivers waiting in `flush_tls` for these records.
-                self.wake_waiters();
-            }
-            if refused {
-                self.closed.set(Some(Code::TlsKeysExhausted));
-                return Err(sending_closed(Code::TlsKeysExhausted));
-            }
+            Ok(())
         }
-        Ok(())
     }
 
     /// One write in the process: `pieces` encrypted and sent in order,
     /// holding the send lock throughout, so that no other task's write comes
     /// between them.
-    async fn write_in_process(&self, pieces: &[&[u8]]) -> io::Result<()> {
-        let sending = self.lock_send().await;
-        if let Some(e) = self.cannot_send() {
-            sending.done();
-            return Err(e);
-        }
-        let mut wire = self.take_wire();
-        let mut res = Ok(());
-        for (i, piece) in pieces.iter().enumerate() {
-            res = self
-                .send_plain(&mut wire, piece, i + 1 == pieces.len())
-                .await;
-            if res.is_err() {
-                break;
+    #[allow(clippy::manual_async_fn)]
+    fn write_in_process<'a>(
+        &'a self,
+        pieces: &'a [&'a [u8]],
+    ) -> impl Future<Output = io::Result<()>> + 'a {
+        async move {
+            let sending = self.lock_send().await;
+            if let Some(e) = self.cannot_send() {
+                sending.done();
+                return Err(e);
             }
+            let mut wire = self.take_wire();
+            let mut res = Ok(());
+            for (i, piece) in pieces.iter().enumerate() {
+                res = self
+                    .send_plain(&mut wire, piece, i + 1 == pieces.len())
+                    .await;
+                if res.is_err() {
+                    break;
+                }
+            }
+            if res.is_ok() && !wire.is_empty() {
+                // Records of pieces that came before empty last ones.
+                res = self.send_wire(&mut wire).await;
+            }
+            self.keep_wire(wire);
+            // A failure on the socket has marked the stream broken already; one
+            // before anything was sent (rustls refusing the data, keys used up,
+            // a file read) leaves it whole.
+            sending.done();
+            res
         }
-        if res.is_ok() && !wire.is_empty() {
-            // Records of pieces that came before empty last ones.
-            res = self.send_wire(&mut wire).await;
-        }
-        self.keep_wire(wire);
-        // A failure on the socket has marked the stream broken already; one
-        // before anything was sent (rustls refusing the data, keys used up,
-        // a file read) leaves it whole.
-        sending.done();
-        res
     }
 
     /// Receives one chunk of TLS data, decrypts it into `plain`, and sends
-    /// whatever the protocol wants to send in response.
+    /// whatever the protocol wants to send in response. For the handshake;
+    /// [`recv`](Self::recv) uses [`pump_established`](Self::pump_established).
     async fn pump(&self) -> io::Result<()> {
         // Records held back for the next send (see `hold_output`) go out
         // now if the receive has to wait: the peer may be waiting for them.
@@ -1714,18 +1732,7 @@ impl TlsStream {
             self.eof.set(true);
             return Ok(());
         }
-        let result = {
-            let mut conn = self.conn();
-            let mut plain = self.plain.borrow_mut();
-            // Data decrypted before a failure stays in `plain`.
-            let result = conn.read_tls(&chunk, &mut plain).map_err(read_error);
-            if conn.peer_closed() {
-                self.close_notify.set(true);
-                self.eof.set(true);
-            }
-            result
-        };
-        drop(chunk);
+        let result = self.decrypt(chunk);
         // Handshake messages, key updates, or the alert describing `result`.
         // Not being able to send them is no reason to withhold what was
         // received, if sending has failed before.
@@ -1733,6 +1740,61 @@ impl TlsStream {
             return result;
         }
         let flushed = self.flush_for_recv().await;
+        result.and(flushed)
+    }
+
+    /// Decrypts a received `chunk` into `plain` (the end of the stream if it
+    /// is empty), and gives the chunk back.
+    fn decrypt(&self, chunk: giong::RecvBuf) -> io::Result<()> {
+        if chunk.is_empty() {
+            self.eof.set(true);
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let mut plain = self.plain.borrow_mut();
+        // Data decrypted before a failure stays in `plain`.
+        let result = conn.read_tls(&chunk, &mut plain).map_err(read_error);
+        if conn.peer_closed() {
+            self.close_notify.set(true);
+            self.eof.set(true);
+        }
+        result
+    }
+
+    /// [`pump`](Self::pump) on an established stream, for
+    /// [`recv`](Self::recv). Every record it may send goes out without
+    /// waiting ([`flush_now`](Self::flush_now)), so its future holds no
+    /// send: a receive that waits, as an idle connection's does for as long
+    /// as the connection is idle, is the size of the socket's receive and
+    /// not of the handshake's sending (over 500 bytes more).
+    async fn pump_established(&self) -> io::Result<()> {
+        debug_assert!(self.established.get());
+        // Records held back for the next send (see `hold_output`) go out
+        // now if the receive has to wait: the peer may be waiting for them.
+        let ready = if !self.broken.get() && self.wants_send() {
+            poll_fn(|cx| Poll::Ready(self.tcp.poll_recv(cx))).await
+        } else {
+            Poll::Pending
+        };
+        let chunk = match ready {
+            Poll::Ready(chunk) => chunk?,
+            Poll::Pending => {
+                if !self.broken.get() && self.wants_send() {
+                    // As in `pump`: a failure marks the stream broken.
+                    let _ = self.flush_now();
+                }
+                // Cancelling here loses nothing: `recv` is cancel safe.
+                self.tcp.recv().await?
+            }
+        };
+        let result = self.decrypt(chunk);
+        // Once established, key updates wait for the next send (see
+        // `hold_output`); the alert describing a failure goes out now,
+        // unless sending has failed before.
+        if result.is_ok() || self.broken.get() {
+            return result;
+        }
+        let flushed = self.flush_now();
         result.and(flushed)
     }
 
@@ -1788,7 +1850,7 @@ impl TlsStream {
             if self.eof.get() {
                 return Ok(Vec::new());
             }
-            if let Err(e) = self.pump().await {
+            if let Err(e) = self.pump_established().await {
                 // Data that arrived intact before the failure comes first.
                 if self.plain.borrow().is_empty() {
                     return Err(e);

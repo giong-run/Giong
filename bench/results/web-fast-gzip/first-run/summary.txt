@@ -1,0 +1,39 @@
+base: miniz; medians over rounds; change against the base
+workers path    mode    build       req/s  change  us/req  change  p50 us   p99 us    p99.9      max RSS+ KiB peak KiB errors
+      1 /users  closed  miniz      28,967           34.47           2,646    2,818    2,859    4,604    1,192    4,438      0
+      1 /users  closed  fast       42,293  +46.0%   23.62  -31.5%   1,802    1,942    1,987    3,721      936    4,288      0
+
+      1 /users  open50  miniz      14,483           35.00             101      254      296    1,128    1,174    4,416      0
+      1 /users  open50  fast       14,483   +0.0%   24.08  -31.2%      83      209      237      919      946    4,306      0
+
+      1 /users  open80  miniz      23,173           34.98             157      346      485    2,156    1,200    4,444      0
+      1 /users  open80  fast       23,173   +0.0%   24.31  -30.5%      91      228      296    1,063      970    4,330      0
+
+      1 /json   closed  miniz     335,532            2.98             189      312      383    2,122      846    4,080      0
+      1 /json   closed  fast      335,825   +0.1%    2.97   -0.1%     189      309      382    2,123      762    4,114      0
+
+      1 /json   open50  miniz     167,763            3.22             144      288      315    1,577      796    4,032      0
+      1 /json   open50  fast      167,764   +0.0%    3.23   +0.1%     144      288      320    1,682      758    4,124      0
+
+      1 /json   open80  miniz     268,409            3.07             167    9,896   56,361   84,891      802    4,042      0
+      1 /json   open80  fast      268,417   +0.0%    3.10   +1.2%     165   79,102  139,330  153,918      758    4,124      0
+
+      4 /users  closed  miniz     112,356           35.53           2,310    2,908    2,974    4,977    4,300    8,142      0
+      4 /users  closed  fast      161,176  +43.5%   24.75  -30.3%   1,556    2,003    2,077    4,073    3,600    7,542      0
+
+      4 /users  open50  miniz      56,176           35.75             123      308      375    1,093    4,242    8,102      0
+      4 /users  open50  fast       56,176   +0.0%   24.41  -31.7%     101      265      326      972    3,730    7,704      0
+
+      4 /users  open80  miniz      89,881           35.89             245      594      680    2,919    4,370    8,240      0
+      4 /users  open80  fast       89,882   +0.0%   24.63  -31.4%     164      350      398    1,700    3,820    7,794      0
+
+      4 /json   closed  miniz   1,182,885            3.37             204      313      378      618    2,888    6,760      0
+      4 /json   closed  fast    1,188,511   +0.5%    3.36   -0.5%     204      312      381    2,630    2,850    6,822      0
+
+      4 /json   open50  miniz     591,433            3.43             159      290      315    1,725    2,874    6,724      0
+      4 /json   open50  fast      591,432   -0.0%    3.44   +0.5%     174      299      325    2,059    2,848    6,810      0
+
+      4 /json   open80  miniz     941,569            3.38             204      328      366    2,825    3,002    6,850      0
+      4 /json   open80  fast      945,577   +0.4%    3.35   -0.7%     198      323      357    2,832    2,904    6,862      0
+
+open50/open80: open loop at 50% and 80% of the base build's closed-loop rate in the same round.

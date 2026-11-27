@@ -555,7 +555,10 @@ fn runtime_life() {
                     }
                 });
                 for _ in 0..CONNECTIONS {
-                    let stream = TcpStream::connect(shared).await.unwrap();
+                    let stream = match TcpStream::connect(shared).await {
+                        Ok(stream) => stream,
+                        Err(e) => panic!("connect to {shared}: {e}{}", ports_in_use(shared)),
+                    };
                     stream.write_all(vec![ECHO; 8]).await.0.unwrap();
                     let mut back = 0;
                     while back < 8 {
@@ -582,6 +585,46 @@ fn runtime_life() {
         })
         .unwrap();
     drop(holder);
+}
+
+/// What the machine says about its TCP ports, for the message of a failed
+/// connect to `addr` (#504): whether a blocking connect of the standard
+/// library to the same address works now (if it does, the machine was not
+/// short of anything the connect needs), its connections by state, and its
+/// dynamic port range. Seen with `WSAENOBUFS` on Windows; not running out
+/// of ports, which 40,000 connections in TIME_WAIT did not do.
+#[cfg(windows)]
+fn ports_in_use(addr: SocketAddr) -> String {
+    use std::process::Command;
+    let again = match std::net::TcpStream::connect_timeout(&addr, Duration::from_secs(2)) {
+        Ok(_) => "works".to_string(),
+        Err(e) => format!("fails too: {e}"),
+    };
+    let run = |program: &str, args: &[&str]| {
+        Command::new(program)
+            .args(args)
+            .output()
+            .map(|out| String::from_utf8_lossy(&out.stdout).into_owned())
+            .unwrap_or_else(|e| format!("{program}: {e}"))
+    };
+    let mut states = BTreeMap::<String, usize>::new();
+    for line in run("netstat", &["-an", "-p", "TCP"]).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.len() == 4 && fields[0] == "TCP" {
+            *states.entry(fields[3].to_string()).or_default() += 1;
+        }
+    }
+    let range = run("netsh", &["int", "ipv4", "show", "dynamicport", "tcp"]);
+    format!(
+        "\nthe standard library's connect to {addr} right after: {again}\n\
+         TCP connections by state: {states:?}\n{}",
+        range.trim()
+    )
+}
+
+#[cfg(unix)]
+fn ports_in_use(_: SocketAddr) -> String {
+    String::new()
 }
 
 /// What each open descriptor is, by number: where its link in `/proc` or

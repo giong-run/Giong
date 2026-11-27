@@ -1,6 +1,6 @@
 [package]
 name = "giong-mysql"
-version = "1.5.1"
+version = "1.5.4"
 edition = "2021"
 rust-version = "1.80"
 description = "A MySQL client and connection pool for the giong thread-per-core runtime"
@@ -12,8 +12,8 @@ keywords = ["mysql", "database", "io-uring", "async"]
 categories = ["database", "network-programming", "asynchronous"]
 
 [dependencies]
-giong = { path = "..", version = "1.5.1" }
-giong-tls = { path = "../giong-tls", version = "1.5.1" }
+giong = { path = "..", version = "1.5.4" }
+giong-tls = { path = "../giong-tls", version = "1.5.4" }
 # SHA-1 and SHA-256 for the password scrambles, and the random padding of
 # RSA-OAEP. Already compiled in through rustls, so it adds nothing to the
 # build.
@@ -21,6 +21,9 @@ ring = "0.17"
 # TCP keepalive and TCP_USER_TIMEOUT on the connection, to notice a server
 # that vanished without closing. Already a dependency of giong.
 socket2 = { version = "0.6", features = ["all"] }
+# Wipes the password and what is derived from it when they are dropped.
+# Already compiled in through rustls.
+zeroize = "1"
 
 [dev-dependencies]
 libc = "0.2"

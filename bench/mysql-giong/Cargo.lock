@@ -51,7 +51,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "io-uring",
  "libc",
@@ -61,17 +61,18 @@ dependencies = [
 
 [[package]]
 name = "giong-mysql"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "giong-tls",
  "ring",
  "socket2",
+ "zeroize",
 ]
 
 [[package]]
 name = "giong-tls"
-version = "1.5.1"
+version = "1.5.4"
 dependencies = [
  "giong",
  "libc",

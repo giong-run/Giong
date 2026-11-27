@@ -46,7 +46,11 @@ request; everything else is automated and safe to re-run.
    to the bounded channel; no alias was kept (STABILITY.md, *Changes made before 1.0*).
    From 1.0.0 on a deprecated item stays for the rest of 1.x. Thank outside contributors in
    the entry for their change: `([#4](…/issues/4), thanks to [@name](https://github.com/name))`.
-   CI runs on the branch as on any pull request.
+   CI runs on the branch as on any pull request. The pull request and the CI run that
+   Prepare release starts are github-actions' own, so their workflows wait until someone
+   with write access presses *Approve and run workflows* on the pull request. The run
+   Prepare release dispatches posts the required `CI gate` status itself: GitHub starts
+   no `ci-gate.yml` for a run of github-actions.
 
 3. **Merge it.** Squash-merge as usual. That is the last manual step:
    - `release-tag.yml` sees the new version on `main`, tags the merge commit `vX.Y.Z`
@@ -63,14 +67,23 @@ request; everything else is automated and safe to re-run.
      requests are left out). It is marked *Latest*, or *Pre-release* for a version with
      a suffix.
    - It builds the `giong` command for Linux (static musl, x86_64 and aarch64), macOS
-     (aarch64 and x86_64) and Windows (x86_64) and attaches each archive and its
-     `.sha256` to the Release: what `https://giong.run/install.sh` and `install.ps1`
-     download. Until an archive is there, the scripts build with `cargo install`.
+     (aarch64 and x86_64) and Windows (x86_64) with `cargo auditable` (the binary lists
+     the crates compiled in), and attaches each archive, its `.sha256` and its CycloneDX
+     SBOM (`.cdx.json`, from `scripts/sbom-cli.sh`) to the Release: what
+     `https://giong.run/install.sh` and `install.ps1` download. Until an archive is
+     there, the scripts build with `cargo install`. Before uploading, it attests the
+     archive and the binary in it through GitHub artifact attestations (`actions/attest`:
+     a SLSA build provenance and the SBOM, signed with the job's OIDC identity through
+     Sigstore), then checks them the way a user does, with `gh attestation verify`
+     limited to `release.yml`, the tag and GitHub-hosted runners.
    - It starts the Site workflow, which deploys giong.run with the new version.
 
-4. **Check it.** The run's summary shows the notes. Look at the
-   [Release](https://github.com/giong-run/Giong/releases/latest), the crate pages on
-   crates.io (the README, including the dark-mode logo) and https://giong.run.
+4. **Check it.** The run's summary shows the notes and the attestations. Look at the
+   [Release](https://github.com/giong-run/Giong/releases/latest) (five archives, each with
+   a `.sha256` and a `.cdx.json`), the crate pages on crates.io (the README, including the
+   dark-mode logo) and https://giong.run. Any download can be checked with
+   `gh attestation verify <file> --repo giong-run/Giong --signer-workflow
+   giong-run/Giong/.github/workflows/release.yml`.
 
 ## Release candidates of 1.0
 

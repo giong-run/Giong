@@ -1,0 +1,16 @@
+# Instructions per request of bench/giong-http's server, counted by callgrind with
+# bench/results/idle-conn-memory/callgrind.sh. /json: `callgrind.sh <binary> /json 2000` (one
+# worker, plain TCP, 300 keep-alive requests of warm-up, counters zeroed, 2,000 requests on
+# one connection). handshake: `callgrind.sh <binary> handshake 500` (TLS, a new connection
+# per request, each offered the session of the one before; 100 connections of warm-up).
+# Two runs of each build, interleaved. main is main a1b2db5 (built from da127ad, the same
+# code); change is the final version of the change merged with it.
+build,path,run,instructions_per_request
+main,/json,1,6388.7
+main,handshake,1,1284369.1
+change,/json,1,6377.6
+change,handshake,1,1283834.3
+main,/json,2,6391.6
+main,handshake,2,1284863.6
+change,/json,2,6377.6
+change,handshake,2,1283572.1

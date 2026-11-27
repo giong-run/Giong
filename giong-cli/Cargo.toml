@@ -1,6 +1,6 @@
 [package]
 name = "giong-cli"
-version = "1.5.1"
+version = "1.5.4"
 edition = "2021"
 rust-version = "1.80"
 description = "The giong command: start, run, check and ship services on the Gióng async runtime"
@@ -42,6 +42,6 @@ unsafe_code = "deny"
 # drive the `giong` binary against it. Unix only: giong-web does not build on
 # Windows. `dev` keeps giong-web's Record in the release test builds CI runs.
 [target.'cfg(unix)'.dev-dependencies]
-giong = { path = "..", version = "1.5.1" }
-giong-web = { path = "../giong-web", version = "1.5.1", features = ["dev"] }
-giong-mcp = { path = "../giong-mcp", version = "1.5.1", features = ["web"] }
+giong = { path = "..", version = "1.5.4" }
+giong-web = { path = "../giong-web", version = "1.5.4", features = ["dev"] }
+giong-mcp = { path = "../giong-mcp", version = "1.5.4", features = ["web"] }

@@ -1,6 +1,6 @@
 [package]
 name = "giong-redis"
-version = "1.5.1"
+version = "1.5.4"
 edition = "2021"
 rust-version = "1.80"
 description = "A Redis client, pipelining across tasks, with Pub/Sub and a pool, for the giong thread-per-core runtime"
@@ -12,11 +12,14 @@ keywords = ["redis", "valkey", "io-uring", "async", "cache"]
 categories = ["database", "network-programming", "asynchronous"]
 
 [dependencies]
-giong = { path = "..", version = "1.5.1" }
-giong-tls = { path = "../giong-tls", version = "1.5.1" }
+giong = { path = "..", version = "1.5.4" }
+giong-tls = { path = "../giong-tls", version = "1.5.4" }
 # TCP keepalive and TCP_USER_TIMEOUT on the connection, to notice a server
 # that vanished without closing. Already a dependency of giong.
 socket2 = { version = "0.6", features = ["all"] }
+# Wipes the password when it is dropped, and the command that carried it.
+# Already compiled in through rustls.
+zeroize = "1"
 
 [dev-dependencies]
 libc = "0.2"

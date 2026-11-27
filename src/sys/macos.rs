@@ -52,6 +52,39 @@ pub(crate) unsafe fn stat_at(
     libc::fstatat(dir, path, out, flags & !AT_EMPTY_PATH) as isize
 }
 
+/// What [`open_beneath`] needs: macOS has no `openat2`, so the flags and
+/// the mode of an `openat`.
+pub(crate) struct OpenHow {
+    flags: i32,
+    mode: u32,
+}
+
+/// The [`OpenHow`] of an `open(2)` with `flags` and `mode` beneath a root.
+pub(crate) fn open_how(flags: i32, mode: u32) -> OpenHow {
+    OpenHow { flags, mode }
+}
+
+/// `AT_SYMLINK_NOFOLLOW_ANY` (macOS 11): a stat that refuses a symbolic
+/// link anywhere in the path. Not in the `libc` crate.
+pub(crate) const AT_SYMLINK_NOFOLLOW_ANY: i32 = 0x0800;
+
+/// Opens `path` beneath `dir`; blocking, `-1` and `errno` on failure.
+/// `O_NOFOLLOW_ANY` (macOS 11) refuses a symbolic link anywhere in the
+/// path, and `fs::Root` has already refused `..` and absolute paths, so
+/// the path cannot lead out of `dir`.
+///
+/// # Safety
+///
+/// `path` must be a valid C string.
+pub(crate) unsafe fn open_beneath(dir: RawFd, path: *const libc::c_char, how: &OpenHow) -> isize {
+    libc::openat(
+        dir,
+        path,
+        how.flags | libc::O_NOFOLLOW_ANY,
+        how.mode as libc::c_uint,
+    ) as isize
+}
+
 impl Bell {
     /// A non-blocking, close-on-exec pipe. macOS has no `pipe2`, so the
     /// flags are set after the `pipe`: a `fork` and `exec` on another thread

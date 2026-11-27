@@ -1,6 +1,6 @@
 [package]
 name = "giong-mcp"
-version = "1.5.1"
+version = "1.5.4"
 edition = "2021"
 rust-version = "1.80"
 description = "An MCP server that lets AI agents look inside a running giong service: workers, tasks, pools, profiles"
@@ -13,13 +13,13 @@ categories = ["development-tools::debugging", "asynchronous", "network-programmi
 exclude = ["fuzz/"]
 
 [dependencies]
-giong = { path = "..", version = "1.5.1" }
-giong-http = { path = "../giong-http", version = "1.5.1" }
+giong = { path = "..", version = "1.5.4" }
+giong-http = { path = "../giong-http", version = "1.5.4" }
 # JSON-RPC messages. Already in the workspace through giong-web's `serde`
 # feature.
 serde_json = "1"
 # The `routes` tool: the routes of the giong-web apps the workers serve.
-giong-web = { path = "../giong-web", version = "1.5.1", optional = true }
+giong-web = { path = "../giong-web", version = "1.5.4", optional = true }
 
 [features]
 # The `routes` tool, which lists the routes of the giong-web apps the
@@ -44,8 +44,8 @@ windows-sys = { version = "0.61", features = [
 socket2 = "0.6"
 
 [dev-dependencies]
-giong-http = { path = "../giong-http", version = "1.5.1", features = ["client"] }
-giong-web = { path = "../giong-web", version = "1.5.1" }
+giong-http = { path = "../giong-http", version = "1.5.4", features = ["client"] }
+giong-web = { path = "../giong-web", version = "1.5.4" }
 
 # Unix sockets made outside giong-mcp in the tests: Windows' standard
 # library has none.

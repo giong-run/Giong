@@ -102,6 +102,7 @@ when it is no longer raised.
 | [GIONG-E0202](E0202.md) | `OffsetOutOfRange` | file offset out of range |
 | [GIONG-E0203](E0203.md) | `InvalidOpenOptions` | invalid combination of open options |
 | [GIONG-E0204](E0204.md) | `FileTooLarge` | file too large to read into memory |
+| [GIONG-E0205](E0205.md) | `OutsideRoot` | the path leads outside the root |
 
 ## giong-http
 
@@ -130,6 +131,7 @@ when it is no longer raised.
 | [GIONG-E1121](E1121.md) | `HttpServerLowMemory` | connection refused: the server is low on memory |
 | [GIONG-E1122](E1122.md) | `HttpInvalidTrailer` | invalid HTTP trailer field |
 | [GIONG-E1123](E1123.md) | `HttpServerOutOfFiles` | connection not accepted: the server is out of file descriptors |
+| [GIONG-E1124](E1124.md) | `HttpServerAddressLimit` | connection refused: the client's address has too many connections open |
 
 ## giong-web
 

@@ -4,6 +4,7 @@
 
 use ring::digest::{digest, Context, SHA1_FOR_LEGACY_USE_ONLY as SHA1, SHA256};
 use ring::rand::{SecureRandom, SystemRandom};
+use zeroize::Zeroizing;
 
 use crate::error::{Error, ErrorKind};
 
@@ -50,7 +51,10 @@ pub(crate) fn rsa_encrypt_password(
     pem: &[u8],
 ) -> Result<Vec<u8>, Error> {
     let key = RsaPublicKey::from_pem(pem)?;
-    let mut message = password.as_bytes().to_vec();
+    // Sized so that nothing moves (and leaves a copy behind) before it is
+    // wiped.
+    let mut message = Zeroizing::new(Vec::with_capacity(password.len() + 1));
+    message.extend_from_slice(password.as_bytes());
     message.push(0);
     if !nonce.is_empty() {
         for (i, b) in message.iter_mut().enumerate() {
@@ -142,19 +146,22 @@ impl RsaPublicKey {
                 k * 8
             )));
         }
-        let mut db = Vec::with_capacity(k - H - 1);
+        // The padding hides nothing by itself (anyone can undo it), so every
+        // buffer that holds the message, padded or not, is wiped, and so is
+        // each number computed from it (see `BigUint`'s `Drop`).
+        let mut db = Zeroizing::new(Vec::with_capacity(k - H - 1));
         db.extend_from_slice(digest(&SHA1, b"").as_ref());
         db.resize(k - message.len() - H - 2, 0);
         db.push(1);
         db.extend_from_slice(message);
-        let mut seed = [0u8; H];
-        rng.fill(&mut seed)
+        let mut seed = Zeroizing::new([0u8; H]);
+        rng.fill(&mut seed[..])
             .map_err(|_| key_error("no random bytes for the padding"))?;
-        let db_mask = mgf1(&seed, db.len());
-        let masked_db = xor(&db, &db_mask);
+        let db_mask = mgf1(&seed[..], db.len());
+        let masked_db = Zeroizing::new(xor(&db, &db_mask));
         let seed_mask = mgf1(&masked_db, H);
-        let masked_seed = xor(&seed, &seed_mask);
-        let mut em = Vec::with_capacity(k);
+        let masked_seed = xor(&seed[..], &seed_mask);
+        let mut em = Zeroizing::new(Vec::with_capacity(k));
         em.push(0);
         em.extend_from_slice(&masked_seed);
         em.extend_from_slice(&masked_db);
@@ -262,6 +269,15 @@ impl<'a> Der<'a> {
 /// 2048-bit encryption takes a few milliseconds.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct BigUint(Vec<u32>);
+
+/// Wiped when dropped: the message and every step of its encryption pass
+/// through these numbers. Each is built at its final size, so no smaller
+/// copy is left behind by a reallocation.
+impl Drop for BigUint {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
+}
 
 impl BigUint {
     fn from_be(bytes: &[u8]) -> Self {

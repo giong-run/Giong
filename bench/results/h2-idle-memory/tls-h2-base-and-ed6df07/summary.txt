@@ -1,0 +1,4 @@
+8000 idle HTTPS connections (h2), one worker; median of the rounds
+binary            anon KiB/conn  RSS KiB/conn  RSS after MiB
+base-da127ad               9.81          9.85           81.2
+change                     6.72          6.76           57.1

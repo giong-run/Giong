@@ -68,7 +68,12 @@ impl Handler for App {
                 Response::new(200).body(pattern(1 << 20))
             }
             "/empty" => Response::new(204),
-            "/upload" => {
+            "/upload" | "/upload-late" => {
+                if req.path() == "/upload-late" {
+                    // Work before the body is asked for (an authorization
+                    // check, say).
+                    giong::time::sleep(std::time::Duration::from_millis(700)).await;
+                }
                 let body = req.body_stream().expect("a streamed body");
                 let mut sum = 0u64;
                 let mut len = 0u64;
@@ -140,7 +145,7 @@ impl Handler for App {
     }
 
     fn stream_body(&self, req: &Request) -> Option<u64> {
-        matches!(req.path(), "/upload" | "/trailers").then_some(1 << 20)
+        matches!(req.path(), "/upload" | "/upload-late" | "/trailers").then_some(1 << 20)
     }
 }
 
@@ -1110,6 +1115,43 @@ fn requests_in_early_data_are_marked_and_unsafe_ones_wait() {
         let reply = parse(&late.read_to_end(1 << 16).await.unwrap());
         assert_eq!((reply.status(), &reply.body[..]), (200, &b"hi"[..]));
         drop(control);
+    });
+}
+
+#[test]
+fn a_body_waiting_for_100_continue_has_no_timeout_until_the_handler_asks() {
+    use std::time::Duration;
+    run(|| async {
+        // The client waits for `100 Continue`, which goes out when the
+        // handler asks for the body: the time before that is the handler's,
+        // not the client's, for the request timeout and the minimum rate.
+        let servers = [
+            Server::new().request_timeout(Duration::from_millis(300)),
+            Server::new().min_body_rate(1000, Duration::from_millis(200)),
+        ];
+        for server in servers {
+            let client = connect_to(server).await;
+            let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+            let head = post(
+                "/upload-late",
+                &[("expect", "100-continue"), ("content-length", "3")],
+            );
+            send.write_all(&head).await.unwrap();
+            let mut got = Vec::new();
+            while let Ok(Some(bytes)) = recv.read().await {
+                got.extend_from_slice(&bytes);
+                if !parse(&got).statuses.is_empty() {
+                    break;
+                }
+            }
+            assert_eq!(parse(&got).statuses, [100], "{:?}", parse(&got));
+            send.write_all(&data(b"xyz")).await.unwrap();
+            send.finish().unwrap();
+            got.extend(recv.read_to_end(1 << 20).await.unwrap());
+            let reply = parse(&got);
+            assert_eq!(reply.statuses, [100, 200]);
+            assert_eq!(reply.body, b"3 363");
+        }
     });
 }
 

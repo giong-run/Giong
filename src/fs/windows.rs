@@ -31,6 +31,9 @@
 //! A [`File`] has no cursor: every read and write names its offset, so one
 //! file can be shared by many tasks without them disturbing each other.
 //!
+//! A path that comes from outside (a request, an upload, a configuration
+//! file) is opened through a [`Root`], which keeps it beneath one directory.
+//!
 //! This is the API of the Unix module without what only Unix has
 //! (permission bits, inode numbers, `open(2)` flags), and with handles in
 //! place of descriptors.
@@ -257,6 +260,27 @@ impl OpenOptions {
     pub async fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
         self.check()?;
         let path = owned_path(path.as_ref())?;
+        let options = self.std_options(0);
+        // A file the caller never receives is closed where it is dropped:
+        // with the operation's resources.
+        let file = blocking(move || options.open(path)).await?;
+        Ok(File::from_std_opened(file))
+    }
+
+    /// Opens `path` beneath `root` with these options, refusing a path
+    /// that could lead out of it (see [`Root`]).
+    ///
+    /// Cancel safe as [`open`](Self::open) is.
+    pub async fn open_in<P: AsRef<Path>>(&self, root: &Root, path: P) -> io::Result<File> {
+        self.check()?;
+        let file = root
+            .open_beneath(path.as_ref(), Want::File(self.clone()))
+            .await?;
+        Ok(File::from_std_opened(file))
+    }
+
+    /// The standard library's options for these, with `extra` flags.
+    fn std_options(&self, extra: u32) -> std::fs::OpenOptions {
         let mut options = std::fs::OpenOptions::new();
         options
             .read(self.read)
@@ -265,15 +289,13 @@ impl OpenOptions {
             .truncate(self.truncate && !self.create_new)
             .create(self.create)
             .create_new(self.create_new)
-            .custom_flags(self.custom_flags | sys::FILE_FLAG_OVERLAPPED);
-        // A file the caller never receives is closed where it is dropped:
-        // with the operation's resources.
-        let file = blocking(move || options.open(path)).await?;
-        let handle = file.into_raw_handle();
-        // A console (`CONIN$`, `CONOUT$`) ignores the overlapped flag and
-        // cannot join the completion port: its calls block, so they go to
-        // the blocking threads.
-        Ok(File::from_handle(handle, !sys::is_char_device(handle)))
+            .custom_flags(self.custom_flags | sys::FILE_FLAG_OVERLAPPED | extra);
+        options
+    }
+
+    /// Whether opening with these options may create or empty a file.
+    fn changes_the_file(&self) -> bool {
+        self.create || self.create_new || self.truncate
     }
 }
 
@@ -360,6 +382,15 @@ impl File {
     /// writes through the worker's completion port.
     pub fn from_std(file: std::fs::File) -> Self {
         Self::from_handle(file.into_raw_handle(), false)
+    }
+
+    /// A file `OpenOptions` opened, for overlapped I/O.
+    fn from_std_opened(file: std::fs::File) -> Self {
+        let handle = file.into_raw_handle();
+        // A console (`CONIN$`, `CONOUT$`) ignores the overlapped flag and
+        // cannot join the completion port: its calls block, so they go to
+        // the blocking threads.
+        Self::from_handle(handle, !sys::is_char_device(handle))
     }
 
     fn from_handle(handle: RawHandle, overlapped: bool) -> Self {
@@ -670,6 +701,318 @@ impl std::fmt::Debug for File {
     }
 }
 
+/// A directory that paths are opened beneath, and never outside of.
+///
+/// A path from a request, an upload or a configuration file can hold `..`,
+/// be absolute, or reach a symbolic link or a junction someone placed in
+/// the directory: joined to the directory and opened, it can lead anywhere
+/// on the machine. A `Root` refuses, with `GIONG-E0205`, any path that is
+/// absolute (with a drive, a share or a leading `\`), has a `..`
+/// component, or goes through a symbolic link or a junction (wherever it
+/// points): each component is opened without following reparse points,
+/// and the directories on the way are held open, so that none can be
+/// swapped for a link between the check and the open. The file opened is
+/// then checked to be beneath the directory, where Windows says it is.
+///
+/// ```no_run
+/// use giong::fs::Root;
+///
+/// # async fn demo(request_path: &str) -> std::io::Result<()> {
+/// let public = Root::new("public").await?;
+/// // "css\\site.css" opens; "..\\.env", "C:\\secrets" and a link to either
+/// // are refused.
+/// let file = public.open(request_path).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The directory itself may be reached through a link (`Root::new`
+/// follows links like any open): only what is beneath it is checked. While
+/// a `Root` holds it, the directory cannot be renamed or removed, so that
+/// its path keeps naming the same directory. Like a [`File`], a `Root`
+/// belongs to the worker that opened it.
+pub struct Root {
+    /// The directory, held open without `FILE_SHARE_DELETE`.
+    _dir: std::fs::File,
+    /// Its full path as Windows resolved it (`\\?\C:\...`): what is beneath
+    /// is opened from there, so no name is read as a device (`CON`).
+    full: Arc<PathBuf>,
+    path: PathBuf,
+    _not_send: PhantomData<*const ()>,
+}
+
+/// What an open beneath a root is for.
+enum Want {
+    /// A file, with these options.
+    File(OpenOptions),
+    /// A directory, held as a root of its own.
+    Root,
+    /// Only its metadata.
+    Metadata,
+}
+
+/// `CreateFileW` flags: open a directory (`FILE_FLAG_BACKUP_SEMANTICS`)
+/// and a reparse point itself instead of what it points at.
+const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+/// Access to read a file's attributes only.
+const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+/// Others may read and write, but not rename or remove.
+const SHARE_ALL_BUT_DELETE: u32 = 0x1 | 0x2;
+/// `ERROR_DIRECTORY`: the path is not a directory.
+const ERROR_DIRECTORY: i32 = 267;
+
+impl Root {
+    /// Opens the directory `dir` as a root.
+    ///
+    /// Cancel safe: if the future is dropped, the handle the open may still
+    /// produce is closed, and nothing else changes.
+    pub async fn new<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
+        let path = owned_path(dir.as_ref())?;
+        let at = path.clone();
+        let (dir, full) = blocking(move || {
+            let dir = open_directory(&at, 0)?;
+            let full = final_path(&dir)?;
+            Ok((dir, full))
+        })
+        .await?;
+        Ok(Self {
+            _dir: dir,
+            full: Arc::new(full),
+            path,
+            _not_send: PhantomData,
+        })
+    }
+
+    /// Opens the file at `path` beneath the root for reading.
+    ///
+    /// Cancel safe: if the future is dropped, the handle the open may still
+    /// produce is closed, and nothing else changes.
+    pub async fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
+        OpenOptions::new().read(true).open_in(self, path).await
+    }
+
+    /// Opens the file at `path` beneath the root for writing, creating it
+    /// if needed and emptying it if it exists.
+    ///
+    /// Not cancel safe: if the future is dropped, the file may have been
+    /// created or emptied (the handle is closed either way).
+    pub async fn create<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open_in(self, path)
+            .await
+    }
+
+    /// Reads the whole file at `path` beneath the root, as [`read`] does.
+    ///
+    /// Cancel safe for a regular file: if the future is dropped, nothing
+    /// changes and the file is closed.
+    pub async fn read<P: AsRef<Path>>(&self, path: P) -> io::Result<Vec<u8>> {
+        read_all(self.open(path).await?).await
+    }
+
+    /// Size, type and modification time of what is at `path` beneath the
+    /// root. A symbolic link or a junction there is refused, as everywhere
+    /// under a root.
+    ///
+    /// Cancel safe: it changes nothing.
+    pub async fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
+        let file = self.open_beneath(path.as_ref(), Want::Metadata).await?;
+        blocking(move || file.metadata().map(Metadata::from_std)).await
+    }
+
+    /// Opens the directory at `path` beneath this root as a root of its
+    /// own, for paths beneath it.
+    ///
+    /// Cancel safe: if the future is dropped, the handle the open may still
+    /// produce is closed, and nothing else changes.
+    pub async fn open_root<P: AsRef<Path>>(&self, path: P) -> io::Result<Root> {
+        let path = path.as_ref();
+        let dir = self.open_beneath(path, Want::Root).await?;
+        let (dir, full) = blocking(move || {
+            let full = final_path(&dir)?;
+            Ok((dir, full))
+        })
+        .await?;
+        Ok(Root {
+            _dir: dir,
+            full: Arc::new(full),
+            path: self.path.join(path),
+            _not_send: PhantomData,
+        })
+    }
+
+    /// The directory's path, as given to [`new`](Self::new) (joined with
+    /// the path given to [`open_root`](Self::open_root)).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// What is at `path` beneath the root, opened for `want`.
+    async fn open_beneath(&self, path: &Path, want: Want) -> io::Result<std::fs::File> {
+        use std::path::Component;
+        let mut parts = Vec::new();
+        for part in owned_path(path)?.components() {
+            match part {
+                Component::Prefix(_) | Component::RootDir => {
+                    return Err(outside(&self.path, path, "is absolute"))
+                }
+                Component::ParentDir => {
+                    return Err(outside(&self.path, path, "has a .. component"))
+                }
+                Component::CurDir => {}
+                Component::Normal(name) => parts.push(name.to_os_string()),
+            }
+        }
+        let full = Arc::clone(&self.full);
+        let (root, rel) = (self.path.clone(), path.to_path_buf());
+        blocking(move || walk_beneath(&full, &parts, &want, &root, &rel)).await
+    }
+}
+
+impl std::fmt::Debug for Root {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Root").field("path", &self.path).finish()
+    }
+}
+
+/// Opens the directory at `path`, without letting it be renamed or
+/// removed while it is open; `extra` flags added.
+fn open_directory(path: &Path, extra: u32) -> io::Result<std::fs::File> {
+    let dir = std::fs::OpenOptions::new()
+        .access_mode(FILE_READ_ATTRIBUTES)
+        .share_mode(SHARE_ALL_BUT_DELETE)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | extra)
+        .open(path)?;
+    if !dir.metadata()?.is_dir() {
+        return Err(io::Error::from_raw_os_error(ERROR_DIRECTORY));
+    }
+    Ok(dir)
+}
+
+/// The blocking part of an open beneath a root: each directory on the
+/// way is opened without following reparse points and held open (so that
+/// it cannot be renamed or swapped) until the end, and a symbolic link or
+/// a junction anywhere is refused.
+fn walk_beneath(
+    full: &Path,
+    parts: &[OsString],
+    want: &Want,
+    root: &Path,
+    rel: &Path,
+) -> io::Result<std::fs::File> {
+    let link = || outside(root, rel, "goes through a symbolic link or a junction");
+    let is_link = |file: &std::fs::File| -> io::Result<bool> {
+        // A name surrogate (a symbolic link, a junction), as the standard
+        // library tells them; other reparse points (OneDrive placeholders,
+        // deduplicated files) are files.
+        Ok(file.metadata()?.file_type().is_symlink())
+    };
+    let mut at = full.to_path_buf();
+    let mut held = Vec::with_capacity(parts.len());
+    let (last, dirs) = match parts.split_last() {
+        Some((last, dirs)) => (Some(last), dirs),
+        None => (None, &[][..]),
+    };
+    for part in dirs {
+        at.push(part);
+        let dir = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(SHARE_ALL_BUT_DELETE)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&at)?;
+        if is_link(&dir)? {
+            return Err(link());
+        }
+        if !dir.metadata()?.is_dir() {
+            return Err(io::Error::from_raw_os_error(ERROR_DIRECTORY));
+        }
+        held.push(dir);
+    }
+    if let Some(last) = last {
+        at.push(last);
+        // What is there now, if anything: a link is refused before any
+        // open that could follow it.
+        let existing = std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(SHARE_ALL_BUT_DELETE | 0x4)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&at);
+        match existing {
+            Ok(file) if is_link(&file)? => return Err(link()),
+            Ok(_) => {}
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e),
+        }
+    }
+    let file = match want {
+        // An open that creates or empties never follows a reparse point,
+        // so that a link put there since the look above is opened (and
+        // refused) itself, and nothing outside is created or emptied.
+        Want::File(options) if options.changes_the_file() => options
+            .std_options(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&at)?,
+        Want::File(options) => options.std_options(0).open(&at)?,
+        Want::Root => open_directory(&at, FILE_FLAG_OPEN_REPARSE_POINT)?,
+        Want::Metadata => std::fs::OpenOptions::new()
+            .access_mode(FILE_READ_ATTRIBUTES)
+            .share_mode(SHARE_ALL_BUT_DELETE | 0x4)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(&at)?,
+    };
+    if is_link(&file)? {
+        return Err(link());
+    }
+    // Where Windows says the file is: beneath the root, or refused.
+    if !final_path(&file)?.starts_with(full) {
+        return Err(outside(root, rel, "leads outside the directory"));
+    }
+    drop(held);
+    Ok(file)
+}
+
+/// The full path of an open file, as Windows resolved it.
+fn final_path(file: &std::fs::File) -> io::Result<PathBuf> {
+    use std::os::windows::ffi::OsStringExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFinalPathNameByHandleW, FILE_NAME_NORMALIZED, VOLUME_NAME_DOS,
+    };
+    let mut buf = vec![0u16; 512];
+    loop {
+        // SAFETY: an open handle, and a buffer of `buf.len()` units.
+        let n = unsafe {
+            GetFinalPathNameByHandleW(
+                file.as_raw_handle(),
+                buf.as_mut_ptr(),
+                buf.len() as u32,
+                FILE_NAME_NORMALIZED | VOLUME_NAME_DOS,
+            )
+        } as usize;
+        if n == 0 {
+            return Err(io::Error::last_os_error());
+        }
+        if n < buf.len() {
+            buf.truncate(n);
+            return Ok(PathBuf::from(OsString::from_wide(&buf)));
+        }
+        // Too small: `n` is the size needed, the NUL included.
+        buf.resize(n, 0);
+    }
+}
+
+#[cold]
+fn outside(root: &Path, path: &Path, why: &str) -> io::Error {
+    raise(
+        Code::OutsideRoot,
+        format!("the path {path:?} {why}, so it is not opened beneath the root {root:?}"),
+        "give a path relative to the root, without .. and without symbolic links or junctions \
+         on the way; to open files in a directory a link leads to, open a Root on that directory",
+    )
+}
+
 /// What a file is and how large; see [`metadata`] and [`File::metadata`].
 #[derive(Clone, Debug)]
 pub struct Metadata {
@@ -746,7 +1089,11 @@ pub async fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 /// Cancel safe: if the future is dropped, nothing changes and the file is
 /// closed.
 pub async fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-    let file = File::open(path).await?;
+    read_all(File::open(path).await?).await
+}
+
+/// The whole of `file`, from its start.
+async fn read_all(file: File) -> io::Result<Vec<u8>> {
     // The size is only a hint: a file may grow while it is being read.
     let hint = file.len().unwrap_or(0) as usize;
     // Every allocation is fallible: a file that claims more than memory

@@ -14,6 +14,7 @@ use giong::net::{TcpStream, UnixStream};
 use giong::RecvBuf;
 use giong_tls::TlsStream;
 use socket2::{SockRef, TcpKeepalive};
+use zeroize::{Zeroize, Zeroizing};
 
 use crate::auth::{md5_password, Scram};
 use crate::config::{AuthMethod, Config, Host};
@@ -542,8 +543,13 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
                         ),
                     ));
                 }
-                let mut data = password()?.as_bytes().to_vec();
+                // Sized so that nothing moves (and leaves a copy behind)
+                // before it is wiped.
+                let password = password()?;
+                let mut data = Zeroizing::new(Vec::with_capacity(password.len() + 1));
+                data.extend_from_slice(password.as_bytes());
                 data.push(0);
+                out.reserve_exact(5 + data.len());
                 protocol::password(&mut out, &data)?;
             }
             Backend::AuthenticationMd5Password(salt) => {
@@ -551,6 +557,7 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
                 check_auth(config, method)?;
                 let mut data = md5_password(user, password()?, salt).into_bytes();
                 data.push(0);
+                out.reserve_exact(5 + data.len());
                 protocol::password(&mut out, &data)?;
             }
             Backend::AuthenticationSasl(mechanisms) => {
@@ -574,10 +581,12 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
                     Error::protocol("the server continued a SASL exchange that was never started")
                 })?;
                 let (salt, iterations) = s.server_first(data)?;
-                let salted = config
-                    .scram_keys
-                    .salted_password(s.password(), &salt, iterations)
-                    .await;
+                let salted = Zeroizing::new(
+                    config
+                        .scram_keys
+                        .salted_password(s.password(), &salt, iterations)
+                        .await,
+                );
                 protocol::password(&mut out, &s.client_final_salted(&salted)?)?;
             }
             Backend::AuthenticationSaslFinal(data) => {
@@ -616,7 +625,10 @@ pub(crate) async fn startup(stream: Stream, config: &Config) -> Result<Startup, 
             }
         }
         if !out.is_empty() {
-            send(&stream, out).await?;
+            // It may hold the password: wiped once written.
+            let (r, mut out) = stream.write_all(out).await;
+            out.zeroize();
+            r.map_err(|e| Error::io(ErrorKind::Connect, "writing to the server failed", e))?;
         }
     }
     if scram.as_ref().is_some_and(|s| !s.is_done()) {

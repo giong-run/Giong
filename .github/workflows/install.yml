@@ -2,9 +2,11 @@ name: Install
 
 # giong.run/install.sh and install.ps1, run as a user runs them, against the
 # giong command built from this commit and packaged as release.yml packages
-# it (scripts/package-cli.sh), served from a local web server through
-# GIONG_DOWNLOAD_URL. A damaged archive must be refused. release.yml runs the
-# same scripts again against the real Release assets.
+# it (cargo auditable, scripts/package-cli.sh, scripts/sbom-cli.sh), served
+# from a local web server through GIONG_DOWNLOAD_URL. A damaged archive must be
+# refused. release.yml runs the same scripts again against the real Release
+# assets, and attests them (which this workflow does not: an attestation is
+# only for what a release ships).
 
 on:
   pull_request:
@@ -12,6 +14,7 @@ on:
       - "site/public/install.sh"
       - "site/public/install.ps1"
       - "scripts/package-cli.sh"
+      - "scripts/sbom-cli.sh"
       - "giong-cli/**"
       - ".github/workflows/install.yml"
       - ".github/workflows/release.yml"
@@ -48,7 +51,10 @@ jobs:
         with:
           toolchain: ${{ env.RUST_STABLE }}
           targets: ${{ matrix.target }}
-      - run: cargo build --release --locked -p giong-cli --target ${{ matrix.target }}
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: cargo-auditable@0.7.7,cargo-cyclonedx@0.5.10
+      - run: cargo auditable build --release --locked -p giong-cli --target ${{ matrix.target }}
       - name: Package as a release
         shell: bash
         run: |
@@ -56,13 +62,28 @@ jobs:
           version=$($py scripts/release.py version)
           echo "GIONG_VERSION=$version" >> "$GITHUB_ENV"
           scripts/package-cli.sh ${{ matrix.target }} "$version" "dist/v$version"
-          ls -l "dist/v$version"
+          scripts/sbom-cli.sh ${{ matrix.target }} "$version" "sbom"
+          ls -l "dist/v$version" sbom
+          jq -r '.components[] | "\(.name) \(.version)"' sbom/*.cdx.json
           # A second copy with a checksum that does not match.
           mkdir -p "damaged/v$version"
           cp "dist/v$version"/* "damaged/v$version/"
           for f in "damaged/v$version"/*.sha256; do
             echo "0000000000000000000000000000000000000000000000000000000000000000  ${f##*/}" > "$f"
           done
+      # What `cargo audit bin` and other scanners read: the zlib-compressed
+      # JSON list of crates in the binary's .dep-v0 section.
+      - name: The binary lists its crates
+        if: runner.os == 'Linux'
+        run: |
+          objcopy --dump-section .dep-v0=deps.z "target/${{ matrix.target }}/release/giong" "$RUNNER_TEMP/giong.copy"
+          python3 -I -c '
+          import json, sys, zlib
+          deps = json.loads(zlib.decompress(open("deps.z", "rb").read()))["packages"]
+          names = {(p["name"], p["version"]) for p in deps}
+          print(len(deps), "crates:", " ".join(sorted(n for n, _ in names)))
+          assert ("giong-cli", sys.argv[1]) in names, names
+          ' "$GIONG_VERSION"
       - name: install.sh
         if: runner.os != 'Windows'
         run: |

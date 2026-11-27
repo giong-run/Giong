@@ -8,6 +8,7 @@ use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use giong_tls::TlsConnector;
+use zeroize::Zeroizing;
 
 use crate::error::{Error, ErrorKind};
 
@@ -67,6 +68,19 @@ pub(crate) enum Host {
     Unix(PathBuf),
 }
 
+/// A password, wiped from memory when dropped (and so in each clone of a
+/// [`Config`] as it goes).
+#[derive(Clone)]
+pub(crate) struct Password(Zeroizing<String>);
+
+impl std::ops::Deref for Password {
+    type Target = str;
+
+    fn deref(&self) -> &str {
+        &self.0
+    }
+}
+
 /// Connection settings: where the server is, who to log in as, and the limits
 /// that apply to the connection.
 ///
@@ -111,7 +125,7 @@ pub struct Config {
     pub(crate) host: Host,
     pub(crate) port: u16,
     pub(crate) user: Option<String>,
-    pub(crate) password: Option<String>,
+    pub(crate) password: Option<Password>,
     pub(crate) database: Option<String>,
     pub(crate) application_name: Option<String>,
     pub(crate) session: Vec<(String, String)>,
@@ -208,8 +222,11 @@ impl Config {
     }
 
     /// The password, if the user has one.
+    ///
+    /// The copy kept here, and every copy made while logging in, is wiped
+    /// from memory when dropped; the string passed in is the caller's.
     pub fn password(mut self, password: &str) -> Self {
-        self.password = Some(password.to_owned());
+        self.password = Some(Password(Zeroizing::new(password.to_owned())));
         self
     }
 
@@ -570,7 +587,9 @@ fn one_expression(value: &str) -> Result<(), &'static str> {
 
 fn percent_decode(s: &str, what: &str) -> Result<String, Error> {
     let bytes = s.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
+    // The bytes may be a password: wiped unless they are kept, also when the
+    // URL turns out to be malformed half way. Sized so that nothing moves.
+    let mut out = Zeroizing::new(Vec::with_capacity(bytes.len()));
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] == b'%' {
@@ -592,8 +611,10 @@ fn percent_decode(s: &str, what: &str) -> Result<String, Error> {
             i += 1;
         }
     }
-    String::from_utf8(out)
-        .map_err(|_| Error::config(format!("the {what} in the URL is not UTF-8 once decoded")))
+    String::from_utf8(std::mem::take(&mut *out)).map_err(|e| {
+        zeroize::Zeroize::zeroize(&mut e.into_bytes());
+        Error::config(format!("the {what} in the URL is not UTF-8 once decoded"))
+    })
 }
 
 fn parse_url(url: &str) -> Result<Config, Error> {
@@ -657,7 +678,7 @@ fn parse(url: &str) -> Result<Config, Error> {
                 config.user = Some(percent_decode(user, "user")?);
             }
             if let Some(p) = password {
-                config.password = Some(percent_decode(p, "password")?);
+                config.password = Some(Password(Zeroizing::new(percent_decode(p, "password")?)));
             }
             hostport
         }
