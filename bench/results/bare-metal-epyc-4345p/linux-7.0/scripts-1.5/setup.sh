@@ -39,10 +39,10 @@ root soft memlock unlimited
 root hard memlock unlimited
 L
 
-[ -x /root/.cargo/bin/rustup ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.100.0
+[ -x /root/.cargo/bin/rustup ] || curl -sSf https://sh.rustup.rs | sh -s -- -y --profile minimal --default-toolchain 1.97.0
 . /root/.cargo/env
-rustup toolchain install 1.100.0 --profile minimal
-rustup default 1.100.0
+rustup toolchain install 1.97.0 --profile minimal
+rustup default 1.97.0
 
 # wrk2 (constant-rate wrk) for the gzip latency run; the rate sweeps use bench/lab's loadgen.
 if ! command -v wrk2 >/dev/null; then
