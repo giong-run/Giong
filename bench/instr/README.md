@@ -162,11 +162,17 @@ numbers in scheduling order, so the table grew by different steps from run to ru
 `idle-https` the child does each TLS handshake and one keep-alive request with rustls, then
 drops its TLS state and keeps the socket (the server cannot tell; nothing is sent);
 `idle-h2-tls` does the same with ALPN `h2` and the HTTP/2 exchange of `idle-h2` inside TLS. Every count
-is the server's alone, handshakes included. The heap count is exact: it
-repeats within a byte per connection, and within 0.04% across GitHub's runners (Intel and AMD,
-two clouds; item 6 of [`conditions.txt`](../results/instr/conditions.txt)). Its limit is 1%,
-and the baseline's idle rows are taken from a CI run, not from a development machine, where
-the kernel build alone moved `idle-http1` by 1.3%. The resident set moves with the
+is the server's alone, handshakes included. The child opens its connections 32 at a time, each
+batch once the server has accepted the last (the parent waits with `yield_now`, which allocates
+nothing). `idle-http1` sends no request, so before that nothing made the child wait for the
+server, and how many connections the server took in one turn depended on the runner's speed;
+the io_uring driver's completion queue and reap buffer grow to the largest such turn, and CI
+read 1,262.3, 1,237.7 or 1,225.4 heap bytes per connection from the same tree, on aws and
+azure kernels alike ([#507](https://github.com/giong-run/Giong/issues/507)). The heap count
+is now exact: it repeats within a byte per connection, and within 0.04% across GitHub's runners
+(Intel and AMD, two clouds; item 6 of [`conditions.txt`](../results/instr/conditions.txt)). Its
+limit is 1%, and the baseline's idle rows are taken from a CI run, not from a development
+machine. The resident set moves with the
 allocator's choices (2.7% between rounds for `idle-h2`); its limit is 10%. For `idle-h2` the child sends the preface, SETTINGS and
 one `GET /` on each connection and reads the answer, as `bench/h2.sh` does: until 0.9 it sent no
 request, and missed that 0.8.0 kept each connection's memory for streams for a second after a
@@ -177,7 +183,7 @@ moves bytes to the heap depending on timing, which made the heap per connection 
 
 | case | heap per connection | resident set per connection |
 |---|---:|---:|
-| `idle-http1` (io_uring / epoll) | 1,262 / 1,329 bytes | 1,356 / 1,442 bytes |
+| `idle-http1` (io_uring / epoll) | 1,217 / 1,329 bytes | 1,356 / 1,442 bytes |
 | `idle-h2` (io_uring / epoll) | 2,518 / 2,535 bytes | 2,845 / 2,798 bytes |
 | `idle-https` (io_uring / epoll) | 5,141 / 5,158 bytes | 5,550 / 5,458 bytes |
 | `idle-h2-tls` (io_uring / epoll) | 6,397 / 6,414 bytes | 6,978 / 6,865 bytes |
