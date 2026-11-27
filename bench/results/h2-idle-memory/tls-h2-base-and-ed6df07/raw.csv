@@ -1,0 +1,7 @@
+binary,round,connections,rss_anon_kib_per_conn,vmrss_kib_per_conn,vmrss_after_mib
+base-da127ad,1,8000,9.81,9.84,81.1
+change,1,8000,6.72,6.75,57.1
+base-da127ad,2,8000,9.81,9.85,81.2
+change,2,8000,6.72,6.76,57.1
+base-da127ad,3,8000,9.81,9.85,81.2
+change,3,8000,6.72,6.76,57.1

@@ -167,11 +167,12 @@ Most of the handshake gain is the cipher suite: Axum with its rustls set to the 
 
 ### Memory
 
-An idle connection, rustls in the process, holds 6.1 KiB of heap (`bench/instr`'s `idle-https`, which counts the server's side after a handshake and one request), down from 10.8 KiB before 1.5.2; 8,000 idle connections to one worker of giong-http take 52.8 MiB of resident memory instead of 89.8 (`bench/tls-idle.sh`, [`bench/results/tls-idle/`](../bench/results/tls-idle/README.md)). For comparison, nginx 1.24 with OpenSSL took 15.1 KiB per idle HTTPS connection in the same kind of measurement in 0.7.
+An idle connection, rustls in the process, holds 5.0 KiB of heap (`bench/instr`'s `idle-https`, which counts the server's side after a handshake and one request), down from 10.8 KiB before 1.5.2, and 6.2 KiB with HTTP/2 (`idle-h2-tls`, 9.5 KiB before); 8,000 idle connections to one worker of giong-http take 45.7 MiB of resident memory instead of 89.8, and 56.1 MiB with HTTP/2 (`bench/tls-idle.sh`, [`bench/results/tls-idle/`](../bench/results/tls-idle/README.md), [`bench/results/h2-idle-memory/`](../bench/results/h2-idle-memory/README.md)). For comparison, nginx 1.24 with OpenSSL took 15.1 KiB per idle HTTPS connection in the same kind of measurement in 0.7.
 
 - **No receive buffer while idle.** rustls runs through its unbuffered API: received bytes are processed from a scratch buffer each thread shares, and a connection keeps bytes of its own only while it holds part of a record. rustls' buffered connection kept a 4 KiB buffer for the life of every connection.
 - **No send buffer while idle.** Outgoing records are written through scratch buffers each thread shares (up to four of up to 16 KiB), where every stream kept its own.
-- What is left is mostly the connection's task, which holds the TLS state (3.5 KiB), and rustls' own allocations for the keys and the handshake state.
+- **No room for sends in a waiting receive.** On an established stream a receive only ever sends a key update or an alert, which go out without waiting, so a waiting `TlsStream::recv` is 136 bytes; it held 640, room for the handshake's sends, in every idle connection's task.
+- What is left is mostly the connection's task (2.5 KiB, the TLS state included), and rustls' own allocations for the keys and the handshake state.
 
 Requests cost the same or less: 1.1% fewer instructions per HTTPS request (`bench/instr`'s `https`, client and server), and `bench/tls.sh` measured no loss on any endpoint (requests per second, median of five rounds, against 1cb2988: small JSON +1.5%, 8.5 KiB JSON +7.8%, new connections +3.8%, 64 KiB answers +2.3%, with less server CPU per request on all four).
 
