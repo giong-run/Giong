@@ -1,0 +1,8 @@
+main /json /json 6385.3 instructions per request
+main /users /users 179123.9 instructions per request
+change /json /json 5566.8 instructions per request
+change /users /users 178319.1 instructions per request
+main /json /json 6388.8 instructions per request
+main /users /users 179124.0 instructions per request
+change /json /json 5565.3 instructions per request
+change /users /users 178319.0 instructions per request

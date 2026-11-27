@@ -232,8 +232,11 @@ impl From<Vec<u8>> for Body {
 #[derive(Debug)]
 pub struct Response {
     status: u16,
-    /// Extra header lines, already in wire format.
-    headers: Vec<u8>,
+    /// Extra header lines, already in wire format. Borrowed while they are
+    /// a constant line (`Content-Type` of [`json`](Self::json) and
+    /// [`text`](Self::text)), so that such a response allocates nothing for
+    /// its headers.
+    headers: Cow<'static, [u8]>,
     body: Body,
     extensions: Extensions,
 }
@@ -300,7 +303,7 @@ impl Response {
     fn with_status(status: u16) -> Self {
         Self {
             status,
-            headers: Vec::new(),
+            headers: Cow::Borrowed(b""),
             body: Body::Empty,
             extensions: Extensions::default(),
         }
@@ -308,9 +311,9 @@ impl Response {
 
     /// `200 OK` with a `text/plain; charset=utf-8` body.
     pub fn text(body: impl Into<Body>) -> Self {
-        Self::new(200)
-            .header("Content-Type", "text/plain; charset=utf-8")
-            .body(body)
+        let mut resp = Self::with_status(200);
+        resp.push_line(b"Content-Type: text/plain; charset=utf-8\r\n");
+        resp.body(body)
     }
 
     /// `200 OK` with an `application/json` body.
@@ -319,9 +322,9 @@ impl Response {
     /// value into JSON, use a serializer (giong-web's `json` does it with
     /// serde) rather than writing JSON by hand.
     pub fn json(body: impl Into<Body>) -> Self {
-        Self::new(200)
-            .header("Content-Type", "application/json")
-            .body(body)
+        let mut resp = Self::with_status(200);
+        resp.push_line(b"Content-Type: application/json\r\n");
+        resp.body(body)
     }
 
     /// Adds a header field.
@@ -417,12 +420,35 @@ impl Response {
             let value = value.trim();
             // One allocation for the field: four `extend`s into an empty
             // buffer grow it three times.
-            self.headers.reserve(name.len() + value.len() + 4);
-            self.headers.extend_from_slice(name.as_bytes());
-            self.headers.extend_from_slice(b": ");
-            self.headers.extend_from_slice(value.as_bytes());
-            self.headers.extend_from_slice(b"\r\n");
+            let headers = self.headers_mut(name.len() + value.len() + 4);
+            headers.extend_from_slice(name.as_bytes());
+            headers.extend_from_slice(b": ");
+            headers.extend_from_slice(value.as_bytes());
+            headers.extend_from_slice(b"\r\n");
         }
+    }
+
+    /// Adds a constant header line, valid and ending in CRLF: kept borrowed
+    /// when it is the first.
+    fn push_line(&mut self, line: &'static [u8]) {
+        debug_assert!(line.ends_with(b"\r\n"));
+        if self.headers.is_empty() {
+            self.headers = Cow::Borrowed(line);
+        } else {
+            self.headers_mut(line.len()).extend_from_slice(line);
+        }
+    }
+
+    /// The header lines, owned, with room for `more` bytes.
+    fn headers_mut(&mut self, more: usize) -> &mut Vec<u8> {
+        if let Cow::Borrowed(lines) = self.headers {
+            let mut owned = Vec::with_capacity(lines.len() + more);
+            owned.extend_from_slice(lines);
+            self.headers = Cow::Owned(owned);
+        }
+        let headers = self.headers.to_mut();
+        headers.reserve(more);
+        headers
     }
 
     /// Sets the body.
@@ -488,7 +514,7 @@ impl Response {
                 kept.extend_from_slice(b"\r\n");
             }
         }
-        self.headers = kept;
+        self.headers = Cow::Owned(kept);
         self
     }
 
@@ -569,15 +595,21 @@ impl Response {
     /// closes the connection after it).
     pub(crate) fn write_head(&self, out: &mut Vec<u8>, minor: u8, keep_alive: bool) {
         out.reserve(128 + self.headers.len());
-        out.extend_from_slice(if minor == 0 {
-            b"HTTP/1.0 "
-        } else {
-            b"HTTP/1.1 "
-        });
-        push_number(out, self.status as usize);
-        out.push(b' ');
-        out.extend_from_slice(reason(self.status).as_bytes());
-        out.extend_from_slice(b"\r\nDate: ");
+        match (self.status, minor) {
+            // Most answers, in one copy.
+            (200, 1) => out.extend_from_slice(b"HTTP/1.1 200 OK\r\nDate: "),
+            _ => {
+                out.extend_from_slice(if minor == 0 {
+                    b"HTTP/1.0 "
+                } else {
+                    b"HTTP/1.1 "
+                });
+                push_number(out, self.status as usize);
+                out.push(b' ');
+                out.extend_from_slice(reason(self.status).as_bytes());
+                out.extend_from_slice(b"\r\nDate: ");
+            }
+        }
         out.extend_from_slice(&crate::date::now());
         out.extend_from_slice(b"\r\n");
         match (self.bodiless(), self.body.is_stream()) {
@@ -706,6 +738,32 @@ mod tests {
         assert_eq!(
             wire(&Response::new(599), 1, true, false),
             "HTTP/1.1 599 Server Error\r\nContent-Length: 0\r\n\r\n"
+        );
+    }
+
+    #[test]
+    fn a_constant_content_type_is_borrowed_until_another_header_is_added() {
+        let resp = Response::json("{}");
+        assert!(matches!(resp.headers, Cow::Borrowed(_)));
+        assert_eq!(resp.get_header("content-type"), Some("application/json"));
+        assert_eq!(
+            resp.header_fields().collect::<Vec<_>>(),
+            [(&b"Content-Type"[..], &b"application/json"[..])]
+        );
+        let resp = resp.header("X-A", "1");
+        assert!(matches!(resp.headers, Cow::Owned(_)));
+        assert_eq!(
+            resp.headers().collect::<Vec<_>>(),
+            [("Content-Type", "application/json"), ("X-A", "1")]
+        );
+        let resp = resp.remove_header("Content-Type");
+        assert_eq!(resp.headers().collect::<Vec<_>>(), [("X-A", "1")]);
+        let resp = Response::text("x")
+            .remove_header("content-type")
+            .header("Content-Type", "text/html");
+        assert_eq!(
+            resp.headers().collect::<Vec<_>>(),
+            [("Content-Type", "text/html")]
         );
     }
 

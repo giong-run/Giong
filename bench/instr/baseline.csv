@@ -109,6 +109,21 @@
 # over TLS (the new idle-h2-tls, against 9,683 measured on main). The io_uring
 # idle-http1 heap row keeps its midpoint between kernels, moved by the 56
 # bytes (the CI run: 1262.3).
+# The instruction and allocation rows of http1, http1-client, h2, h2-streams,
+# https and web, the allocation rows of idle-h2, idle-h2-tls and idle-https,
+# and the heap rows of idle-h2 and idle-h2-tls: a JSON or text response keeps
+# its Content-Type line borrowed (no allocation), a 200 status line is one
+# copy, the Date header is read from the worker's clock of the turn, and a
+# shutdown signal holds no reference to the runtime
+# (changelog.d/perf-http-response-path.md). Measured on a 4-vCPU cloud VM
+# (Linux 6.18, the same rustc and valgrind), main 6c2c852 against the change,
+# scripts/instr.py on both, 3 rounds (bench/results/http-response-path/):
+# http1 -8.9% (io_uring) and -8.0% (epoll), web -6.1% and -5.6%, http1-client
+# -3.7% and -3.5%, h2-streams -2.3%, https -2.2% and -2.1%, h2 -1.8%; one
+# allocation fewer per request (ten per h2-streams operation), 8 heap bytes
+# fewer per idle HTTP/2 connection. The rows hold `scripts/instr.py update`'s
+# medians of the change; rows that moved 0.07% or less, and the resident-set
+# rows, are unchanged.
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1100.4,1
 io_uring,spawn,allocations,1.000,1
@@ -126,18 +141,18 @@ io_uring,udp-echo,instructions,3712.4,1
 io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,190.2,1
 io_uring,file-read,allocations,0.000,1
-io_uring,http1,instructions,8155.7,1
-io_uring,http1,allocations,1.000,1
-io_uring,http1-client,instructions,19847.3,1
-io_uring,http1-client,allocations,7.008,1
-io_uring,h2,instructions,28074.6,1
-io_uring,h2,allocations,14.001,1
-io_uring,h2-streams,instructions,222155.3,0.5
-io_uring,h2-streams,allocations,150.005,0.5
-io_uring,https,instructions,30681.0,1
-io_uring,https,allocations,13.035,1
-io_uring,web,instructions,10988.4,1
-io_uring,web,allocations,3.000,1
+io_uring,http1,instructions,7438.7,1
+io_uring,http1,allocations,0.000,1
+io_uring,http1-client,instructions,19134.3,1
+io_uring,http1-client,allocations,6.008,1
+io_uring,h2,instructions,27554.5,1
+io_uring,h2,allocations,13.001,1
+io_uring,h2-streams,instructions,217153.9,0.5
+io_uring,h2-streams,allocations,140.005,0.5
+io_uring,https,instructions,30011.8,1
+io_uring,https,allocations,12.035,1
+io_uring,web,instructions,10326.3,1
+io_uring,web,allocations,2.000,1
 io_uring,redis-get,instructions,7745.1,1
 io_uring,redis-get,allocations,2.000,1
 io_uring,postgres-query,instructions,9541.5,1
@@ -147,15 +162,15 @@ io_uring,mysql-query,allocations,23.000,1
 io_uring,idle-http1,heap_bytes,1251.9,1.5
 io_uring,idle-http1,rss_bytes,1355.8,10
 io_uring,idle-http1,allocations,3.030,1
-io_uring,idle-h2,heap_bytes,2517.9,1
+io_uring,idle-h2,heap_bytes,2509.9,1
 io_uring,idle-h2,rss_bytes,2844.7,10
-io_uring,idle-h2,allocations,25.040,1
+io_uring,idle-h2,allocations,24.050,1
 io_uring,idle-https,heap_bytes,5141.3,1
 io_uring,idle-https,rss_bytes,5550.1,10
-io_uring,idle-https,allocations,122.100,1
-io_uring,idle-h2-tls,heap_bytes,6396.8,1
+io_uring,idle-https,allocations,121.180,1
+io_uring,idle-h2-tls,heap_bytes,6388.8,1
 io_uring,idle-h2-tls,rss_bytes,6977.5,10
-io_uring,idle-h2-tls,allocations,142.170,1
+io_uring,idle-h2-tls,allocations,141.220,1
 epoll,spawn,instructions,996.5,1
 epoll,spawn,allocations,1.000,1
 epoll,yield,instructions,306.2,1
@@ -172,18 +187,18 @@ epoll,udp-echo,instructions,4453.6,1
 epoll,udp-echo,allocations,1.000,1
 epoll,file-read,instructions,241.9,3
 epoll,file-read,allocations,0.016,1
-epoll,http1,instructions,9066.6,1
-epoll,http1,allocations,1.000,1
-epoll,http1-client,instructions,20948.7,1
-epoll,http1-client,allocations,7.000,1
-epoll,h2,instructions,29195.6,1
-epoll,h2,allocations,14.001,1
-epoll,h2-streams,instructions,223508.9,0.5
-epoll,h2-streams,allocations,150.004,0.5
-epoll,https,instructions,31774.8,1
-epoll,https,allocations,13.000,1
-epoll,web,instructions,11893.5,1
-epoll,web,allocations,3.000,1
+epoll,http1,instructions,8347.5,1
+epoll,http1,allocations,0.000,1
+epoll,http1-client,instructions,20225.3,1
+epoll,http1-client,allocations,6.000,1
+epoll,h2,instructions,28679.2,1
+epoll,h2,allocations,13.000,1
+epoll,h2-streams,instructions,218240.0,0.5
+epoll,h2-streams,allocations,140.003,0.5
+epoll,https,instructions,31098.9,1
+epoll,https,allocations,12.000,1
+epoll,web,instructions,11233.4,1
+epoll,web,allocations,2.000,1
 epoll,redis-get,instructions,8521.8,1
 epoll,redis-get,allocations,2.000,1
 epoll,postgres-query,instructions,10367.7,1
@@ -193,12 +208,12 @@ epoll,mysql-query,allocations,23.000,1
 epoll,idle-http1,heap_bytes,1328.9,1
 epoll,idle-http1,rss_bytes,1441.8,10
 epoll,idle-http1,allocations,4.020,1
-epoll,idle-h2,heap_bytes,2534.6,1
+epoll,idle-h2,heap_bytes,2526.6,1
 epoll,idle-h2,rss_bytes,2797.6,10
-epoll,idle-h2,allocations,25.040,1
+epoll,idle-h2,allocations,24.050,1
 epoll,idle-https,heap_bytes,5157.9,1
 epoll,idle-https,rss_bytes,5457.9,10
-epoll,idle-https,allocations,122.100,1
-epoll,idle-h2-tls,heap_bytes,6413.5,1
+epoll,idle-https,allocations,121.160,1
+epoll,idle-h2-tls,heap_bytes,6405.5,1
 epoll,idle-h2-tls,rss_bytes,6864.9,10
-epoll,idle-h2-tls,allocations,142.130,1
+epoll,idle-h2-tls,allocations,141.150,1

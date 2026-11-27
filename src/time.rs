@@ -548,6 +548,16 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
     }
 }
 
+/// The worker's clock of this turn of its event loop: read at most once a
+/// turn and shared by everything that asks during it, so it is behind the
+/// real time by as long as the turn has run so far, and never ahead.
+/// [`Instant::now`] outside a runtime. For the crates of this workspace
+/// (giong-http's `Date` header), not part of the API.
+#[doc(hidden)]
+pub fn turn_clock() -> Instant {
+    runtime::try_with_worker(|w| w.clock()).unwrap_or_else(Instant::now)
+}
+
 /// Error returned by [`timeout`] when the time runs out first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Elapsed;
