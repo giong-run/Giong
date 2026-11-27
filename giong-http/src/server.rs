@@ -702,8 +702,8 @@ impl Server {
     /// it, since the worker count is only known on the worker.
     ///
     /// What a worker holds is then about this limit plus what its
-    /// connections cost on their own (about 1.3 KiB each while idle over
-    /// HTTP/1.1, 3.2 KiB over HTTP/2, 5.2 KiB over HTTPS and 10 KiB over
+    /// connections cost on their own (about 1.2 KiB each while idle over
+    /// HTTP/1.1, 2.5 KiB over HTTP/2, 5.0 KiB over HTTPS and 6.2 KiB over
     /// HTTP/2 with TLS, and up to the 4 KiB above while a request arrives); see `docs/DEPLOYMENT.md` for
     /// sizing a container.
     pub fn max_buffered_request_bytes(mut self, bytes: usize) -> Self {
@@ -756,8 +756,8 @@ impl Server {
     /// (default: 10,000). Normally every worker makes its own call, so the
     /// limit applies per worker.
     ///
-    /// An idle connection costs a few KiB (about 1.3 KiB over HTTP/1.1, 3.2
-    /// KiB over HTTP/2, 5.2 KiB over HTTPS, 10 KiB over HTTP/2 with TLS,
+    /// An idle connection costs a few KiB (about 1.2 KiB over HTTP/1.1, 2.5
+    /// KiB over HTTP/2, 5.0 KiB over HTTPS, 6.2 KiB over HTTP/2 with TLS,
     /// plus the kernel's socket buffers), so the default holds a worker's idle connections to tens
     /// of MiB. The requests the connections are receiving have a bound of
     /// their own, shared by all of them:

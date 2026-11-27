@@ -91,6 +91,10 @@
 # version does: 744 bytes fewer per idle HTTP/1.1 connection, 1,248 per HTTP/2
 # and 784 per HTTPS. The io_uring idle-http1 heap row keeps its midpoint
 # between kernels, moved by the 744 bytes (the CI run: 1318.3).
+# Every idle row: HTTP/2 connections go on in a task of their own, TLS
+# receives hold no send, and write futures keep their arguments once
+# (changelog.d/perf-h2-idle-memory.md). PROVISIONAL: the local VM's changes
+# applied to the rows above, to be replaced by this change's CI run.
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1100.4,1
 io_uring,spawn,allocations,1.000,1
@@ -126,15 +130,18 @@ io_uring,postgres-query,instructions,9604.5,1
 io_uring,postgres-query,allocations,14.000,1
 io_uring,mysql-query,instructions,13066.6,1
 io_uring,mysql-query,allocations,23.000,1
-io_uring,idle-http1,heap_bytes,1307.9,1.5
-io_uring,idle-http1,rss_bytes,1513.5,10
+io_uring,idle-http1,heap_bytes,1251.9,1.5
+io_uring,idle-http1,rss_bytes,1452.0,10
 io_uring,idle-http1,allocations,3.030,1
-io_uring,idle-h2,heap_bytes,3317.8,1
-io_uring,idle-h2,rss_bytes,3706.9,10
+io_uring,idle-h2,heap_bytes,2517.8,1
+io_uring,idle-h2,rss_bytes,2908.0,10
 io_uring,idle-h2,allocations,25.040,1
-io_uring,idle-https,heap_bytes,5285.3,1
-io_uring,idle-https,rss_bytes,5695.5,10
+io_uring,idle-https,heap_bytes,5141.3,1
+io_uring,idle-https,rss_bytes,5551.0,10
 io_uring,idle-https,allocations,122.100,1
+io_uring,idle-h2-tls,heap_bytes,6396.8,1
+io_uring,idle-h2-tls,rss_bytes,6971.0,10
+io_uring,idle-h2-tls,allocations,142.200,1
 epoll,spawn,instructions,996.5,1
 epoll,spawn,allocations,1.000,1
 epoll,yield,instructions,306.2,1
@@ -169,12 +176,15 @@ epoll,postgres-query,instructions,10344.7,1
 epoll,postgres-query,allocations,14.000,1
 epoll,mysql-query,instructions,13807.7,1
 epoll,mysql-query,allocations,23.000,1
-epoll,idle-http1,heap_bytes,1384.9,1
-epoll,idle-http1,rss_bytes,1505.3,10
+epoll,idle-http1,heap_bytes,1328.9,1
+epoll,idle-http1,rss_bytes,1444.0,10
 epoll,idle-http1,allocations,4.020,1
-epoll,idle-h2,heap_bytes,3334.4,1
-epoll,idle-h2,rss_bytes,3629.1,10
+epoll,idle-h2,heap_bytes,2534.4,1
+epoll,idle-h2,rss_bytes,2830.0,10
 epoll,idle-h2,allocations,25.040,1
-epoll,idle-https,heap_bytes,5301.9,1
-epoll,idle-https,rss_bytes,5599.2,10
+epoll,idle-https,heap_bytes,5157.9,1
+epoll,idle-https,rss_bytes,5455.0,10
 epoll,idle-https,allocations,122.100,1
+epoll,idle-h2-tls,heap_bytes,6413.4,1
+epoll,idle-h2-tls,rss_bytes,6875.0,10
+epoll,idle-h2-tls,allocations,142.200,1
