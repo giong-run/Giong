@@ -455,11 +455,53 @@ fn a_body_that_keeps_the_minimum_rate_is_not_cut() {
     let mut c = server.client();
     let body = pattern(2000);
     c.send(upload("steady-rate", body.len()));
-    // 200 bytes every 50 ms: 4,000 bytes a second, for half a second.
-    for piece in body.chunks(200) {
-        std::thread::sleep(Duration::from_millis(50));
+    // 200 bytes every 50 ms: 4,000 bytes a second, for half a second. The
+    // first piece goes with the head: before it, only the 200 ms grace
+    // stands between a sleep the machine stretches and a cut (a macOS
+    // runner stretched one past it, #525); after it, each 50 ms gap has
+    // at least 350 ms to spare.
+    for (i, piece) in body.chunks(200).enumerate() {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         c.stream.write_all(piece).unwrap();
     }
+    let r = c.reply();
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r.text().starts_with("2000 "), "{}", r.text());
+}
+
+#[test]
+fn what_arrives_with_the_head_counts_toward_the_minimum_rate() {
+    // 1,000 bytes in the same write as the head earn a second at 1,000
+    // bytes a second: a pause of 600 ms after them, three times the grace,
+    // is within the rate. Before #525 those bytes earned nothing over
+    // HTTP/1.1 and the body was cut after the grace.
+    let server = rated_server();
+    let body = pattern(2000);
+    let mut c = server.client();
+    let mut first = upload("with-head", body.len()).into_bytes();
+    first.extend_from_slice(&body[..1000]);
+    c.send(&first);
+    std::thread::sleep(Duration::from_millis(600));
+    c.send(&body[1000..]);
+    let r = c.reply();
+    assert_eq!(r.status, 200, "{}", r.text());
+    assert!(r.text().starts_with("2000 "), "{}", r.text());
+
+    // The same with a chunked body: its framing counts too, as it does
+    // for what arrives later.
+    let mut c = server.client();
+    let mut first = chunked_upload("with-head-chunked").into_bytes();
+    first.extend_from_slice(format!("{:x}\r\n", 1000).as_bytes());
+    first.extend_from_slice(&body[..1000]);
+    first.extend_from_slice(b"\r\n");
+    c.send(&first);
+    std::thread::sleep(Duration::from_millis(600));
+    let mut rest = format!("{:x}\r\n", 1000).into_bytes();
+    rest.extend_from_slice(&body[1000..]);
+    rest.extend_from_slice(b"\r\n0\r\n\r\n");
+    c.send(&rest);
     let r = c.reply();
     assert_eq!(r.status, 200, "{}", r.text());
     assert!(r.text().starts_with("2000 "), "{}", r.text());

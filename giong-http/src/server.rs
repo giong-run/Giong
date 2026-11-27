@@ -2690,8 +2690,13 @@ impl<T: Transport> Conn<T> {
 
     async fn pump_length(&mut self, body: &Streamed) -> Result<(), Failure> {
         let mut left = body.length;
-        // What arrived with the head.
+        // What arrived with the head, which counts for `min_body_rate` as
+        // what arrives later does.
         let have = (self.buf.len() - self.pos).min(usize::try_from(left).unwrap_or(usize::MAX));
+        let mut clock = RateClock {
+            got: have as u64,
+            ..RateClock::default()
+        };
         if have > 0 {
             let piece = self.buf[self.pos..self.pos + have].to_vec();
             self.pos += have;
@@ -2701,7 +2706,6 @@ impl<T: Transport> Conn<T> {
         if left > 0 {
             self.continue_body(body).await?;
         }
-        let mut clock = RateClock::default();
         while left > 0 {
             let chunk = self.recv_body(&mut clock).await?;
             let n = usize::try_from(left).map_or(chunk.len(), |left| left.min(chunk.len()));
@@ -2724,7 +2728,12 @@ impl<T: Transport> Conn<T> {
         let mut input = self.buf[self.pos..].to_vec();
         self.pos = self.buf.len();
         let mut waited = false;
-        let mut clock = RateClock::default();
+        // What arrived with the head counts for `min_body_rate` as what
+        // arrives later does: every byte of the chunked body, framing too.
+        let mut clock = RateClock {
+            got: input.len() as u64,
+            ..RateClock::default()
+        };
         loop {
             let progress = decoder.feed(&input);
             let piece = mem::take(&mut decoder.body);
