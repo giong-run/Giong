@@ -737,13 +737,26 @@ mod tests {
         assert!(e.contains("not hex"), "{e}");
     }
 
+    // Temporary (check-loadgen workflow): the old test's flood.
+    #[test]
+    #[ignore]
+    fn tmp_flood() {
+        let addr = serve(
+            vec![b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until close"],
+            Some(1),
+        );
+        let o = run(&plan(addr, None));
+        eprintln!("RESULT flood connects={} failed={} err={:?}", o.connects, o.failed, o.first_error);
+    }
+
     #[test]
     fn closed_connections_reconnect_and_close_framing_works() {
         let addr = serve(
             vec![b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until close"],
             Some(1),
         );
-        let o = run(&plan(addr, None));
+        let o = run(&plan(addr, Some(400.0)));
+        eprintln!("RESULT paced connects={} failed={} err={:?}", o.connects, o.failed, o.first_error);
         assert_eq!(o.failed, 0, "{:?}", o.first_error);
         assert!(o.connects > 4 && o.connects >= o.answered(), "{o:?}");
         // A keep-alive answer the server then drops: retried once, not failed.

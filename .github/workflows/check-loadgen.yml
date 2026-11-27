@@ -1,0 +1,42 @@
+# Temporary check (removed before review).
+name: check loadgen
+on:
+  push:
+    branches: [fix/loadgen-reconnect-flake]
+permissions:
+  contents: read
+jobs:
+  check:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-2022, windows-2025]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 50
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: "1.100.0"
+      - run: cargo test -p giong-cli --bin giong --locked --no-run
+      - name: flood vs paced, 150 runs each, alternating
+        run: |
+          for i in $(seq 1 150); do
+            cargo test -q -p giong-cli --bin giong --locked tmp_flood -- --ignored --nocapture 2>&1 | grep RESULT
+            cargo test -q -p giong-cli --bin giong --locked closed_connections_reconnect -- --nocapture 2>&1 | grep RESULT
+          done > results.txt
+          echo "flood failures: $(grep 'RESULT flood' results.txt | grep -vc 'failed=0 ')"
+          echo "paced failures: $(grep 'RESULT paced' results.txt | grep -vc 'failed=0 ')"
+          grep -v 'failed=0 ' results.txt | head -20
+          awk '/RESULT flood/{split($3,a,"=");s+=a[2];n++} END{print "flood mean connects", s/n}' results.txt
+          awk '/RESULT paced/{split($3,a,"=");s+=a[2];n++} END{print "paced mean connects", s/n}' results.txt
+      - name: the whole giong-cli unit suite in parallel, 20 times, with the flood
+        run: |
+          f=0
+          for i in $(seq 1 20); do
+            cargo test -q -p giong-cli --bin giong --locked -- --include-ignored 2>&1 | grep -E "RESULT flood" | grep -v 'failed=0 ' && f=$((f+1))
+          done
+          echo "flood failures with the suite beside it: $f / 20"
