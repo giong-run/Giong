@@ -8,6 +8,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+Leaner HTTP/2, a fix for bodies that wait for `100 Continue`, and release binaries you can
+verify. An idle HTTP/2 connection holds 2,518 bytes of heap instead of 3,318, and 6,397
+instead of 9,683 over TLS: 8,000 idle HTTP/2 connections over TLS take 56.1 MiB instead of
+81.2, and an HTTPS request takes 2.9% fewer instructions. Over HTTP/2 and HTTP/3, a request
+body sent with `expect: 100-continue` is no longer cut while the handler works before
+reading it. Release binaries carry a signed build provenance attestation, a CycloneDX SBOM
+and the list of crates compiled into them, and `SECURITY.md` gives the threat model and how
+to report a vulnerability. No API is removed or changed.
+
 ## [1.5.2] - 2026-11-27
 
 Leaner connections and a round of hardening. An idle TLS connection holds 5.2 KiB of heap
