@@ -1657,3 +1657,203 @@ impl BlockingUnix {
         Ok(sock)
     }
 }
+
+/// Opens a connection to `server` from `ip`, another loopback address.
+#[cfg(target_os = "linux")]
+fn client_from(server: &TestServer, ip: &str) -> Client {
+    let socket = socket2::Socket::new(socket2::Domain::IPV4, socket2::Type::STREAM, None).unwrap();
+    let local: SocketAddr = format!("{ip}:0").parse().unwrap();
+    socket.bind(&local.into()).unwrap();
+    socket.connect(&server.addr.into()).unwrap();
+    let stream: TcpStream = socket.into();
+    stream.set_nodelay(true).unwrap();
+    stream
+        .set_read_timeout(Some(Duration::from_secs(10)))
+        .unwrap();
+    Client {
+        stream,
+        buf: Vec::new(),
+    }
+}
+
+/// Retries a request on new connections until one is answered `200`: a
+/// connection the client closed frees its place once the server has seen
+/// the close, a moment later.
+fn served_again(server: &TestServer) -> Client {
+    let start = Instant::now();
+    loop {
+        let mut c = server.client();
+        c.send("GET /again HTTP/1.1\r\nHost: t\r\n\r\n");
+        let r = c.reply();
+        if r.status == 200 {
+            return c;
+        }
+        assert_eq!(r.status, 429, "{}", r.text());
+        assert!(start.elapsed() < Duration::from_secs(10), "still refused");
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
+/// Past `max_connections_per_ip`, an address's next connection is refused
+/// with a `429` that names the code, and closed; its other connections, and
+/// a connection it closes giving its place back, are not affected.
+#[test]
+fn connections_past_max_connections_per_ip_are_refused() {
+    let server = TestServer::start(Server::new().max_connections_per_ip(2), echo);
+    // One used and idle, one that has sent nothing.
+    let mut used = server.client();
+    used.send("GET /used HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(used.reply().status, 200);
+    let mut quiet = server.client();
+
+    for _ in 0..3 {
+        let mut c = server.client();
+        c.send("GET /third HTTP/1.1\r\nHost: t\r\n\r\n");
+        let r = c.reply();
+        assert_eq!(r.status, 429);
+        assert_eq!(r.header("retry-after"), Some("1"));
+        assert_eq!(r.header("connection"), Some("close"));
+        assert!(r.text().starts_with("GIONG-E1124"), "{}", r.text());
+        c.expect_closed();
+    }
+
+    // The two keep being served.
+    used.send("GET /still HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert!(used.reply().text().starts_with("GET /still "));
+    quiet.send("GET /late HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert!(quiet.reply().text().starts_with("GET /late "));
+
+    // Closing one gives its place to the next.
+    drop(quiet);
+    let mut again = served_again(&server);
+    again.send("GET /more HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(again.reply().status, 200);
+}
+
+/// The limit is per address: another address is served while one is at it.
+#[cfg(target_os = "linux")]
+#[test]
+fn max_connections_per_ip_counts_each_address_on_its_own() {
+    let server = TestServer::start(Server::new().max_connections_per_ip(1), echo);
+    let _held = client_from(&server, "127.0.0.1");
+    let mut refused = client_from(&server, "127.0.0.1");
+    refused.send("GET / HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(refused.reply().status, 429);
+
+    let mut other = client_from(&server, "127.0.0.2");
+    other.send("GET /other HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert!(other.reply().text().starts_with("GET /other "));
+}
+
+/// At `max_connections`, a connection past its address's share is refused
+/// before an idle connection is asked to make room for it.
+#[cfg(unix)]
+#[test]
+fn a_connection_past_its_address_share_makes_no_idle_connection_close() {
+    let server = TestServer::start(
+        Server::new().max_connections(2).max_connections_per_ip(2),
+        echo,
+    );
+    let mut idle: Vec<Client> = (0..2)
+        .map(|i| {
+            let mut c = server.client();
+            c.send(format!("GET /{i} HTTP/1.1\r\nHost: t\r\n\r\n"));
+            assert_eq!(c.reply().status, 200);
+            c
+        })
+        .collect();
+    let mut c = server.client();
+    c.send("GET /third HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert_eq!(c.reply().status, 429);
+    for (i, c) in idle.iter_mut().enumerate() {
+        c.send(format!("GET /again{i} HTTP/1.1\r\nHost: t\r\n\r\n"));
+        let r = c.reply();
+        assert!(
+            r.text().starts_with(&format!("GET /again{i} ")),
+            "{}",
+            r.text()
+        );
+    }
+}
+
+/// `first_request_timeout` bounds the wait for the first request's head,
+/// counted from the accept: a connection that sends nothing is closed
+/// without an answer, one that trickles a head gets `408`. The body, and
+/// the requests after the first, are not counted.
+#[test]
+fn the_first_request_has_first_request_timeout_for_its_head() {
+    let server = TestServer::start(
+        Server::new()
+            .first_request_timeout(Duration::from_millis(200))
+            .request_timeout(Duration::from_secs(5))
+            .idle_timeout(Duration::from_secs(5)),
+        echo,
+    );
+
+    // Nothing sent: closed silently, well before the idle timeout.
+    let mut c = server.client();
+    let start = Instant::now();
+    c.expect_closed();
+    assert!(start.elapsed() >= Duration::from_millis(200));
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // Half a head, then silence: 408 at the first deadline, not at the
+    // request timeout.
+    let mut c = server.client();
+    let start = Instant::now();
+    c.send("GET / HTTP/1.1\r\nHost:");
+    assert_eq!(c.reply().status, 408);
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // The head in time, the body after the deadline: served.
+    let mut c = server.client();
+    c.send("POST /slow HTTP/1.1\r\nHost: t\r\nContent-Length: 3\r\n\r\n");
+    std::thread::sleep(Duration::from_millis(400));
+    c.send("abc");
+    let r = c.reply();
+    assert_eq!((r.status, r.header("x-body-len")), (200, Some("3")));
+
+    // After the first request, an idle connection has `idle_timeout`.
+    std::thread::sleep(Duration::from_millis(400));
+    c.send("GET /second HTTP/1.1\r\nHost: t\r\n\r\n");
+    assert!(c.reply().text().starts_with("GET /second "));
+}
+
+/// Without `first_request_timeout`, a new connection waits `idle_timeout`
+/// for its first byte, as before.
+#[test]
+fn without_first_request_timeout_the_first_request_waits_idle_timeout() {
+    let server = TestServer::start(
+        Server::new()
+            .request_timeout(Duration::from_secs(5))
+            .idle_timeout(Duration::from_millis(600)),
+        echo,
+    );
+    let mut c = server.client();
+    let start = Instant::now();
+    c.expect_closed();
+    assert!(start.elapsed() >= Duration::from_millis(600));
+}
+
+#[test]
+fn the_new_limits_show_in_debug_and_default_to_off() {
+    let text = format!("{:?}", Server::new());
+    assert!(text.contains("max_connections_per_ip: 0"), "{text}");
+    assert!(text.contains("first_request_timeout: 0ns"), "{text}");
+    let text = format!(
+        "{:?}",
+        Server::new()
+            .max_connections_per_ip(64)
+            .first_request_timeout(Duration::from_secs(10))
+    );
+    assert!(text.contains("max_connections_per_ip: 64"), "{text}");
+    assert!(text.contains("first_request_timeout: 10s"), "{text}");
+}

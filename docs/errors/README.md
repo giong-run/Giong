@@ -130,6 +130,7 @@ when it is no longer raised.
 | [GIONG-E1121](E1121.md) | `HttpServerLowMemory` | connection refused: the server is low on memory |
 | [GIONG-E1122](E1122.md) | `HttpInvalidTrailer` | invalid HTTP trailer field |
 | [GIONG-E1123](E1123.md) | `HttpServerOutOfFiles` | connection not accepted: the server is out of file descriptors |
+| [GIONG-E1124](E1124.md) | `HttpServerAddressLimit` | connection refused: the client's address has too many connections open |
 
 ## giong-web
 

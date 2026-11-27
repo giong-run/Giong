@@ -527,3 +527,60 @@ fn the_connection_limit_counts_tls_connections() {
     second.send("GET /second HTTP/1.1\r\nHost: localhost\r\n\r\n");
     assert_eq!(second.reply().text(), "GET /second body=");
 }
+
+/// Past `max_connections_per_ip`, a new TLS connection is closed before its
+/// handshake; the connection the address has keeps being served.
+#[test]
+fn tls_connections_past_max_connections_per_ip_are_closed() {
+    let server = TestServer::start(Server::new().max_connections_per_ip(1), echo);
+    let mut held = server.client();
+    held.send("GET /held HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(held.reply().status, 200);
+
+    let mut c = server.client();
+    let err = c
+        .stream
+        .write_all(b"GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        .and_then(|()| c.stream.flush())
+        .and_then(|()| c.stream.read(&mut [0u8; 64]).map(|_| ()));
+    assert!(err.is_err(), "the server answered");
+    assert!(c.stream.conn.is_handshaking(), "the handshake completed");
+
+    held.send("GET /still HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(held.reply().status, 200);
+}
+
+/// Over TLS, `first_request_timeout` counts from the accept: a session
+/// that completes its handshake and sends nothing is closed by then.
+#[test]
+fn a_tls_connection_that_sends_no_request_is_closed_at_the_first_deadline() {
+    let server = TestServer::start(
+        Server::new()
+            .first_request_timeout(Duration::from_millis(300))
+            .idle_timeout(Duration::from_secs(5)),
+        echo,
+    );
+    let mut c = server.client();
+    let start = Instant::now();
+    // Drive the handshake: rustls completes it on the first write or read.
+    c.send(b"");
+    c.expect_closed();
+    assert!(
+        start.elapsed() >= Duration::from_millis(250),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(
+        start.elapsed() < Duration::from_secs(3),
+        "{:?}",
+        start.elapsed()
+    );
+
+    // A request in time, then the connection idles past the first deadline.
+    let mut c = server.client();
+    c.send("GET / HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(c.reply().status, 200);
+    std::thread::sleep(Duration::from_millis(500));
+    c.send("GET /later HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert_eq!(c.reply().status, 200);
+}

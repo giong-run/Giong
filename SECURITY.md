@@ -58,8 +58,9 @@ does giong promise, so that breaking that promise is a vulnerability?
   - crash the process or a worker, or make a worker hang;
   - make the process hold memory, connections, streams or CPU past the documented limits
     (for example `max_head_size`, `max_body_size`, `max_buffered_request_bytes`,
-    `max_concurrent_streams`, the HTTP/2 memory and reset budgets, `min_body_rate` when set,
-    `max_connections`), or keep a resource past its documented timeout;
+    `max_concurrent_streams`, the HTTP/2 memory and reset budgets, `max_connections`, and
+    `min_body_rate`, `max_connections_per_ip` and `first_request_timeout` when set), or keep
+    a resource past its documented timeout;
   - smuggle a request past the parser (request desync), or make one request's data or
     headers reach another request or connection;
   - get past certificate or name checks, or downgrade TLS below what the configuration

@@ -379,6 +379,13 @@ codes! {
     /// waits in the listen queue; each worker says so on stderr, at most
     /// once a minute.
     HttpServerOutOfFiles = 1123, Other, "connection not accepted: the server is out of file descriptors";
+    /// The server refused a new connection: its client's address (an IPv4
+    /// address, or an IPv6 /64 network) had `Server::max_connections_per_ip`
+    /// connections open on the worker already. Answered with `429 Too Many
+    /// Requests` and `Retry-After: 1` (this code in the body) on a
+    /// connection without TLS; a TLS connection is closed before its
+    /// handshake. Each worker says so on stderr, at most once a minute.
+    HttpServerAddressLimit = 1124, ConnectionRefused, "connection refused: the client's address has too many connections open";
 
     // --------------------------------------------------------- giong-web
     /// A route pattern given to the router is not valid. It panics with
