@@ -166,6 +166,38 @@ fn one_off_reads_work_and_do_not_mix_with_recv() {
     });
 }
 
+/// `recv_into` mixes with `recv` on one stream: a body whose first bytes
+/// came through `recv` is completed straight into its own buffer, every byte
+/// in order, and `recv` works again after it.
+#[test]
+fn recv_into_completes_a_body_after_recv() {
+    giong::block_on(async {
+        let (a, b) = UnixStream::pair().unwrap();
+        const LEN: usize = 1 << 20;
+        let expected = payload(LEN, 7);
+        let writer = giong::spawn({
+            let data = expected.clone();
+            async move {
+                a.write_all(data).await.0.unwrap();
+                a
+            }
+        });
+        let head = b.recv().await.unwrap();
+        let mut body = Vec::with_capacity(LEN);
+        body.extend_from_slice(&head);
+        drop(head);
+        while body.len() < LEN {
+            let (res, buf) = b.recv_into(body).await;
+            body = buf;
+            assert!(res.unwrap() > 0, "the stream ended at {}", body.len());
+        }
+        assert!(body == expected);
+        let a = writer.await.unwrap();
+        a.write_all("tail").await.0.unwrap();
+        assert_eq!(&*b.recv().await.unwrap(), b"tail");
+    });
+}
+
 #[test]
 fn bind_and_connect_errors() {
     let path = SocketPath::new("errors");

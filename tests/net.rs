@@ -1394,7 +1394,7 @@ fn pattern(i: usize) -> u8 {
     (i % 251) as u8
 }
 
-/// `recv_into` (hidden, used by giong-http for large bodies) after `recv`,
+/// `recv_into` (giong-http uses it for large bodies) after `recv`,
 /// with data already taken into pool buffers, then `recv` again: every byte
 /// arrives once and in order, under either driver.
 #[test]
