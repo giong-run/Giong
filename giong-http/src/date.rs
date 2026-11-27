@@ -1,25 +1,35 @@
 //! The `Date` header value, formatted at most once per second per thread.
 
 use std::cell::Cell;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 thread_local! {
-    static CACHE: Cell<(u64, [u8; 29])> = const { Cell::new((u64::MAX, [0; 29])) };
+    /// The text, and the time on the worker's clock until which it holds:
+    /// the start of the next second.
+    static CACHE: Cell<(Option<Instant>, [u8; 29])> = const { Cell::new((None, [0; 29])) };
 }
 
 /// The current time as an IMF-fixdate, e.g. `Sun, 06 Nov 1994 08:49:37 GMT`.
+///
+/// The worker reads its clock once per turn of its event loop
+/// (`giong::time::turn_clock`), so a response costs no clock read of its own
+/// while its second lasts. As that clock is never ahead, the text changes at
+/// the second or a little before it, never early by a whole second; within
+/// a turn that crosses the second, it stays the earlier one, as nginx's
+/// cached time does.
 pub(crate) fn now() -> [u8; 29] {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    let clock = giong::time::turn_clock();
     CACHE.with(|cache| {
-        let (at, text) = cache.get();
-        if at == secs {
+        let (until, text) = cache.get();
+        if until.is_some_and(|until| clock < until) {
             return text;
         }
-        let text = format(secs);
-        cache.set((secs, text));
+        let since = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default();
+        let text = format(since.as_secs());
+        let left = Duration::from_secs(1) - Duration::from_nanos(u64::from(since.subsec_nanos()));
+        cache.set((Some(clock + left), text));
         text
     })
 }
@@ -79,5 +89,31 @@ mod tests {
         }
         assert_eq!(now().len(), 29);
         assert!(now().ends_with(b" GMT"));
+    }
+
+    fn wall_clock_secs() -> u64 {
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+    }
+
+    /// The text read from the worker's clock is the wall clock's second,
+    /// and moves on once that second is over.
+    #[test]
+    fn follows_the_wall_clock_on_a_worker() {
+        giong::block_on(async {
+            for _ in 0..2 {
+                let before = wall_clock_secs();
+                let text = now();
+                let after = wall_clock_secs();
+                assert!(
+                    (before..=after).any(|secs| format(secs) == text),
+                    "{:?} is not between {before} and {after}",
+                    std::str::from_utf8(&text)
+                );
+                giong::time::sleep(Duration::from_millis(1100)).await;
+            }
+        });
     }
 }

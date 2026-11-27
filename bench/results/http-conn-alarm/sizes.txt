@@ -1,0 +1,14 @@
+# rustc -Zprint-type-sizes on bench/instr (nightly), before = the change before this one, change = this one
+== before
+{async block@giong_http::server::Conn<giong::net::TcpStream>::serve<json>::{closure#0}}	856
+{async fn body of giong_http::server::Conn<giong::net::TcpStream>::next_request<json>()}	392
+{async fn body of giong_http::server::Conn<giong::net::TcpStream>::read_more()}	344
+giong_http::server::Conn<giong::net::TcpStream>	336
+{async fn body of giong_http::server::Conn<giong::net::TcpStream>::flush()}	320
+== change
+{async block@giong_http::server::Conn<giong::net::TcpStream>::serve<json>::{closure#0}}	760
+{async fn body of giong_http::server::Conn<giong::net::TcpStream>::next_request<json>()}	392
+{async fn body of giong_http::server::Conn<giong::net::TcpStream>::read_more()}	344
+{async fn body of giong_http::server::Conn<giong::net::TcpStream>::flush()}	320
+giong_http::server::Conn<giong::net::TcpStream>	240
+{async block@giong_http::server::Conn<giong::net::TcpStream>::recv_until::{closure#0}}	184

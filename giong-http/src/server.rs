@@ -18,7 +18,7 @@ use std::time::{Duration, Instant};
 
 use giong::net::{TcpListener, TcpStream, UnixListener, UnixStream};
 use giong::observe::RequestTrace;
-use giong::time::{sleep, timeout};
+use giong::time::{sleep, timeout, Alarm, Rang};
 
 use crate::body::{Failure, Next, Pipe, RateClock, StreamBody};
 use crate::budget::{self, Charge, FREE};
@@ -498,7 +498,7 @@ where
     }
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct Config {
     pub(crate) idle_timeout: Duration,
     pub(crate) request_timeout: Duration,
@@ -517,6 +517,31 @@ pub(crate) struct Config {
     pub(crate) http2_budget: u64,
     pub(crate) max_buffered_request_bytes: BufferedLimit,
     pub(crate) min_body_rate: crate::body::MinRate,
+}
+
+thread_local! {
+    /// The configuration the connections of this thread share (see
+    /// [`shared_config`]).
+    static SHARED_CONFIG: std::cell::RefCell<Option<Rc<Config>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// One copy of `cfg` for every connection of this thread that has the same
+/// configuration: a connection holds a pointer instead of the 120 bytes of
+/// a copy of its own. A server is usually one per thread; one with other
+/// settings replaces the copy kept here, and its connections share the new
+/// one.
+pub(crate) fn shared_config(cfg: &Config) -> Rc<Config> {
+    SHARED_CONFIG.with(|shared| {
+        let mut shared = shared.borrow_mut();
+        match &*shared {
+            Some(kept) if **kept == *cfg => kept.clone(),
+            _ => {
+                let kept = Rc::new(*cfg);
+                *shared = Some(kept.clone());
+                kept
+            }
+        }
+    })
 }
 
 impl Config {
@@ -1005,7 +1030,7 @@ impl Server {
     /// connections already accepted go on as their own tasks.
     pub async fn serve<H: Handler>(&self, listener: TcpListener, handler: H) {
         let handler = Rc::new(handler);
-        let cfg = self.cfg;
+        let cfg = shared_config(&self.cfg);
         let first = self.first_request_timeout;
         let accept = || listener.accept();
         self.accept_loop(
@@ -1015,7 +1040,7 @@ impl Server {
             |stream: TcpStream, slot| {
                 let _ = stream.set_nodelay(true);
                 drop(giong::spawn(
-                    Conn::new(stream, cfg, Some(slot))
+                    Conn::new(stream, cfg.clone(), Some(slot))
                         .first_request_by(first_deadline(first))
                         .serve(handler.clone()),
                 ));
@@ -1042,7 +1067,7 @@ impl Server {
     /// Cancel safe, like [`serve`](Self::serve).
     pub async fn serve_unix<H: Handler>(&self, listener: UnixListener, handler: H) {
         let handler = Rc::new(handler);
-        let cfg = self.cfg;
+        let cfg = shared_config(&self.cfg);
         let first = self.first_request_timeout;
         let accept = || listener.accept();
         self.accept_loop(
@@ -1051,7 +1076,7 @@ impl Server {
             |_: &UnixStream| None,
             |stream: UnixStream, slot| {
                 drop(giong::spawn(
-                    Conn::new(stream, cfg, Some(slot))
+                    Conn::new(stream, cfg.clone(), Some(slot))
                         .first_request_by(first_deadline(first))
                         .serve(handler.clone()),
                 ));
@@ -1088,7 +1113,7 @@ impl Server {
         handler: H,
     ) {
         let handler = Rc::new(handler);
-        let cfg = self.cfg;
+        let cfg = shared_config(&self.cfg);
         // The server says which protocols it speaks, whatever the acceptor
         // was configured with.
         let acceptor = if cfg.http2 {
@@ -1106,6 +1131,7 @@ impl Server {
                 let _ = stream.set_nodelay(true);
                 let acceptor = acceptor.clone();
                 let handler = handler.clone();
+                let cfg = cfg.clone();
                 // Counted from the accept, so the handshake is within it.
                 let first = first_deadline(first);
                 // The handshake, on the heap for its length only, holding what
@@ -1336,7 +1362,7 @@ impl Server {
         T: Transport,
         H: Handler,
     {
-        Conn::new(stream, self.cfg, None)
+        Conn::new(stream, shared_config(&self.cfg), None)
             .first_request_by(first_deadline(self.first_request_timeout))
             .serve(handler)
     }
@@ -1992,7 +2018,7 @@ fn open_files_limits() -> Option<&'static (String, String)> {
 #[allow(clippy::manual_async_fn)]
 fn serve_h2<T: Transport, H: Handler>(
     stream: T,
-    cfg: Config,
+    cfg: Rc<Config>,
     peer: Option<SocketAddr>,
     handler: Rc<H>,
     slot: Slot,
@@ -2011,6 +2037,12 @@ enum Wait {
     Chunked(Decoder),
     /// Until the read buffer holds this many bytes of body.
     Length(usize),
+}
+
+/// How [`Conn::recv_until`] ended.
+enum Waited<C> {
+    Received(io::Result<C>),
+    TimedOut,
 }
 
 /// Why a connection stops reading requests.
@@ -2108,7 +2140,8 @@ fn into_head(mut bufs: Vec<Cow<'static, [u8]>>) -> Vec<u8> {
 
 struct Conn<T> {
     stream: T,
-    cfg: Config,
+    /// Shared by the connections of the thread (see [`shared_config`]).
+    cfg: Rc<Config>,
     /// The client's address, looked up once per connection.
     peer: Option<SocketAddr>,
     /// Received bytes. Shared with the requests handed to the handler, so it
@@ -2134,6 +2167,9 @@ struct Conn<T> {
     /// `deadline` is `first_request_timeout`'s, which ends with the first
     /// head: the body then has `request_timeout`.
     head_deadline: bool,
+    /// The timeout of the wait for a request, and the shutdown signal, armed
+    /// once for the connection rather than once per wait (see `recv_until`).
+    alarm: Alarm,
     /// Nothing has been parsed yet: the connection may still turn out to be
     /// HTTP/2 with prior knowledge.
     first: bool,
@@ -2255,7 +2291,7 @@ impl Drop for TracesAt {
 }
 
 impl<T: Transport> Conn<T> {
-    fn new(stream: T, cfg: Config, slot: Option<Slot>) -> Self {
+    fn new(stream: T, cfg: Rc<Config>, slot: Option<Slot>) -> Self {
         Self {
             peer: stream.peer_addr(),
             stream,
@@ -2268,6 +2304,7 @@ impl<T: Transport> Conn<T> {
             closing: false,
             deadline: None,
             head_deadline: false,
+            alarm: Alarm::new(),
             first: true,
             body_into: false,
             charge: Charge::none(),
@@ -3129,47 +3166,94 @@ impl<T: Transport> Conn<T> {
             }
             // Nothing of a request has arrived, so a deadline is
             // `first_request_timeout`'s: the connection has sent nothing yet,
-            // and is closed without an answer when it passes.
-            let wait = match self.deadline {
-                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
-                None => self.cfg.idle_timeout,
+            // and is closed without an answer when it passes. Otherwise the
+            // idle timeout, from the worker's clock of this turn: never more
+            // than the turn has run so far before now.
+            let deadline = match self.deadline {
+                Some(deadline) => deadline,
+                None => giong::time::turn_clock() + self.cfg.idle_timeout,
             };
-            let recv = timeout(wait, self.stream.recv());
-            let received = giong::until_shutdown(recv).await;
+            // Shutting down: a request that was already on its way is still
+            // answered (with `Connection: close`, as every response once the
+            // shutdown has begun), then the connection closes.
+            let waited = self
+                .recv_until(deadline, Some(self.cfg.shutdown_linger))
+                .await;
             if let Some(slot) = &self._slot {
                 slot.set_idle(false);
             }
-            match received {
-                Some(received) => received,
-                None => {
-                    // Moved whole: matched and left in place, it would be
-                    // kept across the wait.
-                    drop(received);
-                    // Shutting down: a request that was already on its way is
-                    // still answered, then the connection closes.
-                    self.closing = true;
-                    timeout(self.cfg.shutdown_linger, self.stream.recv()).await
-                }
+            match waited {
+                Waited::Received(received) => received,
+                Waited::TimedOut => return Err(End::Close),
             }
         } else {
             let request_timeout = self.cfg.request_timeout;
             let deadline = *self
                 .deadline
                 .get_or_insert_with(|| Instant::now() + request_timeout);
-            let left = deadline.saturating_duration_since(Instant::now());
-            match timeout(left, self.stream.recv()).await {
-                Ok(received) => Ok(received),
-                Err(_) => return Err(End::Status(408)),
+            // Unlike the wait for a request, the rest of one is not cut
+            // short by a shutdown: it is answered.
+            match self.recv_until(deadline, None).await {
+                Waited::Received(received) => received,
+                Waited::TimedOut => return Err(End::Status(408)),
             }
         };
         match received {
-            Ok(Ok(chunk)) if !chunk.is_empty() => {
+            Ok(chunk) if !chunk.is_empty() => {
                 self.append(&chunk);
                 drop(chunk);
                 self.account(0)
             }
             // Idle for too long, an I/O error, or closed by the peer.
             _ => Err(End::Close),
+        }
+    }
+
+    /// Receives the next chunk unless `deadline` passes first, with the
+    /// connection's alarm: a wait arms no timer and registers no shutdown
+    /// waker of its own, and a later deadline than the last wait's costs
+    /// nothing in the timer wheel. At a shutdown, the deadline becomes
+    /// `linger` from then, or stays (`None`). The alarm stays armed after
+    /// the wait (it is dropped with the connection), so between requests
+    /// the task may be woken once by an old deadline: every await of the
+    /// connection is fine with a spurious wake-up.
+    fn recv_until(
+        &mut self,
+        mut deadline: Instant,
+        mut linger: Option<Duration>,
+    ) -> impl Future<Output = Waited<T::Chunk>> + '_ {
+        let recv = self.stream.recv();
+        let alarm = &mut self.alarm;
+        let mut shut = false;
+        async move {
+            let mut recv = pin!(recv);
+            poll_fn(move |cx| {
+                // What was received first, before the deadline, as a timeout
+                // does, and before a shutdown. The alarm is armed only when
+                // there is a wait, and keeps an earlier deadline while input
+                // is ready (it then wakes the connection once in vain).
+                if let Poll::Ready(received) = recv.as_mut().poll(cx) {
+                    return Poll::Ready(Waited::Received(received));
+                }
+                loop {
+                    let rang = if shut {
+                        alarm.poll_deadline(deadline, cx)
+                    } else {
+                        alarm.poll_until(deadline, cx)
+                    };
+                    match rang {
+                        Poll::Pending => return Poll::Pending,
+                        Poll::Ready(Rang::Deadline) => return Poll::Ready(Waited::TimedOut),
+                        Poll::Ready(Rang::Shutdown) => {
+                            shut = true;
+                            if let Some(linger) = linger.take() {
+                                deadline = Instant::now() + linger;
+                            }
+                        }
+                    }
+                }
+            })
+            .await
         }
     }
 
@@ -3568,7 +3652,8 @@ mod tests {
                     giong::time::sleep(Duration::from_millis(1)).await;
                     Response::new(200 + u16::from(std::hint::black_box(&state)[0] - 7))
                 };
-                let conn = Conn::new(stream, Server::new().cfg, None).serve(Rc::new(handler));
+                let conn =
+                    Conn::new(stream, Rc::new(Server::new().cfg), None).serve(Rc::new(handler));
                 let size = mem::size_of_val(&conn);
                 assert!(size <= 2048, "a connection's future takes {size} bytes");
             })

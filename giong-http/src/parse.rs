@@ -260,10 +260,52 @@ pub(crate) fn header_lines(block: &[u8]) -> impl Iterator<Item = (&[u8], &[u8])>
         })
 }
 
-/// Parses a complete head (`head` ends with the empty line). On failure returns
-/// the status code to answer with.
-pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
-    debug_assert!(head.ends_with(b"\r\n\r\n"));
+/// Reads a request line in one pass over its bytes, if it is the common
+/// kind: a method of at most 32 token bytes, a target of visible ASCII but
+/// `#`, `HTTP/1.1` or `HTTP/1.0`, single spaces and CRLF. Returns where the
+/// two spaces and the LF are and the minor version, as [`request_line`]
+/// would, which reads anything else, and says what is wrong with it.
+fn quick_request_line(head: &[u8]) -> Option<(usize, usize, usize, u8)> {
+    let mut i = 0;
+    while TOKEN[*head.get(i)? as usize] {
+        i += 1;
+    }
+    if i == 0 || i > 32 || head[i] != b' ' {
+        return None;
+    }
+    let sp1 = i;
+    i += 1;
+    while TARGET[*head.get(i)? as usize] {
+        i += 1;
+    }
+    if i == sp1 + 1 || head[i] != b' ' {
+        return None;
+    }
+    let sp2 = i;
+    let minor = match head.get(sp2 + 1..sp2 + 11)? {
+        b"HTTP/1.1\r\n" => 1,
+        b"HTTP/1.0\r\n" => 0,
+        _ => return None,
+    };
+    Some((sp1, sp2, sp2 + 10, minor))
+}
+
+/// Bytes of a request target: visible ASCII, so that it is always valid
+/// UTF-8, but `#`: no fragment, which a client never sends (RFC 9112,
+/// section 3.2) and which a proxy and the handler could read differently.
+const TARGET: [bool; 256] = {
+    let mut table = [false; 256];
+    let mut b = 0x21;
+    while b <= 0x7e {
+        table[b] = b != b'#' as usize;
+        b += 1;
+    }
+    table
+};
+
+/// The request line, read with every check: where its two spaces and its LF
+/// are, and the minor version.
+fn request_line(head: &[u8]) -> Result<(usize, usize, usize, u8), u16> {
     let line_end = head
         .iter()
         .position(|&b| b == b'\n')
@@ -283,14 +325,7 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
     if !is_token_str(method) || method.len() > 32 {
         return Err(400);
     }
-    // Visible ASCII only, so the target is always valid UTF-8; no fragment,
-    // which a client never sends (RFC 9112, section 3.2) and which a proxy
-    // and the handler could read differently.
-    if target.is_empty()
-        || !target
-            .iter()
-            .all(|&b| (0x21..=0x7e).contains(&b) && b != b'#')
-    {
+    if target.is_empty() || !target.iter().all(|&b| TARGET[b as usize]) {
         return Err(400);
     }
     // The version first: the rules below are HTTP/1.x's, and another
@@ -306,6 +341,18 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
         }
         _ => return Err(400),
     };
+    Ok((sp1, sp2, line_end, minor))
+}
+
+/// Parses a complete head (`head` ends with the empty line). On failure returns
+/// the status code to answer with.
+pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
+    debug_assert!(head.ends_with(b"\r\n\r\n"));
+    let (sp1, sp2, line_end, minor) = match quick_request_line(head) {
+        Some(parts) => parts,
+        None => request_line(head)?,
+    };
+    let (method, target) = (&head[..sp1], &head[sp1 + 1..sp2]);
     // The target is a path (origin form), `*` for OPTIONS, `host:port` for
     // CONNECT, or a whole URL (absolute form, RFC 9112 section 3.2.2), as
     // a client sends to a proxy. A server must take the host from such a
@@ -348,22 +395,33 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
     let mut host: Option<&[u8]> = None;
     let mut transfer_encoding = false;
 
-    let mut rest = &head[headers];
-    while !rest.is_empty() {
-        // Every line ends in CRLF; a bare LF or CR anywhere is an error.
-        let nl = rest.iter().position(|&b| b == b'\n').ok_or(400u16)?;
-        if nl == 0 || rest[nl - 1] != b'\r' {
-            return Err(400);
-        }
-        let line = &rest[..nl - 1];
-        rest = &rest[nl + 1..];
-
-        // No obsolete line folding, no whitespace around the name.
-        let colon = line.iter().position(|&b| b == b':').ok_or(400u16)?;
-        let (name, value) = (&line[..colon], trim(&line[colon + 1..]));
-        if !is_token_str(name) {
-            return Err(400);
-        }
+    let mut pos = headers.start;
+    while pos < headers.end {
+        // The common line in one pass; anything else with every check.
+        let (name, value, checked) = match quick_field(head, pos) {
+            Some(field) if field.next <= headers.end => {
+                pos = field.next;
+                (&head[field.name], &head[field.value], true)
+            }
+            _ => {
+                let rest = &head[pos..headers.end];
+                // Every line ends in CRLF; a bare LF or CR anywhere is an
+                // error.
+                let nl = rest.iter().position(|&b| b == b'\n').ok_or(400u16)?;
+                if nl == 0 || rest[nl - 1] != b'\r' {
+                    return Err(400);
+                }
+                let line = &rest[..nl - 1];
+                pos += nl + 1;
+                // No obsolete line folding, no whitespace around the name.
+                let colon = line.iter().position(|&b| b == b':').ok_or(400u16)?;
+                let (name, value) = (&line[..colon], trim(&line[colon + 1..]));
+                if !is_token_str(name) {
+                    return Err(400);
+                }
+                (name, value, false)
+            }
+        };
         // `Host` has a stricter syntax than a field value, which it implies.
         if name.eq_ignore_ascii_case(b"host") {
             if !valid_host(value) {
@@ -373,7 +431,7 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
             host = Some(value);
             continue;
         }
-        if !is_field_value(value) {
+        if !checked && !is_field_value(value) {
             return Err(400);
         }
 
@@ -433,6 +491,336 @@ pub(crate) fn parse_head(head: &[u8]) -> Result<Head, u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `parse_head` before its one-pass fast paths, kept to check that they
+    /// change no verdict.
+    fn reference_parse_head(head: &[u8]) -> Result<Head, u16> {
+        debug_assert!(head.ends_with(b"\r\n\r\n"));
+        let line_end = head
+            .iter()
+            .position(|&b| b == b'\n')
+            .filter(|&i| i > 0 && head[i - 1] == b'\r')
+            .ok_or(400u16)?;
+        let line = &head[..line_end - 1];
+
+        // request-line = method SP request-target SP HTTP-version
+        let sp1 = line.iter().position(|&b| b == b' ').ok_or(400u16)?;
+        let sp2 = sp1
+            + 1
+            + line[sp1 + 1..]
+                .iter()
+                .position(|&b| b == b' ')
+                .ok_or(400u16)?;
+        let (method, target, version) = (&line[..sp1], &line[sp1 + 1..sp2], &line[sp2 + 1..]);
+        if !is_token_str(method) || method.len() > 32 {
+            return Err(400);
+        }
+        // Visible ASCII only, so the target is always valid UTF-8; no fragment,
+        // which a client never sends (RFC 9112, section 3.2) and which a proxy
+        // and the handler could read differently.
+        if target.is_empty()
+            || !target
+                .iter()
+                .all(|&b| (0x21..=0x7e).contains(&b) && b != b'#')
+        {
+            return Err(400);
+        }
+        // The version first: the rules below are HTTP/1.x's, and another
+        // version (`PRI * HTTP/2.0`, the HTTP/2 preface) is answered with 505
+        // whatever its target.
+        let minor = match version {
+            b"HTTP/1.1" => 1,
+            b"HTTP/1.0" => 0,
+            [b'H', b'T', b'T', b'P', b'/', major, b'.', minor]
+                if major.is_ascii_digit() && minor.is_ascii_digit() =>
+            {
+                return Err(505)
+            }
+            _ => return Err(400),
+        };
+        // The target is a path (origin form), `*` for OPTIONS, `host:port` for
+        // CONNECT, or a whole URL (absolute form, RFC 9112 section 3.2.2), as
+        // a client sends to a proxy. A server must take the host from such a
+        // URL and ignore `Host`, but handlers read `Host`: a proxy in front
+        // that routes on the URL while the handler picks the site from `Host`
+        // could be made to disagree. So the URL must be `http` or `https` and
+        // name the same host as `Host`, as `:authority` must over HTTP/2.
+        let authority = match target {
+            [b'/', ..] => None,
+            b"*" if method == b"OPTIONS" => None,
+            _ if method == b"CONNECT" => None,
+            _ => {
+                let (scheme, authority, _) = split_absolute(target).ok_or(400u16)?;
+                let http =
+                    scheme.eq_ignore_ascii_case(b"http") || scheme.eq_ignore_ascii_case(b"https");
+                // No user name or password either (RFC 9110, section 4.2.4).
+                if !http || authority.is_empty() || authority.contains(&b'@') {
+                    return Err(400);
+                }
+                Some(authority)
+            }
+        };
+
+        let headers = line_end + 1..head.len() - 2;
+        let mut parsed = Head {
+            method: 0..sp1,
+            target: sp1 + 1..sp2,
+            minor,
+            headers: headers.clone(),
+            len: head.len(),
+            content_length: None,
+            chunked: false,
+            close: false,
+            keep_alive: false,
+            expect_continue: false,
+            h2: false,
+            h3: false,
+        };
+        let mut hosts = 0;
+        let mut host: Option<&[u8]> = None;
+        let mut transfer_encoding = false;
+
+        let mut rest = &head[headers];
+        while !rest.is_empty() {
+            // Every line ends in CRLF; a bare LF or CR anywhere is an error.
+            let nl = rest.iter().position(|&b| b == b'\n').ok_or(400u16)?;
+            if nl == 0 || rest[nl - 1] != b'\r' {
+                return Err(400);
+            }
+            let line = &rest[..nl - 1];
+            rest = &rest[nl + 1..];
+
+            // No obsolete line folding, no whitespace around the name.
+            let colon = line.iter().position(|&b| b == b':').ok_or(400u16)?;
+            let (name, value) = (&line[..colon], trim(&line[colon + 1..]));
+            if !is_token_str(name) {
+                return Err(400);
+            }
+            // `Host` has a stricter syntax than a field value, which it implies.
+            if name.eq_ignore_ascii_case(b"host") {
+                if !valid_host(value) {
+                    return Err(400);
+                }
+                hosts += 1;
+                host = Some(value);
+                continue;
+            }
+            if !is_field_value(value) {
+                return Err(400);
+            }
+
+            if name.eq_ignore_ascii_case(b"content-length") {
+                if value.is_empty() || value.len() > 19 || !value.iter().all(u8::is_ascii_digit) {
+                    return Err(400);
+                }
+                let n = value
+                    .iter()
+                    .fold(0u64, |acc, &b| acc * 10 + (b - b'0') as u64);
+                if parsed.content_length.is_some_and(|prev| prev != n) {
+                    return Err(400);
+                }
+                parsed.content_length = Some(n);
+            } else if name.eq_ignore_ascii_case(b"transfer-encoding") {
+                if transfer_encoding || minor == 0 {
+                    return Err(400);
+                }
+                if !value.eq_ignore_ascii_case(b"chunked") {
+                    return Err(501);
+                }
+                transfer_encoding = true;
+                parsed.chunked = true;
+            } else if name.eq_ignore_ascii_case(b"connection") {
+                for token in value.split(|&b| b == b',').map(trim) {
+                    if token.eq_ignore_ascii_case(b"close") {
+                        parsed.close = true;
+                    } else if token.eq_ignore_ascii_case(b"keep-alive") {
+                        parsed.keep_alive = true;
+                    }
+                }
+            } else if name.eq_ignore_ascii_case(b"expect") {
+                if !value.eq_ignore_ascii_case(b"100-continue") {
+                    return Err(417);
+                }
+                parsed.expect_continue = true;
+            }
+        }
+
+        // A message with both framings is the classic smuggling vector.
+        if parsed.chunked && parsed.content_length.is_some() {
+            return Err(400);
+        }
+        if hosts > 1 || (minor == 1 && hosts == 0) {
+            return Err(400);
+        }
+        // An HTTP/1.0 request in absolute form without `Host` is refused too:
+        // the handler would see no host where the proxy saw one.
+        if let Some(authority) = authority {
+            if !host.is_some_and(|host| same_authority(host, authority)) {
+                return Err(400);
+            }
+        }
+        Ok(parsed)
+    }
+
+    /// xorshift64*.
+    struct Rng(u64);
+
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 ^= self.0 >> 12;
+            self.0 ^= self.0 << 25;
+            self.0 ^= self.0 >> 27;
+            self.0.wrapping_mul(0x2545_F491_4F6C_DD1D)
+        }
+
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    /// The fast paths read the common request line and header line in one
+    /// pass and leave everything else to the careful code: on any head, the
+    /// verdict, and every range of a parsed head, must be what the careful
+    /// code alone gives.
+    #[test]
+    #[cfg_attr(miri, ignore = "safe code only, and long under Miri")]
+    fn the_one_pass_paths_change_no_verdict() {
+        let methods: &[&[u8]] = &[
+            b"GET",
+            b"POST",
+            b"OPTIONS",
+            b"CONNECT",
+            b"PRI",
+            b"G\x7fT",
+            b"",
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456",
+            b"ABCDEFGHIJKLMNOPQRSTUVWXYZ012345",
+            b"get",
+        ];
+        let targets: &[&[u8]] = &[
+            b"/",
+            b"/json",
+            b"/a?b=c#d",
+            b"*",
+            b"http://h/p",
+            b"HTTPS://h:1/",
+            b"h:443",
+            b"",
+            b"/caf\xc3\xa9",
+            b"/a b",
+            b"ftp://h/",
+            b"http://u@h/",
+        ];
+        let versions: &[&[u8]] = &[
+            b"HTTP/1.1",
+            b"HTTP/1.0",
+            b"HTTP/2.0",
+            b"HTTP/1.1 ",
+            b"http/1.1",
+            b"HTTP/1.10",
+            b"HTTP/1",
+        ];
+        let fields: &[&[u8]] = &[
+            b"Host: h",
+            b"Host: h:1",
+            b"host:h",
+            b"Host:  h  ",
+            b"Host: u@h",
+            b"Host: [::1]:8",
+            b"Content-Length: 5",
+            b"Content-Length: 5, 5",
+            b"content-length:7",
+            b"Transfer-Encoding: chunked",
+            b"Transfer-Encoding: gzip",
+            b"Connection: close, Keep-Alive",
+            b"Expect: 100-continue",
+            b"Expect: x",
+            b"X-A: \x80\xff",
+            b"X-A: a\tb ",
+            b"X-A:",
+            b"X-A: \x7f",
+            b"X-A: a\x01",
+            b" X-A: b",
+            b"X A: b",
+            b": b",
+            b"X-A",
+            b"X-A: a\rb",
+            b"X-A: a\nb",
+            b"X-\x80: b",
+        ];
+        let separators: &[&[u8]] = &[b" ", b" ", b" ", b"  ", b"\t"];
+        let ends: &[&[u8]] = &[b"\r\n", b"\r\n", b"\r\n", b"\n", b"\r"];
+        let interesting = b"\r\n :\t#\0\x7f\x80\xffHTTP/1.10a@[]%";
+        let mut rng = Rng(0x9e37_79b9_7f4a_7c15);
+        let (mut checked, mut parsed) = (0, 0);
+        for case in 0..200_000 {
+            let mut head = Vec::new();
+            // Mostly the first entry of each list (well formed), so that
+            // many heads parse; otherwise any entry.
+            let pick = |rng: &mut Rng, from: &[&[u8]]| {
+                let i = if rng.below(4) != 0 {
+                    rng.below(from.len().min(2))
+                } else {
+                    rng.below(from.len())
+                };
+                from[i].to_vec()
+            };
+            head.extend(pick(&mut rng, methods));
+            head.extend(pick(&mut rng, separators));
+            head.extend(pick(&mut rng, targets));
+            head.extend(pick(&mut rng, separators));
+            head.extend(pick(&mut rng, versions));
+            head.extend(pick(&mut rng, ends));
+            let lines = rng.below(5);
+            let host_at = if rng.below(5) != 0 {
+                rng.below(lines + 1)
+            } else {
+                usize::MAX
+            };
+            for line in 0..=lines {
+                if line == host_at {
+                    head.extend(pick(&mut rng, &fields[..6]));
+                    head.extend(pick(&mut rng, ends));
+                }
+                if line < lines {
+                    head.extend(fields[6 + rng.below(fields.len() - 6)]);
+                    head.extend(pick(&mut rng, ends));
+                }
+            }
+            // A few random bytes changed, added or removed, some of the time.
+            if rng.below(3) == 0 {
+                for _ in 0..1 + rng.below(3) {
+                    let at = rng.below(head.len() + 1);
+                    match rng.below(3) {
+                        0 if at < head.len() => {
+                            head[at] = interesting[rng.below(interesting.len())]
+                        }
+                        1 => head.insert(at, interesting[rng.below(interesting.len())]),
+                        _ if at < head.len() => drop(head.remove(at)),
+                        _ => {}
+                    }
+                }
+            }
+            head.extend_from_slice(b"\r\n");
+            if !head.ends_with(b"\r\n\r\n") {
+                continue;
+            }
+            let verdict = parse_head(&head);
+            assert_eq!(
+                verdict,
+                reference_parse_head(&head),
+                "case {case}: {:?}",
+                String::from_utf8_lossy(&head)
+            );
+            checked += 1;
+            parsed += usize::from(verdict.is_ok());
+        }
+        // Enough of both verdicts to mean something.
+        assert!(
+            checked > 100_000 && parsed > 10_000,
+            "{checked} heads, {parsed} parsed"
+        );
+    }
 
     fn parse(s: &str) -> Result<Head, u16> {
         parse_head(s.as_bytes())

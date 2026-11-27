@@ -45,7 +45,10 @@ use crate::slab::Slab;
 //
 // Arming and cancelling are O(1) — a linked-list insert/unlink — which is
 // what matters for servers: nearly every timer is an I/O timeout that gets
-// cancelled long before it would fire.
+// cancelled long before it would fire. An [`Alarm`] (a connection's timeouts
+// in giong-http) does neither per wait: it stays armed, and a later deadline
+// only changes the deadline the entry keeps; the wheel moves the entry when
+// it reaches its slot.
 
 const LEVELS: usize = 6;
 const SLOTS: usize = 64;
@@ -69,6 +72,8 @@ struct Entry {
     /// has come.
     level: u8,
     slot: u8,
+    /// An [`Alarm`]'s: woken at shutdown as well.
+    alarm: bool,
     prev: usize,
     next: usize,
 }
@@ -146,14 +151,26 @@ impl Timers {
         nanos.min(u64::MAX as u128) as u64
     }
 
-    fn insert(&mut self, deadline: Instant, waker: Waker) -> TimerKey {
-        // Beyond the wheel's range, a timer is placed at its last tick and
-        // fires early; `Sleep` then simply re-arms itself.
-        let mut at = self.nanos(deadline);
+    /// Where `deadline` goes in the wheel: in nanoseconds since it started,
+    /// and, beyond its range, at its last tick (the timer then fires early;
+    /// `Sleep` and `Alarm` simply re-arm themselves).
+    fn place(&self, deadline: Instant) -> u64 {
+        let at = self.nanos(deadline);
         let last = self.elapsed + MAX_TICKS - 1;
         if tick_of(at) > last {
-            at = last * NANOS_PER_TICK as u64;
+            last * NANOS_PER_TICK as u64
+        } else {
+            at
         }
+    }
+
+    fn insert(&mut self, deadline: Instant, waker: Waker) -> TimerKey {
+        self.insert_entry(deadline, waker, false)
+    }
+
+    #[inline]
+    fn insert_entry(&mut self, deadline: Instant, waker: Waker, alarm: bool) -> TimerKey {
+        let at = self.place(deadline);
         self.seq += 1;
         let uid = self.seq;
         let idx = self.entries.insert(Entry {
@@ -162,11 +179,54 @@ impl Timers {
             waker,
             level: 0,
             slot: 0,
+            alarm,
             prev: NIL,
             next: NIL,
         });
         self.link(idx);
         (idx, uid)
+    }
+
+    /// Moves a registered timer to `deadline` and refreshes its waker;
+    /// `false` if it is gone (it fired). A later deadline is only noted in
+    /// the entry: the entry stays where it is, and when the wheel reaches it
+    /// it goes on to the slot of its new deadline (see [`expired`]), as a
+    /// timer cascading from a higher level does. An earlier one, or a timer
+    /// already on the due list, moves now.
+    ///
+    /// [`expired`]: Self::expired
+    fn retarget(&mut self, key: TimerKey, deadline: Instant, waker: &Waker) -> bool {
+        let at = self.place(deadline);
+        let Some(entry) = self.entries.get_mut(key.0) else {
+            return false;
+        };
+        if entry.uid != key.1 {
+            return false;
+        }
+        if !entry.waker.will_wake(waker) {
+            entry.waker = waker.clone();
+        }
+        if at >= entry.at && entry.level != DUE {
+            // Every bound kept on the slot it is in (`earliest`) stays a
+            // time no later than the earliest deadline in it.
+            entry.at = at;
+            return true;
+        }
+        if at != entry.at {
+            self.unlink(key.0);
+            self.entries.get_mut(key.0).expect("timer entry").at = at;
+            self.link(key.0);
+        }
+        true
+    }
+
+    /// The wakers of every armed [`Alarm`], to wake at shutdown.
+    pub(crate) fn alarm_wakers(&self) -> Vec<Waker> {
+        self.entries
+            .iter()
+            .filter(|entry| entry.alarm)
+            .map(|entry| entry.waker.clone())
+            .collect()
     }
 
     /// Refreshes the waker of a registered timer, re-arming it if it is gone.
@@ -191,6 +251,7 @@ impl Timers {
         self.entries.remove(key.0).map(|entry| entry.waker)
     }
 
+    #[inline(always)]
     fn link(&mut self, idx: usize) {
         let at = self.entries.get(idx).expect("timer entry").at;
         let when = tick_of(at);
@@ -548,6 +609,147 @@ pub fn sleep_until(deadline: Instant) -> Sleep {
     }
 }
 
+/// The worker's clock of this turn of its event loop: read at most once a
+/// turn and shared by everything that asks during it, so it is behind the
+/// real time by as long as the turn has run so far, and never ahead.
+/// [`Instant::now`] outside a runtime. For the crates of this workspace
+/// (giong-http's `Date` header), not part of the API.
+#[doc(hidden)]
+#[inline]
+pub fn turn_clock() -> Instant {
+    runtime::try_with_worker(|w| w.clock()).unwrap_or_else(Instant::now)
+}
+
+/// What an [`Alarm`] went off for.
+#[doc(hidden)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Rang {
+    /// The deadline passed.
+    Deadline,
+    /// The runtime is shutting down, or the worker is draining its tasks
+    /// (as [`shutdown_signal`](crate::shutdown_signal) resolves).
+    Shutdown,
+}
+
+/// A deadline and a shutdown signal in one registration, for something
+/// that waits again and again with a deadline that moves: a connection's
+/// idle and request timeouts in giong-http. A [`timeout`] around every wait
+/// arms a timer and cancels it, and an [`until_shutdown`](crate::until_shutdown)
+/// registers and unregisters a waker; an `Alarm` stays armed from one wait
+/// to the next, and a later deadline only changes the deadline its entry in
+/// the timer wheel keeps (the wheel moves the entry when it reaches it).
+/// 16 bytes. Not `Send`: armed on one worker. For the crates of this
+/// workspace, not part of the API.
+#[doc(hidden)]
+pub struct Alarm {
+    /// The registration in the worker's timer wheel: its index, the low 32
+    /// bits of the worker's uid (as [`Sleep`] keeps the whole uid, for an
+    /// alarm polled on a worker of another runtime of the same thread), and
+    /// its uid in the wheel, 0 for none.
+    idx: u32,
+    worker: u32,
+    uid: u64,
+    _not_send: std::marker::PhantomData<*const ()>,
+}
+
+impl Default for Alarm {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Alarm {
+    /// An alarm not armed yet.
+    pub const fn new() -> Self {
+        Self {
+            idx: 0,
+            worker: 0,
+            uid: 0,
+            _not_send: std::marker::PhantomData,
+        }
+    }
+
+    /// `Ready` once the runtime shuts down (checked first) or `deadline`
+    /// has passed; otherwise arms the alarm for `deadline` with the task's
+    /// waker, which is also woken at shutdown. Never early: the deadline is
+    /// compared with the worker's clock of the turn, which is never ahead
+    /// (a deadline it has not reached yet but the real clock has is armed,
+    /// and goes off when the worker fires its timers after this turn).
+    ///
+    /// # Panics
+    ///
+    /// Outside of a giong runtime.
+    pub fn poll_until(&mut self, deadline: Instant, cx: &mut Context<'_>) -> Poll<Rang> {
+        self.poll(deadline, true, cx)
+    }
+
+    /// As [`poll_until`](Self::poll_until), without the shutdown: for the
+    /// wait that goes on after one, which then ends only at `deadline`.
+    pub fn poll_deadline(&mut self, deadline: Instant, cx: &mut Context<'_>) -> Poll<Rang> {
+        self.poll(deadline, false, cx)
+    }
+
+    #[inline]
+    fn poll(&mut self, deadline: Instant, shutdown: bool, cx: &mut Context<'_>) -> Poll<Rang> {
+        runtime::with_worker(|w| {
+            // As `ShutdownSignal`: the flag is set before the wake-up is
+            // handed to this worker, which wakes armed alarms only after this
+            // returns, so an alarm armed here cannot miss it.
+            if shutdown && w.shutting_down() {
+                return Poll::Ready(Rang::Shutdown);
+            }
+            let now = w.clock();
+            let worker = w.shared.uid as u32;
+            let mut timers = w.timers.borrow_mut();
+            let armed = self.uid != 0 && self.worker == worker;
+            if now >= deadline {
+                if armed {
+                    drop(timers.remove((self.idx as usize, self.uid)));
+                }
+                self.uid = 0;
+                return Poll::Ready(Rang::Deadline);
+            }
+            if armed && timers.retarget((self.idx as usize, self.uid), deadline, cx.waker()) {
+                return Poll::Pending;
+            }
+            let (idx, uid) = timers.insert_entry(deadline, cx.waker().clone(), true);
+            self.idx = u32::try_from(idx).expect("fewer than 2^32 timers");
+            self.worker = worker;
+            self.uid = uid;
+            Poll::Pending
+        })
+    }
+}
+
+impl Drop for Alarm {
+    fn drop(&mut self) {
+        if self.uid == 0 {
+            return;
+        }
+        let key = (self.idx as usize, self.uid);
+        let worker = self.worker;
+        let waker = runtime::try_with_worker(|w| {
+            if w.shared.uid as u32 == worker {
+                w.timers
+                    .try_borrow_mut()
+                    .ok()
+                    .and_then(|mut t| t.remove(key))
+            } else {
+                None
+            }
+        });
+        drop(waker);
+    }
+}
+
+impl fmt::Debug for Alarm {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Alarm")
+            .field("armed", &(self.uid != 0))
+            .finish()
+    }
+}
+
 /// Error returned by [`timeout`] when the time runs out first.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Elapsed;
@@ -661,6 +863,18 @@ mod tests {
     /// checks that they agree on exactly which timers have fired, and that
     /// the wheel never asks the event loop to sleep past a due timer.
     fn run_model(seed: u64, steps: usize, max_delay_ms: u64, max_step_us: u64) {
+        run_model_with(seed, steps, max_delay_ms, max_step_us, false)
+    }
+
+    /// As `run_model`, and with `retarget`, also moves live timers to new
+    /// deadlines, later or earlier, as an `Alarm` does.
+    fn run_model_with(
+        seed: u64,
+        steps: usize,
+        max_delay_ms: u64,
+        max_step_us: u64,
+        retarget: bool,
+    ) {
         let start = Instant::now();
         let mut wheel = Timers::starting_at(start);
         let mut rng = Rng(seed);
@@ -673,7 +887,23 @@ mod tests {
         let mut quiet_until: u128 = 0;
 
         for _ in 0..steps {
-            match rng.below(10) {
+            match rng.below(if retarget { 12 } else { 10 }) {
+                10..=11 => {
+                    if !live.is_empty() {
+                        let nth = rng.below(live.len() as u64) as usize;
+                        let id = *live.keys().nth(nth).unwrap();
+                        let delay_ns = rng.below(max_delay_ms * 1_000_000) as u128 + 1;
+                        let deadline_ns = now_ns + delay_ns;
+                        let waker = Waker::from(Arc::new(Recorder(id, fired.clone())));
+                        let entry = live.get_mut(&id).unwrap();
+                        let deadline = start + Duration::from_nanos(deadline_ns as u64);
+                        assert!(
+                            wheel.retarget(entry.1, deadline, &waker),
+                            "seed {seed}: live timer {id} could not be moved"
+                        );
+                        entry.0 = deadline_ns;
+                    }
+                }
                 0..=4 => {
                     let delay_ns = rng.below(max_delay_ms * 1_000_000) as u128 + 1;
                     let deadline_ns = now_ns + delay_ns;
@@ -820,5 +1050,87 @@ mod tests {
         assert!(wheel.expired(start + Duration::from_secs(3600)).is_empty());
         assert!(wheel.remove(key).is_some());
         assert!(wheel.next_deadline().is_none());
+    }
+
+    #[test]
+    #[cfg_attr(miri, ignore = "safe code only, and minutes long under Miri")]
+    fn wheel_matches_model_with_moved_timers() {
+        for seed in 300..=330 {
+            run_model_with(seed, 4_000, 200, 3_000, true);
+        }
+        for seed in 400..=420 {
+            run_model_with(seed, 4_000, 600_000, 5_000_000, true);
+        }
+    }
+
+    #[test]
+    fn a_timer_moved_later_stays_put_and_fires_at_its_new_deadline() {
+        let start = Instant::now();
+        let mut wheel = Timers::starting_at(start);
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let waker = Waker::from(Arc::new(Recorder(1, fired.clone())));
+        let at = |ms| start + Duration::from_millis(ms);
+        let key = wheel.insert(at(100), waker.clone());
+        assert!(wheel.retarget(key, at(300), &waker));
+        // Still where it was: the wheel may wake up for it, but it does not
+        // fire until its new deadline.
+        assert!(wheel.next_deadline().unwrap() <= at(300));
+        assert!(wheel.expired(at(150)).is_empty());
+        assert!(wheel.expired(at(299)).is_empty());
+        assert!(wheel.next_deadline().unwrap() <= at(300));
+        assert_eq!(wheel.expired(at(300)).len(), 1);
+        assert!(
+            !wheel.retarget(key, at(400), &waker),
+            "a fired timer cannot be moved"
+        );
+        assert_eq!(wheel.len(), 0);
+    }
+
+    #[test]
+    fn a_timer_moved_earlier_fires_at_its_new_deadline() {
+        let start = Instant::now();
+        let mut wheel = Timers::starting_at(start);
+        let fired = Arc::new(Mutex::new(Vec::new()));
+        let waker = Waker::from(Arc::new(Recorder(1, fired.clone())));
+        let at = |ms| start + Duration::from_millis(ms);
+        let key = wheel.insert(at(60_000), waker.clone());
+        assert!(wheel.retarget(key, at(20), &waker));
+        assert!(wheel.next_deadline().unwrap() <= at(20));
+        assert!(wheel.expired(at(19)).is_empty());
+        assert_eq!(wheel.expired(at(20)).len(), 1);
+        let key = wheel.insert(at(30), waker.clone());
+        assert!(wheel.remove(key).is_some());
+        assert!(
+            !wheel.retarget(key, at(40), &waker),
+            "a removed timer cannot be moved"
+        );
+    }
+
+    #[test]
+    fn a_dropped_alarm_leaves_no_timer() {
+        crate::block_on(async {
+            let timers = || runtime::with_worker(|w| w.timers.borrow().len());
+            let before = timers();
+            let mut alarm = Alarm::new();
+            std::future::poll_fn(|cx| {
+                assert!(alarm
+                    .poll_until(Instant::now() + Duration::from_secs(60), cx)
+                    .is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(timers(), before + 1);
+            // Moved, not armed again.
+            std::future::poll_fn(|cx| {
+                assert!(alarm
+                    .poll_until(Instant::now() + Duration::from_secs(90), cx)
+                    .is_pending());
+                Poll::Ready(())
+            })
+            .await;
+            assert_eq!(timers(), before + 1);
+            drop(alarm);
+            assert_eq!(timers(), before);
+        });
     }
 }

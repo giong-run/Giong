@@ -1,11 +1,11 @@
 //! Timers.
 
 use std::cell::RefCell;
-use std::future::Future;
+use std::future::{poll_fn, Future};
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use giong::time::{sleep, sleep_until, timeout, Elapsed};
+use giong::time::{sleep, sleep_until, timeout, Alarm, Elapsed, Rang};
 
 #[test]
 fn sleep_waits_at_least_the_duration() {
@@ -253,4 +253,75 @@ fn under_wine() -> bool {
         let ntdll = GetModuleHandleA(c"ntdll.dll".as_ptr().cast());
         !ntdll.is_null() && GetProcAddress(ntdll, c"wine_get_version".as_ptr().cast()).is_some()
     }
+}
+
+/// An `Alarm` (giong-http's per-connection timeouts) goes off at its
+/// deadline, never before.
+#[test]
+fn an_alarm_goes_off_at_its_deadline() {
+    giong::block_on(async {
+        let mut alarm = Alarm::new();
+        let deadline = Instant::now() + Duration::from_millis(30);
+        let rang = poll_fn(|cx| alarm.poll_until(deadline, cx)).await;
+        assert_eq!(rang, Rang::Deadline);
+        assert!(Instant::now() >= deadline);
+    });
+}
+
+/// Moved to a later deadline, an alarm stays where it is in the timer wheel
+/// and does not wake its task at the earlier one.
+#[test]
+fn an_alarm_moved_later_waits_for_its_new_deadline() {
+    giong::block_on(async {
+        let mut alarm = Alarm::new();
+        let start = Instant::now();
+        let (first, later) = (
+            start + Duration::from_millis(20),
+            start + Duration::from_millis(120),
+        );
+        let mut polls = 0;
+        let rang = poll_fn(|cx| {
+            polls += 1;
+            if polls == 1 {
+                // Polled again at once, to move the alarm.
+                cx.waker().wake_by_ref();
+                alarm.poll_until(first, cx)
+            } else {
+                alarm.poll_until(later, cx)
+            }
+        })
+        .await;
+        assert_eq!(rang, Rang::Deadline);
+        assert!(Instant::now() >= later);
+        assert_eq!(polls, 3, "woken at the earlier deadline");
+    });
+}
+
+/// Moved to an earlier deadline, an alarm goes off at that one.
+#[test]
+fn an_alarm_moved_earlier_goes_off_at_its_new_deadline() {
+    giong::block_on(async {
+        let mut alarm = Alarm::new();
+        let start = Instant::now();
+        let mut polls = 0;
+        let rang = poll_fn(|cx| {
+            polls += 1;
+            if polls == 1 {
+                cx.waker().wake_by_ref();
+                alarm.poll_until(start + Duration::from_secs(3600), cx)
+            } else {
+                alarm.poll_until(start + Duration::from_millis(20), cx)
+            }
+        })
+        .await;
+        assert_eq!(rang, Rang::Deadline);
+        assert!(start.elapsed() >= Duration::from_millis(20));
+        assert!(start.elapsed() < Duration::from_secs(60));
+    });
+}
+
+/// An alarm is 16 bytes: giong-http keeps one in every connection.
+#[test]
+fn an_alarm_is_sixteen_bytes() {
+    assert_eq!(std::mem::size_of::<Alarm>(), 16);
 }

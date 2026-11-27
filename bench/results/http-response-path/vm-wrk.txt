@@ -1,0 +1,6 @@
+main /json rps=149,854 user=1.013us sys=5.545us total=6.558us busy=1.00
+change /json rps=160,825 user=0.783us sys=5.343us total=6.126us busy=1.00
+main /json rps=150,081 user=0.930us sys=5.643us total=6.573us busy=1.00
+change /json rps=153,330 user=0.839us sys=5.577us total=6.416us busy=0.98
+main /json rps=149,821 user=1.071us sys=5.554us total=6.625us busy=1.01
+change /json rps=151,842 user=0.862us sys=5.659us total=6.521us busy=1.00

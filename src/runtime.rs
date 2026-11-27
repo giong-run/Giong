@@ -776,6 +776,11 @@ impl Worker {
         for waker in waiters {
             waker.wake();
         }
+        // An armed `time::Alarm` goes off at shutdown too.
+        let alarms = self.timers.borrow().alarm_wakers();
+        for waker in alarms {
+            waker.wake();
+        }
     }
 
     /// The event loop: run tasks → enter the kernel → fire timers → repeat.
@@ -1204,6 +1209,12 @@ impl Worker {
                 now
             }
         }
+    }
+
+    /// `true` once a [`ShutdownSignal`] polled on this worker resolves: the
+    /// runtime is shutting down, or the worker is draining its tasks.
+    pub(crate) fn shutting_down(&self) -> bool {
+        self.rt.shutdown.load(Ordering::SeqCst) || self.draining.get()
     }
 
     /// Reads the clock again and keeps the new time for the rest of the turn.
@@ -2398,8 +2409,10 @@ pub fn try_worker_id() -> Option<usize> {
 
 /// Future returned by [`shutdown_signal`].
 pub struct ShutdownSignal {
-    rt: Arc<RuntimeShared>,
-    /// Registration in the worker's waiter list, and that worker's uid.
+    /// Registration in the worker's waiter list, and that worker's uid. The
+    /// runtime is reached through the worker: no reference of its own, so
+    /// that a signal made for every wait (giong-http makes one per request
+    /// on a keep-alive connection) touches no count shared by the workers.
     key: Option<(usize, usize)>,
     /// Registered with one worker thread.
     _not_send: PhantomData<*const ()>,
@@ -2408,12 +2421,11 @@ pub struct ShutdownSignal {
 impl ShutdownSignal {
     fn unregister(&mut self) {
         if let Some((key, uid)) = self.key.take() {
-            // After a shutdown the waiter list has been emptied and the key is stale.
-            if self.rt.shutdown.load(Ordering::SeqCst) {
-                return;
-            }
             let waker = try_with_worker(|w| {
-                if w.shared.uid == uid && !w.draining.get() {
+                // After a shutdown the waiter list has been emptied and the
+                // key is stale.
+                if w.shared.uid == uid && !w.draining.get() && !w.rt.shutdown.load(Ordering::SeqCst)
+                {
                     w.shutdown_waiters
                         .try_borrow_mut()
                         .ok()
@@ -2431,15 +2443,14 @@ impl Future for ShutdownSignal {
     type Output = ();
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<()> {
-        if self.rt.shutdown.load(Ordering::SeqCst) || with_worker(|w| w.draining.get()) {
-            self.key = None;
-            return Poll::Ready(());
-        }
         // The flag is set *before* the wake-up is injected into this worker,
         // and this thread drains injected work only after we return, so a
         // registration made here cannot miss it.
         let registered = self.key;
         let key = with_worker(|w| {
+            if w.rt.shutdown.load(Ordering::SeqCst) || w.draining.get() {
+                return None;
+            }
             let uid = w.shared.uid;
             let mut waiters = w.shutdown_waiters.borrow_mut();
             if let Some((key, owner)) = registered {
@@ -2448,14 +2459,17 @@ impl Future for ShutdownSignal {
                         if !waker.will_wake(cx.waker()) {
                             *waker = cx.waker().clone();
                         }
-                        return (key, uid);
+                        return Some((key, uid));
                     }
                 }
             }
-            (waiters.insert(cx.waker().clone()), uid)
+            Some((waiters.insert(cx.waker().clone()), uid))
         });
-        self.key = Some(key);
-        Poll::Pending
+        self.key = key;
+        match key {
+            Some(_) => Poll::Pending,
+            None => Poll::Ready(()),
+        }
     }
 }
 
@@ -2474,8 +2488,8 @@ impl Drop for ShutdownSignal {
 ///
 /// Panics when called outside of a giong runtime.
 pub fn shutdown_signal() -> ShutdownSignal {
+    with_worker(|_| ());
     ShutdownSignal {
-        rt: with_worker(|w| w.rt.clone()),
         key: None,
         _not_send: PhantomData,
     }

@@ -1,0 +1,8 @@
+before /json /json 5135.8 instructions per request
+before /users /users 177905.8 instructions per request
+change /json /json 4935.8 instructions per request
+change /users /users 177691.0 instructions per request
+before /json /json 5138.8 instructions per request
+before /users /users 177905.9 instructions per request
+change /json /json 4933.1 instructions per request
+change /users /users 177691.0 instructions per request
