@@ -652,7 +652,12 @@ fn datagrams_of_a_shared_port_keep_their_control_messages() {
             reached.insert(buf[0]);
         }
     }
-    assert!(reached.len() > 1, "every sender reached one socket");
+    // Linux and Windows spread senders by a hash of their address. On
+    // macOS the workers' sockets are one socket, and a datagram goes to the
+    // worker that reads first, so one worker may take them all (#527).
+    if !cfg!(target_os = "macos") {
+        assert!(reached.len() > 1, "every sender reached one socket");
+    }
     handle.shutdown();
     server.join().unwrap();
 }
