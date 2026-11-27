@@ -58,7 +58,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "io-uring",
  "libc",
@@ -68,7 +68,7 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "giong",
  "giong-tls",
@@ -79,7 +79,7 @@ dependencies = [
 
 [[package]]
 name = "giong-tls"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "giong",
  "libc",
