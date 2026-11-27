@@ -1,0 +1,28 @@
+[package]
+name = "bench-h3"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# HTTP/3 request throughput (bench/results/bare-metal-epyc-4345p/linux-7.0/scripts-1.5/h3.sh):
+# giong-http's `Server::serve_h3` on giong-quic against the `h3` crate on quinn and Tokio,
+# both driven by a client on the `h3` crate, quinn and Tokio (not giong's own client).
+
+[dependencies]
+giong = { path = "../.." }
+giong-http = { path = "../../giong-http", features = ["unstable-http3"] }
+giong-quic = { path = "../../giong-quic" }
+rustls = { version = "0.23.33", default-features = false, features = ["ring", "std"] }
+bytes = "1.9"
+h3 = "0.0.8"
+h3-quinn = "0.0.10"
+http = "1.2"
+quinn = { version = "0.11.9", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
+tokio = { version = "1.38", features = ["rt", "rt-multi-thread", "net", "time", "macros"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]
