@@ -90,7 +90,7 @@ dependencies = [
 
 [[package]]
 name = "giong"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "io-uring",
  "libc",
@@ -100,7 +100,7 @@ dependencies = [
 
 [[package]]
 name = "giong-grpc"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "giong",
  "giong-http",
@@ -111,7 +111,7 @@ dependencies = [
 
 [[package]]
 name = "giong-grpc-build"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "prost",
  "prost-types",
@@ -120,7 +120,7 @@ dependencies = [
 
 [[package]]
 name = "giong-http"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "giong",
  "giong-tls",
@@ -131,11 +131,11 @@ dependencies = [
 
 [[package]]
 name = "giong-proto"
-version = "1.5.4"
+version = "1.5.5"
 
 [[package]]
 name = "giong-tls"
-version = "1.5.4"
+version = "1.5.5"
 dependencies = [
  "giong",
  "libc",

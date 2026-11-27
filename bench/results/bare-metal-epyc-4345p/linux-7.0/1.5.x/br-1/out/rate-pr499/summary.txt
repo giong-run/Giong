@@ -1,0 +1,26 @@
+Closed loop (64 connections per worker): requests/s, median over rounds (min-max), gain over one worker
+  /json   main         1 workers     454,801 (446,748-455,588)  x1.00  p99 262 us  2.19 us/req  server 0.96 load 0.12 1.1 Gbit/s  errors 0  [server]
+  /json   main         4 workers   1,534,856 (1,518,371-1,557,729)  x3.37  p99 261 us  2.60 us/req  server 0.96 load 0.42 3.6 Gbit/s  errors 0  [server]
+  /json   pr499        1 workers     488,417 (482,221-510,657)  x1.00  p99 259 us  2.04 us/req  server 0.96 load 0.13 1.2 Gbit/s  errors 0  [server]
+  /json   pr499        4 workers   1,622,682 (1,610,078-1,635,999)  x3.32  p99 276 us  2.46 us/req  server 0.96 load 0.46 3.9 Gbit/s  errors 0  [server]
+  /json   tokio-raw    1 workers     518,001 (515,661-522,312)  x1.00  p99 254 us  1.93 us/req  server 0.96 load 0.13 1.1 Gbit/s  errors 0  [server]
+  /json   tokio-raw    4 workers   1,579,922 (1,562,346-1,580,138)  x3.05  p99 276 us  2.32 us/req  server 0.90 load 0.43 3.5 Gbit/s  errors 0  [neither]
+
+Open loop: p99 in microseconds at each offered rate (median over rounds); '!' = answered under 99% of offered
+  /json
+         req/s         main x1         main x4        pr499 x1        pr499 x4    tokio-raw x1    tokio-raw x4
+       100,000             269             273             267             290             284             284
+       200,000             288             294             282             292             286             294
+       300,000         210,240             292          18,284             290         250,085             292
+       400,000         639,631             290          57,016             292         213,385             294
+       500,000      2,090,861!             294      1,354,760!             294         220,725             294
+     1,000,000                             310                             323                             854
+     1,500,000                      2,084,569!                      1,455,424!                          61,473
+
+Highest sustained rate: answered at least 99% of offered, with p99 at most 5 ms (medians)
+  /json   main         1 workers     200,000 req/s  p50 163 p99 288 p99.9 310 us  server 0.47  2.31 us/req
+  /json   main         4 workers   1,000,000 req/s  p50 185 p99 310 p99.9 347 us  server 0.69  2.56 us/req
+  /json   pr499        1 workers     200,000 req/s  p50 148 p99 282 p99.9 310 us  server 0.45  2.21 us/req
+  /json   pr499        4 workers   1,000,000 req/s  p50 197 p99 323 p99.9 965 us  server 0.63  2.37 us/req
+  /json   tokio-raw    1 workers     200,000 req/s  p50 154 p99 286 p99.9 310 us  server 0.42  2.06 us/req
+  /json   tokio-raw    4 workers   1,000,000 req/s  p50 203 p99 854 p99.9 1,528 us  server 0.62  2.22 us/req

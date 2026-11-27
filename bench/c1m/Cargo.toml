@@ -1,0 +1,18 @@
+[package]
+name = "c1m-hold"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Opens up to a million connections to bench/giong-http from another machine and holds them
+# (bench/results/bare-metal-epyc-4345p/linux-7.0/scripts-1.5/c1m.sh).
+
+[dependencies]
+rustls = { version = "0.23.33", default-features = false, features = ["ring", "std", "tls12"] }
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+
+[workspace]

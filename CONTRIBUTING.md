@@ -233,6 +233,12 @@ new crate, is in [docs/RELEASING.md](docs/RELEASING.md).
 What that asks of a contributor is in the list above: a changelog entry in `changelog.d/`
 and a pull request title in the commit convention, since both feed the release notes.
 
+Contributors are credited by their GitHub handle: the changelog entry for the change ends
+with `thanks to [@name](https://github.com/name)`, which puts the name in the release's
+thank-you line, and the README lists everyone under *Contributors*. When a maintainer
+finishes a contribution in a pull request of their own, the original commits keep their
+author and the squash commit names them with a `Co-authored-by:` trailer.
+
 ## Security
 
 Please do not open a public issue for a vulnerability such as a memory-safety bug that

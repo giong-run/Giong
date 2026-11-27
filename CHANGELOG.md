@@ -8,6 +8,56 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.5.5] - 2026-11-27
+
+A build store, a fix for `giong dev` in SQLite projects, and faster uploads. `giong dev`
+keeps one copy of each dependency build for all your projects: four projects from
+`giong new` hold 401.3 MiB of builds instead of 645.8 (-37.9%), and cargo rebuilds nothing.
+In a project from `giong new` (SQLite, the default), `giong dev` no longer restarts about
+once a second while the service writes its database (63 restarts in a minute before, 1
+now). `TcpStream::recv_into` and `UnixStream::recv_into` are public: a large body goes
+straight into your own buffer, and the benchmark server's 1 MiB uploads take 129 µs of CPU
+instead of 234. Thanks to [@concacotdua](https://github.com/concacotdua), whose `fast-gzip`
+in 1.5.4 is now credited by name. No API is removed or changed.
+
+### Added
+
+- **giong-cli**: a build store, so the disk holds one copy of each dependency build for all
+  your projects instead of one per project. After each build, `giong dev` replaces the files
+  a registry or git dependency's build wrote with hard links to one copy in
+  `~/.giong/store` when the bytes are the same; each project keeps its own `target/`, so
+  cargo works as before (no shared lock, no binaries overwriting each other, and cargo sees
+  every build as fresh: 0 units rebuilt). Four projects from `giong new`: 645.8 MiB of builds
+  on disk became 401.3 MiB (-37.9%), in 0.3 s. `giong cache share ~/code` does the same for
+  projects already built, `giong cache gc` removes what no project uses and keeps the builds
+  under a budget (`GIONG_STORE_BUDGET`, default 30G), and `giong cache` says what it saves.
+  New code `GIONG-E5025` (`StoreUnusable`).
+- **giong**: `TcpStream::recv_into` and `UnixStream::recv_into` are documented, stable API
+  (hidden until now; giong-http has received large bodies with them since 1.1). They
+  receive straight into the free capacity of your own `Vec<u8>` and may be mixed with
+  `recv` on one stream, so a large message whose size is known, such as a body after its
+  head, is written there by the kernel instead of being copied out of the runtime's 16 KiB
+  pool buffers. The benchmark lab's own server (`bench/giong`) now completes uploads this
+  way: on a 4-vCPU cloud VM, a 1 MiB upload costs 129 µs of server CPU instead of 234 and
+  moves 8.0 GB/s instead of 4.4 (Tokio 8.0); 64 KiB uploads move 11% more.
+
+### Changed
+
+- **giong**: the README lists outside contributors under *Contributors*, and the 1.5.4
+  entry for giong-web's `fast-gzip` feature now credits its author by handle, which the
+  1.5.4 release notes missed (thanks to [@concacotdua](https://github.com/concacotdua),
+  [#512](https://github.com/giong-run/Giong/pull/512)).
+
+### Fixed
+
+- **giong-cli**: `giong dev` no longer restarts in a loop in a project made with `giong new`
+  (SQLite, the default): the service's writes to `data/app.db-wal` and `data/app.db-shm`
+  counted as a change, and each restart wrote them again, about once a second (63 restarts
+  in a minute; 1 now). The watcher skips what the project's `.gitignore` ignores, except
+  `.env`, which still restarts the service, and never watches SQLite files (`*.db`,
+  `*.sqlite`, `*.sqlite3` and their `-wal`, `-shm` and `-journal` files)
+  ([#514](https://github.com/giong-run/Giong/issues/514)).
+
 ## [1.5.4] - 2026-11-27
 
 Safer paths and secrets, and faster gzip. `fs::Root` opens the paths that come from a
@@ -41,8 +91,9 @@ requests per second on one worker. No API is removed or changed.
   second on one worker and 43.5% more on four, a lower p99 at every load, and 4% smaller
   bodies. Responses without gzip are unchanged. Larger bodies and other levels keep the
   pure Rust compressor. The binary grows by about 90 KiB and building needs a C compiler. A
-  new fuzz target checks both compressors against an independent decoder. Contributed by concacotdua
-  ([#429](https://github.com/giong-run/Giong/pull/429)).
+  new fuzz target checks both compressors against an independent decoder
+  ([#429](https://github.com/giong-run/Giong/pull/429), thanks to
+  [@concacotdua](https://github.com/concacotdua)).
 
 ### Security
 
@@ -4027,7 +4078,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.4...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.5...HEAD
+[1.5.5]: https://github.com/giong-run/Giong/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/giong-run/Giong/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/giong-run/Giong/compare/v1.5.2...v1.5.3
 [1.5.2]: https://github.com/giong-run/Giong/compare/v1.5.1...v1.5.2

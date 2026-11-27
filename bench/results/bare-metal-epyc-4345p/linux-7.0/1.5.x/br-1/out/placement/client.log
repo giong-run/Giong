@@ -1,0 +1,208 @@
+== skew-closed plain round 1
+probe_rps=30370 p50_us=66 p99_us=550 p999_us=640 max_us=964 probe_conns=6074 hot_rps=3259
+  worker 0: 60340 requests, p50_us=25 p99_us=89
+  worker 1: 61140 requests, p50_us=267 p99_us=598
+  first request of a connection: p50_us=280 p99_us=661
+== skew-paced plain round 1
+probe_rps=16000 p50_us=48 p99_us=494 p999_us=712 max_us=1002 probe_conns=3200 hot_rps=4033
+  worker 0: 32640 requests, p50_us=246 p99_us=524
+  worker 1: 31360 requests, p50_us=25 p99_us=68
+  first request of a connection: p50_us=66 p99_us=758
+== mixed plain round 1
+hot_rps=19291 light_p50_us=328 light_p99_us=528 light_p999_us=547 light_max_us=644
+  worker 0: 3 hot, 11 light
+  worker 1: 3 hot, 7 light
+== skew-closed before round 1
+probe_rps=50075 p50_us=45 p99_us=324 p999_us=494 max_us=675 probe_conns=10015 hot_rps=3898
+  worker 0: 37560 requests, p50_us=247 p99_us=481
+  worker 1: 162740 requests, p50_us=45 p99_us=213
+  first request of a connection: p50_us=112 p99_us=505
+== skew-paced before round 1
+probe_rps=16000 p50_us=38 p99_us=470 p999_us=535 max_us=718 probe_conns=3200 hot_rps=4165
+  worker 0: 27820 requests, p50_us=224 p99_us=475
+  worker 1: 36180 requests, p50_us=25 p99_us=75
+  first request of a connection: p50_us=95 p99_us=498
+== mixed before round 1
+hot_rps=19283 light_p50_us=175 light_p99_us=630 light_p999_us=731 light_max_us=736
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== skew-closed balanced round 1
+probe_rps=49680 p50_us=45 p99_us=335 p999_us=493 max_us=650 probe_conns=9936 hot_rps=3940
+  worker 0: 162700 requests, p50_us=45 p99_us=221
+  worker 1: 36020 requests, p50_us=247 p99_us=472
+  first request of a connection: p50_us=110 p99_us=502
+== skew-paced balanced round 1
+probe_rps=16000 p50_us=32 p99_us=59 p999_us=68 max_us=82 probe_conns=3200 hot_rps=4872
+  worker 0: 0 requests, p50_us=NaN p99_us=NaN
+  worker 1: 64000 requests, p50_us=32 p99_us=59
+  first request of a connection: p50_us=31 p99_us=61
+== mixed balanced round 1
+hot_rps=19285 light_p50_us=155 light_p99_us=627 light_p999_us=725 light_max_us=729
+  worker 0: 4 hot, 7 light
+  worker 1: 2 hot, 11 light
+== skew-closed plain round 2
+probe_rps=30235 p50_us=66 p99_us=557 p999_us=640 max_us=931 probe_conns=6047 hot_rps=3268
+  worker 0: 60120 requests, p50_us=25 p99_us=89
+  worker 1: 60820 requests, p50_us=267 p99_us=599
+  first request of a connection: p50_us=273 p99_us=660
+== skew-paced plain round 2
+probe_rps=16000 p50_us=47 p99_us=513 p999_us=712 max_us=1001 probe_conns=3200 hot_rps=4045
+  worker 0: 31860 requests, p50_us=25 p99_us=48
+  worker 1: 32140 requests, p50_us=245 p99_us=536
+  first request of a connection: p50_us=52 p99_us=760
+== mixed plain round 2
+hot_rps=19281 light_p50_us=302 light_p99_us=418 light_p999_us=507 light_max_us=511
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== skew-closed before round 2
+probe_rps=50855 p50_us=45 p99_us=298 p999_us=469 max_us=605 probe_conns=10171 hot_rps=4059
+  worker 0: 171720 requests, p50_us=45 p99_us=220
+  worker 1: 31700 requests, p50_us=247 p99_us=454
+  first request of a connection: p50_us=116 p99_us=482
+== skew-paced before round 2
+probe_rps=16005 p50_us=44 p99_us=470 p999_us=536 max_us=676 probe_conns=3201 hot_rps=4170
+  worker 0: 36340 requests, p50_us=25 p99_us=82
+  worker 1: 27680 requests, p50_us=215 p99_us=472
+  first request of a connection: p50_us=92 p99_us=642
+== mixed before round 2
+hot_rps=19286 light_p50_us=303 light_p99_us=417 light_p999_us=511 light_max_us=514
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== skew-closed balanced round 2
+probe_rps=49630 p50_us=45 p99_us=329 p999_us=489 max_us=651 probe_conns=9926 hot_rps=3945
+  worker 0: 35860 requests, p50_us=247 p99_us=471
+  worker 1: 162660 requests, p50_us=45 p99_us=216
+  first request of a connection: p50_us=108 p99_us=498
+== skew-paced balanced round 2
+probe_rps=16005 p50_us=25 p99_us=68 p999_us=69 max_us=77 probe_conns=3201 hot_rps=4872
+  worker 0: 64020 requests, p50_us=25 p99_us=68
+  first request of a connection: p50_us=25 p99_us=71
+== mixed balanced round 2
+hot_rps=19280 light_p50_us=203 light_p99_us=583 light_p999_us=593 light_max_us=686
+  worker 0: 4 hot, 5 light
+  worker 1: 2 hot, 13 light
+== skew-closed plain round 3
+probe_rps=30065 p50_us=67 p99_us=553 p999_us=640 max_us=999 probe_conns=6013 hot_rps=3272
+  worker 0: 59560 requests, p50_us=25 p99_us=90
+  worker 1: 60700 requests, p50_us=267 p99_us=598
+  first request of a connection: p50_us=288 p99_us=661
+== skew-paced plain round 3
+probe_rps=16000 p50_us=47 p99_us=492 p999_us=699 max_us=962 probe_conns=3200 hot_rps=4075
+  worker 0: 32920 requests, p50_us=25 p99_us=55
+  worker 1: 31080 requests, p50_us=234 p99_us=517
+  first request of a connection: p50_us=48 p99_us=732
+== mixed plain round 3
+hot_rps=19288 light_p50_us=304 light_p99_us=427 light_p999_us=511 light_max_us=513
+  worker 0: 3 hot, 8 light
+  worker 1: 3 hot, 10 light
+== skew-closed before round 3
+probe_rps=50855 p50_us=45 p99_us=296 p999_us=471 max_us=655 probe_conns=10171 hot_rps=4064
+  worker 0: 31520 requests, p50_us=247 p99_us=461
+  worker 1: 171900 requests, p50_us=45 p99_us=220
+  first request of a connection: p50_us=120 p99_us=489
+== skew-paced before round 3
+probe_rps=16005 p50_us=32 p99_us=330 p999_us=500 max_us=669 probe_conns=3201 hot_rps=4305
+  worker 0: 22600 requests, p50_us=166 p99_us=471
+  worker 1: 41420 requests, p50_us=25 p99_us=68
+  first request of a connection: p50_us=48 p99_us=464
+== mixed before round 3
+hot_rps=19288 light_p50_us=156 light_p99_us=628 light_p999_us=728 light_max_us=730
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== skew-closed balanced round 3
+probe_rps=49550 p50_us=45 p99_us=333 p999_us=490 max_us=670 probe_conns=9910 hot_rps=3941
+  worker 0: 35980 requests, p50_us=247 p99_us=472
+  worker 1: 162220 requests, p50_us=45 p99_us=222
+  first request of a connection: p50_us=109 p99_us=497
+== skew-paced balanced round 3
+probe_rps=16005 p50_us=25 p99_us=47 p999_us=48 max_us=90 probe_conns=3201 hot_rps=4872
+  worker 0: 0 requests, p50_us=NaN p99_us=NaN
+  worker 1: 64020 requests, p50_us=25 p99_us=47
+  first request of a connection: p50_us=25 p99_us=48
+== mixed balanced round 3
+hot_rps=19294 light_p50_us=304 light_p99_us=468 light_p999_us=512 light_max_us=513
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light
+== skew-closed plain round 4
+probe_rps=30255 p50_us=67 p99_us=540 p999_us=639 max_us=940 probe_conns=6051 hot_rps=3284
+  worker 0: 60240 requests, p50_us=267 p99_us=591
+  worker 1: 60780 requests, p50_us=25 p99_us=90
+  first request of a connection: p50_us=160 p99_us=642
+== skew-paced plain round 4
+probe_rps=16000 p50_us=47 p99_us=494 p999_us=696 max_us=1002 probe_conns=3200 hot_rps=4051
+  worker 0: 31920 requests, p50_us=244 p99_us=536
+  worker 1: 32080 requests, p50_us=25 p99_us=60
+  first request of a connection: p50_us=56 p99_us=737
+== mixed plain round 4
+hot_rps=19040 light_p50_us=475 light_p99_us=882 light_p999_us=887 light_max_us=918
+  worker 0: 5 hot, 10 light
+  worker 1: 1 hot, 8 light
+== skew-closed before round 4
+probe_rps=49935 p50_us=45 p99_us=326 p999_us=494 max_us=676 probe_conns=9987 hot_rps=3888
+  worker 0: 37960 requests, p50_us=247 p99_us=488
+  worker 1: 161780 requests, p50_us=45 p99_us=214
+  first request of a connection: p50_us=109 p99_us=507
+== skew-paced before round 4
+probe_rps=16000 p50_us=29 p99_us=291 p999_us=472 max_us=651 probe_conns=3200 hot_rps=4314
+  worker 0: 22220 requests, p50_us=165 p99_us=446
+  worker 1: 41780 requests, p50_us=25 p99_us=68
+  first request of a connection: p50_us=48 p99_us=446
+== mixed before round 4
+hot_rps=19295 light_p50_us=157 light_p99_us=629 light_p999_us=728 light_max_us=732
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== skew-closed balanced round 4
+probe_rps=49790 p50_us=45 p99_us=327 p999_us=489 max_us=655 probe_conns=9958 hot_rps=3938
+  worker 0: 163040 requests, p50_us=45 p99_us=222
+  worker 1: 36120 requests, p50_us=247 p99_us=471
+  first request of a connection: p50_us=109 p99_us=497
+== skew-paced balanced round 4
+probe_rps=16000 p50_us=31 p99_us=61 p999_us=68 max_us=118 probe_conns=3200 hot_rps=4873
+  worker 0: 64000 requests, p50_us=31 p99_us=61
+  first request of a connection: p50_us=29 p99_us=49
+== mixed balanced round 4
+hot_rps=19282 light_p50_us=285 light_p99_us=488 light_p999_us=493 light_max_us=513
+  worker 0: 3 hot, 9 light
+  worker 1: 3 hot, 9 light
+== skew-closed plain round 5
+probe_rps=30095 p50_us=67 p99_us=544 p999_us=639 max_us=1002 probe_conns=6019 hot_rps=3275
+  worker 0: 60580 requests, p50_us=267 p99_us=598
+  worker 1: 59800 requests, p50_us=25 p99_us=89
+  first request of a connection: p50_us=270 p99_us=641
+== skew-paced plain round 5
+probe_rps=16000 p50_us=46 p99_us=494 p999_us=695 max_us=982 probe_conns=3200 hot_rps=4042
+  worker 0: 31780 requests, p50_us=25 p99_us=47
+  worker 1: 32220 requests, p50_us=245 p99_us=536
+  first request of a connection: p50_us=51 p99_us=737
+== mixed plain round 5
+hot_rps=19038 light_p50_us=544 light_p99_us=853 light_p999_us=951 light_max_us=954
+  worker 0: 5 hot, 13 light
+  worker 1: 1 hot, 5 light
+== skew-closed before round 5
+probe_rps=47935 p50_us=27 p99_us=449 p999_us=526 max_us=892 probe_conns=9587 hot_rps=3703
+  worker 0: 44660 requests, p50_us=250 p99_us=496
+  worker 1: 147080 requests, p50_us=25 p99_us=225
+  first request of a connection: p50_us=107 p99_us=543
+== skew-paced before round 5
+probe_rps=16000 p50_us=28 p99_us=267 p999_us=471 max_us=502 probe_conns=3200 hot_rps=4467
+  worker 0: 16360 requests, p50_us=139 p99_us=423
+  worker 1: 47640 requests, p50_us=25 p99_us=68
+  first request of a connection: p50_us=30 p99_us=424
+== mixed before round 5
+hot_rps=19279 light_p50_us=158 light_p99_us=628 light_p999_us=725 light_max_us=727
+  worker 0: 2 hot, 11 light
+  worker 1: 4 hot, 7 light
+== skew-closed balanced round 5
+probe_rps=49620 p50_us=45 p99_us=332 p999_us=490 max_us=669 probe_conns=9924 hot_rps=3939
+  worker 0: 162400 requests, p50_us=45 p99_us=222
+  worker 1: 36080 requests, p50_us=247 p99_us=471
+  first request of a connection: p50_us=113 p99_us=500
+== skew-paced balanced round 5
+probe_rps=16000 p50_us=25 p99_us=57 p999_us=68 max_us=81 probe_conns=3200 hot_rps=4870
+  worker 0: 0 requests, p50_us=NaN p99_us=NaN
+  worker 1: 64000 requests, p50_us=25 p99_us=57
+  first request of a connection: p50_us=25 p99_us=49
+== mixed balanced round 5
+hot_rps=19285 light_p50_us=303 light_p99_us=472 light_p999_us=511 light_max_us=513
+  worker 0: 3 hot, 10 light
+  worker 1: 3 hot, 8 light

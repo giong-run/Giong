@@ -1,0 +1,33 @@
+2026-11-27T14:33:47Z ab-net round 1/6, 1 worker(s) done
+2026-11-27T14:38:17Z ab-net round 2/6, 1 worker(s) done
+2026-11-27T14:42:47Z ab-net round 3/6, 1 worker(s) done
+2026-11-27T14:47:16Z ab-net round 4/6, 1 worker(s) done
+2026-11-27T14:51:46Z ab-net round 5/6, 1 worker(s) done
+2026-11-27T14:56:16Z ab-net round 6/6, 1 worker(s) done
+base: v1.5.1; medians over rounds (min-max); change against the base
+workers case            build           req/s (min-max)              change   p50 us   p99 us  us/req  change srv busy  load errors  limited by
+      1 h2c:json        v1.5.1      1,667,839 1,646,886-1,691,248                379        -    0.60             0.97  0.10      0  server
+      1 h2c:json        main        1,712,486 1,678,568-1,738,634     +2.7%      369        -    0.58   -2.6%     0.96  0.10      0  server
+      1 h2c:json        pr499       1,844,805 1,810,834-1,864,066    +10.6%      343        -    0.54   -9.5%     0.97  0.11      0  server
+
+      1 h2:json         v1.5.1      1,593,006 1,583,099-1,606,296                396        -    0.63             0.97  0.10      0  server
+      1 h2:json         main        1,595,690 1,586,492-1,608,624     +0.2%      396        -    0.63   -0.1%     0.97  0.10      0  server
+      1 h2:json         pr499       1,725,268 1,712,394-1,740,678     +8.3%      366        -    0.58   -7.6%     0.96  0.11      0  server
+
+      1 h2:json-mux     v1.5.1      2,006,945 1,861,670-2,133,910                138        -    0.42             0.83  0.05      0  neither
+      1 h2:json-mux     main        2,020,170 1,841,450-2,168,650     +0.7%      138        -    0.41   -2.1%     0.82  0.05      0  neither
+      1 h2:json-mux     pr499       2,101,270 1,932,250-2,172,260     +4.7%      130        -    0.37  -11.8%     0.75  0.05      0  neither
+
+      1 http:json       v1.5.1        458,643 448,365-462,358                    132      260    2.18             0.97  0.14      0  server
+      1 http:json       main          454,645 450,057-460,387         -0.9%      132      260    2.20   +0.8%     0.97  0.14      0  server
+      1 http:json       pr499         482,474 473,488-494,786         +5.2%      127      258    2.07   -4.9%     0.97  0.14      0  server
+
+      1 http:users      v1.5.1        110,429 109,020-111,057                    578      730    9.06             0.97  0.06      0  server
+      1 http:users      main          109,851 108,310-110,336         -0.5%      581      712    9.12   +0.7%     0.97  0.06      0  server
+      1 http:users      pr499         112,059 109,875-112,725         +1.5%      568      765    8.92   -1.5%     0.97  0.06      0  server
+
+      1 tls:json        v1.5.1        368,239 362,373-373,097                    175      279    2.72             0.97  0.13      0  server
+      1 tls:json        main          370,253 366,578-374,317         +0.5%      177      280    2.70   -0.5%     0.97  0.13      0  server
+      1 tls:json        pr499         389,628 382,369-394,744         +5.8%      164      272    2.57   -5.6%     0.96  0.14      0  server
+
+p99 is '-' for h2load cases (h2load reports a mean, shown as p50).

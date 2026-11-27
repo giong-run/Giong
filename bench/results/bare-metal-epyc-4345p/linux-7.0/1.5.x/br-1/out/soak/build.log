@@ -1,0 +1,89 @@
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded zeroize v1.8.2
+   Compiling libc v0.2.191
+   Compiling shlex v2.0.1
+   Compiling find-msvc-tools v0.1.15
+   Compiling cfg-if v1.0.5
+   Compiling untrusted v0.9.0
+   Compiling zeroize v1.8.2
+   Compiling io-uring v0.7.16
+   Compiling time-core v0.1.9
+   Compiling rustls v0.23.46
+   Compiling num-conv v0.2.2
+   Compiling bitflags v2.13.2
+   Compiling powerfmt v0.2.1
+   Compiling deranged v0.5.9
+   Compiling base64 v0.22.1
+   Compiling once_cell v1.21.4
+   Compiling subtle v2.6.1
+   Compiling rustls-pki-types v1.16.0
+   Compiling cc v1.11.1
+   Compiling pem v3.0.6
+   Compiling getrandom v0.2.17
+   Compiling socket2 v0.6.5
+   Compiling time v0.3.55
+   Compiling ring v0.17.14
+   Compiling yasna v0.5.2
+   Compiling giong v1.5.1 (/root/b/main)
+   Compiling rustls-webpki v0.103.16
+   Compiling rcgen v0.13.2
+   Compiling giong-tls v1.5.1 (/root/b/main/giong-tls)
+    Finished `release` profile [optimized] target(s) in 18.90s
+ Downloading crates ...
+  Downloaded prost v0.13.5
+  Downloaded beef v0.5.2
+  Downloaded rustc_version v0.4.1
+  Downloaded logos-derive v0.15.1
+  Downloaded either v1.19.0
+  Downloaded miette-derive v7.6.0
+  Downloaded prost-types v0.13.5
+  Downloaded protox-parse v0.8.0
+  Downloaded semver v1.0.28
+  Downloaded prost-derive v0.13.5
+  Downloaded anyhow v1.0.104
+  Downloaded protox v0.8.0
+  Downloaded logos-codegen v0.15.1
+  Downloaded miette v7.6.0
+  Downloaded prost-reflect v0.15.3
+  Downloaded itertools v0.14.0
+  Downloaded unicode-width v0.1.14
+  Downloaded regex-syntax v0.8.11
+  Downloaded logos v0.15.1
+   Compiling proc-macro2 v1.0.107
+   Compiling unicode-ident v1.0.27
+   Compiling quote v1.0.47
+   Compiling semver v1.0.28
+   Compiling anyhow v1.0.104
+   Compiling either v1.19.0
+   Compiling beef v0.5.2
+   Compiling regex-syntax v0.8.11
+   Compiling lazy_static v1.5.1
+   Compiling fnv v1.0.7
+   Compiling bytes v1.12.1
+   Compiling thiserror v2.0.21
+   Compiling unicode-width v0.1.14
+   Compiling adler2 v2.0.1
+   Compiling giong-tls v1.5.1 (/root/b/main/giong-tls)
+   Compiling giong-proto v1.5.1 (/root/b/main/giong-proto)
+   Compiling miniz_oxide v0.9.1
+   Compiling itertools v0.14.0
+   Compiling rustc_version v0.4.1
+   Compiling logos-codegen v0.15.1
+   Compiling syn v2.0.119
+   Compiling syn v3.0.10
+   Compiling giong-http v1.5.1 (/root/b/main/giong-http)
+   Compiling thiserror-impl v2.0.21
+   Compiling giong-grpc v1.5.1 (/root/b/main/giong-grpc)
+   Compiling prost-derive v0.13.5
+   Compiling miette-derive v7.6.0
+   Compiling miette v7.6.0
+   Compiling logos-derive v0.15.1
+   Compiling logos v0.15.1
+   Compiling prost v0.13.5
+   Compiling prost-types v0.13.5
+   Compiling prost-reflect v0.15.3
+   Compiling protox-parse v0.8.0
+   Compiling protox v0.8.0
+   Compiling giong-grpc-build v1.5.1 (/root/b/main/giong-grpc-build)
+    Finished `release` profile [optimized] target(s) in 28.31s

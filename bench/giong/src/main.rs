@@ -118,6 +118,21 @@ async fn serve(stream: TcpStream) {
         if pending.len() > MAX_PENDING {
             return;
         }
+        // A large body still to come: receive it straight into `pending`
+        // rather than copying it out of pool buffers (`recv_into`).
+        while need > pending.len() + 16384 && need <= MAX_PENDING {
+            pending.reserve(need - pending.len());
+            let (res, buf) = stream.recv_into(std::mem::take(&mut pending)).await;
+            pending = buf;
+            match res {
+                Ok(n) if n > 0 => {}
+                _ => return,
+            }
+        }
+        if need != 0 && pending.len() >= need {
+            let used = handle_requests(&pending, &mut out, &mut body, &mut need);
+            pending.drain(..used);
+        }
         if !out.is_empty() {
             let (res, buf) = stream.write_all(out).await;
             out = buf;

@@ -160,6 +160,21 @@ pub const POLICIES: &[Policy] = &[
         },
     },
     Policy {
+        name: "cache",
+        reads: "status, and gc --dry-run",
+        writes:
+            "share links builds to the store; gc removes builds no project uses or over the budget",
+        never: "",
+        destructive: true,
+        idempotent: true,
+        access: |words, flags| match words.first().copied() {
+            None | Some("status") => Access::Read,
+            Some("gc") if flags.contains(&"dry-run") => Access::Read,
+            Some("share" | "gc") => Access::Write,
+            Some(_) => Access::Never,
+        },
+    },
+    Policy {
         name: "fix",
         reads: "",
         writes: "applies the edits giong check offers",

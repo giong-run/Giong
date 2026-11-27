@@ -1,0 +1,82 @@
+building...
+warning: struct `QuickField` is never constructed
+  --> /root/b/main/giong-http/src/parse.rs:86:19
+   |
+86 | pub(crate) struct QuickField {
+   |                   ^^^^^^^^^^
+   |
+   = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: function `quick_field` is never used
+   --> /root/b/main/giong-http/src/parse.rs:100:15
+    |
+100 | pub(crate) fn quick_field(head: &[u8], pos: usize) -> Option<QuickField> {
+    |               ^^^^^^^^^^^
+
+round 1/3 done
+round 2/3 done
+round 3/3 done
+/json
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                  2522410     +0.0%        4.90     +0.0%    327.7
+  no-zero-copy            2526753     +0.2%        4.92     +0.4%    328.7
+  no-registered-ring      2514487     -0.3%        4.86     -0.8%    326.7
+  no-packed-buffers       2528540     +0.2%        4.84     -1.3%    328.7
+  all-off                 2531203     +0.3%        4.91     +0.2%    328.7
+
+/static?size=4096
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                   683669     +0.0%        3.71     +0.0%   2775.0
+  no-zero-copy             683892     +0.0%        3.69     -0.6%   2776.1
+  no-registered-ring       683870     +0.0%        3.73     +0.4%   2776.1
+  no-packed-buffers        683851     +0.0%        3.69     -0.6%   2776.1
+  all-off                  684002     +0.0%        3.76     +1.3%   2776.1
+
+/static?size=16384
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                   177982     +0.0%        3.69     +0.0%   2829.3
+  no-zero-copy             178005     +0.0%        3.69     -0.0%   2829.3
+  no-registered-ring       177968     -0.0%        3.75     +1.6%   2828.3
+  no-packed-buffers        178029     +0.0%        3.70     +0.4%   2829.3
+  all-off                  177977     -0.0%        3.70     +0.2%   2829.3
+
+/static?size=65536
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                    44714     +0.0%        5.25     +0.0%   2828.3
+  no-zero-copy              44773     +0.1%        6.21    +18.4%   2832.4
+  no-registered-ring        44695     -0.0%        5.27     +0.5%   2827.3
+  no-packed-buffers         44712     -0.0%        5.18     -1.2%   2828.3
+  all-off                   44751     +0.1%        6.11    +16.3%   2830.3
+
+/static?size=262144
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                    11194     +0.0%        6.90     +0.0%   2830.3
+  no-zero-copy              11193     -0.0%       17.70   +156.5%   2830.3
+  no-registered-ring        11191     -0.0%        6.81     -1.2%   2830.3
+  no-packed-buffers         11189     -0.0%        6.90     +0.0%   2829.3
+  all-off                   11192     -0.0%       17.61   +155.2%   2830.3
+
+/static?size=1048576
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                     2790     +0.0%       18.11     +0.0%   2830.3
+  no-zero-copy               2788     -0.1%       65.70   +262.7%   2829.3
+  no-registered-ring         2791     +0.0%       17.04     -5.9%   2831.4
+  no-packed-buffers          2789     -0.0%       17.74     -2.0%   2831.4
+  all-off                    2790     +0.0%       67.41   +272.2%   2831.4
+
+/static?size=16777216@1
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                      171     +0.0%      139.13     +0.0%   2759.7
+  no-zero-copy                169     -0.9%      998.84   +617.9%   2734.1
+  no-registered-ring          171     +0.4%      139.37     +0.2%   2755.6
+  no-packed-buffers           171     -0.1%      134.58     -3.3%   2757.6
+  all-off                     161     -5.7%      942.25   +577.2%   2599.9
+
+/stream?size=67108864&chunk=65536@1
+  variant                   req/s vs all-on  CPU us/req vs all-on    MiB/s
+  all-on                       43     +0.0%     3396.83     +0.0%   2808.8
+  no-zero-copy                 43     +0.0%     3496.92     +2.9%   2790.4
+  no-registered-ring           43     +0.0%     3333.33     -1.9%   2807.8
+  no-packed-buffers            43     +0.0%     3379.00     -0.5%   2809.9
+  all-off                      43     +0.0%     3405.81     +0.3%   2805.8
+

@@ -43,6 +43,7 @@ use std::io::{BufRead, BufReader, Read, Write};
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command as Process, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -56,6 +57,7 @@ use crate::dotenv;
 use crate::project::Project;
 use crate::report::{Failure, Finding, Report, Severity};
 use crate::state;
+use crate::store;
 use crate::watch::{self, Change, Snapshot};
 
 pub const COMMAND: Command = Command {
@@ -310,6 +312,66 @@ struct Dev {
     /// `--background` started this runner (its events go to
     /// `.giong/runner.log`, and it has a process group of its own).
     background: bool,
+    /// The build store's pass over the last build (src/store.rs), running
+    /// beside the service; stopped before the next build.
+    store_pass: Option<(std::thread::JoinHandle<()>, Arc<AtomicBool>)>,
+}
+
+/// One pass of the build store over `profile`, and its hourly gc: says
+/// what it saved, and nothing when it saved nothing or could not run
+/// (`giong cache` tells why).
+fn store_pass(profile: &Path, build_dir: &Path, root: &Path, json: bool, cancel: &AtomicBool) {
+    let Ok(store) = store::Store::open() else {
+        return;
+    };
+    let Some(local) = store::local_packages(root) else {
+        return;
+    };
+    let Ok(pass) = store::share(&store, profile, &local, cancel) else {
+        return;
+    };
+    let _ = store::note_built(&store, build_dir, root);
+    let say = |message: String, fields: Value| {
+        if json {
+            let mut doc = json!({"event": "store", "message": message, "time": unix_ms()});
+            if let (Some(d), Value::Object(f)) = (doc.as_object_mut(), fields) {
+                d.extend(f);
+            }
+            let _ = writeln!(std::io::stdout().lock(), "{doc}");
+        } else {
+            let _ = writeln!(std::io::stderr().lock(), "giong dev: {message}");
+        }
+    };
+    if pass.linked_bytes > 0 {
+        say(
+            format!(
+                "{} of dependency builds now shared with your other projects (giong cache)",
+                super::clean::human(pass.linked_bytes)
+            ),
+            json!({"linked_files": pass.linked_files, "linked_bytes": pass.linked_bytes}),
+        );
+    }
+    let due =
+        store::now().saturating_sub(store::registry(&store).last_gc) >= store::GC_EVERY.as_secs();
+    if due && !cancel.load(Ordering::Relaxed) {
+        let g = store::gc(
+            &store,
+            store::budget_from_env(),
+            Some(build_dir),
+            false,
+            cancel,
+        );
+        let trimmed: u64 = g.trimmed.iter().map(|t| t.1).sum();
+        if g.unused_bytes + trimmed > 0 {
+            say(
+                format!(
+                    "freed {} of builds no project uses, or over the budget (giong cache)",
+                    super::clean::human(g.unused_bytes + trimmed)
+                ),
+                json!({"unused_bytes": g.unused_bytes, "trimmed_bytes": trimmed}),
+            );
+        }
+    }
 }
 
 pub(crate) fn unix_ms() -> u64 {
@@ -397,6 +459,7 @@ impl Dev {
             starting: false,
             report: Report::new("dev"),
             background: std::env::var_os(devctl::BACKGROUND_VAR).is_some_and(|v| v == "1"),
+            store_pass: None,
             project,
         };
         // A stop asked of a runner that had already gone.
@@ -613,6 +676,8 @@ impl Dev {
     /// Builds; on failure the diagnostics are shown and the build that
     /// served is stopped ([`Dev::fail`]).
     fn build_once(&mut self, changed_at: Instant) -> bool {
+        // Cargo would wait for the store's pass to let go of its lock.
+        self.stop_store_pass();
         // A failure before this change no longer says why nothing serves:
         // this build will (or it serves).
         self.failure = None;
@@ -802,6 +867,7 @@ impl Dev {
                     ),
                     json!({"pid": pid, "took_ms": took.as_millis() as u64, "listen": addrs, "restarts": self.restarts}),
                 );
+                self.start_store_pass();
             }
             Err(finding) => {
                 self.report.push(finding.clone());
@@ -1465,8 +1531,46 @@ impl Dev {
         }
     }
 
+    /// Shares the dependency builds of the build that now serves with the
+    /// other projects on the machine, in the background (src/store.rs).
+    fn start_store_pass(&mut self) {
+        self.stop_store_pass();
+        if store::turned_off() {
+            return;
+        }
+        // A store inside the project (GIONG_HOME there) would be watched:
+        // each of its writes would look like a change and build again.
+        let canonical = |p: &Path| fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let inside = store::default_root()
+            .is_some_and(|r| canonical(&r).starts_with(canonical(&self.project.root)));
+        if inside {
+            return;
+        }
+        let profile = self
+            .project
+            .build_dir
+            .join(if self.release { "release" } else { "debug" });
+        let build_dir = self.project.build_dir.clone();
+        let root = self.project.root.clone();
+        let json = self.json;
+        let cancel = Arc::new(AtomicBool::new(false));
+        let stop = Arc::clone(&cancel);
+        let handle = std::thread::spawn(move || {
+            store_pass(&profile, &build_dir, &root, json, &stop);
+        });
+        self.store_pass = Some((handle, cancel));
+    }
+
+    fn stop_store_pass(&mut self) {
+        if let Some((handle, cancel)) = self.store_pass.take() {
+            cancel.store(true, Ordering::Relaxed);
+            let _ = handle.join();
+        }
+    }
+
     /// Stops everything it started and removes its state file.
     fn shutdown(&mut self) {
+        self.stop_store_pass();
         if let Some(s) = self.current.take() {
             self.stop_now(s);
         }

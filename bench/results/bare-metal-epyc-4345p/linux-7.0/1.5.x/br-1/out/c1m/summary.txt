@@ -1,0 +1,11 @@
+build  mode         held errors  open s   conn/s server KiB/conn  +kernel VmRSS MiB client KiB/conn idle CPU%   probe req/s before/held   p99 us before/held
+main   http1   1,000,000      0   162.6    6,152            1.39     5.37      1362            3.18      0.00    1,001,800 / 1,036,850        131 / 128     
+main   h2c     1,000,000      0   138.1    7,243            3.36     7.32      3292            3.04      0.00    1,042,280 / 1,031,510        128 / 130     
+main   https   1,000,000      0   159.4    6,274            5.31     9.06      5195            2.90      0.00      949,955 / 951,330          129 / 130     
+main   h2tls   1,000,000      0   159.3    6,278            9.68    13.49      9460            3.10      0.00      901,114 / 941,070          134 / 131     
+pr487  http1   1,000,000      0   138.3    7,233            1.32     5.09      1301            2.91      0.00    1,036,690 / 1,081,370        129 / 126     
+pr487  h2c     1,000,000      0   141.2    7,084            2.55     6.35      2498            3.03      0.00    1,041,730 / 1,031,790        129 / 129     
+pr487  https   1,000,000      0   167.2    5,980            5.17     8.91      5058            3.15      0.00      917,700 / 954,123          133 / 129     
+pr487  h2tls   1,000,000      0   156.1    6,407            6.46    10.18      6316            2.91      0.00      919,886 / 944,287          132 / 129     
+server KiB/conn: growth of the server's RssAnon; +kernel: what the server machine lost in all (MemAvailable),
+socket buffers, conntrack and page tables included. idle CPU: the server over 30 s of quiet, 100 = one core.

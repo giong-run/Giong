@@ -1,0 +1,27 @@
+# 2026-11-27T11:11:01Z 7.0.0-44-generic 8 CPUs: AMD EPYC 4345P 8-Core Processor; server CPU 0, 1 worker; spin 200 us; fixed = 5a4cdb35c629c5c76604738feab3f9f32788d79a (5a4cdb3); busy client; 10 s per case
+client    conns   req/s  mode     CPU %  p50 us  p99 us p99.9 us  served/s
+busy          1       0  none       0.0       0       0        0         0
+busy          1       0  fixed      0.0       0       0        0         0
+busy          1       0  tuned      0.0       0       0        0         0
+busy          1     100  none       0.0       6       8      544       100
+busy          1     100  fixed      2.0       6       8       33       100
+busy          1     100  tuned      0.0       6       8       33       100
+busy          1    1000  none       0.2       4       4        6      1000
+busy          1    1000  fixed     19.9       4       4        5      1000
+busy          1    1000  tuned      0.3       4       4        6      1000
+busy          1    2000  none       0.5       4       4        5      2000
+busy          1    2000  fixed     39.8       4       4        5      2000
+busy          1    2000  tuned      0.5       4       4        5      2000
+busy          1    5000  none       1.2       4       4        5      5000
+busy          1    5000  fixed     97.4       3       4        4      5000
+busy          1    5000  tuned     97.3       3       4        4      5000
+busy          1   20000  none       4.6       4       4        5     20000
+busy          1   20000  fixed     98.0       3       3        3     20000
+busy          1   20000  tuned     98.0       3       3        3     20000
+busy         50   20000  none       5.0       4       4        5     20000
+busy         50   20000  fixed     98.0       3       3        5     20000
+busy         50   20000  tuned     97.9       3       3        5     20000
+busy         50   50000  none      12.4       4       4        5     50000
+busy         50   50000  fixed     98.0       3       3        4     50000
+busy         50   50000  tuned     98.0       3       3        4     50000
+medians over rounds; CPU = the server's user + kernel time as a share of one core

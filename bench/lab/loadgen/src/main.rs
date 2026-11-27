@@ -110,12 +110,14 @@ struct Args {
     body: usize,
     src_ips: u32,
     hold: bool,
+    headers: String,
 }
 
 fn usage() -> ! {
     eprintln!(
         "usage: lab-loadgen --addr 127.0.0.1:3006 [--conns 50] [--threads 1] [--duration 10] [--warmup 2]\n\
          \x20                  [--rate 0] [--mix /json@9,/compute?n=27@1] [--body 0] [--src-ips 1] [--hold]\n\
+         \x20                  [--header 'Accept-Encoding: gzip' ...]\n\
          Paths starting with /upload are POSTs carrying --body bytes."
     );
     std::process::exit(2)
@@ -133,6 +135,7 @@ fn parse_args() -> Args {
         body: 0,
         src_ips: 1,
         hold: false,
+        headers: String::new(),
     };
     let mut it = std::env::args().skip(1);
     while let Some(flag) = it.next() {
@@ -150,6 +153,13 @@ fn parse_args() -> Args {
             "--rate" => a.rate = v.parse().unwrap_or_else(|_| usage()),
             "--body" => a.body = v.parse().unwrap_or_else(|_| usage()),
             "--src-ips" => a.src_ips = v.parse().unwrap_or_else(|_| usage()),
+            "--header" => {
+                if !v.contains(':') || v.contains('\r') || v.contains('\n') {
+                    usage();
+                }
+                a.headers.push_str(&v);
+                a.headers.push_str("\r\n");
+            }
             "--mix" => {
                 a.mix = v
                     .split(',')
@@ -636,6 +646,7 @@ fn mono_ns() -> u64 {
 fn main() {
     let args = parse_args();
     let host = args.addr.to_string();
+    let extra = args.headers.clone();
     let body = vec![b'a'; args.body];
     let reqs: Vec<Vec<u8>> = args
         .mix
@@ -643,12 +654,12 @@ fn main() {
         .map(|(path, _)| {
             if path.starts_with("/upload") {
                 let mut r =
-                    format!("POST {path} HTTP/1.1\r\nHost: {host}\r\nContent-Length: {}\r\n\r\n", body.len())
+                    format!("POST {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Content-Length: {}\r\n\r\n", body.len())
                         .into_bytes();
                 r.extend_from_slice(&body);
                 r
             } else {
-                format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n\r\n").into_bytes()
+                format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}\r\n").into_bytes()
             }
         })
         .collect();

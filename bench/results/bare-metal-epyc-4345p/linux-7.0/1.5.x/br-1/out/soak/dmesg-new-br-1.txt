@@ -1,0 +1,1 @@
+363 new kernel log lines during the soak, all "[UFW BLOCK]" (the firewall logging internet scanners on the public interface; addresses removed); 0 other lines.

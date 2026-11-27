@@ -1,0 +1,30 @@
+64 tasks, 3 rounds of 5 s; median, min and max of the rounds
+scheme workload client      req/s median      min      max  p50 us  p99 us  cpu%  srv%  us/req  version
+http   json     giong             375918   372563   384305     169     176   100    87    2.66  HTTP/1.1
+http   json     giong-64          349010   348584   349859     227     234   100    83    2.87  HTTP/1.1
+http   json     reqwest           158948   158826   159699     394     510   100    36    6.29  HTTP/1.1
+
+http   users    giong             308412   307479   321569     201     239    98   260    3.18  HTTP/1.1
+http   users    giong-64          313135   312834   314725     235     260   100   260    3.19  HTTP/1.1
+http   users    reqwest           157725   156490   157833     427     458   100   127    6.34  HTTP/1.1
+
+https  json     giong             323245   322979   325777     197     224   100    89    3.09  HTTP/1.1
+https  json     giong-64          307835   307303   308219     257     264   100    86    3.25  HTTP/1.1
+https  json     reqwest           159194   158793   159514     391     522   100    46    6.28  HTTP/1.1
+
+https  users    giong             227279   227121   228787     281     297   100   216    4.40  HTTP/1.1
+https  users    giong-64          221758   221239   221900     334     364   100   206    4.51  HTTP/1.1
+https  users    reqwest           130858   130706   130899     517     545   100   120    7.64  HTTP/1.1
+
+h2     json     giong             723558   710588   725261      88      90    69    29    0.97  HTTP/2
+h2     json     reqwest           236438   236121   236783     270     273    98    10    4.14  HTTP/2.0
+
+h2     users    giong             122835   122825   123736     520     629    36    95    2.93  HTTP/2
+h2     users    reqwest           123509    86473   124149     518     522    68    95    5.55  HTTP/2.0
+
+h2c    json     giong            1035412  1028476  1039438      61      70   100    43    0.96  HTTP/2
+h2c    json     reqwest           217393   215641   218315     293     301   100     7    4.60  HTTP/2.0
+
+h2c    users    giong             140908   140685   142729     453     538    32    95    2.27  HTTP/2
+h2c    users    reqwest           142093   139388   142740     449     540    75    96    5.25  HTTP/2.0
+

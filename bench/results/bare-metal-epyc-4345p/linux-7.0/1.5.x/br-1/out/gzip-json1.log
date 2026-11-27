@@ -1,0 +1,18 @@
+2026-11-27T10:11:33Z gzip round 1/6, 1 worker(s) done
+2026-11-27T10:12:57Z gzip round 2/6, 1 worker(s) done
+2026-11-27T10:14:20Z gzip round 3/6, 1 worker(s) done
+2026-11-27T10:15:44Z gzip round 4/6, 1 worker(s) done
+2026-11-27T10:17:08Z gzip round 5/6, 1 worker(s) done
+2026-11-27T10:18:32Z gzip round 6/6, 1 worker(s) done
+base: miniz; medians over rounds (min-max); change against the base
+workers path    mode    build       req/s  change  us/req  change  p50 us  p99 us   p99.9     max RSS+ KiB peak KiB errors
+      1 /json   closed  miniz     336,644            2.97             189     311     383     647      816    4,058      0
+      1 /json   closed  fast      333,926   -0.8%    2.99   +0.9%     190     310     383     730      764    4,132      0
+
+      1 /json   open50  miniz     168,320            3.21             157     291     317   1,232      782    4,048      0
+      1 /json   open50  fast      168,319   -0.0%    3.23   +0.5%     148     289     313     831      748    4,106      0
+
+      1 /json   open80  miniz     269,308            3.11             156  68,977 211,550 224,203      782    4,048      0
+      1 /json   open80  fast      269,311   +0.0%    3.08   -0.9%     152   7,246  36,995  48,191      752    4,106      0
+
+open50/open80: open loop at 50% and 80% of the base build's closed-loop rate in the same round.
