@@ -8,6 +8,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+A build store, a fix for `giong dev` in SQLite projects, and faster uploads. `giong dev`
+keeps one copy of each dependency build for all your projects: four projects from
+`giong new` hold 401.3 MiB of builds instead of 645.8 (-37.9%), and cargo rebuilds nothing.
+In a project from `giong new` (SQLite, the default), `giong dev` no longer restarts about
+once a second while the service writes its database (63 restarts in a minute before, 1
+now). `TcpStream::recv_into` and `UnixStream::recv_into` are public: a large body goes
+straight into your own buffer, and the benchmark server's 1 MiB uploads take 129 µs of CPU
+instead of 234. Thanks to [@concacotdua](https://github.com/concacotdua), whose `fast-gzip`
+in 1.5.4 is now credited by name. No API is removed or changed.
+
 ## [1.5.4] - 2026-11-27
 
 Safer paths and secrets, and faster gzip. `fs::Root` opens the paths that come from a
