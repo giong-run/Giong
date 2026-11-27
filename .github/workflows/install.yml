@@ -80,7 +80,7 @@ jobs:
       - name: The binary lists its crates
         if: runner.os == 'Linux'
         run: |
-          objcopy -O binary --only-section=.dep-v0 "target/${{ matrix.target }}/release/giong" deps.z
+          objcopy --dump-section .dep-v0=deps.z "target/${{ matrix.target }}/release/giong" "$RUNNER_TEMP/giong.copy"
           python3 -I -c '
           import json, sys, zlib
           deps = json.loads(zlib.decompress(open("deps.z", "rb").read()))["packages"]
@@ -135,7 +135,7 @@ jobs:
         if: github.event_name == 'workflow_dispatch'
         shell: bash
         run: |
-          archive=$(ls dist/v$GIONG_VERSION/*.tar.gz dist/v$GIONG_VERSION/*.zip 2> /dev/null | head -1)
+          archive=$(ls dist/v$GIONG_VERSION/giong-* | grep -v sha256)
           case "${{ matrix.target }}" in *windows*) bin="target/${{ matrix.target }}/release/giong.exe" ;; *) bin="target/${{ matrix.target }}/release/giong" ;; esac
           { echo "archive=$archive"; echo "sbom=$(ls sbom/*.cdx.json)"; echo "bin=$bin"; } >> "$GITHUB_OUTPUT"
       - if: github.event_name == 'workflow_dispatch'
