@@ -8,6 +8,15 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+Leaner connections and a round of hardening. An idle TLS connection holds 6.1 KiB of heap
+instead of 10.8, an idle HTTP/1.1 connection 1,318 bytes instead of 2,062, and an HTTP/1.1
+client request with its response costs 7 allocations instead of 11. `Server::min_body_rate`,
+off by default, cuts request bodies that trickle in; an HTTP/2 body streamed in pieces is no
+longer cut after `request_timeout` while it keeps arriving; and every dependency passes a
+supply-chain gate. Dev kit fixes: images from `giong image` run `giong new` services, `giong
+routes` and `giong openapi` work on new web projects, and `giong db migrate` and `giong bench`
+say what went wrong. No API is removed or changed.
+
 ## [1.5.1] - 2026-11-26
 
 The first round of fixes after 1.5.0, and the dev kit on SQLite. `giong new` writes a users API
