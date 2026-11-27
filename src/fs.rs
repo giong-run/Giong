@@ -34,6 +34,9 @@
 //! A [`File`] has no cursor: every read and write names its offset, so one
 //! file can be shared by many tasks without them disturbing each other.
 //!
+//! A path that comes from outside (a request, an upload, a configuration
+//! file) is opened through a [`Root`], which keeps it beneath one directory.
+//!
 //! [`read_dir`] lists a directory. It is the one operation here that does not
 //! go through the ring, as io_uring cannot read directories; its
 //! documentation says what that costs.
@@ -45,6 +48,7 @@ use std::mem;
 use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd, RawFd};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
 
@@ -233,6 +237,16 @@ impl OpenOptions {
             mode: self.mode,
         };
         let fd = path_op(path, io).await?;
+        Ok(File::from_fd(fd))
+    }
+
+    /// Opens `path` beneath `root` with these options, refusing a path
+    /// that could lead out of it (see [`Root`]).
+    ///
+    /// Cancel safe as [`open`](Self::open) is.
+    pub async fn open_in<P: AsRef<Path>>(&self, root: &Root, path: P) -> io::Result<File> {
+        let flags = self.flags()?;
+        let fd = root.open_beneath(path.as_ref(), flags, self.mode).await?;
         Ok(File::from_fd(fd))
     }
 }
@@ -616,6 +630,240 @@ async fn close(fd: RawFd) -> io::Result<()> {
     }
 }
 
+/// A directory that paths are opened beneath, and never outside of.
+///
+/// A path from a request, an upload or a configuration file can hold `..`,
+/// start with `/`, or reach a symbolic link someone placed in the
+/// directory: joined to the directory and opened, it can lead anywhere on
+/// the machine. A `Root` opens paths relative to the directory it holds
+/// open and refuses, with `GIONG-E0205`, any path that is absolute, has a
+/// `..` component, or goes through a symbolic link (wherever the link
+/// points). The kernel checks during the open itself, so nothing can swap
+/// a directory for a link between a check and the open, as it can with a
+/// check made beforehand:
+///
+/// - On Linux, `openat2(2)` with `RESOLVE_BENEATH`, `RESOLVE_NO_SYMLINKS`
+///   and `RESOLVE_NO_MAGICLINKS`, as an io_uring operation on the io_uring
+///   driver. Where a seccomp filter hides `openat2` from the epoll driver's
+///   threads, the path is opened one component at a time with
+///   `O_NOFOLLOW`, which refuses the same paths.
+/// - On macOS, `openat(2)` with `O_NOFOLLOW_ANY` (macOS 11).
+/// - On Windows, each component is opened without following reparse
+///   points, and symbolic links and junctions are refused.
+///
+/// ```no_run
+/// use giong::fs::Root;
+///
+/// # async fn demo(request_path: &str) -> std::io::Result<()> {
+/// let public = Root::new("public").await?;
+/// // "css/site.css" opens; "../.env", "/etc/passwd" and a link to either
+/// // are refused.
+/// let file = public.open(request_path).await?;
+/// # Ok(())
+/// # }
+/// ```
+///
+/// The directory itself may be reached through a link (`Root::new`
+/// follows links like any open): only what is beneath it is checked.
+/// Like a [`File`], a `Root` belongs to the worker that opened it; opening
+/// one in each worker costs one open.
+pub struct Root {
+    /// The directory, opened with `O_PATH` on Linux (no read access needed).
+    /// Each open beneath it holds a reference until the open is done, so a
+    /// root dropped meanwhile does not close it: the kernel looks the
+    /// descriptor up when the open runs, and the number could by then name
+    /// another directory.
+    dir: Rc<File>,
+    path: PathBuf,
+}
+
+/// How a root's directory is opened.
+#[cfg(target_os = "linux")]
+const ROOT_FLAGS: i32 = libc::O_PATH | libc::O_DIRECTORY | libc::O_CLOEXEC;
+#[cfg(not(target_os = "linux"))]
+const ROOT_FLAGS: i32 = libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC;
+
+/// How many times an open beneath a root is tried when `openat2` answers
+/// `EAGAIN`: it may when a rename elsewhere raced with the lookup.
+const ROOT_ATTEMPTS: u32 = 16;
+
+impl Root {
+    /// Opens the directory `dir` as a root.
+    ///
+    /// Cancel safe: if the future is dropped, the descriptor the open may
+    /// still produce is closed, and nothing else changes.
+    pub async fn new<P: AsRef<Path>>(dir: P) -> io::Result<Self> {
+        let dir = dir.as_ref();
+        let path = c_path(dir)?;
+        let io = Io::OpenAt {
+            path: path.c_ptr(),
+            flags: ROOT_FLAGS,
+            mode: 0,
+        };
+        let fd = path_op(path, io).await?;
+        Ok(Self {
+            dir: Rc::new(File::from_fd(fd)),
+            path: dir.to_path_buf(),
+        })
+    }
+
+    /// Opens the file at `path` beneath the root for reading.
+    ///
+    /// Cancel safe: if the future is dropped, the descriptor the open may
+    /// still produce is closed, and nothing else changes.
+    pub async fn open<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
+        OpenOptions::new().read(true).open_in(self, path).await
+    }
+
+    /// Opens the file at `path` beneath the root for writing, creating it
+    /// if needed and emptying it if it exists.
+    ///
+    /// Not cancel safe: if the future is dropped, the file may have been
+    /// created or emptied (the descriptor is closed either way).
+    pub async fn create<P: AsRef<Path>>(&self, path: P) -> io::Result<File> {
+        OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open_in(self, path)
+            .await
+    }
+
+    /// Reads the whole file at `path` beneath the root, as [`read`] does.
+    ///
+    /// Cancel safe for a regular file: if the future is dropped, nothing
+    /// changes and the file is closed.
+    pub async fn read<P: AsRef<Path>>(&self, path: P) -> io::Result<Vec<u8>> {
+        read_all(self.open(path).await?).await
+    }
+
+    /// Size, type and modification time of what is at `path` beneath the
+    /// root. A symbolic link there is refused, as everywhere under a root.
+    ///
+    /// Cancel safe: it changes nothing.
+    pub async fn metadata<P: AsRef<Path>>(&self, path: P) -> io::Result<Metadata> {
+        let path = path.as_ref();
+        #[cfg(target_os = "linux")]
+        {
+            // Linux has no stat with `RESOLVE_BENEATH`: an `O_PATH` open
+            // beneath the root, then a stat of what it opened.
+            let fd = self
+                .open_beneath(path, libc::O_PATH | libc::O_CLOEXEC, 0)
+                .await?;
+            File::from_fd(fd).metadata().await
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            self.check(path)?;
+            let meta = statx(self.dir.fd, c_path(path)?, sys::AT_SYMLINK_NOFOLLOW_ANY)
+                .await
+                .map_err(|e| self.refused(path, e))?;
+            // `AT_SYMLINK_NOFOLLOW_ANY` refuses a link on the way but, like
+            // `AT_SYMLINK_NOFOLLOW`, describes one at the end of the path.
+            if meta.is_symlink() {
+                return Err(self.outside(path, "goes through a symbolic link"));
+            }
+            Ok(meta)
+        }
+    }
+
+    /// Opens the directory at `path` beneath this root as a root of its
+    /// own, for paths beneath it.
+    ///
+    /// Cancel safe: if the future is dropped, the descriptor the open may
+    /// still produce is closed, and nothing else changes.
+    pub async fn open_root<P: AsRef<Path>>(&self, path: P) -> io::Result<Root> {
+        let path = path.as_ref();
+        let fd = self.open_beneath(path, ROOT_FLAGS, 0).await?;
+        Ok(Root {
+            dir: Rc::new(File::from_fd(fd)),
+            path: self.path.join(path),
+        })
+    }
+
+    /// The directory's path, as given to [`new`](Self::new) (joined with
+    /// the path given to [`open_root`](Self::open_root)).
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Refuses, before asking the kernel, an absolute path and one with a
+    /// `..` component.
+    fn check(&self, path: &Path) -> io::Result<()> {
+        use std::path::Component;
+        for part in path.components() {
+            match part {
+                Component::RootDir => return Err(self.outside(path, "is absolute")),
+                Component::ParentDir => return Err(self.outside(path, "has a .. component")),
+                _ => {}
+            }
+        }
+        Ok(())
+    }
+
+    /// The descriptor of what is at `path` beneath the root, opened with
+    /// `flags` and `mode`.
+    async fn open_beneath(&self, path: &Path, flags: i32, mode: u32) -> io::Result<RawFd> {
+        self.check(path)?;
+        let mut name = c_path(path)?;
+        let mut how = KernelBox::new(sys::open_how(flags, mode));
+        let mut attempts = 1;
+        loop {
+            let io = Io::OpenBeneath {
+                dir: self.dir.fd,
+                path: name.c_ptr(),
+                how: how.as_ptr(),
+            };
+            // SAFETY: the operation's pointers are to the path and to `how`,
+            // both in `KernelBox`es. The directory goes with them, so that it
+            // stays open until the operation is done even if the root and
+            // this future are dropped.
+            let (res, _, back) = unsafe { Op::new(io, (name, how, Rc::clone(&self.dir))) }.await;
+            (name, how, _) = back;
+            if res >= 0 {
+                return Ok(res);
+            }
+            if res == -libc::EAGAIN && attempts < ROOT_ATTEMPTS {
+                attempts += 1;
+                continue;
+            }
+            return Err(self.refused(path, os_err(res)));
+        }
+    }
+
+    /// `e` as `GIONG-E0205` when the kernel refused the path as leading out
+    /// of the root.
+    fn refused(&self, path: &Path, e: io::Error) -> io::Error {
+        match e.raw_os_error() {
+            Some(libc::ELOOP) => self.outside(path, "goes through a symbolic link"),
+            Some(libc::EXDEV) => self.outside(path, "leads outside the directory"),
+            _ => e,
+        }
+    }
+
+    #[cold]
+    fn outside(&self, path: &Path, why: &str) -> io::Error {
+        raise(
+            Code::OutsideRoot,
+            format!(
+                "the path {path:?} {why}, so it is not opened beneath the root {:?}",
+                self.path
+            ),
+            "give a path relative to the root, without .. and without symbolic links on the \
+             way; to open files in a directory a link leads to, open a Root on that directory",
+        )
+    }
+}
+
+impl std::fmt::Debug for Root {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Root")
+            .field("path", &self.path)
+            .field("fd", &self.dir.fd)
+            .finish()
+    }
+}
+
 /// What [`metadata`] and [`File::metadata`] report about a file.
 #[derive(Clone, Debug)]
 pub struct Metadata {
@@ -723,7 +971,11 @@ pub async fn symlink_metadata<P: AsRef<Path>>(path: P) -> io::Result<Metadata> {
 /// Cancel safe for a regular file: if the future is dropped, nothing changes
 /// and the file is closed.
 pub async fn read<P: AsRef<Path>>(path: P) -> io::Result<Vec<u8>> {
-    let file = File::open(path).await?;
+    read_all(File::open(path).await?).await
+}
+
+/// The whole of `file`, from its start.
+async fn read_all(file: File) -> io::Result<Vec<u8>> {
     // The size is only a hint: files in /proc report 0, and a file may grow
     // while it is being read.
     // Read with a plain `fstat` (see `File::len`): one system call instead

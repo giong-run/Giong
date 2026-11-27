@@ -73,6 +73,11 @@ does giong promise, so that breaking that promise is a vulnerability?
   ring (including counters that lie) must not cause undefined behaviour in the safe
   receive path; it is reported (`GIONG-E0091`). `Receiver::recv_in_place` is `unsafe` and
   is for peers you trust.
+- **Paths opened through `giong::fs::Root`** (a request path, an upload's file name). Such a
+  path must not open, create, empty or stat anything that is not beneath the root's
+  directory: not with `..`, an absolute path, a symbolic link or junction, or a rename that
+  races the lookup. It is refused (`GIONG-E0205`). Paths given to `File::open` and the other
+  `fs` functions are opened as given.
 - **giong-mcp.** Reachable only as documented: a Unix socket of mode `0600`, or TCP with a
   bearer token (a server without one does not start unless the code opts out). Its tools
   look and change nothing in the service.

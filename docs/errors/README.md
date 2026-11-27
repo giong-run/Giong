@@ -102,6 +102,7 @@ when it is no longer raised.
 | [GIONG-E0202](E0202.md) | `OffsetOutOfRange` | file offset out of range |
 | [GIONG-E0203](E0203.md) | `InvalidOpenOptions` | invalid combination of open options |
 | [GIONG-E0204](E0204.md) | `FileTooLarge` | file too large to read into memory |
+| [GIONG-E0205](E0205.md) | `OutsideRoot` | the path leads outside the root |
 
 ## giong-http
 

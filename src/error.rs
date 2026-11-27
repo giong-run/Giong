@@ -293,6 +293,10 @@ codes! {
     /// whole file (its length, which may be that of a sparse file, is more
     /// than the allocator gives). Nothing is kept; the process goes on.
     FileTooLarge = 204, OutOfMemory, "file too large to read into memory";
+    /// A [`Root`](crate::fs::Root) was asked for a path that is absolute,
+    /// has a `..` component or goes through a symbolic link. Nothing was
+    /// opened.
+    OutsideRoot = 205, PermissionDenied, "the path leads outside the root";
 
     // ------------------------------------------------- giong-http client
     /// The URL, a header, the method or the client's settings are not

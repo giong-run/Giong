@@ -676,6 +676,11 @@ fn sqe_for(io: &Io, zero_copy: bool) -> squeue::Entry {
             .flags(flags)
             .mode(mode)
             .build(),
+        // `sys::OpenHow` is the kernel's `open_how`, as `types::OpenHow`
+        // is (a transparent wrapper of it): the same three `u64`s.
+        Io::OpenBeneath { dir, path, how } => {
+            opcode::OpenAt2::new(types::Fd(dir), path, how.cast::<types::OpenHow>()).build()
+        }
         #[cfg(test)]
         Io::Close { fd } if tests::CLOSE_ASYNC.load(std::sync::atomic::Ordering::Relaxed) => {
             // Handed to a kernel worker thread, as some filesystems do,

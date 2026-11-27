@@ -1691,3 +1691,344 @@ fn connect_pipe(server: std::fs::File) -> std::fs::File {
     unsafe { ConnectNamedPipe(server.as_raw_handle(), std::ptr::null_mut()) };
     server
 }
+
+/// The tree the root tests open: `public/` with a file and a directory in
+/// it, and a secret next to it, outside.
+fn root_tree(name: &str) -> TempDir {
+    let dir = TempDir::new(name);
+    std::fs::create_dir_all(dir.path("public").join("css")).unwrap();
+    std::fs::write(dir.path("public").join("a.txt"), b"public").unwrap();
+    std::fs::write(dir.path("public").join("css").join("site.css"), b"body{}").unwrap();
+    std::fs::write(dir.path("secret.txt"), b"secret").unwrap();
+    dir
+}
+
+fn is_outside_root(e: &std::io::Error) -> bool {
+    giong::error::code(e) == Some(giong::error::Code::OutsideRoot)
+}
+
+/// A symbolic link at `at` to `target`; `false` where links cannot be made
+/// (Windows without the privilege or developer mode).
+fn symlink(target: &std::path::Path, at: &std::path::Path, is_dir: bool) -> bool {
+    #[cfg(unix)]
+    {
+        let _ = is_dir;
+        std::os::unix::fs::symlink(target, at).unwrap();
+        true
+    }
+    #[cfg(windows)]
+    {
+        const ERROR_PRIVILEGE_NOT_HELD: i32 = 1314;
+        let made = if is_dir {
+            std::os::windows::fs::symlink_dir(target, at)
+        } else {
+            std::os::windows::fs::symlink_file(target, at)
+        };
+        match made {
+            Ok(()) => true,
+            Err(e) if e.raw_os_error() == Some(ERROR_PRIVILEGE_NOT_HELD) => false,
+            Err(e) => panic!("cannot link {at:?} to {target:?}: {e}"),
+        }
+    }
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "Miri has no openat2")]
+fn a_root_opens_paths_beneath_it_and_refuses_the_others() {
+    let dir = root_tree("root-paths");
+    giong::block_on(async {
+        let root = fs::Root::new(dir.path("public")).await.unwrap();
+        assert_eq!(root.path(), dir.path("public"));
+        assert_eq!(root.read("a.txt").await.unwrap(), b"public");
+        let css = root
+            .open(PathBuf::from("css").join("site.css"))
+            .await
+            .unwrap();
+        let (res, buf) = css.read_at(Vec::with_capacity(16), 0).await;
+        assert_eq!((res.unwrap(), &buf[..]), (6, &b"body{}"[..]));
+        assert_eq!(root.read("./a.txt").await.unwrap(), b"public");
+        assert!(root.metadata("css").await.unwrap().is_dir());
+        assert_eq!(root.metadata("a.txt").await.unwrap().len(), 6);
+
+        // Absolute paths and `..` are refused before the kernel is asked,
+        // even a `..` that would stay inside.
+        let absolute = dir.path("secret.txt");
+        let up = PathBuf::from("..").join("secret.txt");
+        let up_and_back = PathBuf::from("css").join("..").join("a.txt");
+        let up_twice = PathBuf::from("css")
+            .join("..")
+            .join("..")
+            .join("secret.txt");
+        for path in [&absolute, &up, &up_and_back, &up_twice] {
+            let e = root.open(path).await.unwrap_err();
+            assert!(is_outside_root(&e), "{path:?}: {e}");
+            assert_eq!(e.kind(), ErrorKind::PermissionDenied);
+            let message = e.to_string();
+            assert!(message.contains("GIONG-E0205"), "{message}");
+            assert!(message.contains("public"), "{message}");
+            assert!(is_outside_root(&root.read(path).await.unwrap_err()));
+            assert!(is_outside_root(&root.metadata(path).await.unwrap_err()));
+            assert!(is_outside_root(&root.open_root(path).await.unwrap_err()));
+            assert!(is_outside_root(&root.create(path).await.unwrap_err()));
+        }
+        // What is missing is missing, not refused.
+        let e = root.open("missing.txt").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NotFound, "{e}");
+        assert!(!is_outside_root(&e));
+    });
+    assert_eq!(std::fs::read(dir.path("secret.txt")).unwrap(), b"secret");
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "Miri has no openat2")]
+fn files_are_created_and_written_beneath_a_root() {
+    let dir = root_tree("root-writes");
+    giong::block_on(async {
+        let root = fs::Root::new(dir.path("public")).await.unwrap();
+        let file = root.create("new.txt").await.unwrap();
+        file.write_all_at(&b"hello"[..], 0).await.0.unwrap();
+        file.close().await.unwrap();
+        let log = OpenOptions::new()
+            .append(true)
+            .create(true)
+            .open_in(&root, PathBuf::from("css").join("log"))
+            .await
+            .unwrap();
+        log.write_all_at(&b"one "[..], 0).await.0.unwrap();
+        log.write_all_at(&b"two"[..], 0).await.0.unwrap();
+        drop(log);
+        let e = OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open_in(&root, "a.txt")
+            .await
+            .unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::AlreadyExists);
+        // Wrong options are refused as by `open`.
+        let e = OpenOptions::new()
+            .open_in(&root, "a.txt")
+            .await
+            .unwrap_err();
+        assert_eq!(
+            giong::error::code(&e),
+            Some(giong::error::Code::InvalidOpenOptions)
+        );
+
+        // A root beneath a root: its paths are beneath its own directory.
+        let css = root.open_root("css").await.unwrap();
+        assert_eq!(css.path(), dir.path("public").join("css"));
+        assert_eq!(css.read("site.css").await.unwrap(), b"body{}");
+        assert!(is_outside_root(
+            &css.open(PathBuf::from("..").join("a.txt"))
+                .await
+                .unwrap_err()
+        ));
+        assert!(root.open_root("a.txt").await.is_err(), "a file is no root");
+    });
+    assert_eq!(
+        std::fs::read(dir.path("public").join("new.txt")).unwrap(),
+        b"hello"
+    );
+    assert_eq!(
+        std::fs::read(dir.path("public").join("css").join("log")).unwrap(),
+        b"one two"
+    );
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "Miri has no openat2")]
+fn links_beneath_a_root_are_refused_wherever_they_point() {
+    let dir = root_tree("root-links");
+    let public = dir.path("public");
+    let links = [
+        // Out of the root, to a file and to a directory.
+        ("out", PathBuf::from("..").join("secret.txt"), false),
+        ("up", PathBuf::from(".."), true),
+        // Inside it: refused too, so that no check of where a link
+        // points can be raced.
+        ("in", PathBuf::from("a.txt"), false),
+        ("styles", PathBuf::from("css"), true),
+        // To nothing yet: an open that creates must not create through it.
+        ("dangling", PathBuf::from("..").join("created.txt"), false),
+        // An absolute link.
+        ("absolute", dir.path("secret.txt"), false),
+    ];
+    for (name, target, is_dir) in &links {
+        if !symlink(target, &public.join(name), *is_dir) {
+            eprintln!("skipped: symbolic links cannot be made here");
+            return;
+        }
+    }
+    // The directory of a root may itself be reached through a link.
+    assert!(symlink(&public, &dir.path("public-link"), true));
+    giong::block_on(async {
+        let root = fs::Root::new(dir.path("public-link")).await.unwrap();
+        assert_eq!(root.read("a.txt").await.unwrap(), b"public");
+        let paths = [
+            PathBuf::from("out"),
+            PathBuf::from("up").join("secret.txt"),
+            PathBuf::from("in"),
+            PathBuf::from("styles").join("site.css"),
+            PathBuf::from("absolute"),
+            PathBuf::from("dangling"),
+        ];
+        for path in &paths {
+            let e = root.open(path).await.unwrap_err();
+            assert!(is_outside_root(&e), "{path:?}: {e}");
+            assert!(e.to_string().contains("symbolic link"), "{e}");
+            assert!(
+                is_outside_root(&root.metadata(path).await.unwrap_err()),
+                "{path:?}"
+            );
+            let e = root.create(path).await.unwrap_err();
+            assert!(is_outside_root(&e), "create {path:?}: {e}");
+        }
+        assert!(is_outside_root(&root.open_root("up").await.unwrap_err()));
+        assert!(is_outside_root(
+            &root.open_root("styles").await.unwrap_err()
+        ));
+    });
+    // Nothing outside was emptied or created.
+    assert_eq!(std::fs::read(dir.path("secret.txt")).unwrap(), b"secret");
+    assert_eq!(std::fs::read(public.join("a.txt")).unwrap(), b"public");
+    assert!(!dir.path("created.txt").exists());
+}
+
+/// The magic links of `/proc` (a process's open files, its executable)
+/// lead anywhere: refused under a root too.
+#[test]
+#[cfg(target_os = "linux")]
+#[cfg_attr(miri, ignore = "Miri has no openat2")]
+fn magic_links_beneath_a_root_are_refused() {
+    let dir = root_tree("root-magic");
+    let kept = std::fs::File::open(dir.path("secret.txt")).unwrap();
+    use std::os::fd::AsRawFd;
+    let fd = kept.as_raw_fd();
+    giong::block_on(async move {
+        let root = fs::Root::new("/proc/self").await.unwrap();
+        assert!(!root.read("status").await.unwrap().is_empty());
+        for path in [
+            format!("fd/{fd}"),
+            "exe".to_owned(),
+            "cwd/Cargo.toml".to_owned(),
+        ] {
+            let e = root.open(&path).await.unwrap_err();
+            assert!(is_outside_root(&e), "{path}: {e}");
+        }
+    });
+    drop(kept);
+}
+
+#[test]
+#[cfg_attr(miri, ignore = "Miri has no openat2")]
+fn opens_beneath_a_root_release_their_descriptors() {
+    let dir = root_tree("root-fds");
+    let path = dir.path("public").join("a.txt");
+    giong::block_on(async {
+        let root = fs::Root::new(dir.path("public")).await.unwrap();
+        for _ in 0..100 {
+            drop(root.open("a.txt").await.unwrap());
+            root.metadata("a.txt").await.unwrap();
+            // An open dropped before it is polled, and one dropped after.
+            drop(root.open("a.txt"));
+            let mut open = std::pin::pin!(root.open("a.txt"));
+            let _ = futures_poll_once(open.as_mut()).await;
+        }
+        giong::time::timeout(Duration::from_secs(1), async {
+            while open_fds(&path) > 0 {
+                giong::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("files opened beneath a root should close");
+        drop(root);
+    });
+    assert_eq!(open_fds(&path), 0);
+    assert_eq!(open_fds(&dir.path("public")), 0);
+}
+
+/// A root dropped while an open beneath it is still on its way keeps its
+/// directory open until that open is done. Closed at once, its number could
+/// be given to another directory first, and the open (here one that
+/// creates) would run beneath that one.
+#[test]
+#[cfg(unix)]
+#[cfg_attr(miri, ignore = "Miri has no openat2")]
+fn a_root_dropped_mid_open_keeps_its_directory_until_the_open_is_done() {
+    let dir = root_tree("root-dropped");
+    std::fs::create_dir(dir.path("other")).unwrap();
+    let public = dir.path("public");
+    giong::block_on(async {
+        for i in 0..20 {
+            let name = format!("new-{i}.txt");
+            let root = fs::Root::new(&public).await.unwrap();
+            let mut create = Box::pin(root.create(&name));
+            let _ = futures_poll_once(create.as_mut()).await;
+            drop(create);
+            drop(root);
+            assert!(
+                open_fds(&public) > 0,
+                "the directory closed before the open beneath it was done"
+            );
+            // The lowest free number: the root's, had it been closed.
+            let other = std::fs::File::open(dir.path("other")).unwrap();
+            giong::time::timeout(Duration::from_secs(1), async {
+                while open_fds(&public) > 0 {
+                    giong::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .expect("the directory should close once the open beneath it is done");
+            drop(other);
+            assert!(!dir.path("other").join(&name).exists(), "{name}");
+        }
+    });
+}
+
+/// Polls `fut` once and returns whether it finished, dropping nothing.
+async fn futures_poll_once<F: std::future::Future>(fut: std::pin::Pin<&mut F>) -> bool {
+    let mut fut = Some(fut);
+    std::future::poll_fn(move |cx| {
+        let done = fut.take().unwrap().poll(cx).is_ready();
+        std::task::Poll::Ready(done)
+    })
+    .await
+}
+
+/// A junction (which needs no privilege to make, unlike a symbolic link)
+/// leads out of the directory as a link does: refused.
+#[test]
+#[cfg(windows)]
+fn junctions_beneath_a_root_are_refused() {
+    let dir = root_tree("root-junction");
+    std::fs::create_dir(dir.path("outside")).unwrap();
+    std::fs::write(dir.path("outside").join("data.txt"), b"outside").unwrap();
+    let made = std::process::Command::new("cmd")
+        .arg("/C")
+        .arg("mklink")
+        .arg("/J")
+        .arg(dir.path("public").join("way-out"))
+        .arg(dir.path("outside"))
+        .output()
+        .unwrap();
+    assert!(made.status.success(), "{made:?}");
+    giong::block_on(async {
+        let root = fs::Root::new(dir.path("public")).await.unwrap();
+        let through = PathBuf::from("way-out").join("data.txt");
+        for e in [
+            root.open(&through).await.unwrap_err(),
+            root.create(&through).await.unwrap_err(),
+            root.metadata("way-out").await.unwrap_err(),
+            root.open_root("way-out").await.unwrap_err(),
+        ] {
+            assert!(is_outside_root(&e), "{e}");
+        }
+        // Names Windows would otherwise read as devices are files here.
+        let e = root.open("CON").await.unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NotFound, "{e}");
+    });
+    assert_eq!(
+        std::fs::read(dir.path("outside").join("data.txt")).unwrap(),
+        b"outside"
+    );
+}
