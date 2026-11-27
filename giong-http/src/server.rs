@@ -1031,9 +1031,18 @@ impl Server {
                         return;
                     };
                     if h2 {
-                        // On the heap, so that HTTP/1.1 connections do not
-                        // carry the larger HTTP/2 state.
-                        HeapFuture::with(move || serve_h2(tls, cfg, peer, handler, slot)).await;
+                        // A task of its own, and this one ends: this task is
+                        // as large as the HTTP/1.1 state, which an HTTP/2
+                        // connection has no use for, and HTTP/1.1
+                        // connections do not carry the HTTP/2 state.
+                        drop(giong::spawn(serve_h2(
+                            tls,
+                            cfg,
+                            peer,
+                            handler,
+                            slot,
+                            Vec::new,
+                        )));
                     } else {
                         Conn::new(tls, cfg, Some(slot)).serve(handler).await;
                     }
@@ -1695,11 +1704,12 @@ fn open_files_limits() -> Option<&'static (String, String)> {
         .as_ref()
 }
 
-/// An HTTP/2 connection chosen through ALPN: its own task body.
+/// An HTTP/2 connection of an accept loop, chosen through ALPN or by its
+/// preface: its own task body. `input` gives what has been received
+/// already: `Vec::new` after ALPN, which takes no room in the task.
 ///
 /// Not an `async fn`: one keeps its arguments twice (as received, and moved
 /// into its body), and the stream, a TLS session, is over a kilobyte.
-#[cfg(feature = "tls")]
 #[allow(clippy::manual_async_fn)]
 fn serve_h2<T: Transport, H: Handler>(
     stream: T,
@@ -1707,9 +1717,12 @@ fn serve_h2<T: Transport, H: Handler>(
     peer: Option<SocketAddr>,
     handler: Rc<H>,
     slot: Slot,
+    input: impl FnOnce() -> Vec<u8>,
 ) -> impl Future<Output = ()> {
     async move {
-        crate::h2::serve(&stream, &cfg, &peer, &*handler, Vec::new(), Some(&slot)).await;
+        crate::h2::serve(&stream, &cfg, &peer, &*handler, input(), Some(&slot)).await;
+        // Closed before the slot gives the connection's place back.
+        drop(stream);
     }
 }
 
@@ -1852,7 +1865,7 @@ struct Conn<T> {
     /// its index plus one, 0 for none. Kept there and not in the connection,
     /// so that tracing does not make idle connections larger (this fits in
     /// what the connection's layout leaves free).
-    traces: u32,
+    traces: TracesAt,
     /// The connection's place under `max_connections`, given back when the
     /// connection is dropped. Declared last, so that the stream is closed
     /// first.
@@ -1942,10 +1955,16 @@ fn free_traces(slot: u32) {
     drop(traces);
 }
 
-impl<T> Drop for Conn<T> {
+/// See `Conn::traces`: where a connection's traces are kept in `TRACES`,
+/// its index plus one, 0 for none. The entry is freed with this, and not by
+/// a `Drop` of the connection, so that a connection handed over to HTTP/2
+/// can be taken apart (see `Conn::serve`).
+struct TracesAt(u32);
+
+impl Drop for TracesAt {
     fn drop(&mut self) {
-        if self.traces != 0 {
-            free_traces(self.traces);
+        if self.0 != 0 {
+            free_traces(self.0);
         }
     }
 }
@@ -1966,7 +1985,7 @@ impl<T: Transport> Conn<T> {
             first: true,
             body_into: false,
             charge: Charge::none(),
-            traces: 0,
+            traces: TracesAt(0),
             _slot: slot,
         }
     }
@@ -1976,15 +1995,15 @@ impl<T: Transport> Conn<T> {
     #[cold]
     #[inline(never)]
     fn trace_arrival(&mut self) {
-        if self.traces != 0 && with_traces(self.traces, |t| t.current.is_some()) == Some(true) {
+        if self.traces.0 != 0 && with_traces(self.traces.0, |t| t.current.is_some()) == Some(true) {
             return;
         }
         if let Some(trace) = RequestTrace::start("http/1.1") {
-            if self.traces == 0 {
-                self.traces = new_traces();
+            if self.traces.0 == 0 {
+                self.traces.0 = new_traces();
             }
-            if self.traces != 0 {
-                with_traces(self.traces, |t| t.current = Some(Box::new(trace)));
+            if self.traces.0 != 0 {
+                with_traces(self.traces.0, |t| t.current = Some(Box::new(trace)));
             }
         }
     }
@@ -1994,11 +2013,11 @@ impl<T: Transport> Conn<T> {
     #[cold]
     #[inline(never)]
     fn trace_handler(&mut self) -> Option<Box<RequestTrace>> {
-        if self.traces == 0 {
+        if self.traces.0 == 0 {
             return None;
         }
         clear_handed_back();
-        let mut trace = with_traces(self.traces, |t| t.current.take()).flatten()?;
+        let mut trace = with_traces(self.traces.0, |t| t.current.take()).flatten()?;
         trace.started();
         Some(trace)
     }
@@ -2007,8 +2026,8 @@ impl<T: Transport> Conn<T> {
     #[cold]
     #[inline(never)]
     fn trace_back(&mut self, trace: Option<Box<RequestTrace>>) {
-        if let (true, Some(trace)) = (self.traces != 0, trace) {
-            with_traces(self.traces, |t| t.current = Some(trace));
+        if let (true, Some(trace)) = (self.traces.0 != 0, trace) {
+            with_traces(self.traces.0, |t| t.current = Some(trace));
         }
     }
 
@@ -2019,8 +2038,8 @@ impl<T: Transport> Conn<T> {
     #[inline(never)]
     fn trace_answered(&mut self, status: u16) {
         let handed = handed_back();
-        if self.traces != 0 {
-            with_traces(self.traces, |t| {
+        if self.traces.0 != 0 {
+            with_traces(self.traces.0, |t| {
                 if let Some(mut trace) = t.current.take().or(handed) {
                     trace.responded(status);
                     t.answered.push(*trace);
@@ -2032,7 +2051,7 @@ impl<T: Transport> Conn<T> {
     /// Everything answered has been written.
     #[inline]
     fn trace_written(&mut self) {
-        if self.traces != 0 {
+        if self.traces.0 != 0 {
             self.trace_written_slow();
         }
     }
@@ -2041,7 +2060,7 @@ impl<T: Transport> Conn<T> {
     #[inline(never)]
     fn trace_written_slow(&mut self) {
         // Finishing a trace does not reach `TRACES`.
-        with_traces(self.traces, |t| {
+        with_traces(self.traces.0, |t| {
             for trace in t.answered.drain(..) {
                 trace.finish();
             }
@@ -2054,12 +2073,42 @@ impl<T: Transport> Conn<T> {
     /// it there. An `async fn` that took it by value would keep it twice
     /// (the argument, and the variable it is moved into), and every idle
     /// connection would pay for the copy.
+    ///
+    /// A connection of an accept loop that turns out to be HTTP/2 (the
+    /// preface, with prior knowledge) goes on in a task of its own with what
+    /// HTTP/2 needs of it, and this one ends: this task is as large as the
+    /// HTTP/1.1 state, which HTTP/2 has no use for.
     fn serve<H: Handler>(self, handler: Rc<H>) -> impl Future<Output = ()> {
         let mut conn = self;
-        async move { conn.run(&*handler).await }
+        async move {
+            if let Some(input) = conn.run(&*handler).await {
+                let Conn {
+                    stream,
+                    cfg,
+                    peer,
+                    _slot: Some(slot),
+                    ..
+                } = conn
+                else {
+                    unreachable!("only a connection with a slot is handed over");
+                };
+                drop(giong::spawn(serve_h2(
+                    stream,
+                    cfg,
+                    peer,
+                    handler,
+                    slot,
+                    move || input,
+                )));
+            }
+        }
     }
 
-    async fn run<H: Handler>(&mut self, handler: &H) {
+    /// Serves the connection's requests until it closes. Returns what has
+    /// been received of an HTTP/2 connection, which the caller serves, if
+    /// the connection is an accept loop's (it has a slot); any other
+    /// connection is served to the end here.
+    async fn run<H: Handler>(&mut self, handler: &H) -> Option<Vec<u8>> {
         // Set when the connection closes with part of a request body unread.
         let mut linger = false;
         // Why the connection stops reading requests. Nothing is awaited
@@ -2085,7 +2134,7 @@ impl<T: Transport> Conn<T> {
                 (minor, head_only, connect, wants_keep_alive, req)
             };
 
-            let traced = self.traces != 0;
+            let traced = self.traces.0 != 0;
             // Only small values cross an `.await` from here on: a local kept
             // across more than one `.await` has its room in every state of
             // this future, waiting for the next request included.
@@ -2125,7 +2174,7 @@ impl<T: Transport> Conn<T> {
                                     // it would be kept across the waits.
                                     drop(first);
                                     if self.flush().await.is_err() {
-                                        return;
+                                        return None;
                                     }
                                     fut.await
                                 }
@@ -2152,7 +2201,7 @@ impl<T: Transport> Conn<T> {
                     });
                     match answer.await {
                         Ok(answered) => answered,
-                        Err(_) => return,
+                        Err(_) => return None,
                     }
                 }
             };
@@ -2208,7 +2257,7 @@ impl<T: Transport> Conn<T> {
                     .await
                     .is_err()
                 {
-                    return;
+                    return None;
                 }
             }
             if !keep_alive {
@@ -2218,7 +2267,7 @@ impl<T: Transport> Conn<T> {
             // Nothing may be appended after a separate body: send it now.
             let send_now = self.out.len() >= FLUSH_AT || !matches!(self.body, Body::Empty);
             if send_now && self.flush().await.is_err() {
-                return;
+                return None;
             }
         };
         match end {
@@ -2235,15 +2284,11 @@ impl<T: Transport> Conn<T> {
                 let input = self.buf[self.pos..].to_vec();
                 self.release_read_buffer_all();
                 self.charge.shrink_to(0);
+                if self._slot.is_some() {
+                    return Some(input);
+                }
                 HeapFuture::with(|| {
-                    crate::h2::serve(
-                        &self.stream,
-                        &self.cfg,
-                        &self.peer,
-                        handler,
-                        input,
-                        self._slot.as_ref(),
-                    )
+                    crate::h2::serve(&self.stream, &self.cfg, &self.peer, handler, input, None)
                 })
                 .await;
             }
@@ -2254,6 +2299,7 @@ impl<T: Transport> Conn<T> {
                 }
             }
         }
+        None
     }
 
     /// Writes the answer to a request that is refused without its handler

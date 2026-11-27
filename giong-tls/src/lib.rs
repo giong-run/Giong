@@ -1681,7 +1681,8 @@ impl TlsStream {
     }
 
     /// Receives one chunk of TLS data, decrypts it into `plain`, and sends
-    /// whatever the protocol wants to send in response.
+    /// whatever the protocol wants to send in response. For the handshake;
+    /// [`recv`](Self::recv) uses [`pump_established`](Self::pump_established).
     async fn pump(&self) -> io::Result<()> {
         // Records held back for the next send (see `hold_output`) go out
         // now if the receive has to wait: the peer may be waiting for them.
@@ -1714,18 +1715,7 @@ impl TlsStream {
             self.eof.set(true);
             return Ok(());
         }
-        let result = {
-            let mut conn = self.conn();
-            let mut plain = self.plain.borrow_mut();
-            // Data decrypted before a failure stays in `plain`.
-            let result = conn.read_tls(&chunk, &mut plain).map_err(read_error);
-            if conn.peer_closed() {
-                self.close_notify.set(true);
-                self.eof.set(true);
-            }
-            result
-        };
-        drop(chunk);
+        let result = self.decrypt(chunk);
         // Handshake messages, key updates, or the alert describing `result`.
         // Not being able to send them is no reason to withhold what was
         // received, if sending has failed before.
@@ -1733,6 +1723,61 @@ impl TlsStream {
             return result;
         }
         let flushed = self.flush_for_recv().await;
+        result.and(flushed)
+    }
+
+    /// Decrypts a received `chunk` into `plain` (the end of the stream if it
+    /// is empty), and gives the chunk back.
+    fn decrypt(&self, chunk: giong::RecvBuf) -> io::Result<()> {
+        if chunk.is_empty() {
+            self.eof.set(true);
+            return Ok(());
+        }
+        let mut conn = self.conn();
+        let mut plain = self.plain.borrow_mut();
+        // Data decrypted before a failure stays in `plain`.
+        let result = conn.read_tls(&chunk, &mut plain).map_err(read_error);
+        if conn.peer_closed() {
+            self.close_notify.set(true);
+            self.eof.set(true);
+        }
+        result
+    }
+
+    /// [`pump`](Self::pump) on an established stream, for
+    /// [`recv`](Self::recv). Every record it may send goes out without
+    /// waiting ([`flush_now`](Self::flush_now)), so its future holds no
+    /// send: a receive that waits, as an idle connection's does for as long
+    /// as the connection is idle, is the size of the socket's receive and
+    /// not of the handshake's sending (over 500 bytes more).
+    async fn pump_established(&self) -> io::Result<()> {
+        debug_assert!(self.established.get());
+        // Records held back for the next send (see `hold_output`) go out
+        // now if the receive has to wait: the peer may be waiting for them.
+        let ready = if !self.broken.get() && self.wants_send() {
+            poll_fn(|cx| Poll::Ready(self.tcp.poll_recv(cx))).await
+        } else {
+            Poll::Pending
+        };
+        let chunk = match ready {
+            Poll::Ready(chunk) => chunk?,
+            Poll::Pending => {
+                if !self.broken.get() && self.wants_send() {
+                    // As in `pump`: a failure marks the stream broken.
+                    let _ = self.flush_now();
+                }
+                // Cancelling here loses nothing: `recv` is cancel safe.
+                self.tcp.recv().await?
+            }
+        };
+        let result = self.decrypt(chunk);
+        // Once established, key updates wait for the next send (see
+        // `hold_output`); the alert describing a failure goes out now,
+        // unless sending has failed before.
+        if result.is_ok() || self.broken.get() {
+            return result;
+        }
+        let flushed = self.flush_now();
         result.and(flushed)
     }
 
@@ -1788,7 +1833,7 @@ impl TlsStream {
             if self.eof.get() {
                 return Ok(Vec::new());
             }
-            if let Err(e) = self.pump().await {
+            if let Err(e) = self.pump_established().await {
                 // Data that arrived intact before the failure comes first.
                 if self.plain.borrow().is_empty() {
                     return Err(e);
