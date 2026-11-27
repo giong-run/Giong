@@ -81,10 +81,12 @@
 # cloud VM (Linux 6.18, the same rustc and valgrind), main 81588a2 against
 # the change, scripts/instr.py on both, 3 rounds: http1 -1.5% (io_uring) and
 # -1.2% (epoll), web -2.3% and -2.1% (a handler's future is made in its heap
-# block instead of copied there); http1-client (-0.5%), https (-0.4%), h2
-# (-0.3%) and h2-streams (-0.2%) moved about half their limit or less and are
-# unchanged. CI's runners gave the same http1 and web counts as the VM within
-# 0.1% on an earlier version of the change. The idle rows are that version's
+# block instead of copied there). The instruction rows of http1-client, h2,
+# h2-streams and https: the change merged with main 1bdaec9 (after the client
+# change above), measured on the same VM, 3 rounds, against the rows above:
+# http1-client -0.6% (io_uring) and -0.5% (epoll), https -0.4%, h2 -0.3% and
+# -0.2%, h2-streams -0.2% and -0.3%. CI's runners gave the same http1 and web
+# counts as the VM within 0.1% on an earlier version of the change. The idle rows are that version's
 # CI run (45901272650), which gave the same heap bytes as the VM, as the final
 # version does: 744 bytes fewer per idle HTTP/1.1 connection, 1,248 per HTTP/2
 # and 784 per HTTPS. The io_uring idle-http1 heap row keeps its midpoint
@@ -108,13 +110,13 @@ io_uring,file-read,instructions,190.2,1
 io_uring,file-read,allocations,0.000,1
 io_uring,http1,instructions,8172.6,1
 io_uring,http1,allocations,1.000,1
-io_uring,http1-client,instructions,20094.3,1
+io_uring,http1-client,instructions,19973.4,1
 io_uring,http1-client,allocations,7.008,1
-io_uring,h2,instructions,28265.4,1
+io_uring,h2,instructions,28182.6,1
 io_uring,h2,allocations,14.001,1
-io_uring,h2-streams,instructions,225106.8,0.5
+io_uring,h2-streams,instructions,224663.8,0.5
 io_uring,h2-streams,allocations,150.005,0.5
-io_uring,https,instructions,31729.2,1
+io_uring,https,instructions,31605.0,1
 io_uring,https,allocations,13.035,1
 io_uring,web,instructions,10999.5,1
 io_uring,web,allocations,3.000,1
@@ -151,13 +153,13 @@ epoll,file-read,instructions,241.9,3
 epoll,file-read,allocations,0.016,1
 epoll,http1,instructions,9089.5,1
 epoll,http1,allocations,1.000,1
-epoll,http1-client,instructions,21183.7,1
+epoll,http1-client,instructions,21068.6,1
 epoll,http1-client,allocations,7.000,1
-epoll,h2,instructions,29393.4,1
+epoll,h2,instructions,29322.7,1
 epoll,h2,allocations,14.001,1
-epoll,h2-streams,instructions,226570.3,0.5
+epoll,h2-streams,instructions,225852.5,0.5
 epoll,h2-streams,allocations,150.004,0.5
-epoll,https,instructions,32814.9,1
+epoll,https,instructions,32684.9,1
 epoll,https,allocations,13.000,1
 epoll,web,instructions,11916.5,1
 epoll,web,allocations,3.000,1
