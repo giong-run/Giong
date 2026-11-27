@@ -183,10 +183,10 @@ moves bytes to the heap depending on timing, which made the heap per connection 
 
 | case | heap per connection | resident set per connection |
 |---|---:|---:|
-| `idle-http1` (io_uring / epoll) | 1,104 / 1,217 bytes | 1,356 / 1,442 bytes |
-| `idle-h2` (io_uring / epoll) | 2,398 / 2,415 bytes | 2,845 / 2,798 bytes |
-| `idle-https` (io_uring / epoll) | 5,029 / 5,046 bytes | 5,550 / 5,458 bytes |
-| `idle-h2-tls` (io_uring / epoll) | 6,277 / 6,294 bytes | 6,978 / 6,865 bytes |
+| `idle-http1` (io_uring / epoll) | 1,104 / 1,217 bytes | 1,202 / 1,329 bytes |
+| `idle-h2` (io_uring / epoll) | 2,398 / 2,415 bytes | 2,734 / 2,751 bytes |
+| `idle-https` (io_uring / epoll) | 5,029 / 5,046 bytes | 5,444 / 5,345 bytes |
+| `idle-h2-tls` (io_uring / epoll) | 6,277 / 6,294 bytes | 6,849 / 6,730 bytes |
 
 The instruction counts above were measured on a 4-vCPU Xeon VM (Linux 6.18), last on 2026-11-27,
 and are the same on CI's runners. The memory is from the CI run of the change that moved an
@@ -202,8 +202,8 @@ buffer, `idle-https` was 10,834 bytes
 ([`bench/results/tls-idle/`](../results/tls-idle/README.md)). The `idle-h2` and `idle-h2-tls`
 heap rows are 8 bytes lower since a shutdown signal holds no reference to the runtime, and every
 heap row 112 bytes lower since a connection's timeouts are one alarm and the connections of a
-worker share the server's settings (both measured on the same kind of VM, 2026-11-27; the
-resident-set column is still the CI run's). What CI compares against is `baseline.csv`.
+worker share the server's settings (both measured on the same kind of VM, 2026-11-27). The
+resident-set column is from the merge queue's CI run of that last change. What CI compares against is `baseline.csv`.
 
 ## When the check fails
 

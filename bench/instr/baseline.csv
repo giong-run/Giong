@@ -155,6 +155,12 @@
 # With one alarm per connection and the shared settings
 # (changelog.d/perf-http-conn-alarm.md), measured the same way: 1104.0, the
 # 112 bytes fewer per idle connection of every other idle row.
+# Every idle resident-set row: the merge queue's run of this change
+# (46070719430, on main 0a256f0 with the change), after the 112 to 120 heap
+# bytes fewer per idle connection above. Every row came out 1.7% to 11.3%
+# lower; the io_uring idle-http1 row, 153.6 bytes lower, also loses the
+# burst-sized driver buffers that #507's batched opening took out of its heap
+# row but that its resident-set row, taken before, still held.
 driver,case,metric,value,tolerance_pct
 io_uring,spawn,instructions,1100.4,1
 io_uring,spawn,allocations,1.000,1
@@ -191,16 +197,16 @@ io_uring,postgres-query,allocations,14.000,1
 io_uring,mysql-query,instructions,13033.6,1
 io_uring,mysql-query,allocations,23.000,1
 io_uring,idle-http1,heap_bytes,1104.0,1
-io_uring,idle-http1,rss_bytes,1355.8,10
+io_uring,idle-http1,rss_bytes,1202.2,10
 io_uring,idle-http1,allocations,3.030,1
 io_uring,idle-h2,heap_bytes,2397.9,1
-io_uring,idle-h2,rss_bytes,2844.7,10
+io_uring,idle-h2,rss_bytes,2734.1,10
 io_uring,idle-h2,allocations,24.050,1
 io_uring,idle-https,heap_bytes,5028.9,1
-io_uring,idle-https,rss_bytes,5550.1,10
+io_uring,idle-https,rss_bytes,5443.6,10
 io_uring,idle-https,allocations,121.180,1
 io_uring,idle-h2-tls,heap_bytes,6276.8,1
-io_uring,idle-h2-tls,rss_bytes,6977.5,10
+io_uring,idle-h2-tls,rss_bytes,6848.5,10
 io_uring,idle-h2-tls,allocations,141.220,1
 epoll,spawn,instructions,996.5,1
 epoll,spawn,allocations,1.000,1
@@ -237,14 +243,14 @@ epoll,postgres-query,allocations,14.000,1
 epoll,mysql-query,instructions,13860.7,1
 epoll,mysql-query,allocations,23.000,1
 epoll,idle-http1,heap_bytes,1216.6,1
-epoll,idle-http1,rss_bytes,1441.8,10
+epoll,idle-http1,rss_bytes,1329.2,10
 epoll,idle-http1,allocations,4.020,1
 epoll,idle-h2,heap_bytes,2414.6,1
-epoll,idle-h2,rss_bytes,2797.6,10
+epoll,idle-h2,rss_bytes,2750.5,10
 epoll,idle-h2,allocations,24.050,1
 epoll,idle-https,heap_bytes,5045.6,1
-epoll,idle-https,rss_bytes,5457.9,10
+epoll,idle-https,rss_bytes,5345.3,10
 epoll,idle-https,allocations,121.160,1
 epoll,idle-h2-tls,heap_bytes,6293.5,1
-epoll,idle-h2-tls,rss_bytes,6864.9,10
+epoll,idle-h2-tls,rss_bytes,6729.7,10
 epoll,idle-h2-tls,allocations,141.150,1
