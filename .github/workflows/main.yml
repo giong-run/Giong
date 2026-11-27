@@ -67,4 +67,9 @@ jobs:
   ci:
     needs: already-tested
     if: ${{ !cancelled() && needs.already-tested.outputs.by == '' }}
+    # ci.yml's all-checks may post a commit status (only on a run Prepare release starts);
+    # a called workflow gets no more than its caller allows.
+    permissions:
+      contents: read
+      statuses: write
     uses: ./.github/workflows/ci.yml
