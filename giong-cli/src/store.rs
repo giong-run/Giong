@@ -16,10 +16,13 @@
 //!   byte for byte the same (compared, not hashed), and the object belongs to
 //!   the same user and cannot be written by others. What cargo reads is what
 //!   it built.
-//! - **Nothing writes into a shared file.** rustc and every linker write a
-//!   new file and rename it over the old one: a rebuild gives the project a
-//!   file of its own and leaves the object alone (`rustc_replaces_its_outputs`
-//!   checks this on each platform CI runs).
+//! - **Nothing writes into a shared file.** rustc writes a new library and
+//!   its metadata and renames them over the old ones, and so do the linkers
+//!   of Linux and macOS for shared libraries and programs: a rebuild gives
+//!   the project a file of its own and leaves the object alone
+//!   (`rustc_replaces_its_outputs` checks this on each platform CI runs).
+//!   MSVC's `link.exe` writes into the file it finds, so on Windows only
+//!   libraries and their metadata are shared.
 //! - **Cargo still sees its builds as fresh.** Cargo up to 1.100 calls a unit
 //!   stale when one of its dependencies' output files is newer than its own,
 //!   and a hard link shares one modification time between projects. So every
@@ -797,20 +800,24 @@ pub fn share(
     Ok(pass)
 }
 
-/// The files rustc writes by renaming a new file over the old one: the
-/// libraries, their metadata, proc-macro libraries and build-script
-/// programs (`rustc_replaces_its_outputs` checks each on every platform).
+/// The files a build writes by renaming a new file over the old one, so a
+/// rebuild never writes into a shared object. rustc writes libraries and
+/// their metadata that way on every platform. Proc-macro libraries and
+/// build-script programs come from the platform's linker: the linkers of
+/// Linux and macOS replace the file too, but MSVC's `link.exe` writes into
+/// the one it finds, so on Windows they stay each project's own.
+/// `rustc_replaces_its_outputs` checks every kind this shares.
 fn rustc_writes(path: &Path) -> bool {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("")
         .to_ascii_lowercase();
-    [".rlib", ".rmeta", ".so", ".dylib", ".dll"]
-        .iter()
-        .any(|ext| name.ends_with(ext))
-        || name == "build_script_build"
-        || name == "build_script_build.exe"
+    if name.ends_with(".rlib") || name.ends_with(".rmeta") {
+        return true;
+    }
+    !cfg!(windows)
+        && ([".so", ".dylib"].iter().any(|ext| name.ends_with(ext)) || name == "build_script_build")
 }
 
 enum Placed {
@@ -1704,11 +1711,21 @@ mod tests {
         fs::remove_dir_all(&t).unwrap();
     }
 
-    /// The store is safe only if rustc never writes into an existing output
-    /// (a shared file would change under every project). On each platform:
-    /// an rlib, an rmeta, a proc-macro and a binary, each a hard link to a
-    /// "store" copy, are built again with different code; the store copies
-    /// must not change.
+    /// Whether the store shares a file of this kind. The test's program is
+    /// `b`, where cargo's is `build_script_build`.
+    fn shared_kind(path: &Path) -> bool {
+        let name = path.file_name().unwrap().to_string_lossy().to_lowercase();
+        match name.strip_suffix(".exe").unwrap_or(&name) {
+            "b" => rustc_writes(Path::new(&name.replacen('b', "build_script_build", 1))),
+            _ => rustc_writes(path),
+        }
+    }
+
+    /// The store is safe only if a build never writes into an output it
+    /// shares (a shared file would change under every project). On each
+    /// platform: an rlib, an rmeta, a proc-macro and a binary, each a hard
+    /// link to a "store" copy, are built again with different code; the
+    /// store copies of every kind [`rustc_writes`] shares must not change.
     #[test]
     fn rustc_replaces_its_outputs() {
         let rustc = std::env::var("RUSTC").unwrap_or_else(|_| "rustc".into());
@@ -1778,16 +1795,17 @@ mod tests {
             fs::hard_link(&k, &p).unwrap();
             kept.push((k.clone(), fs::read(&k).unwrap()));
         }
-        assert!(kept.len() >= 4, "{kept:?}");
+        // What the store would share: at least a library and its metadata,
+        // and on Linux and macOS the proc-macro library and the program too.
+        let shared = kept.iter().filter(|(k, _)| shared_kind(k)).count();
+        assert!(shared >= if cfg!(windows) { 2 } else { 4 }, "{kept:?}");
         build(2);
-        for (k, before) in &kept {
-            assert_eq!(
-                &fs::read(k).unwrap(),
-                before,
-                "{} was written into",
-                k.display()
-            );
-        }
+        let written: Vec<_> = kept
+            .iter()
+            .filter(|(k, before)| shared_kind(k) && fs::read(k).unwrap() != *before)
+            .map(|(k, _)| k.display().to_string())
+            .collect();
+        assert!(written.is_empty(), "written into in place: {written:?}");
         fs::remove_dir_all(&t).unwrap();
     }
 }

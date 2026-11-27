@@ -44,9 +44,11 @@ dependencies no other project has.
 - A file a build script wrote into `OUT_DIR` (the C code of `ring`, SQLite) is never shared:
   a build script that runs again may write into the file it finds there, which would change
   every project's copy. Only what rustc writes (libraries, metadata, proc-macro libraries,
-  build-script programs) is shared, because rustc writes a new file and renames it over the
-  old one (`rustc_replaces_its_outputs` in `giong-cli/src/store.rs` checks this on every
-  platform CI runs).
+  build-script programs) is shared, because rustc and the linkers of Linux and macOS write a
+  new file and rename it over the old one (`rustc_replaces_its_outputs` in
+  `giong-cli/src/store.rs` checks this on every platform CI runs). MSVC's `link.exe` writes
+  into the file it finds, so on Windows proc-macro libraries and build-script programs stay
+  per project and only libraries and their metadata are shared.
 - A crate whose build script generates code includes the project's own path in its build
   (serde's does), so its bytes differ per project, and so do the crates built on it with the
   same features. Different features give different bytes too. Measured on four projects:
