@@ -1,0 +1,4 @@
+# gzip.sh 2026-11-27T10:10:04Z: server br-1 7.0.0-44-generic on CPUs 0-7, loadgen on 10.40.96.4 with 16 threads and 'Accept-Encoding: gzip', 10 s per measurement after 2 s of warm-up
+# PR #429 at 03b79ca; bench/giong-web there binds BENCH_HOST:3011 (build.sh)
+# miniz /json: 200 27 bytes, headers: Content-Length: 27
+# fast /json: 200 27 bytes, headers: Content-Length: 27

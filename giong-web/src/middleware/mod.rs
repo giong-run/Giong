@@ -39,9 +39,9 @@ mod timeout;
 #[cfg(feature = "tracing")]
 mod trace;
 
-#[cfg(any(test, fuzzing))]
-pub(crate) use compression::gunzip;
 pub use compression::Compression;
+#[cfg(any(test, fuzzing))]
+pub(crate) use compression::{check_round_trip, gunzip};
 pub use cors::Cors;
 pub use logger::Logger;
 pub use record::Record;
