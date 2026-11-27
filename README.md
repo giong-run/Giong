@@ -960,6 +960,20 @@ scripts/        check.sh (repeated tests, fallback setups, epoll, seccomp, Threa
 assets/         logo, icons, social preview (sources in assets/README.md)
 ```
 
+## Contributors
+
+giong is written by [@thekivashyn](https://github.com/thekivashyn), with contributions
+from:
+
+- [@alejandrodev-vn](https://github.com/alejandrodev-vn): found the file descriptors left
+  open at runtime shutdown ([#4](https://github.com/giong-run/Giong/issues/4), fixed in 0.2.1).
+- [@concacotdua](https://github.com/concacotdua): the `fast-gzip` feature of giong-web,
+  31% less server CPU per gzipped response
+  ([#429](https://github.com/giong-run/Giong/pull/429), shipped in 1.5.4).
+
+Every release thanks its contributors in [CHANGELOG.md](CHANGELOG.md) and on its GitHub
+Release page. [CONTRIBUTING.md](CONTRIBUTING.md) explains how to make a first contribution.
+
 ## License
 
 Dual-licensed under either of

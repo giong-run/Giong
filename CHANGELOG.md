@@ -41,8 +41,9 @@ requests per second on one worker. No API is removed or changed.
   second on one worker and 43.5% more on four, a lower p99 at every load, and 4% smaller
   bodies. Responses without gzip are unchanged. Larger bodies and other levels keep the
   pure Rust compressor. The binary grows by about 90 KiB and building needs a C compiler. A
-  new fuzz target checks both compressors against an independent decoder. Contributed by concacotdua
-  ([#429](https://github.com/giong-run/Giong/pull/429)).
+  new fuzz target checks both compressors against an independent decoder
+  ([#429](https://github.com/giong-run/Giong/pull/429), thanks to
+  [@concacotdua](https://github.com/concacotdua)).
 
 ### Security
 
