@@ -976,8 +976,12 @@ jobs:
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5
+    # For the commit status below; the job checks nothing out.
+    permissions:
+      statuses: write
     steps:
-      - env:
+      - id: verdict
+        env:
           NEEDS: ${{ toJSON(needs) }}
           HEAVY: ${{ needs.plan.outputs.heavy }}
           EVENT: ${{ github.event_name }}
@@ -991,3 +995,20 @@ jobs:
           else
               jq -e 'all(.[]; .result == "success")' <<<"$NEEDS" > /dev/null
           fi
+      # The required check is "CI gate", which ci-gate.yml posts when a run of CI ends. GitHub
+      # starts no workflow_run for a run whose actor is github-actions[bot], so the run that
+      # Prepare release dispatches on its release branch (release.py --dispatch-ci) never
+      # got a gate. With the pull request's own runs (opened by the bot as well) in the same
+      # case, 1.5.2's release pull request stayed blocked with every check green. Such a run
+      # posts the status itself, with this job's verdict.
+      - name: Gate a run that ci-gate.yml cannot see
+        if: always() && github.event_name == 'workflow_dispatch' && github.actor == 'github-actions[bot]'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          STATE: ${{ steps.verdict.outcome == 'success' && 'success' || 'failure' }}
+          URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+        run: >
+          gh api -X POST "repos/$GITHUB_REPOSITORY/statuses/$GITHUB_SHA"
+          -f state="$STATE" -f context="CI gate"
+          -f description="CI $STATE (a run started by Prepare release, which ci-gate.yml cannot see)"
+          -f target_url="$URL"

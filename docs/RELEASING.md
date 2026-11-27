@@ -46,7 +46,11 @@ request; everything else is automated and safe to re-run.
    to the bounded channel; no alias was kept (STABILITY.md, *Changes made before 1.0*).
    From 1.0.0 on a deprecated item stays for the rest of 1.x. Thank outside contributors in
    the entry for their change: `([#4](…/issues/4), thanks to [@name](https://github.com/name))`.
-   CI runs on the branch as on any pull request.
+   CI runs on the branch as on any pull request. The pull request and the CI run that
+   Prepare release starts are github-actions' own, so their workflows wait until someone
+   with write access presses *Approve and run workflows* on the pull request. The run
+   Prepare release dispatches posts the required `CI gate` status itself: GitHub starts
+   no `ci-gate.yml` for a run of github-actions.
 
 3. **Merge it.** Squash-merge as usual. That is the last manual step:
    - `release-tag.yml` sees the new version on `main`, tags the merge commit `vX.Y.Z`
