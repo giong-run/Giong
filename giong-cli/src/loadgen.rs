@@ -743,7 +743,12 @@ mod tests {
             vec![b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nbody until close"],
             Some(1),
         );
-        let o = run(&plan(addr, None));
+        // At a fixed rate: about 140 connections show the reconnects as well
+        // as the 1,500 to 5,000 that as fast as it answers opened, and once
+        // in hundreds of runs on Windows one of those loopback connects timed
+        // out (#517), with the server's side of each closed connection in
+        // TIME_WAIT on the same port.
+        let o = run(&plan(addr, Some(400.0)));
         assert_eq!(o.failed, 0, "{:?}", o.first_error);
         assert!(o.connects > 4 && o.connects >= o.answered(), "{o:?}");
         // A keep-alive answer the server then drops: retried once, not failed.
