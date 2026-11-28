@@ -171,6 +171,9 @@ pub fn read_request(stream: &mut impl Read) -> Result<Req, Option<Refusal>> {
         match stream.read(&mut chunk) {
             Ok(0) => return Err(None),
             Ok(n) => buf.extend_from_slice(&chunk[..n]),
+            // A signal, as the SIGCHLD of a process another thread started,
+            // ends a read with a timeout early (#537).
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e)
                 if matches!(
                     e.kind(),
@@ -258,6 +261,7 @@ pub fn read_request(stream: &mut impl Read) -> Result<Req, Option<Refusal>> {
         match stream.read(&mut chunk) {
             Ok(0) => return Err(None),
             Ok(n) => body.extend_from_slice(&chunk[..n]),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
             Err(e)
                 if matches!(
                     e.kind(),
@@ -425,6 +429,38 @@ mod tests {
 
     fn req(raw: &str) -> Result<Req, Option<Refusal>> {
         read_request(&mut raw.as_bytes())
+    }
+
+    #[test]
+    fn a_read_a_signal_ends_early_is_read_again() {
+        // The SIGCHLD of a process another thread started ends a read with
+        // a timeout with EINTR (#537): the request is still read whole.
+        struct Interrupting(Vec<&'static [u8]>, bool);
+        impl Read for Interrupting {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                self.1 = !self.1;
+                if self.1 {
+                    return Err(std::io::ErrorKind::Interrupted.into());
+                }
+                if self.0.is_empty() {
+                    return Ok(0);
+                }
+                let piece = self.0.remove(0);
+                buf[..piece.len()].copy_from_slice(piece);
+                Ok(piece.len())
+            }
+        }
+        let mut stream = Interrupting(
+            vec![
+                b"POST /api/x HTTP/1.1\r\n",
+                b"Content-Length: 4\r\n\r\nab",
+                b"cd",
+            ],
+            false,
+        );
+        let r = read_request(&mut stream).map_err(|e| e.is_some()).unwrap();
+        assert_eq!((r.method.as_str(), r.path.as_str()), ("POST", "/api/x"));
+        assert_eq!(r.body, b"abcd");
     }
 
     fn get(path: &str, headers: &[(&str, &str)]) -> Req {

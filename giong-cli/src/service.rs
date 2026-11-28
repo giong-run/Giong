@@ -478,7 +478,13 @@ fn exchange<S: Stream>(
                 return Err(e);
             }
         }
-        let n = s.read(&mut chunk).map_err(timeout)?;
+        let n = match s.read(&mut chunk) {
+            // A signal, as the SIGCHLD of a process another thread started,
+            // ends a read with a timeout early (#537): again, with what is
+            // left of the deadline.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            r => r.map_err(timeout)?,
+        };
         if n == 0 {
             break;
         }
@@ -576,6 +582,55 @@ fn dechunk(mut rest: &[u8]) -> Result<Vec<u8>, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Answers with `pieces`, each read ended once by a signal first.
+    struct Interrupting {
+        pieces: Vec<&'static [u8]>,
+        interrupted: bool,
+    }
+
+    impl Read for Interrupting {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            self.interrupted = !self.interrupted;
+            if self.interrupted {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            if self.pieces.is_empty() {
+                return Ok(0);
+            }
+            let piece = self.pieces.remove(0);
+            buf[..piece.len()].copy_from_slice(piece);
+            Ok(piece.len())
+        }
+    }
+
+    impl Write for Interrupting {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    impl Stream for Interrupting {
+        fn timeouts(&self, _: Duration) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn a_read_a_signal_ends_early_is_read_again() {
+        // The SIGCHLD of a process another thread started ends a read with
+        // a timeout with EINTR (#537).
+        let mut s = Interrupting {
+            pieces: vec![b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\n", b"{}"],
+            interrupted: false,
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let answer = exchange(&mut s, "POST / HTTP/1.1\r\n\r\n", "", deadline).unwrap();
+        assert!(answer.ends_with(b"\r\n\r\n{}"), "{answer:?}");
+    }
 
     #[test]
     fn a_server_that_trickles_or_stays_silent_times_out() {

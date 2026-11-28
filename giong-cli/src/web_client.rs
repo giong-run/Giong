@@ -240,6 +240,10 @@ pub fn send(base: &Base, req: &Outgoing, timeout: Duration) -> Result<Answer, Se
             .map_err(|e| SendError::Connect(e.to_string()))?;
         let n = match stream.read(&mut chunk) {
             Ok(n) => n,
+            // A signal, as the SIGCHLD of a process another thread started,
+            // ends a read with a timeout early (#537): again, with what is
+            // left of the deadline.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e)
                 if matches!(
                     e.kind(),
