@@ -254,23 +254,16 @@ fn share(store: &Store, dirs: &[String]) -> Result<Report, Failure> {
                     }));
                 }
                 Err(skip) => {
-                    let severity = match skip {
-                        store::Skip::CannotLink(_) | store::Skip::Io(_) => Severity::Warning,
-                        _ => Severity::Info,
-                    };
                     r.push(
                         Finding::new(
                             Code::STORE_UNUSABLE,
-                            severity,
+                            skip_severity(&skip),
                             format!("{} was skipped: {}", profile.display(), skip.why()),
                         )
-                        .fix(match skip {
-                            store::Skip::Busy => "run giong cache share again once the build ends",
-                            store::Skip::CannotLink(_) => {
-                                "set GIONG_STORE_DIR to a directory on the same drive as the project"
-                            }
-                            _ => "rustup update stable, then build the project again",
-                        }),
+                        .fix(skip_fix(
+                            &skip,
+                            "run giong cache share again once the build ends",
+                        )),
                     );
                 }
             }
@@ -327,16 +320,41 @@ fn fill(store: &Store) -> Result<Report, Failure> {
         Err(skip) => r.push(
             Finding::new(
                 Code::STORE_UNUSABLE,
-                Severity::Info,
+                skip_severity(&skip),
                 format!("{} was not filled: {}", p.build_dir.display(), skip.why()),
             )
-            .fix(match skip {
-                store::Skip::Busy => "run giong cache fill again once the build ends",
-                _ => "check that cargo generate-lockfile works in the project",
-            }),
+            .fix(skip_fix(
+                &skip,
+                "run giong cache fill again once the build ends",
+            )),
         ),
     }
     Ok(r)
+}
+
+/// How much a project the store skipped matters: a build in progress or an
+/// old cargo is expected, a store that cannot work is not.
+fn skip_severity(skip: &store::Skip) -> Severity {
+    match skip {
+        store::Skip::CannotLink(_) | store::Skip::Io(_) => Severity::Warning,
+        store::Skip::Busy | store::Skip::OldLayout => Severity::Info,
+    }
+}
+
+/// What to do about a project the store skipped, for each cause; `busy` is
+/// the command to run again once the build ends.
+fn skip_fix(skip: &store::Skip, busy: &'static str) -> &'static str {
+    match skip {
+        store::Skip::Busy => busy,
+        store::Skip::OldLayout => "rustup update stable, then build the project again",
+        store::Skip::CannotLink(_) => {
+            "set GIONG_STORE_DIR to a directory on the same drive as the project"
+        }
+        store::Skip::Io(_) => {
+            "check that the project's build directory and the store can be written (the error \
+             names the file), and that cargo generate-lockfile works in the project"
+        }
+    }
 }
 
 fn gc(store: &Store, budget: Option<u64>, dry: bool) -> Report {
@@ -409,4 +427,29 @@ fn gc(store: &Store, budget: Option<u64>, dry: bool) -> Report {
         ),
     );
     r
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_skipped_project_gets_the_fix_for_its_cause() {
+        let fix = |skip: store::Skip| skip_fix(&skip, "run it again");
+        assert_eq!(fix(store::Skip::Busy), "run it again");
+        assert!(fix(store::Skip::OldLayout).starts_with("rustup update"));
+        assert!(fix(store::Skip::CannotLink("EXDEV".into())).contains("GIONG_STORE_DIR"));
+        // A write that failed is not fixed by a newer Rust, as it used to
+        // say for `giong cache share`.
+        let io = fix(store::Skip::Io("permission denied".into()));
+        assert!(
+            !io.contains("rustup") && io.contains("can be written"),
+            "{io}"
+        );
+        assert_eq!(skip_severity(&store::Skip::Busy), Severity::Info);
+        assert_eq!(
+            skip_severity(&store::Skip::Io(String::new())),
+            Severity::Warning
+        );
+    }
 }
