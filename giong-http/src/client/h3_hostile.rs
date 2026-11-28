@@ -188,7 +188,7 @@ fn honest(src: &mut impl Source) -> Vec<u8> {
 fn misplaced(src: &mut impl Source) -> Vec<u8> {
     let mut out = Vec::new();
     match src.below(6) {
-        0 => Settings::write_frame(&mut out, 1 << 20),
+        0 => Settings::write_frame(&mut out, 1 << 20, 0),
         1 => frame::write_goaway(&mut out, 4 * src.below(100) as u64),
         2 => {
             Header::write(&mut out, kind::PUSH_PROMISE, 3);
@@ -270,7 +270,7 @@ async fn own_stream(conn: &Connection, src: &mut impl Source, held: &mut Vec<Sen
         // A second control stream.
         3 => {
             out.push(0x00);
-            Settings::write_frame(&mut out, 1 << 20);
+            Settings::write_frame(&mut out, 1 << 20, 0);
         }
         // A stream of a kind no one knows.
         4 => {
@@ -304,7 +304,7 @@ pub async fn serve(conn: Connection, mut src: impl Source) {
         }
         _ => {
             let mut out = vec![0x00];
-            Settings::write_frame(&mut out, 1 << 20);
+            Settings::write_frame(&mut out, 1 << 20, 0);
             Some((out, true))
         }
     };

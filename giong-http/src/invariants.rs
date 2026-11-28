@@ -656,6 +656,12 @@ pub fn check_qpack(input: &[u8]) -> bool {
     crate::h3::qpack::check(input)
 }
 
+/// Checks the QPACK dynamic table on `input` (see
+/// `h3::qpack::check_table`).
+pub fn check_qpack_table(input: &[u8]) -> bool {
+    crate::h3::qpack::check_table(input)
+}
+
 /// What HTTP/3 framing must guarantee for any bytes: reading never panics
 /// and never claims more than it was given; a frame header that reads
 /// writes back to bytes that read the same; SETTINGS and the one-integer
@@ -690,12 +696,20 @@ pub fn check_h3_frames(input: &[u8]) -> bool {
     }
     if let Ok(settings) = Settings::parse(input) {
         let mut out = Vec::new();
-        Settings::write_frame(&mut out, settings.max_field_section_size);
+        let table = settings.qpack_max_table_capacity;
+        Settings::write_frame(&mut out, settings.max_field_section_size, table);
         let Ok(Need::Got(header)) = Header::read(&out, On::Control) else {
             panic!("our SETTINGS frame has a header");
         };
         let ours = Settings::parse(&out[header.size..]).expect("our SETTINGS parse");
         assert_eq!(ours.max_field_section_size, settings.max_field_section_size);
+        assert_eq!(ours.qpack_max_table_capacity, table);
+        if table > 0 {
+            assert_eq!(
+                ours.qpack_blocked_streams,
+                crate::h3::qpack::BLOCKED_STREAMS
+            );
+        }
     }
     if let Ok(id) = parse_single_id(input) {
         assert_eq!(read_varint(input), Some((id, input.len())));
@@ -772,7 +786,7 @@ pub fn h3_input(data: &[u8]) -> H3Input {
                     0,
                 ],
             ),
-            _ => Settings::write_frame(&mut control, 1 << 20),
+            _ => Settings::write_frame(&mut control, 1 << 20, 0),
         }
         input.control = Some(control);
     }
