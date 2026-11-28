@@ -142,8 +142,16 @@ impl Request {
     }
 
     fn head_str(&self, range: Range<usize>) -> &str {
-        // The parser only accepts ASCII in the method and the target.
-        std::str::from_utf8(&self.head_bytes()[range]).unwrap_or("")
+        // The parser only accepts ASCII in the method and the target, and
+        // an ASCII check is cheaper than a UTF-8 one: these two are read for
+        // every request, and again by every handler that looks.
+        let bytes = &self.head_bytes()[range];
+        if bytes.is_ascii() {
+            // SAFETY: ASCII bytes are valid UTF-8, checked just above.
+            unsafe { std::str::from_utf8_unchecked(bytes) }
+        } else {
+            std::str::from_utf8(bytes).unwrap_or("")
+        }
     }
 
     /// The request method, e.g. `GET`. Case-sensitive, as sent.

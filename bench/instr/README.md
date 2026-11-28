@@ -52,12 +52,12 @@ instructions per request.
 | `tcp-echo` | 64 bytes to an echo task and back over TCP | 3,196 | 4,134 |
 | `udp-echo` | a 64-byte datagram to an echo task and back | 3,712 | 4,454 |
 | `file-read` | read 4 KiB at an offset of an open file (page cache) | 190 | 242 |
-| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 6,847 | 7,758 |
+| `http1` | giong-http server, `GET /json` over HTTP/1.1 keep-alive, raw client | 6,821 | 7,735 |
 | `http1-client` | giong-http client and server, HTTP/1.1 | 18,357 | 19,447 |
 | `h2` | giong-http client and server, HTTP/2 (prior knowledge) | 27,555 | 28,679 |
-| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 217,154 | 218,240 |
+| `h2-streams` | ten HTTP/2 requests at once on one connection, client and server | 216,483 | 217,743 |
 | `https` | giong-http client and server over TLS (rustls), HTTP/1.1 | 29,222 | 30,310 |
-| `web` | a giong-web router with a path parameter, raw client | 9,675 | 10,592 |
+| `web` | a giong-web router with a path parameter, raw client | 9,346 | 10,260 |
 | `redis-get` | giong-redis `GET` against a fake server | 7,723 | 8,500 |
 | `postgres-query` | giong-postgres query, one parameter, one row, fake server | 9,542 | 10,368 |
 | `mysql-query` | giong-mysql query, one parameter, one row, fake server | 13,034 | 13,861 |
@@ -183,13 +183,14 @@ moves bytes to the heap depending on timing, which made the heap per connection 
 
 | case | heap per connection | resident set per connection |
 |---|---:|---:|
-| `idle-http1` (io_uring / epoll) | 1,104 / 1,217 bytes | 1,202 / 1,329 bytes |
+| `idle-http1` (io_uring / epoll) | 1,080 / 1,193 bytes | 1,186 / 1,313 bytes |
 | `idle-h2` (io_uring / epoll) | 2,398 / 2,415 bytes | 2,734 / 2,751 bytes |
-| `idle-https` (io_uring / epoll) | 5,029 / 5,046 bytes | 5,444 / 5,345 bytes |
+| `idle-https` (io_uring / epoll) | 5,005 / 5,022 bytes | 5,423 / 5,329 bytes |
 | `idle-h2-tls` (io_uring / epoll) | 6,277 / 6,294 bytes | 6,849 / 6,730 bytes |
 
 The instruction counts above were measured on a 4-vCPU Xeon VM (Linux 6.18), last on 2026-11-27,
-and are the same on CI's runners. The memory is from the CI run of the change that moved an
+and are the same on CI's runners; `http1`, `h2-streams`, `web` and the `idle-http1` and
+`idle-https` rows are from the CI run of the write-alarm change (2026-11-28). The memory is from the CI run of the change that moved an
 HTTP/2 connection to a task of its own and made the futures of TLS receives and of writes
 smaller (2026-11-27), which gave the same heap bytes as a 4-vCPU VM: before it, 1,318, 3,318,
 5,285 and 9,683 bytes on io_uring

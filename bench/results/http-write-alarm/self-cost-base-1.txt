@@ -1,0 +1,125 @@
+total 5577
+   1018  <giong_http::server::Conn<giong::net::TcpStream>>::run::<bench_giong_http::handler>::{closure#0}
+    580  giong_http::parse::parse_head
+    258  <giong_http::server::Conn<giong::net::TcpStream>>::read_more::{closure#0}
+    248  <giong::driver::uring::Uring>::reap_now
+    225  <giong::net::TcpStream>::write_all::<alloc::vec::Vec<u8>>::{closure#0}
+    192  <giong::op::Op<alloc::vec::Vec<u8>> as core::future::future::Future>::poll
+    170  bench_giong_http::handler::{closure#0}
+    169  <giong::runtime::Worker>::drive
+    152  <giong_http::server::Conn<giong::net::TcpStream>>::flush::{closure#0}
+    142  <giong::net::StreamSocket>::poll_recv
+    140  core::str::converts::from_utf8
+    140  <giong_http::server::Conn<giong::net::TcpStream>>::recv_until::{closure#0}
+    134  giong_http::parse::valid_host
+    133  <giong::time::Timers>::insert_entry
+    123  <giong_http::response::Response>::write_head
+    105  giong_http::date::now
+    101  <giong::driver::Driver>::poll_multi
+     99  <giong::time::Sleep as core::future::future::Future>::poll
+     88  giong::runtime::with_worker::<core::task::poll::Poll<giong::time::Rang>, <giong::time::Alarm>::poll::{closure#0}>
+     83  __memcpy_avx_unaligned_erms
+     79  <giong::executor::TaskWaker as alloc::task::Wake>::wake_by_ref
+     72  <giong::executor::LocalTask<<giong_http::server::Conn<giong::net::TcpStream>>::serve<bench_giong_http::handler>::{closure#0}> as giong::executor::Runnable>::run
+     72  giong_http::server::give_buffer
+     68  <giong::driver::Driver>::start
+     65  <giong::time::Sleep>::unregister
+     65  <std::sys::pal::unix::time::Timespec>::sub_timespec
+     59  <giong_http::response::Response>::write_to
+     54  <giong_http::server::Conn<giong::net::TcpStream>>::append
+     54  <giong::driver::Driver>::poll_op
+     52  giong_http::response::push_number
+     48  <giong::driver::uring::Uring>::push
+     46  <giong_http::server::Slot>::set_idle
+     44  giong_http::server::take_buffer
+     36  core::ptr::drop_glue::<giong_http::heap::HeapFuture<giong_http::server::Caught<bench_giong_http::handler::{closure#0}>>>
+     36  <giong_http::server::Caught<bench_giong_http::handler::{closure#0}> as core::future::future::Future>::poll
+     34  <giong::slab::Slab<giong::driver::uring::OpState>>::insert
+     34  <std::sys::pal::unix::time::Timespec>::now
+     28  core::ptr::drop_glue::<giong::op::Op<alloc::vec::Vec<u8>>>
+     27  <giong_http::server::Conn<giong::net::TcpStream>>::release_read_buffer
+     26  <giong::net::MultiSlot>::key
+     25  <giong::time::Timers>::unlink
+     24  clock_gettime@@GLIBC_2.17
+     23  core::ptr::drop_glue::<alloc::vec::Vec<alloc::boxed::Box<dyn core::ops::function::FnOnce<(), Output = ()> + core::marker::Send>>>
+     21  alloc::task::raw_waker::wake::<giong::executor::TaskWaker>
+     20  giong::time::turn_clock
+     20  core::ptr::drop_glue::<giong_http::response::Body>
+     19  <giong::buf::BufPool>::release
+     18  core::ptr::drop_glue::<giong_http::request::Request>
+     15  core::ptr::drop_glue::<<giong_http::server::Conn<giong::net::TcpStream>>::flush::{closure#0}>
+     15  core::ptr::drop_glue::<bench_giong_http::handler::{closure#0}>
+     15  core::ptr::drop_glue::<giong::driver::uring::OpState>
+     13  alloc::task::raw_waker::clone_waker::<giong::executor::TaskWaker>
+     12  <std::time::Instant as core::ops::arith::Add<core::time::Duration>>::add
+     12  core::ptr::drop_glue::<<giong_http::server::Conn<giong::net::TcpStream>>::read_more::{closure#0}>
+      8  core::ptr::drop_glue::<<giong::net::StreamSocket>::write_all<alloc::vec::Vec<u8>>::{closure#0}>
+      7  <giong::runtime::Worker>::fire_timers_now
+      5  <giong::driver::Driver>::park
+      3  alloc::task::raw_waker::drop_waker::<giong::executor::TaskWaker>
+      2  giong::observe::clock_ns
+      1  syscall
+      0  <giong::buf::BufPool>::recycle
+      0  <giong::runtime::Worker>::run::<<giong::runtime::Runtime>::run<bench_giong_http::main::{closure#3}, bench_giong_http::main::{closure#3}::{closure#0}>::{closure#
+      0  __memset_avx2_unaligned_erms
+      0  <giong_http::server::Server>::accept_loop::<giong::net::TcpStream, <giong::net::TcpListener>::accept::{closure#0}, <giong_http::server::Server>::serve<bench_gio
+      0  _int_free
+      0  malloc
+      0  _int_malloc
+      0  <giong_http::server::Server>::accept_loop::<giong::net::TcpStream, <giong::net::TcpListener>::accept::{closure#0}, <giong_http::server::Server>::serve<bench_gio
+      0  free
+      0  <giong_http::server::Server>::serve::<bench_giong_http::handler>::{closure#0}
+      0  <giong::driver::Driver>::drop_multi
+      0  <std::hash::random::RandomState as core::hash::BuildHasher>::hash_one::<&usize>
+      0  <giong::runtime::ShutdownSignal as core::future::future::Future>::poll
+      0  <giong::net::TcpListener>::poll_next
+      0  <giong::executor::JoinState<()>>::complete
+      0  <giong::time::Alarm as core::ops::drop::Drop>::drop
+      0  giong::net::close_socket
+      0  send
+      0  <giong::driver::Driver>::ensure_recv_buffer
+      0  <core::hash::sip::Hasher<core::hash::sip::Sip13Rounds> as core::hash::Hasher>::write
+      0  <giong_http::server::Slot as core::ops::drop::Drop>::drop
+      0  <giong_http::server::Slot>::set_fd
+      0  <giong::runtime::ShutdownSignal as core::ops::drop::Drop>::drop
+      0  <giong::net::TcpListener>::accept::{closure#0}
+      0  <giong_http::server::Conn<giong::net::TcpStream>>::close_write::{closure#0}
+      0  _int_free_merge_chunk
+      0  giong_http::memory::low
+      0  <alloc::raw_vec::RawVecInner>::finish_grow
+      0  <giong::driver::Driver>::arm_multi
+      0  <giong::runtime::Worker>::retire
+      0  <giong_http::server::Slots>::take::{closure#0}
+      0  core::ptr::drop_glue::<giong_http::server::Conn<giong::net::TcpStream>>
+      0  __pthread_enable_asynccancel
+      0  <hashbrown::map::HashMap<usize, alloc::collections::vec_deque::VecDeque<core::task::wake::Waker>, std::hash::random::RandomState>>::remove::<usize>
+      0  <alloc::rc::Rc<dyn giong::executor::Runnable>>::drop_slow
+      0  __pthread_disable_asynccancel
+      0  <giong_http::server::Slot>::count_ip
+      0  giong::executor::panicked_in_drop::<()>
+      0  __memcmp_avx2_movbe
+      0  <alloc::raw_vec::RawVec<giong::runtime::Inject>>::grow_one
+      0  core::ptr::drop_glue::<alloc::collections::vec_deque::VecDeque<giong::driver::uring::Queued>>
+      0  core::ptr::drop_glue::<giong::executor::JoinState<()>>
+      0  _int_free_maybe_consolidate
+      0  <core::str::pattern::CharSearcher as core::str::pattern::Searcher>::next_match
+      0  <giong::executor::LocalTask<<giong_http::server::Conn<giong::net::TcpStream>>::serve<bench_giong_http::handler>::{closure#0}> as giong::executor::Runnable>::can
+      0  <alloc::collections::vec_deque::VecDeque<giong::driver::uring::Queued>>::grow
+      0  core::ptr::drop_glue::<<giong_http::server::Server>::accept_loop<giong::net::TcpStream, <giong::net::TcpListener>::accept::{closure#0}, <giong_http::server::Ser
+      0  core::ptr::drop_glue::<<giong_http::server::Conn<giong::net::TcpStream>>::run<bench_giong_http::handler>::{closure#0}>
+      0  core::ptr::drop_glue::<<giong_http::server::Conn<giong::net::TcpStream>>::serve<bench_giong_http::handler>::{closure#0}>
+      0  giong_http::memory::field
+      0  <alloc::rc::Rc<alloc::vec::Vec<u8>>>::drop_slow
+      0  core::ptr::drop_glue::<giong::executor::LocalTask<<giong_http::server::Conn<giong::net::TcpStream>>::serve<bench_giong_http::handler>::{closure#0}>>
+      0  <giong_http::server::TracesAt as core::ops::drop::Drop>::drop
+      0  core::ptr::drop_glue::<giong::driver::MultiPoll>
+      0  core::ptr::drop_glue::<core::option::Option<giong::executor::Task>>
+      0  shutdown
+      0  <str>::trim_matches::<<char>::is_whitespace>
+      0  setsockopt
+      0  giong_http::memory::read_all
+      0  getpeername
+      0  __errno_location
+      0  <core::str::pattern::StrSearcher>::new
+      0  <giong::runtime::Worker>::run::<<giong::runtime::Runtime>::run<bench_giong_http::main::{closure#3}, bench_giong_http::main::{closure#3}::{closure#0}>::{closure#
+      0  pread
