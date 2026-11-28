@@ -141,6 +141,20 @@ impl<T: 'static> Future for Op<T> {
                     // was transferred; submitting again waits afresh.
                     continue;
                 }
+                #[cfg(target_os = "linux")]
+                if res == -libc::ECANCELED
+                    && this.io.is_some_and(|io| io.restarts_when_cut())
+                    && crate::task::restart_after_cut()
+                {
+                    // Cut by a deadline linked to it on io_uring, yet polled
+                    // again: by code outside the scope that started it (an
+                    // operation that outlives its future's poll, such as the
+                    // watch an ipc endpoint keeps), since a scope never
+                    // polls its body after its deadline. Nothing was
+                    // transferred; it waits afresh, under the deadline in
+                    // force now, if any.
+                    continue;
+                }
                 if res == -crate::sys::errno::EOPNOTSUPP {
                     if let Some(copying) = this.io.and_then(|io| io.copying()) {
                         // A zero-copy send the socket refuses (kernel TLS):

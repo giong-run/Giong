@@ -561,6 +561,16 @@ impl Io {
         )
     }
 
+    /// `true` for the linked operations that, cut by a deadline, did
+    /// nothing and can simply be submitted again: everything in
+    /// [`links_deadline`](Self::links_deadline) but `connect`, which leaves
+    /// the socket half way.
+    #[cfg(target_os = "linux")]
+    #[inline]
+    pub(crate) fn restarts_when_cut(&self) -> bool {
+        self.links_deadline() && !matches!(self, Io::Connect { .. })
+    }
+
     pub(crate) fn waits_when_not_ready(&self) -> bool {
         match *self {
             Io::Recv { .. } | Io::RecvMsg { .. } => true,

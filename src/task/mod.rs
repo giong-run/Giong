@@ -31,9 +31,16 @@
 //!   (`IORING_OP_LINK_TIMEOUT`). The kernel cancels it at the deadline by
 //!   itself: no timer wake-up, no cancel request, and the operation is gone
 //!   even if the worker is busy at that moment, so data that arrives later
-//!   stays in the socket. On the other drivers the deadline's timer in the
-//!   worker's timer wheel ends the same operations; the result your code
-//!   sees is the same.
+//!   stays in the socket. (A read that already completed when the scope
+//!   ends, for example one the worker, stalled, handed to the kernel only
+//!   after the data was there, is dropped with its data, as any dropped
+//!   one-off read on io_uring.) On the other drivers the deadline's timer
+//!   in the worker's timer wheel ends the same operations; the result your
+//!   code sees is the same.
+//! * An operation that outlives the code that started it (one an object
+//!   keeps in flight across calls) and is polled again after its deadline
+//!   cut it, outside the scope, is submitted again, under the deadline in
+//!   force there, if any: it does not report the cut.
 //! * Nested deadlines take the earlier one: an inner scope cannot extend
 //!   the time an outer one gives.
 //! * Tasks started with [`TaskGroup::spawn`] inside it inherit it. A task
@@ -85,7 +92,7 @@ mod ready;
 mod scope;
 
 #[cfg(target_os = "linux")]
-pub(crate) use context::kernel_deadline;
+pub(crate) use context::{kernel_deadline, restart_after_cut};
 pub use deadline::{deadline, remaining};
 pub use error::{CancelReason, Cancelled};
 pub use group::TaskGroup;

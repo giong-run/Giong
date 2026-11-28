@@ -116,6 +116,20 @@ pub(crate) fn kernel_deadline() -> Option<(u64, u32)> {
         .flatten()
 }
 
+/// Whether an operation cut by a linked deadline may be submitted again
+/// where it is polled now: not under a deadline that has passed too, which
+/// would cut it again at once (a scope never polls its body then, so this
+/// is only a guard against a loop).
+#[cfg(target_os = "linux")]
+#[cold]
+#[inline(never)]
+pub(crate) fn restart_after_cut() -> bool {
+    match current_deadline() {
+        Some(d) => d.at > std::time::Instant::now(),
+        None => true,
+    }
+}
+
 /// The deadline in force.
 pub(crate) fn current_deadline() -> Option<DeadlineAt> {
     CX.try_with(|cx| cx.deadline.get()).ok().flatten()

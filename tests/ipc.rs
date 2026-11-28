@@ -751,3 +751,54 @@ fn a_new_channel_leaks_no_descriptor_into_exec() {
         );
     }
 }
+
+/// A receiver whose wait began inside a scope with a deadline keeps working
+/// after the scope: the watch on the peer's socket, which the receiver keeps
+/// in flight across calls, was linked to that deadline on io_uring, and the
+/// kernel cancelling it there read as the peer having gone away.
+#[test]
+fn a_wait_cut_by_a_scope_deadline_leaves_the_channel_usable() {
+    use giong::task::Scope;
+
+    let path = SockPath::new();
+    giong::block_on(async {
+        let listener = IpcListener::bind(&path.0, 1 << 16).unwrap();
+        let server = giong::spawn(async move { listener.accept().await.unwrap() });
+        let (_client_tx, mut client_rx) = ipc::connect(&path.0, 4096).await.unwrap();
+        let (mut server_tx, _server_rx) = server.await.unwrap();
+
+        // Nothing comes within the deadline.
+        let cut = Scope::with_timeout(Duration::from_millis(30))
+            .run(async {
+                let _ = client_rx.recv().await?;
+                Ok(())
+            })
+            .await;
+        assert_eq!(cut.unwrap_err().kind(), io::ErrorKind::TimedOut);
+
+        // One that comes in time, then the old deadline passes.
+        let quick = Scope::with_timeout(Duration::from_millis(30));
+        let got = quick
+            .run(async {
+                server_tx.send(b"in time").await?;
+                let msg = client_rx.recv().await?.expect("a message");
+                Ok(msg.to_vec())
+            })
+            .await
+            .unwrap();
+        assert_eq!(got, b"in time");
+        // A recv that waits past both deadlines, with nothing coming yet.
+        let late = timeout(Duration::from_millis(100), client_rx.recv())
+            .await
+            .map(|r| r.map(|m| m.map(|m| m.to_vec())));
+        assert!(late.is_err(), "nothing was sent: {late:?}");
+
+        server_tx.send(b"later").await.unwrap();
+        let msg = timeout(Duration::from_secs(5), client_rx.recv())
+            .await
+            .expect("the message")
+            .expect("the peer is still there")
+            .expect("a message");
+        assert_eq!(&*msg, b"later");
+    });
+}
