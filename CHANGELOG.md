@@ -8,6 +8,16 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+Fixes for `giong dev` and `giong cache` while they start processes. On Linux, a child
+process that exits while another thread is starting one can end a socket read with a timeout
+early (EINTR), and `giong dev` took that for a failure: in its requests to the service, in
+the dashboard and in the web client. In a test with three threads starting processes, 39 of
+40 such reads ended early; they now read again within their deadline. The build store no
+longer takes a project lock it has just let go of for a running build (a process being
+started holds a copy for a moment, up to 20 ms measured under load), while a running cargo
+build's lock is still reported at once. `giong cache share` and `giong cache fill` give a
+project they skipped the fix for its cause. No API is removed or changed.
+
 ## [1.5.6] - 2026-11-28
 
 A fast first build for new projects, and a faster HTTP server. `giong dev` starts a new
