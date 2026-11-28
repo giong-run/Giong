@@ -1,0 +1,120 @@
+# Verus proofs
+
+[Kani](kani.md) proves the unsafe core for every input within stated bounds (5 slots, 2
+buffers). [Verus](https://github.com/verus-lang/verus) proves properties for *every* input
+with no bound at all: it turns the code and its specification into formulas that an SMT
+solver (Z3) checks once for all values. The proofs live in `verify/`, outside every crate:
+no user of giong compiles them, downloads Verus or gets a new dependency, and the code
+they prove is the code that ships, unchanged (0 instructions of difference).
+
+```sh
+python3 scripts/verus.py install   # the pinned Verus into target/verus, and Rust 1.100.0
+python3 scripts/verus.py all       # drift, prove, planted (about 10 s)
+scripts/check.sh verus             # the same
+```
+
+CI: the `lint` job runs `scripts/verus.py drift` on every pull request (Python only, under a
+second); the `verus` job installs Verus and runs `all` in the merge queue, and on a pull
+request that changes `verify/` or `scripts/verus.py`. It takes about 1 minute, most of it
+the runner's setup.
+
+## What is proven
+
+| Proof | Property | Bounds | Time |
+| --- | --- | --- | --- |
+| `verify/ipc_ring.rs` | For every capacity from 4 KiB to 1 GiB, any sequence of calls and **any value the peer process writes** into the shared memory (both positions and every record head): `push`, `has_room`, `peek`, `release` and `has_data` never read or write outside the direction's data area; never panic (no arithmetic overflow or underflow, no division by zero, the `debug_assert!` in `push` holds); `peek`'s loop ends; the record `peek` returns lies inside the data area, before the producer's checked tail, and is aligned; each side's position only grows, stays 8-byte aligned and at most one ring apart from the other side's checked position; a producer never moves past the consumer's checked head plus the capacity. | None: all capacities, all sequence lengths (the invariant is inductive), all peer behaviour | 2 s |
+
+The untrusted peer is modelled exactly as it is: vstd specifies the standard atomics with
+no knowledge of what a load returns, so every `head` and `tail` the ring loads is an
+arbitrary `u64`, and every record head it reads is an arbitrary `u32`. Nothing in the proof
+assumes the peer follows the protocol.
+
+**What it found.** A wrap marker (a record head of `u32::MAX`) at offset 0 was followed
+like any other: the consumer skipped a whole ring and looked again. No producer writes one
+there (every record fits from offset 0), but a peer that did, and kept moving `tail` one
+ring ahead, could keep `peek` looping, and with it the worker, for as long as it kept
+winning the race. Verus could not prove that the loop ends; `peek` now reports the marker
+as corrupt (`GIONG-E0091`), and the loop runs at most twice. The test
+`a_wrap_marker_at_the_start_of_the_data_area_is_reported` covers it.
+
+**Planted bugs.** `scripts/verus.py planted` puts each of these into a copy of the proof and
+fails unless Verus rejects it, so a proof that has become vacuous (proving anything) is
+caught by CI:
+
+- `checked_head` accepting a head more than one ring behind the tail (the producer's room
+  underflows);
+- `peek` following a wrap marker at offset 0 (the loop does not end);
+- `peek` returning a record that runs past the end of the data area;
+- `push` forgetting the room a wrap marker skips (it would pass the consumer's head).
+
+Proof size: 213 lines of code in `src/ipc/ring.rs` (without its tests), 248 lines of
+specification, proof and trusted model in `verify/ipc_ring.rs`: 1.2 lines of proof per
+line of code. The Verus-verified systems in the literature range from about 3:1 (Atmosphere)
+to 12:1 (a runtime's liveness, Lion); a ring of integer positions is at the easy end.
+
+## How the code and the proof stay one
+
+`verify/ipc_ring.rs` holds, between `// verus-mirror: begin` and `// verus-mirror: end`, the
+whole of `src/ipc/ring.rs` except its tests, with Verus annotations added: `requires` and
+`ensures` on functions, `invariant` and `decreases` on loops, `proof { }` blocks, named
+return values (`-> (r: T)`), and `#[verifier::...]` attributes. `scripts/verus.py drift`
+removes exactly those, drops comments and the tests module, and compares the two token by
+token. Visibility is not compared (Verus wants `pub` on a const the source declares
+`pub(crate)`). Any other difference fails the `lint` job with the first tokens that differ.
+
+So a change to `src/ipc/ring.rs` is made twice: in the source, and the same edit in the
+mirror. Then `scripts/verus.py all` says whether the proof still holds; if it does not,
+either the change broke a property (fix the change) or the proof needs another step (add
+it in a `proof { }` block, or a lemma above the mirror).
+
+Rules the drift check enforces:
+
+- The executable code inside the mirror is the source's: proof code goes in `proof { }`
+  blocks (an `assert` outside one is refused), on lines of its own, and spec clauses each
+  start with the keyword alone on its line, ending at the line that opens the body (the
+  layout `verusfmt` produces).
+- Nothing may be trusted without a reason: an `#[verifier::external_body]` or
+  `#[verifier::external]` item must be listed in `TRUSTED` in `scripts/verus.py`, with why,
+  and `assume(` and `admit(` are refused anywhere.
+
+## What is trusted
+
+What Verus takes on faith, in `verify/ipc_ring.rs`'s `mem` module and in `TRUSTED`:
+
+- **Raw memory.** `writable(p, n)` says `n` bytes from `p` lie in one allocation this
+  process may use. Two axioms: a block's front part, and the `m` bytes `k` into it, are
+  writable too. `pointer::add` requires the block it moves within; `copy_nonoverlapping`
+  requires a readable source and a writable destination; `<[T]>::as_ptr` and
+  `as_mut_ptr` give their slice's length. The source and destination of each copy never
+  overlap (a local array or the caller's message, and the mapping); that is not proven.
+- **`Ring::new`**: the constructor casts the mapping's base and takes the address of a
+  `Dir`; its `ensures` restates its `# Safety` contract (a mapping of the right length, a
+  capacity in range).
+- **`Ring::dir`**: dereferences the shared `Dir`. Only its atomics are read through it.
+- **Verus, Z3 and rustc** themselves.
+
+## What is not covered
+
+- **The callers in `src/ipc.rs`.** That `release` gets the length `peek` returned, that a
+  message is at most `max_message` long (checked there before `push`), and the sleeping
+  handshakes, are not proven. Each is a precondition the proof states (`release`'s
+  `requires`, `push`'s `requires`).
+- **The producer's writes are not tracked one by one.** The proof shows the producer's
+  position never passes the consumer's checked head plus the capacity, and that each write
+  lies inside the data area; that each write lies between the old and the new position is
+  plain from the code, not proven.
+- **Concurrency and memory ordering.** Every load is arbitrary, so no interleaving of the
+  peer's writes can break what is proven. Whether an honest peer's records arrive intact
+  (ordering of the data writes against the `tail` store) is the job of the tests and of
+  TSan.
+- **Fewer than 2^64 - 2^30 bytes sent.** The producer's position is a `u64`; `push`
+  requires that it has room to grow (centuries at memory speed). The consumer's position is
+  bounded by the tail it checked, so no peer can make it overflow.
+
+## Verus version
+
+`VERUS_VERSION` in `scripts/verus.py` pins the release (0.2026.11.22.1ce6a59); each Verus
+release is built against one Rust toolchain (`VERUS_TOOLCHAIN`, 1.100.0, CI's
+`RUST_STABLE`). To move to a newer Verus: change both, run `scripts/verus.py install` and
+`all`, and fix what the new version rejects (its syntax still moves: this release wants
+`final(self)` for the value of `&mut self` in an `ensures`).

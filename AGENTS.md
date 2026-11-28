@@ -141,6 +141,7 @@ scripts/check.sh seccomp     # io_uring blocked as in Docker (scripts/no-io-urin
 scripts/check.sh tsan        # ThreadSanitizer (nightly + rust-src)
 scripts/check.sh loom        # loom models of the cross-thread wake-ups (src/notify.rs)
 scripts/check.sh kani        # Kani proofs of the unsafe core (docs/kani.md; needs kani-verifier 0.68.0)
+scripts/check.sh verus       # Verus proofs in verify/ (docs/verus.md; `python3 scripts/verus.py install` first)
 scripts/check.sh soak        # minutes of connection churn, plain and then over TLS, then checks for leaks
 scripts/kernels.sh           # the suite on real 5.15 (epoll), 6.0 and 6.1 kernels in QEMU (slow)
 KTLS=1 scripts/kernels.sh 5.15.225 6.1.155 6.18.63   # with the kernel's tls module loaded (kernel TLS)
@@ -182,7 +183,9 @@ instructions per operation on the hot paths, counted by callgrind, and heap per 
 connection, both within 1% of `bench/instr/baseline.csv`; a change meant to move them
 commits the new baseline the job prints, see `bench/instr/README.md`), `kani` (the proofs
 in `docs/kani.md`; a change to the slab, the buffer pool, `KernelBox` or the io_uring
-operation lifecycle keeps them passing), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
+operation lifecycle keeps them passing), `verus` (the proofs in `docs/verus.md`: a change
+to `src/ipc/ring.rs` is made in its mirror in `verify/ipc_ring.rs` too, or `lint`'s drift
+check fails), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
 profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`), HTTP/3 and QUIC with h3spec
 (`h3spec`) and the database crates against other server versions (`servers`) on every pull
 request, every crate's tests on macOS 15 and 26 (`macos.yml`) and on Windows Server 2022

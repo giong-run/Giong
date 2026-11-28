@@ -14,6 +14,7 @@ from the root one. The API reference is on [docs.rs](https://docs.rs/giong).
 | [DEPLOYMENT.md](DEPLOYMENT.md) | Running a giong service: checking a machine, the locked-memory limit, kernel quirks, restarting on the same port, sizing memory, io_uring in Docker, Kubernetes and sandboxes. |
 | [design/portability.md](design/portability.md) | The driver boundary for Linux, macOS and Windows, and what still differs on macOS and Windows, area by area. |
 | [kani.md](kani.md) | The Kani proofs of the `unsafe` core and how to run them. |
+| [verus.md](verus.md) | The Verus proofs (no bounds): the IPC ring against any peer; how the proofs follow the code. |
 | [DEVELOPMENT.md](DEVELOPMENT.md) | How a change goes from an item to a merge with several agents at once: preflight checks, changelog entries, avoiding conflicts in the merge queue, handoff. |
 | [RELEASING.md](RELEASING.md) | How a release is cut and published (maintainers). |
 | [reviews/](reviews/) | Written reviews: the 1.0 API freeze, API portability, giong-tls's security review, the gaps a general runtime still has. |

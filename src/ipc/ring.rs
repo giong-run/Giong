@@ -24,6 +24,10 @@
 //! position is checked before use, so a peer that writes garbage makes the
 //! channel fail with `GIONG-E0091` and never makes this process read or
 //! write outside the mapping.
+//!
+//! Proven with Verus for every capacity and anything the peer writes
+//! (docs/verus.md): `verify/ipc_ring.rs` holds this file with the proof's
+//! annotations, and CI fails when the two differ. Change both.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 
@@ -290,6 +294,14 @@ impl Ring {
             let len = u32::from_le_bytes(head);
             let contiguous = self.capacity - off;
             if len == SKIP {
+                // A producer writes a marker only before a record that does
+                // not fit in what is left of the area, and every record fits
+                // from offset 0: a marker there comes from a broken peer, and
+                // following it would let the peer keep this loop, and the
+                // worker, turning for as long as it keeps moving `tail`.
+                if off == 0 {
+                    return Err(Corrupt("a wrap marker at the start of the data area"));
+                }
                 if contiguous > avail {
                     return Err(Corrupt("a wrap marker points past the written data"));
                 }
@@ -443,6 +455,24 @@ mod tests {
         rx.dir().head.0.store(1 << 40, Ordering::Release);
         // The producer reads `head` again when it needs to know the room.
         assert!(tx.has_room(1).is_err());
+    }
+
+    #[test]
+    fn a_wrap_marker_at_the_start_of_the_data_area_is_reported() {
+        // No producer writes one (every record fits from offset 0); a peer
+        // that does, and keeps moving `tail` a whole ring ahead, could keep
+        // `peek` skipping forever. Found by the Verus proof (docs/verus.md).
+        let cap = MIN_CAPACITY;
+        let mut mem = Mem::new(cap);
+        let (tx, mut rx) = mem.rings(cap);
+        // SAFETY: offset 0 of the data area, inside the buffer.
+        unsafe { std::ptr::write_unaligned(tx.data.cast::<u32>(), SKIP) };
+        rx.dir().tail.0.store(cap as u64, Ordering::Release);
+        assert_eq!(
+            rx.peek().unwrap_err(),
+            Corrupt("a wrap marker at the start of the data area")
+        );
+        assert_eq!(rx.pos(), 0);
     }
 
     #[test]

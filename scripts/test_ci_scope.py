@@ -47,6 +47,16 @@ class Plan(unittest.TestCase):
         self.assertEqual(self.plan([], event="workflow_dispatch"), "full")
         self.assertEqual(self.plan([], event="push"), "full")
 
+    def test_verus_runs_for_a_proof_and_in_the_queue(self):
+        on = lambda files, event="pull_request", draft=False: scope.runs_verus(
+            *scope.plan(files, event, draft))
+        self.assertTrue(on(["verify/ipc_ring.rs"]))
+        self.assertTrue(on(["scripts/verus.py"], draft=True))
+        self.assertFalse(on(["src/net.rs"]))
+        self.assertFalse(on(["docs/verus.md"]))
+        self.assertTrue(on(["src/net.rs"], event="merge_group"))
+        self.assertTrue(on(["src/net.rs"], event="workflow_dispatch"))
+
     def test_code_prose_is_code(self):
         self.assertEqual(self.plan(["docs/errors/E0001.md"]), "pr")
 
