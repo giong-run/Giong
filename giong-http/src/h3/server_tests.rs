@@ -1163,11 +1163,15 @@ fn a_trickling_streamed_body_is_cut_once_it_falls_below_the_minimum_rate() {
         let server = Server::new().min_body_rate(1000, Duration::from_millis(200));
         let client = connect_to(server).await;
 
-        // 200 bytes every 50 ms (4,000 bytes a second): answered.
+        // 200 bytes every 50 ms (4,000 bytes a second): answered. The first
+        // piece goes right after the head, so that a stretched sleep has 350
+        // ms to spare instead of the 150 ms the grace leaves (#532).
         let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
         send.write_all(&post("/upload", &[])).await.unwrap();
-        for piece in pattern(2000).chunks(200) {
-            giong::time::sleep(Duration::from_millis(50)).await;
+        for (i, piece) in pattern(2000).chunks(200).enumerate() {
+            if i > 0 {
+                giong::time::sleep(Duration::from_millis(50)).await;
+            }
             send.write_all(&data(piece)).await.unwrap();
         }
         send.finish().unwrap();
