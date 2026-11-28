@@ -1,0 +1,18 @@
+round 1 | no priority field | late 16384 B | late 33.1 ms | bulk mean 614.4 ms
+round 1 | no priority field | late 262144 B | late 191.1 ms | bulk mean 652.6 ms
+round 1 | no priority field | late 1048576 B | late 655.2 ms | bulk mean 750.0 ms
+round 1 | priority: u=0 | late 16384 B | late 24.9 ms | bulk mean 611.7 ms
+round 1 | priority: u=0 | late 262144 B | late 56.8 ms | bulk mean 650.2 ms
+round 1 | priority: u=0 | late 1048576 B | late 157.6 ms | bulk mean 754.2 ms
+round 2 | no priority field | late 16384 B | late 33.9 ms | bulk mean 622.0 ms
+round 2 | no priority field | late 262144 B | late 191.3 ms | bulk mean 649.9 ms
+round 2 | no priority field | late 1048576 B | late 657.3 ms | bulk mean 751.0 ms
+round 2 | priority: u=0 | late 16384 B | late 24.8 ms | bulk mean 623.3 ms
+round 2 | priority: u=0 | late 262144 B | late 56.6 ms | bulk mean 653.0 ms
+round 2 | priority: u=0 | late 1048576 B | late 157.4 ms | bulk mean 754.4 ms
+round 3 | no priority field | late 16384 B | late 33.9 ms | bulk mean 620.8 ms
+round 3 | no priority field | late 262144 B | late 191.0 ms | bulk mean 653.3 ms
+round 3 | no priority field | late 1048576 B | late 653.5 ms | bulk mean 747.8 ms
+round 3 | priority: u=0 | late 16384 B | late 25.8 ms | bulk mean 621.3 ms
+round 3 | priority: u=0 | late 262144 B | late 56.3 ms | bulk mean 654.0 ms
+round 3 | priority: u=0 | late 1048576 B | late 157.4 ms | bulk mean 754.6 ms
