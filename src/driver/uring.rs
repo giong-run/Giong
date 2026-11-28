@@ -2583,6 +2583,7 @@ mod tests {
             opcode::RecvMsgMulti::CODE,
             opcode::AsyncCancel::CODE,
             opcode::Read::CODE,
+            opcode::LinkTimeout::CODE,
         ] {
             assert!(none.contains(&code));
         }
@@ -2631,6 +2632,42 @@ mod tests {
             results.extend(ring.completion().map(|c| (c.user_data(), c.result())));
         }
         assert_eq!(results, [(1, -libc::EACCES), (2, 1), (3, -libc::EACCES)]);
+        // A read with a linked deadline, the way a task scope submits it:
+        // the link flags and `LINK_TIMEOUT` are allowed, and the deadline's
+        // completion is skipped when the read finishes first.
+        // SAFETY: one byte from a valid buffer to our pipe.
+        assert_eq!(unsafe { libc::write(w, b"y".as_ptr().cast(), 1) }, 1);
+        let ts = types::Timespec::new().sec(5);
+        let read = opcode::Read::new(types::Fd(r), buf.as_mut_ptr(), 1)
+            .build()
+            .flags(squeue::Flags::IO_LINK)
+            .user_data(4);
+        let deadline = opcode::LinkTimeout::new(&ts)
+            .build()
+            .flags(squeue::Flags::SKIP_SUCCESS)
+            .user_data(5);
+        // SAFETY: the buffer, the pipe and `ts` outlive the submission,
+        // which is waited for here.
+        unsafe {
+            let mut sq = ring.submission();
+            sq.push(&read).unwrap();
+            sq.push(&deadline).unwrap();
+        }
+        ring.submit_and_wait(1).unwrap();
+        let linked: Vec<_> = ring
+            .completion()
+            .map(|c| (c.user_data(), c.result()))
+            .collect();
+        // The deadline's -ECANCELED is skipped where the kernel has
+        // `SKIP_SUCCESS` for it; an older one may still post it.
+        assert_eq!(linked.first(), Some(&(4, 1)), "{linked:?}");
+        assert!(
+            linked[1..]
+                .iter()
+                .all(|&(d, res)| d == 5 && res == -libc::ECANCELED),
+            "{linked:?}"
+        );
+        assert_eq!(buf[0], b'y');
         // SAFETY: both ends are ours.
         unsafe {
             libc::close(r);

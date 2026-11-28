@@ -100,8 +100,10 @@ const _: () = assert!(std::mem::size_of::<TaskRestriction>() == 16 + 16 * MAX_RE
 /// a descriptor the process already has. `statx` is one of them because
 /// giong reads an open file's metadata with it (an empty path and
 /// `AT_EMPTY_PATH`); the kernel cannot tell that from a `statx` by path,
-/// which giong refuses itself under [`FileAccess::None`].
-fn descriptor_ops() -> [u8; 16] {
+/// which giong refuses itself under [`FileAccess::None`]. `LINK_TIMEOUT`
+/// is the deadline a task scope links to an operation; it only cancels
+/// the operation it is linked to.
+fn descriptor_ops() -> [u8; 17] {
     [
         opcode::Accept::CODE,
         opcode::AsyncCancel::CODE,
@@ -109,6 +111,7 @@ fn descriptor_ops() -> [u8; 16] {
         opcode::Connect::CODE,
         opcode::Fallocate::CODE,
         opcode::Fsync::CODE,
+        opcode::LinkTimeout::CODE,
         opcode::PollAdd::CODE,
         opcode::Read::CODE,
         opcode::Recv::CODE,
@@ -149,9 +152,16 @@ pub(crate) fn allowed_ops(files: FileAccess) -> Vec<u8> {
 }
 
 /// The SQE flags giong sets: `BUFFER_SELECT` on receives from the buffer
-/// rings, `ASYNC` on a close a test hands to a kernel worker.
+/// rings, `ASYNC` on a close a test hands to a kernel worker, `IO_LINK` and
+/// `SKIP_SUCCESS` on an operation with a linked deadline and its
+/// `LINK_TIMEOUT`. None of them reaches anything the opcodes do not: a
+/// link only orders two allowed entries.
 pub(crate) fn allowed_sqe_flags() -> u8 {
-    (squeue::Flags::BUFFER_SELECT | squeue::Flags::ASYNC).bits()
+    (squeue::Flags::BUFFER_SELECT
+        | squeue::Flags::ASYNC
+        | squeue::Flags::IO_LINK
+        | squeue::Flags::SKIP_SUCCESS)
+        .bits()
 }
 
 /// The opcodes a kernel has, from `IORING_REGISTER_PROBE` on a ring: the
