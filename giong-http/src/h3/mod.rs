@@ -12,6 +12,8 @@
 pub(crate) mod frame;
 pub(crate) mod qpack;
 #[cfg(feature = "unstable-http3")]
+pub(crate) mod qpack_conn;
+#[cfg(feature = "unstable-http3")]
 pub(crate) mod server;
 #[cfg(all(test, feature = "unstable-http3"))]
 mod server_tests;

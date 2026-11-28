@@ -312,13 +312,21 @@ impl Settings {
         Ok(settings)
     }
 
-    /// Appends a whole SETTINGS frame announcing `max_field_section_size`.
-    /// The QPACK settings are left at their defaults: no dynamic table, no
-    /// blocked streams.
-    pub(crate) fn write_frame(out: &mut Vec<u8>, max_field_section_size: u64) {
-        let mut payload = Vec::with_capacity(9);
+    /// Appends a whole SETTINGS frame announcing `max_field_section_size`
+    /// and, when `qpack_table` is above zero, the dynamic table the peer's
+    /// QPACK encoder may fill and the streams that may wait for it
+    /// ([`qpack::BLOCKED_STREAMS`](super::qpack::BLOCKED_STREAMS)).
+    /// Without, the QPACK settings keep their defaults: no table.
+    pub(crate) fn write_frame(out: &mut Vec<u8>, max_field_section_size: u64, qpack_table: u64) {
+        let mut payload = Vec::with_capacity(24);
         write_varint(&mut payload, setting::MAX_FIELD_SECTION_SIZE);
         write_varint(&mut payload, max_field_section_size.min(VARINT_MAX));
+        if qpack_table > 0 {
+            write_varint(&mut payload, setting::QPACK_MAX_TABLE_CAPACITY);
+            write_varint(&mut payload, qpack_table.min(VARINT_MAX));
+            write_varint(&mut payload, setting::QPACK_BLOCKED_STREAMS);
+            write_varint(&mut payload, super::qpack::BLOCKED_STREAMS);
+        }
         Header::write(out, kind::SETTINGS, payload.len() as u64);
         out.extend_from_slice(&payload);
     }

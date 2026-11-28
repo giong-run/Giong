@@ -7,10 +7,14 @@
 //! server can make the client hold for each of them.
 //!
 //! One task reads what the server opens: its control stream (SETTINGS,
-//! then GOAWAY when it wants no more requests) and its QPACK streams, which
-//! have nothing to say because the client allows no dynamic table. A
-//! server that breaks the protocol there or on a response has the
-//! connection closed with the error code RFC 9114 names.
+//! then GOAWAY when it wants no more requests) and its QPACK streams. By
+//! default the client allows no dynamic table, so those have nothing to
+//! say; with `ClientBuilder::qpack_table_size` the server's encoder stream
+//! fills one, a response that refers to insertions not received yet waits
+//! for them, and the client's decoder stream (`qpack_conn::Decoder`)
+//! acknowledges what was decoded. A server that breaks the protocol there
+//! or on a response has the connection closed with the error code RFC 9114
+//! or RFC 9204 names.
 
 use std::cell::{Cell, RefCell};
 use std::io;
@@ -22,6 +26,7 @@ use super::h2::{check_field, Decoded, Request, ResponseHead, StreamError};
 use crate::h2::hpack::Index;
 use crate::h3::frame::{self, kind, Code, Header, Need, On, Settings, StreamType};
 use crate::h3::qpack::{self, Encoder};
+use crate::h3::qpack_conn::Decoder;
 use crate::trailers::Trailers;
 
 /// The largest SETTINGS frame read. HTTP/3 defines three settings.
@@ -47,9 +52,19 @@ struct State {
     /// The client's control stream stays open for as long as the
     /// connection: closing it is a connection error (section 6.2.1).
     control: RefCell<Option<SendStream>>,
+    /// The decoder of the server's field sections, when the client allows
+    /// the server a dynamic table (`ClientBuilder::qpack_table_size`).
+    qpack: Option<Decoder>,
 }
 
 impl State {
+    /// Nothing more is decoded: requests waiting for insertions stop.
+    fn end_qpack(&self) {
+        if let Some(decoder) = &self.qpack {
+            decoder.end();
+        }
+    }
+
     /// Closes the connection for an error of the server's, once.
     fn fail(&self, quic: &giong_quic::Connection, error: frame::Error) {
         let mut closed = self.closed.borrow_mut();
@@ -57,6 +72,8 @@ impl State {
             *closed = Some(format!("the server broke HTTP/3: {error}"));
             quic.close(error.code as u32, error.what.as_bytes());
         }
+        drop(closed);
+        self.end_qpack();
     }
 
     /// Notes that the connection is gone.
@@ -65,6 +82,8 @@ impl State {
         if closed.is_none() {
             *closed = Some(why.to_string());
         }
+        drop(closed);
+        self.end_qpack();
     }
 }
 
@@ -78,6 +97,7 @@ impl Drop for Shared {
     fn drop(&mut self) {
         // The last request is over and the client let the connection go.
         self.quic.close(Code::NoError as u32, b"");
+        self.state.end_qpack();
     }
 }
 
@@ -92,25 +112,38 @@ pub(crate) struct Connection {
 impl Connection {
     /// Speaks HTTP/3 on a QUIC connection just made: opens the control
     /// stream with the client's settings and starts reading the server's.
+    /// `qpack_table_size` is the dynamic table the server may fill for its
+    /// field sections, 0 for none.
     pub(crate) async fn start(
         quic: giong_quic::Connection,
         max_head_size: usize,
+        qpack_table_size: u32,
     ) -> io::Result<Self> {
         let quic = Rc::new(quic);
-        let control = open_control(&quic, max_head_size).await?;
+        let control = open_control(&quic, max_head_size, qpack_table_size).await?;
         let early = control.is_early();
         let state = Rc::new(State {
             closed: RefCell::new(None),
             goaway: Cell::new(None),
             critical: Cell::new(0),
             control: RefCell::new(Some(control)),
+            qpack: (qpack_table_size > 0).then(|| Decoder::new(qpack_table_size)),
         });
         drop(giong::spawn(server_streams(quic.clone(), state.clone())));
+        if state.qpack.is_some() {
+            let (quic, state) = (quic.clone(), state.clone());
+            drop(giong::spawn(async move {
+                if let Some(decoder) = &state.qpack {
+                    decoder.write(&quic).await;
+                }
+            }));
+        }
         if early {
             drop(giong::spawn(settle(
                 quic.clone(),
                 state.clone(),
                 max_head_size,
+                qpack_table_size,
             )));
         }
         Ok(Self {
@@ -187,6 +220,7 @@ impl Connection {
             trailer_fields: None,
             done: false,
             early,
+            qpack_waiting: false,
         };
         let body = req.body.unwrap_or_default();
         let mut out = Vec::with_capacity(128 + req.path.len());
@@ -230,10 +264,11 @@ impl Drop for Cancel {
 async fn open_control(
     quic: &giong_quic::Connection,
     max_head_size: usize,
+    qpack_table_size: u32,
 ) -> io::Result<SendStream> {
     let mut control = quic.open_uni().await?;
     let mut out = vec![StreamType::CONTROL as u8];
-    Settings::write_frame(&mut out, max_head_size as u64);
+    Settings::write_frame(&mut out, max_head_size as u64, u64::from(qpack_table_size));
     control.write_all(&out).await?;
     Ok(control)
 }
@@ -241,10 +276,15 @@ async fn open_control(
 /// For a control stream opened in 0-RTT data: once the handshake is over,
 /// opens it again if the server refused that data, since it then never
 /// saw the client's settings.
-async fn settle(quic: Rc<giong_quic::Connection>, state: Rc<State>, max_head_size: usize) {
+async fn settle(
+    quic: Rc<giong_quic::Connection>,
+    state: Rc<State>,
+    max_head_size: usize,
+    qpack_table_size: u32,
+) {
     let reopened = match quic.handshake().await {
         Ok(true) => return,
-        Ok(false) => open_control(&quic, max_head_size).await,
+        Ok(false) => open_control(&quic, max_head_size, qpack_table_size).await,
         Err(e) => Err(e),
     };
     match reopened {
@@ -414,6 +454,9 @@ pub(crate) struct Stream {
     /// The stream was opened before the handshake ended, so the request
     /// may have gone out in 0-RTT data.
     early: bool,
+    /// A field section waits for insertions on the server's encoder
+    /// stream. Given up then, the decoder has told the encoder already.
+    qpack_waiting: bool,
 }
 
 impl Stream {
@@ -472,8 +515,7 @@ impl Stream {
 
     /// A malformed response (section 4.1.2): the stream alone is given up.
     fn malformed(&mut self, what: &str) -> StreamError {
-        self.done = true;
-        self.r.recv.stop(Code::MessageError as u32);
+        self.cancel_as(Code::MessageError);
         StreamError::Protocol(what.to_owned())
     }
 
@@ -483,8 +525,8 @@ impl Stream {
         // What the client said it accepts counts decoded sizes; an encoded
         // section is never larger than that by more than a little.
         if len > (max as u64).saturating_mul(2).saturating_add(1024) {
-            self.done = true;
-            self.r.recv.stop(Code::ExcessiveLoad as u32);
+            // Given up undecoded: `cancel` tells the server's encoder.
+            self.cancel_as(Code::ExcessiveLoad);
             return Err(too_large(max));
         }
         let block = match self.r.exact(len as usize).await {
@@ -492,14 +534,24 @@ impl Stream {
             Err(fail) => return Err(self.stop(fail)),
         };
         let mut d = Decoded::default();
-        if let Err(error) =
-            qpack::decode(&block, |name, value| check_field(&mut d, max, name, value))
-        {
+        let field = |name: &[u8], value: &[u8]| check_field(&mut d, max, name, value);
+        let state = self.conn.shared.state.clone();
+        let decoded = match &state.qpack {
+            Some(decoder) => {
+                // Dropped while it waits, the decode cancels the stream
+                // for the encoder itself.
+                self.qpack_waiting = true;
+                let decoded = decoder.decode(self.id, &block, field).await;
+                self.qpack_waiting = false;
+                decoded
+            }
+            None => qpack::decode(&block, field),
+        };
+        if let Err(error) = decoded {
             return Err(self.broke(error));
         }
         if d.size > max {
-            self.done = true;
-            self.r.recv.stop(Code::ExcessiveLoad as u32);
+            self.cancel_as(Code::ExcessiveLoad);
             return Err(too_large(max));
         }
         if let Some(what) = d.malformed {
@@ -700,8 +752,20 @@ impl Stream {
 
     /// Stops reading: the server is told the response is not wanted.
     pub(crate) fn cancel(&mut self) {
+        self.cancel_as(Code::RequestCancelled);
+    }
+
+    /// Stops reading with `code`, unless the stream is over. A field
+    /// section of the server's may be on its way, or read and not decoded:
+    /// with a dynamic table, its encoder is told not to wait for an
+    /// acknowledgment (RFC 9204, section 4.4.2).
+    fn cancel_as(&mut self, code: Code) {
         if !std::mem::replace(&mut self.done, true) {
-            self.r.recv.stop(Code::RequestCancelled as u32);
+            self.r.recv.stop(code as u32);
+            match &self.conn.shared.state.qpack {
+                Some(decoder) if !self.qpack_waiting => decoder.cancel(self.id),
+                _ => {}
+            }
         }
     }
 }
@@ -778,7 +842,10 @@ async fn server_stream(state: &State, r: &mut Reader) -> Result<(), Fail> {
         }
         StreamType::QpackEncoder => {
             critical(state, 2)?;
-            kept_open(qpack_stream(r, qpack::encoder_stream).await)
+            kept_open(match &state.qpack {
+                Some(decoder) => qpack_stream(r, |buf| decoder.encoder_stream(buf)).await,
+                None => qpack_stream(r, qpack::encoder_stream).await,
+            })
         }
         StreamType::QpackDecoder => {
             critical(state, 4)?;
@@ -809,7 +876,7 @@ fn kept_open(read: Result<(), Fail>) -> Result<(), Fail> {
 /// not allow, for as long as the connection lives.
 async fn qpack_stream(
     r: &mut Reader,
-    check: fn(&[u8]) -> Result<usize, frame::Error>,
+    mut check: impl FnMut(&[u8]) -> Result<usize, frame::Error>,
 ) -> Result<(), Fail> {
     loop {
         let used = check(r.rest())?;
@@ -850,9 +917,10 @@ async fn control_stream(state: &State, r: &mut Reader) -> Result<(), Fail> {
                     )
                     .into());
                 }
-                // Nothing in them changes what this client sends: it uses
-                // no dynamic table, and its field sections are what the
-                // program gave it. They are checked all the same.
+                // Nothing in them changes what this client sends: its
+                // encoder uses no dynamic table, and its field sections
+                // are what the program gave it. They are checked all the
+                // same.
                 let payload = r.exact(header.len as usize).await?;
                 Settings::parse(&payload)?;
             }
