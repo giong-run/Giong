@@ -1,18 +1,21 @@
-//! QPACK, the field compression of HTTP/3 (RFC 9204), without a dynamic
-//! table.
+//! QPACK, the field compression of HTTP/3 (RFC 9204).
 //!
-//! giong announces `SETTINGS_QPACK_MAX_TABLE_CAPACITY` = 0 and never asks
-//! the peer for a table either, which RFC 9204 allows in full: every field
-//! line is then a reference into the static table or a literal, no stream
-//! ever waits for another, and the encoder and decoder streams carry
-//! nothing. [`decode`] reads the field sections a peer sends, [`Encoder`]
-//! writes ours, and [`encoder_stream`] / [`decoder_stream`] check that the
-//! peer's two QPACK streams say only what such a peer may be told.
+//! [`decode`] reads the field sections a peer sends with the static table
+//! alone, and [`encoder_stream`] / [`decoder_stream`] check that the
+//! peer's two QPACK streams say only what such a peer may be told: that is
+//! everything when we announce `SETTINGS_QPACK_MAX_TABLE_CAPACITY` = 0,
+//! which RFC 9204 allows in full (no stream ever waits for another, and
+//! the QPACK streams carry nothing).
 //!
-//! A dynamic table comes later, and only with a benchmark that shows what
-//! it buys (plan for 1.3).
+//! When the peer is allowed a dynamic table, [`Table`] keeps it: it applies
+//! the peer's encoder stream, reads the prefix of a field section (how
+//! many insertions it needs) and decodes it, and writes what our decoder
+//! stream says. Waiting for insertions is the connection's business
+//! (`qpack_conn`). [`Encoder`] writes our field sections with static
+//! references and literals.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 
 use super::frame::{Code, Error};
 use crate::h2::hpack::huffman;
@@ -213,32 +216,77 @@ fn decode_with(
         return Err(no_table);
     }
     let negative = *block.get(pos).ok_or(ends)? & 0x80 != 0;
-    let delta = read_int(block, &mut pos, 7, large)?.ok_or(ends)?;
+    let _delta = read_int(block, &mut pos, 7, large)?.ok_or(ends)?;
     // Base = Required Insert Count + Delta Base, or with the sign bit
     // Required Insert Count - Delta Base - 1, which is below zero here.
     if negative {
         return Err(failed("Base below zero"));
     }
-    let _ = delta;
+    lines(block, pos, None, scratch, field)
+}
+
+/// What a field section's prefix says about the dynamic table (RFC 9204,
+/// section 4.5.1), and where its field lines start.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct Prefix {
+    /// How many insertions the section needs to have been received: the
+    /// section waits for them (its stream is blocked) until they are.
+    pub(crate) required: u64,
+    base: u64,
+    lines: usize,
+}
+
+/// Decodes the field lines of a section from `pos` on. With `dynamic`
+/// (the table, the Required Insert Count and the Base), references into
+/// the dynamic table are resolved; without, they are errors.
+fn lines(
+    block: &[u8],
+    mut pos: usize,
+    dynamic: Option<(&Table, Prefix)>,
+    scratch: &mut Scratch,
+    field: &mut impl FnMut(&[u8], &[u8]),
+) -> Result<(), Error> {
+    let large = failed("integer too large in a field section");
     let ends = failed("field section ends inside a field line");
+    // The largest absolute index referenced, plus one.
+    let mut needed = 0;
+    // The dynamic entry at absolute index `abs`, which must be below the
+    // Required Insert Count (section 2.2.3) and still in the table.
+    let mut entry = |abs: Option<u64>| -> Result<(&[u8], &[u8]), Error> {
+        let Some((table, prefix)) = dynamic else {
+            return Err(failed(
+                "reference to a dynamic table that was never allowed",
+            ));
+        };
+        let abs = abs
+            .filter(|&abs| abs < prefix.required)
+            .ok_or(failed("reference past the Required Insert Count"))?;
+        needed = needed.max(abs + 1);
+        table
+            .get(abs)
+            .ok_or(failed("reference to an evicted dynamic table entry"))
+    };
+    let base = dynamic.map_or(0, |(_, p)| p.base);
     while pos < block.len() {
         let b = block[pos];
         if b & 0x80 != 0 {
             // Indexed field line (4.5.2): 1 T index(6).
-            if b & 0x40 == 0 {
-                return Err(no_table);
-            }
             let index = read_int(block, &mut pos, 6, large)?.ok_or(ends)?;
-            let (name, value) = static_entry(index)?;
+            let (name, value) = if b & 0x40 != 0 {
+                static_entry(index)?
+            } else {
+                entry(base.checked_sub(index + 1))?
+            };
             field(name, value);
         } else if b & 0x40 != 0 {
             // Literal field line with name reference (4.5.4): 01 N T
             // index(4), then the value.
-            if b & 0x10 == 0 {
-                return Err(no_table);
-            }
             let index = read_int(block, &mut pos, 4, large)?.ok_or(ends)?;
-            let (name, _) = static_entry(index)?;
+            let (name, _) = if b & 0x10 != 0 {
+                static_entry(index)?
+            } else {
+                entry(base.checked_sub(index + 1))?
+            };
             let value = read_string(block, &mut pos, 7, &mut scratch.value)?;
             field(name, value.unwrap_or(&scratch.value));
         } else if b & 0x20 != 0 {
@@ -250,11 +298,26 @@ fn decode_with(
                 name.unwrap_or(&scratch.name),
                 value.unwrap_or(&scratch.value),
             );
+        } else if b & 0x10 != 0 {
+            // Indexed field line with post-base index (4.5.3): 0001
+            // index(4).
+            let index = read_int(block, &mut pos, 4, large)?.ok_or(ends)?;
+            let (name, value) = entry(base.checked_add(index))?;
+            field(name, value);
         } else {
-            // Indexed field line with post-base index (4.5.3: 0001) or
-            // literal with post-base name reference (4.5.5: 0000): both
-            // point into the dynamic table.
-            return Err(no_table);
+            // Literal field line with post-base name reference (4.5.5):
+            // 0000 N index(3), then the value.
+            let index = read_int(block, &mut pos, 3, large)?.ok_or(ends)?;
+            let (name, _) = entry(base.checked_add(index))?;
+            let value = read_string(block, &mut pos, 7, &mut scratch.value)?;
+            field(name, value.unwrap_or(&scratch.value));
+        }
+    }
+    if let Some((_, prefix)) = dynamic {
+        // A section must not claim to need more of the table than it
+        // uses (section 4.5.1.1).
+        if prefix.required != needed {
+            return Err(failed("Required Insert Count above what the section uses"));
         }
     }
     Ok(())
@@ -381,6 +444,323 @@ impl Encoder {
     }
 }
 
+/// Streams that may wait for insertions at once when the peer is allowed
+/// a dynamic table (`SETTINGS_QPACK_BLOCKED_STREAMS`). Each holds no more
+/// than one field section while it waits, which the request's own limits
+/// already bound.
+pub(crate) const BLOCKED_STREAMS: u64 = 16;
+
+/// Bytes an entry counts for in a dynamic table besides its name and value
+/// (RFC 9204, section 3.2.1).
+const ENTRY_OVERHEAD: u64 = 32;
+
+/// One entry of a dynamic table: its name and value in one allocation.
+struct Entry {
+    field: Box<[u8]>,
+    name_len: usize,
+}
+
+impl Entry {
+    fn size(&self) -> u64 {
+        self.field.len() as u64 + ENTRY_OVERHEAD
+    }
+}
+
+/// The dynamic table our decoder keeps of what the peer's encoder inserts
+/// (RFC 9204, section 3.2), once we allow it one
+/// (`SETTINGS_QPACK_MAX_TABLE_CAPACITY` above zero).
+///
+/// It holds at most the capacity we announced, counted the way RFC 9204
+/// counts (name, value and 32 bytes an entry): the peer decides what goes
+/// in, never how much memory it takes. Everything here works on bytes in
+/// memory, like the rest of this module; waiting for insertions and
+/// writing to our decoder stream are the connection's business.
+pub(crate) struct Table {
+    /// The capacity we announced: the encoder may set any up to it.
+    max_capacity: u64,
+    /// The capacity the encoder set (section 4.3.1): zero until it does.
+    capacity: u64,
+    /// What the entries count for.
+    size: u64,
+    /// Oldest first: the front has absolute index `inserted - len`.
+    entries: VecDeque<Entry>,
+    /// Insertions received since the connection began.
+    inserted: u64,
+    /// Insertions the encoder has been told about (Insert Count Increment
+    /// and Section Acknowledgment, section 4.4).
+    acked: u64,
+}
+
+impl Table {
+    /// A table for a peer we allow `max_capacity` bytes, above zero.
+    pub(crate) fn new(max_capacity: u64) -> Self {
+        Self {
+            max_capacity,
+            capacity: 0,
+            size: 0,
+            entries: VecDeque::new(),
+            inserted: 0,
+            acked: 0,
+        }
+    }
+
+    /// Insertions received so far.
+    pub(crate) fn inserted(&self) -> u64 {
+        self.inserted
+    }
+
+    /// The bytes the entries count for, never above the capacity we
+    /// announced.
+    #[cfg(test)]
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// The entry at absolute index `abs`, if it is in the table.
+    fn get(&self, abs: u64) -> Option<(&[u8], &[u8])> {
+        let first = self.inserted - self.entries.len() as u64;
+        let entry = self.entries.get(abs.checked_sub(first)? as usize)?;
+        Some(entry.field.split_at(entry.name_len))
+    }
+
+    /// The entry `relative` places before the newest one, as the encoder
+    /// stream names entries (section 3.2.5).
+    fn relative(&self, relative: u64) -> Result<(&[u8], &[u8]), Error> {
+        self.inserted
+            .checked_sub(relative + 1)
+            .and_then(|abs| self.get(abs))
+            .ok_or(stream_error("a reference to an entry not in the table"))
+    }
+
+    fn evict_to(&mut self, room: u64) {
+        while self.size > room {
+            let entry = self.entries.pop_front().expect("size counts the entries");
+            self.size -= entry.size();
+        }
+    }
+
+    fn insert(&mut self, name: &[u8], value: &[u8]) -> Result<(), Error> {
+        let mut field = Vec::with_capacity(name.len() + value.len());
+        field.extend_from_slice(name);
+        field.extend_from_slice(value);
+        let entry = Entry {
+            field: field.into_boxed_slice(),
+            name_len: name.len(),
+        };
+        let size = entry.size();
+        if size > self.capacity {
+            return Err(stream_error("an entry larger than the table"));
+        }
+        // Section 3.2.2: older entries make room. The encoder knows which
+        // of them streams still refer to; evicting one of those is its
+        // error, which shows as a reference to an evicted entry.
+        self.evict_to(self.capacity - size);
+        self.size += size;
+        self.entries.push_back(entry);
+        self.inserted += 1;
+        Ok(())
+    }
+
+    /// Reads what the peer's encoder stream says (RFC 9204, section 4.3),
+    /// from after the stream type on, and applies it. Returns how many
+    /// bytes of `buf` were read: whole instructions only, so the caller
+    /// keeps the rest and calls again with more. A string longer than
+    /// the table could hold is refused when its length is read, so the
+    /// caller never holds more than about twice the capacity we allow.
+    pub(crate) fn encoder_stream(&mut self, buf: &[u8]) -> Result<usize, Error> {
+        let large = stream_error("integer too large on the encoder stream");
+        let limit = self.max_capacity;
+        let mut done = 0;
+        while let Some(&b) = buf.get(done) {
+            let mut pos = done;
+            if b & 0x80 != 0 {
+                // Insert with name reference: 1 T index(6), value.
+                let Some(index) = read_int(buf, &mut pos, 6, large)? else {
+                    break;
+                };
+                let Some(value) = take_string(buf, &mut pos, 7, limit)? else {
+                    break;
+                };
+                let name = if b & 0x40 != 0 {
+                    static_entry(index)
+                        .map_err(|_| stream_error("index past the end of the static table"))?
+                        .0
+                        .to_vec()
+                } else {
+                    self.relative(index)?.0.to_vec()
+                };
+                self.insert(&name, &value)?;
+            } else if b & 0x40 != 0 {
+                // Insert with literal name: 01 H length(5), name, value.
+                let Some(name) = take_string(buf, &mut pos, 5, limit)? else {
+                    break;
+                };
+                let Some(value) = take_string(buf, &mut pos, 7, limit)? else {
+                    break;
+                };
+                self.insert(&name, &value)?;
+            } else if b & 0x20 != 0 {
+                // Set Dynamic Table Capacity: 001 capacity(5).
+                let Some(capacity) = read_int(buf, &mut pos, 5, large)? else {
+                    break;
+                };
+                if capacity > self.max_capacity {
+                    return Err(stream_error("a capacity above the one we allow"));
+                }
+                self.capacity = capacity;
+                self.evict_to(capacity);
+            } else {
+                // Duplicate: 000 index(5).
+                let Some(index) = read_int(buf, &mut pos, 5, large)? else {
+                    break;
+                };
+                let (name, value) = self.relative(index)?;
+                let (name, value) = (name.to_vec(), value.to_vec());
+                self.insert(&name, &value)?;
+            }
+            done = pos;
+        }
+        Ok(done)
+    }
+
+    /// Reads the prefix of a field section (section 4.5.1): how many
+    /// insertions it needs, and its Base.
+    pub(crate) fn prefix(&self, block: &[u8]) -> Result<Prefix, Error> {
+        let ends = failed("field section ends inside its prefix");
+        let large = failed("integer too large in a field section");
+        let bad = failed("invalid Required Insert Count");
+        let mut pos = 0;
+        let encoded = read_int(block, &mut pos, 8, large)?.ok_or(ends)?;
+        let negative = *block.get(pos).ok_or(ends)? & 0x80 != 0;
+        let delta = read_int(block, &mut pos, 7, large)?.ok_or(ends)?;
+        // Section 4.5.1.1: the count is sent modulo twice the most
+        // entries the table can hold.
+        let required = if encoded == 0 {
+            0
+        } else {
+            let max_entries = self.max_capacity / ENTRY_OVERHEAD;
+            let full = 2 * max_entries;
+            if encoded > full {
+                return Err(bad);
+            }
+            let max_value = self.inserted + max_entries;
+            let max_wrapped = max_value / full * full;
+            let mut required = max_wrapped + encoded - 1;
+            if required > max_value {
+                if required <= full {
+                    return Err(bad);
+                }
+                required -= full;
+            }
+            if required == 0 {
+                return Err(bad);
+            }
+            required
+        };
+        let base = if negative {
+            required
+                .checked_sub(delta + 1)
+                .ok_or(failed("Base below zero"))?
+        } else {
+            required + delta
+        };
+        Ok(Prefix {
+            required,
+            base,
+            lines: pos,
+        })
+    }
+
+    /// Decodes the field lines of a section whose prefix said `prefix`,
+    /// once the table holds the insertions it needs.
+    pub(crate) fn decode(
+        &self,
+        block: &[u8],
+        prefix: Prefix,
+        mut field: impl FnMut(&[u8], &[u8]),
+    ) -> Result<(), Error> {
+        debug_assert!(prefix.required <= self.inserted);
+        SCRATCH.with(|scratch| {
+            let mut scratch = scratch.borrow_mut();
+            let scratch = &mut *scratch;
+            let result = lines(
+                block,
+                prefix.lines,
+                Some((self, prefix)),
+                scratch,
+                &mut field,
+            );
+            for buf in [&mut scratch.name, &mut scratch.value] {
+                if buf.capacity() > SCRATCH_KEEP {
+                    *buf = Vec::new();
+                }
+            }
+            result
+        })
+    }
+
+    /// The Insert Count Increment to send (section 4.4.3) for the
+    /// insertions the encoder was not told about yet, if any.
+    pub(crate) fn increment(&mut self, out: &mut Vec<u8>) {
+        let n = self.inserted - self.acked;
+        if n > 0 {
+            // Insert Count Increment: 00 increment(6).
+            write_int(out, 0x00, 6, n as usize);
+            self.acked = self.inserted;
+        }
+    }
+
+    /// Writes a Section Acknowledgment for the field section of `stream`
+    /// that needed `required` insertions (section 4.4.1). Sections that
+    /// needed none are not acknowledged.
+    pub(crate) fn acknowledge(&mut self, stream: u64, required: u64, out: &mut Vec<u8>) {
+        if required > 0 {
+            // Section Acknowledgment: 1 stream id(7).
+            write_int(out, 0x80, 7, stream as usize);
+            self.acked = self.acked.max(required);
+        }
+    }
+}
+
+/// Writes a Stream Cancellation (RFC 9204, section 4.4.2): the decoder
+/// gave up on `stream`, whose sections the encoder may stop counting.
+pub(crate) fn cancel_stream(stream: u64, out: &mut Vec<u8>) {
+    write_int(out, 0x40, 6, stream as usize);
+}
+
+fn stream_error(what: &'static str) -> Error {
+    Error::new(Code::QpackEncoderStreamError, what)
+}
+
+/// Reads a string of the encoder stream whose length has an `n`-bit
+/// prefix and whose Huffman flag is the bit above it: `Ok(None)` if `buf`
+/// ends before it does. A length above `limit` is an error at once.
+fn take_string(buf: &[u8], pos: &mut usize, n: u8, limit: u64) -> Result<Option<Vec<u8>>, Error> {
+    let Some(&first) = buf.get(*pos) else {
+        return Ok(None);
+    };
+    let huffman = first & (1 << n) != 0;
+    let large = stream_error("string length too large on the encoder stream");
+    let Some(len) = read_int(buf, pos, n, large)? else {
+        return Ok(None);
+    };
+    if len > limit {
+        return Err(stream_error("a string longer than the table could hold"));
+    }
+    let len = len as usize;
+    let Some(raw) = buf.get(*pos..*pos + len) else {
+        return Ok(None);
+    };
+    *pos += len;
+    if !huffman {
+        return Ok(Some(raw.to_vec()));
+    }
+    let mut out = Vec::with_capacity(len + len / 2);
+    huffman::decode(raw, &mut out)
+        .map_err(|()| stream_error("invalid Huffman code on the encoder stream"))?;
+    Ok(Some(out))
+}
+
 /// Checks what the peer's encoder stream says (RFC 9204, section 4.3),
 /// from after the stream type on. Returns how many bytes of `buf` were
 /// read: whole instructions only, so the caller keeps the rest and calls
@@ -465,4 +845,103 @@ pub(crate) fn check(block: &[u8]) -> bool {
     decode(&out, |n, v| back.push((n.to_vec(), v.to_vec()))).expect("a section of ours decodes");
     assert_eq!(back, fields);
     true
+}
+
+/// What the dynamic table must guarantee for any input, for the fuzz
+/// target and the randomised tests. `input`: a byte choosing the capacity
+/// we allow (32 bytes to 8 KiB), two bytes giving the length of the
+/// encoder stream that follows, then field sections, each after a byte
+/// giving its length.
+///
+/// The encoder stream read in pieces does what it does read whole (same
+/// error or none, same insertions, same size), the table never counts
+/// above the capacity, and a section either fails, waits for insertions
+/// or decodes to fields that our encoder turns into a section decoding
+/// back to the same fields. Returns `true` if a section decoded with the
+/// table's help.
+#[cfg(any(test, fuzzing))]
+pub(crate) fn check_table(input: &[u8]) -> bool {
+    let Some((&cap, rest)) = input.split_first() else {
+        return false;
+    };
+    let max = 32 * (u64::from(cap) + 1) * 2;
+    let Some((len, rest)) = rest.split_first_chunk::<2>() else {
+        return false;
+    };
+    let len = usize::from(u16::from_be_bytes(*len)).min(rest.len());
+    let (stream, mut sections) = rest.split_at(len);
+
+    let mut whole = Table::new(max);
+    let whole_result = whole.encoder_stream(stream);
+    assert!(whole.size <= max);
+    // In pieces, as a QUIC stream may deliver it: what was read is kept,
+    // the rest comes again with more.
+    let mut pieces = Table::new(max);
+    let mut held = Vec::new();
+    let mut seed = u32::from(cap) | 1;
+    let mut fed = 0;
+    let mut pieces_result = Ok(0);
+    while fed < stream.len() {
+        seed = seed.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+        let n = (1 + (seed >> 16) as usize % 7).min(stream.len() - fed);
+        held.extend_from_slice(&stream[fed..fed + n]);
+        fed += n;
+        match pieces.encoder_stream(&held) {
+            Ok(used) => {
+                assert!(used <= held.len());
+                held.drain(..used);
+            }
+            Err(e) => {
+                pieces_result = Err(e);
+                break;
+            }
+        }
+        assert!(pieces.size <= max);
+    }
+    match (&whole_result, &pieces_result) {
+        (Ok(used), Ok(_)) => {
+            assert_eq!(held.len(), stream.len() - used, "pieces kept another rest");
+        }
+        (Err(a), Err(b)) => assert_eq!(a.code, b.code),
+        // An error found whole lies in an instruction that pieces may not
+        // have completed yet only if it is the last one; then the
+        // pieces read everything before it.
+        (Err(_), Ok(_)) => assert!(!held.is_empty()),
+        (Ok(_), Err(e)) => panic!("an error read in pieces only: {e}"),
+    }
+    if whole_result.is_ok() {
+        assert_eq!(whole.inserted, pieces.inserted);
+        assert_eq!(whole.size, pieces.size);
+    }
+
+    let mut used_table = false;
+    while let Some((&n, rest)) = sections.split_first() {
+        let n = usize::from(n).min(rest.len());
+        let (block, rest) = rest.split_at(n);
+        sections = rest;
+        let Ok(prefix) = whole.prefix(block) else {
+            continue;
+        };
+        if prefix.required > whole.inserted {
+            continue;
+        }
+        let mut fields = Vec::new();
+        if whole
+            .decode(block, prefix, |n, v| fields.push((n.to_vec(), v.to_vec())))
+            .is_err()
+        {
+            continue;
+        }
+        used_table |= prefix.required > 0;
+        let mut out = Vec::new();
+        Encoder::begin(&mut out);
+        for (n, v) in &fields {
+            Encoder::field(n, v, Index::Yes, &mut out);
+        }
+        let mut back = Vec::new();
+        decode(&out, |n, v| back.push((n.to_vec(), v.to_vec())))
+            .expect("a section of ours decodes");
+        assert_eq!(back, fields);
+    }
+    used_table
 }

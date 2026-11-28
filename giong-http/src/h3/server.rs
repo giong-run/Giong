@@ -9,9 +9,11 @@
 //! (`max_head_size`, `max_body_size`, the timeouts, the worker's budget for
 //! buffered requests) apply the same way.
 //!
-//! The QPACK dynamic table is not used in either direction: the server
-//! announces a capacity of zero and encodes with static references and
-//! literals, which RFC 9204 allows in full.
+//! The server encodes its field sections with static references and
+//! literals. It announces a QPACK dynamic table for the client's encoder
+//! only when `Server::qpack_table_size` asks for one (none by default);
+//! a request whose field section needs insertions that have not arrived
+//! waits for them.
 
 use std::cell::{Cell, RefCell};
 use std::future::{poll_fn, Future};
@@ -27,6 +29,7 @@ use super::frame::{
     self, kind, read_varint, write_varint, Code, Error, Header, Need, On, Settings, StreamType,
 };
 use super::qpack::{self, Encoder};
+use super::qpack_conn::Decoder;
 use crate::body::{Failure, Next, Pipe, RateClock};
 use crate::budget::{self, Charge};
 use crate::h2::hpack::Index;
@@ -97,6 +100,9 @@ struct Conn {
     unsent_budget: u64,
     /// The tasks of handlers waiting for `unsent` to fall below the budget.
     parked: RefCell<Vec<Waker>>,
+    /// The QPACK decoder, when the client is allowed a dynamic table
+    /// (`Server::qpack_table_size`).
+    qpack: Option<Rc<Decoder>>,
 }
 
 impl Conn {
@@ -350,6 +356,14 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
         unsent: Cell::new(0),
         unsent_budget: crate::h2::budget(&cfg),
         parked: RefCell::new(Vec::new()),
+        qpack: (cfg.qpack_table_size > 0).then(|| Rc::new(Decoder::new(cfg.qpack_table_size))),
+    });
+    // The decoder's stream writer and the requests waiting for insertions
+    // end with the connection, however `serve` ends.
+    let _qpack = conn.qpack.clone().map(|decoder| {
+        let (conn, writer) = (conn.clone(), decoder.clone());
+        drop(giong::spawn(async move { writer.write(&conn.quic).await }));
+        EndQpack(decoder)
     });
     // The control stream, which stays open for as long as the connection
     // does: closing it is a connection error (section 6.2.1).
@@ -359,7 +373,11 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
     // timeout.
     let mut out = Vec::with_capacity(16);
     write_varint(&mut out, StreamType::CONTROL);
-    Settings::write_frame(&mut out, cfg.max_head_size as u64);
+    Settings::write_frame(
+        &mut out,
+        cfg.max_head_size as u64,
+        u64::from(cfg.qpack_table_size),
+    );
     let opened = timeout(cfg.write_timeout, async {
         let mut control = conn.quic.open_uni().await?;
         control.write_all(&out).await?;
@@ -479,7 +497,10 @@ async fn peer_stream(conn: &Conn, r: &mut Reader) -> Result<(), Stop> {
         }
         StreamType::QpackEncoder => {
             critical(2)?;
-            qpack_stream(r, qpack::encoder_stream).await
+            match &conn.qpack {
+                Some(decoder) => qpack_stream(r, |buf| decoder.encoder_stream(buf)).await,
+                None => qpack_stream(r, qpack::encoder_stream).await,
+            }
         }
         StreamType::QpackDecoder => {
             critical(4)?;
@@ -508,14 +529,14 @@ fn closed_critical() -> Stop {
     )
 }
 
-/// Reads a QPACK stream of a client that was told there is no dynamic
-/// table: `check` accepts the few instructions that remain legal.
+/// Reads a QPACK stream of the client: `read` takes whole instructions
+/// and says how many bytes they were.
 async fn qpack_stream(
     r: &mut Reader,
-    check: fn(&[u8]) -> Result<usize, Error>,
+    mut read: impl FnMut(&[u8]) -> Result<usize, Error>,
 ) -> Result<(), Stop> {
     loop {
-        let used = check(r.rest())?;
+        let used = read(r.rest())?;
         r.consume(used);
         match r.fill().await {
             Ok(true) => {}
@@ -672,6 +693,7 @@ struct BodyState {
 
 /// The next piece of a request body; `None` at the end of the request.
 async fn body_piece(
+    qpack: Option<&Decoder>,
     r: &mut Reader,
     st: &mut BodyState,
     max_head: usize,
@@ -695,12 +717,17 @@ async fn body_piece(
             kind::DATA if header.len > 0 => st.left = header.len,
             kind::HEADERS => {
                 st.trailers = true;
+                let id = r.recv.id();
                 if header.len > max_head as u64 {
+                    if let Some(decoder) = qpack {
+                        decoder.cancel(id);
+                    }
                     return Err(Stop::Stream(Code::ExcessiveLoad));
                 }
                 let block = r.exact(header.len as usize).await?;
                 let mut trailers = TrailerBlock::new(st.keep);
-                qpack::decode(&block, |name, value| trailers.field(name, value))?;
+                decode_section(qpack, id, &block, |name, value| trailers.field(name, value))
+                    .await?;
                 if trailers.error.is_some() {
                     return Err(Stop::Stream(Code::MessageError));
                 }
@@ -752,16 +779,47 @@ async fn read_head(conn: &Conn, r: &mut Reader) -> Result<Built, Stop> {
     // limit that was announced. Answered at once: the rest of the stream,
     // which a client may announce as a gigabyte, is not read (the stream
     // is stopped once the answer is out).
+    let id = r.recv.id();
     if header.len > max_head as u64 {
+        if let Some(decoder) = conn.qpack.as_deref() {
+            decoder.cancel(id);
+        }
         return Ok(Built::Status(431));
     }
     let block = r.exact(header.len as usize).await?;
     let mut builder = Builder::with_scratch(max_head, Vec::new()).http3();
-    qpack::decode(&block, |name, value| builder.field(name, value))?;
+    decode_section(conn.qpack.as_deref(), id, &block, |name, value| {
+        builder.field(name, value)
+    })
+    .await?;
     // Read for each request: a client that moves (a NAT rebinding, or a
     // new network) is seen where it is now. For a request that came in
     // 0-RTT data the address is not validated yet and may be forged.
     Ok(builder.finish(Some(conn.quic.remote_addr())))
+}
+
+/// Decodes a field section of request stream `id`: with the dynamic
+/// table if the client is allowed one, waiting for the insertions it
+/// needs; with the static table alone otherwise.
+async fn decode_section(
+    qpack: Option<&Decoder>,
+    id: u64,
+    block: &[u8],
+    field: impl FnMut(&[u8], &[u8]),
+) -> Result<(), Error> {
+    match qpack {
+        Some(decoder) => decoder.decode(id, block, field).await,
+        None => qpack::decode(block, field),
+    }
+}
+
+/// Ends a connection's QPACK decoder when dropped.
+struct EndQpack(Rc<Decoder>);
+
+impl Drop for EndQpack {
+    fn drop(&mut self) {
+        self.0.end();
+    }
 }
 
 /// A handler's future, on the heap. A panic of the handler becomes the
@@ -878,7 +936,7 @@ async fn exchange<H: Handler>(
         let mut charge = Charge::none();
         let mut st = BodyState::default();
         let read = async {
-            while let Some(piece) = body_piece(r, &mut st, max_head).await? {
+            while let Some(piece) = body_piece(conn.qpack.as_deref(), r, &mut st, max_head).await? {
                 if content_length.is_some_and(|cl| st.received > cl) {
                     return Err(Stop::Stream(Code::MessageError));
                 }
@@ -942,7 +1000,7 @@ async fn exchange<H: Handler>(
                     asked_at.set(Some(at));
                     giong::time::sleep_until(at + wait).await;
                 };
-                let mut next = pin!(body_piece(r, &mut st, max_head));
+                let mut next = pin!(body_piece(conn.qpack.as_deref(), r, &mut st, max_head));
                 let mut expiry = pin!(expiry);
                 poll_fn(|cx| {
                     if let Poll::Ready(got) = next.as_mut().poll(cx) {

@@ -196,7 +196,7 @@ async fn connect_with(server: Server, transport: TransportConfig) -> Client {
     let (conn, endpoint) = connect_bare_with(server, transport).await;
     let mut control = conn.open_uni().await.unwrap();
     let mut out = vec![0x00];
-    Settings::write_frame(&mut out, 1 << 20);
+    Settings::write_frame(&mut out, 1 << 20, 0);
     control.write_all(&out).await.unwrap();
     Client {
         conn,
@@ -784,7 +784,7 @@ fn breaking_the_protocol_closes_the_connection_with_its_code() {
         let client = connect().await;
         let mut second = client.conn.open_uni().await.unwrap();
         let mut out = vec![0x00];
-        Settings::write_frame(&mut out, 1 << 20);
+        Settings::write_frame(&mut out, 1 << 20, 0);
         second.write_all(&out).await.unwrap();
         let seen = closed_with(&client).await;
         assert!(seen.contains("0x103") || seen.contains("259"), "{seen}");
@@ -813,7 +813,7 @@ fn breaking_the_protocol_closes_the_connection_with_its_code() {
         // SETTINGS twice: H3_FRAME_UNEXPECTED.
         let mut client = connect().await;
         let mut out = Vec::new();
-        Settings::write_frame(&mut out, 1 << 20);
+        Settings::write_frame(&mut out, 1 << 20, 0);
         client.control.write_all(&out).await.unwrap();
         let seen = closed_with(&client).await;
         assert!(seen.contains("0x105") || seen.contains("261"), "{seen}");
@@ -1078,7 +1078,7 @@ fn requests_in_early_data_are_marked_and_unsafe_ones_wait() {
             recv
         }
         let mut control_frame = vec![0x00];
-        Settings::write_frame(&mut control_frame, 1 << 20);
+        Settings::write_frame(&mut control_frame, 1 << 20, 0);
         let mut post_hi = post("/echo", &[("content-length", "2")]);
         post_hi.extend_from_slice(&data(b"hi"));
 
@@ -1206,5 +1206,223 @@ fn a_trickling_streamed_body_is_cut_once_it_falls_below_the_minimum_rate() {
         );
         // Only that stream: the connection goes on.
         assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
+    });
+}
+
+/// The server's unidirectional stream of type `kind`, and the bytes after
+/// the type once at least `want` of them arrived.
+async fn server_stream(
+    conn: &Connection,
+    kind: u8,
+    want: usize,
+) -> (giong_quic::RecvStream, Vec<u8>) {
+    loop {
+        let mut stream = conn.accept_uni().await.unwrap();
+        let mut bytes = Vec::new();
+        while bytes.is_empty() {
+            bytes.extend_from_slice(&stream.read().await.unwrap().expect("a stream type"));
+        }
+        if bytes[0] != kind {
+            continue;
+        }
+        bytes.remove(0);
+        while bytes.len() < want {
+            let piece = stream.read().await.unwrap().expect("more bytes");
+            bytes.extend_from_slice(&piece);
+        }
+        return (stream, bytes);
+    }
+}
+
+/// Opens the client's QPACK encoder stream and writes `instructions`.
+async fn encoder_stream(client: &Client, instructions: &[u8]) -> SendStream {
+    let mut stream = client.conn.open_uni().await.unwrap();
+    let mut out = vec![0x02];
+    out.extend_from_slice(instructions);
+    stream.write_all(&out).await.unwrap();
+    stream
+}
+
+/// Inserts `:authority: localhost` and `:path: /` into a table of capacity
+/// 220 (RFC 9204, appendix B.2, with this test's values).
+const INSERTS: &[u8] = b"\x3f\xbd\x01\xc0\x09localhost\xc1\x01/";
+
+/// A GET of `/` whose `:authority` and `:path` are the two entries
+/// [`INSERTS`] makes, as post-base references: Required Insert Count 2,
+/// Base 0.
+fn dynamic_get() -> Vec<u8> {
+    // :method GET (static 17), :scheme https (static 23).
+    let block = [0x03, 0x81, 0x10, 0x11, 0xd1, 0xd7];
+    let mut out = Vec::new();
+    Header::write(&mut out, kind::HEADERS, block.len() as u64);
+    out.extend_from_slice(&block);
+    out
+}
+
+#[test]
+fn a_client_may_use_the_dynamic_table_it_is_allowed() {
+    run(|| async {
+        let client = connect_to(Server::new().qpack_table_size(220)).await;
+        // The SETTINGS frame announces the table and the blocked streams.
+        let (_control, bytes) = server_stream(&client.conn, 0x00, 12).await;
+        // SETTINGS comes first: 12 bytes with these three settings.
+        let (kind, a) = read_varint(&bytes).unwrap();
+        let (len, b) = read_varint(&bytes[a..]).unwrap();
+        assert_eq!(kind, kind::SETTINGS);
+        let control = &bytes[a + b..];
+        let settings = Settings::parse(&control[..len as usize]).unwrap();
+        assert_eq!(settings.qpack_max_table_capacity, 220);
+        assert_eq!(settings.qpack_blocked_streams, qpack::BLOCKED_STREAMS);
+
+        let _encoder = encoder_stream(&client, INSERTS).await;
+        let reply = roundtrip(&client, dynamic_get()).await.unwrap();
+        assert_eq!(reply.statuses, [200]);
+        assert_eq!(reply.body, b"hello over HTTP/3");
+        // The decoder stream: Insert Count Increment 2, then the Section
+        // Acknowledgment of stream 0.
+        let (_decoder, said) = server_stream(&client.conn, 0x03, 2).await;
+        assert_eq!(said, [0x02, 0x80]);
+        // Later requests refer to the same entries.
+        for _ in 0..3 {
+            let reply = roundtrip(&client, dynamic_get()).await.unwrap();
+            assert_eq!(reply.status(), 200);
+        }
+    });
+}
+
+#[test]
+fn a_request_waits_for_the_insertions_it_needs() {
+    run(|| async {
+        let client = connect_to(Server::new().qpack_table_size(220)).await;
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        send.write_all(&dynamic_get()).await.unwrap();
+        send.finish().unwrap();
+        // The section is blocked: nothing can be answered yet.
+        let early = giong::time::timeout(
+            std::time::Duration::from_millis(100),
+            recv.read_to_end(1 << 20),
+        )
+        .await;
+        assert!(early.is_err(), "answered before the insertions arrived");
+        let _encoder = encoder_stream(&client, INSERTS).await;
+        let reply = parse(&recv.read_to_end(1 << 20).await.unwrap());
+        assert_eq!(reply.status(), 200);
+    });
+}
+
+#[test]
+fn too_many_waiting_requests_are_a_connection_error() {
+    run(|| async {
+        let client = connect_to(Server::new().qpack_table_size(220)).await;
+        let mut streams = Vec::new();
+        for _ in 0..=qpack::BLOCKED_STREAMS {
+            let (mut send, recv) = client.conn.open_bi().await.unwrap();
+            send.write_all(&dynamic_get()).await.unwrap();
+            streams.push((send, recv));
+        }
+        // QPACK_DECOMPRESSION_FAILED (0x200).
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x200") || seen.contains("512"), "{seen}");
+    });
+}
+
+#[test]
+fn a_request_that_gives_up_waiting_is_cancelled_for_the_encoder() {
+    run(|| async {
+        let server = Server::new()
+            .qpack_table_size(220)
+            .request_timeout(std::time::Duration::from_millis(100));
+        let client = connect_to(server).await;
+        let (mut send, _recv) = client.conn.open_bi().await.unwrap();
+        send.write_all(&dynamic_get()).await.unwrap();
+        // The request times out while it waits: Stream Cancellation of
+        // stream 0 (01 stream id(6)).
+        let (mut decoder, said) = server_stream(&client.conn, 0x03, 1).await;
+        assert_eq!(said, [0x40]);
+        // And no longer counts as waiting: 16 more may wait.
+        let mut streams = Vec::new();
+        for _ in 0..qpack::BLOCKED_STREAMS {
+            let (mut send, recv) = client.conn.open_bi().await.unwrap();
+            send.write_all(&dynamic_get()).await.unwrap();
+            streams.push((send, recv));
+        }
+        let _encoder = encoder_stream(&client, INSERTS).await;
+        // The Insert Count Increment comes before anything else the
+        // decoder says of these insertions: once it is here, a request
+        // that needs them does not wait. Sent before it, the request could
+        // reach the server ahead of the insertions, as a 17th waiting.
+        let piece = decoder.read().await.unwrap().expect("an increment");
+        // Insert Count Increment: 00 increment(6), here 2 (or 1 and 1).
+        assert_eq!(piece[0] & 0xc0, 0, "{piece:02x?}");
+        let reply = roundtrip(&client, dynamic_get()).await.unwrap();
+        assert_eq!(reply.status(), 200);
+    });
+}
+
+#[test]
+fn a_section_answered_431_undecoded_is_cancelled_for_the_encoder() {
+    run(|| async {
+        let client = connect_to(Server::new().qpack_table_size(220)).await;
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        let mut out = Vec::new();
+        Header::write(&mut out, kind::HEADERS, 1 << 30);
+        out.extend_from_slice(&[0; 100]);
+        send.write_all(&out).await.unwrap();
+        let reply = recv.read_to_end(1 << 20).await.unwrap();
+        assert_eq!(parse(&reply).status(), 431);
+        // Stream Cancellation of stream 0: the encoder stops counting the
+        // references of a section nobody decoded.
+        let (_decoder, said) = server_stream(&client.conn, 0x03, 1).await;
+        assert_eq!(said, [0x40]);
+    });
+}
+
+#[test]
+fn a_client_that_never_reads_the_decoder_stream_cannot_grow_it() {
+    run(|| async {
+        // 32 bytes of credit on each stream the server opens: what the
+        // decoder stream says past that waits, since the client reads none
+        // of it.
+        let transport = TransportConfig::default().windows(32, 1 << 20);
+        let client = connect_with(Server::new().qpack_table_size(220), transport).await;
+        let mut encoder = encoder_stream(&client, INSERTS).await;
+        // Each Duplicate (000 index(5)) read on its own is one more Insert
+        // Count Increment to say: past the cap (64 bytes in tests, 16 KiB
+        // otherwise), H3_EXCESSIVE_LOAD (0x107).
+        for _ in 0..200 {
+            if encoder.write_all(&[0x00]).await.is_err() {
+                break;
+            }
+            giong::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x107") || seen.contains("263"), "{seen}");
+    });
+}
+
+#[test]
+fn an_encoder_stream_that_breaks_rfc_9204_closes_the_connection() {
+    run(|| async {
+        // A capacity above the one allowed: QPACK_ENCODER_STREAM_ERROR
+        // (0x201).
+        let client = connect_to(Server::new().qpack_table_size(220)).await;
+        let _encoder = encoder_stream(&client, b"\x3f\xbe\x01").await;
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x201") || seen.contains("513"), "{seen}");
+        // A section referring to an entry the table no longer holds:
+        // QPACK_DECOMPRESSION_FAILED. Capacity 64 holds one entry of
+        // `:authority: localhost` (32 + 19); the second insertion evicts
+        // the first.
+        let client = connect_to(Server::new().qpack_table_size(220)).await;
+        let _encoder = encoder_stream(&client, b"\x3f\x21\xc0\x09localhost\xc0\x09localhost").await;
+        // Required Insert Count 1 (encoded 2), Base 1: entry 0.
+        let block = [0x02, 0x00, 0x80, 0xd1, 0xd7, 0xc1];
+        let mut request = Vec::new();
+        Header::write(&mut request, kind::HEADERS, block.len() as u64);
+        request.extend_from_slice(&block);
+        giong::time::sleep(std::time::Duration::from_millis(50)).await;
+        let _ = roundtrip(&client, request).await;
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x200") || seen.contains("512"), "{seen}");
     });
 }
