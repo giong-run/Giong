@@ -74,6 +74,7 @@ impl Handler for App {
                 let Some(body) = req.body_stream() else {
                     return Response::text("0 bytes");
                 };
+                self.record("sum started");
                 // A stream the client resets may drop its handler.
                 let mut cancelled = Cancelled(Some(self.clone()));
                 let mut size = 0;
@@ -276,9 +277,18 @@ fn an_aborted_request_body_cancels_the_request() {
         let app = App::default();
         let (base, client) = serve(app.clone());
         let (request, body) = client.post(&format!("{base}/sum")).streamed_body();
+        let seen = app.clone();
         let producer = giong::spawn(async move {
             body.send("part").await.unwrap();
-            sleep(Duration::from_millis(20)).await;
+            // Aborted once the server has the request: an abort before the
+            // head went out (the handshake is slow under TSan) cancels a
+            // request the server never sees.
+            for _ in 0..1000 {
+                if seen.seen("sum started") {
+                    break;
+                }
+                sleep(Duration::from_millis(5)).await;
+            }
             body.abort();
         });
         let err = request.send().await.unwrap_err();
