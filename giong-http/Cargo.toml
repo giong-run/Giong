@@ -82,6 +82,10 @@ required-features = ["client"]
 name = "h3"
 required-features = ["unstable-http3"]
 
+[[test]]
+name = "h3_duplex"
+required-features = ["unstable-http3", "client"]
+
 [[example]]
 name = "h2"
 required-features = ["tls"]

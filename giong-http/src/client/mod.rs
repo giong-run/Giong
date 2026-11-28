@@ -55,11 +55,11 @@
 //!   connections with a PING, closing those that do not answer in time.
 //! * Request bodies written piece by piece
 //!   ([`RequestBuilder::streamed_body`], [`RequestBody`]), with trailer
-//!   fields after them; over HTTP/2 the response is read while the request
-//!   is still being written (full duplex). The trailer fields of a response
-//!   are read with [`StreamingResponse::trailers`]; an HTTP/2 or HTTP/3
-//!   request sent with [`RequestBuilder::send_streaming`] says
-//!   `te: trailers`. A streamed body goes over HTTP/1.1 or HTTP/2.
+//!   fields after them; over HTTP/2 and HTTP/3 the response is read while
+//!   the request is still being written (full duplex). The trailer fields
+//!   of a response are read with [`StreamingResponse::trailers`]; an HTTP/2
+//!   or HTTP/3 request sent with [`RequestBuilder::send_streaming`] says
+//!   `te: trailers`.
 //! * Every request has a timeout (30 s by default) that covers waiting for
 //!   a connection, connecting, sending, and reading the whole response,
 //!   redirects included; connecting has its own (10 s).
@@ -463,10 +463,10 @@ impl ClientBuilder {
     /// such as giong-http's own `Server::serve_h3`. Every request to an
     /// `https` origin then goes over QUIC, on one connection for each
     /// origin; nothing falls back to TCP. Not through a proxy, where
-    /// requests stay on HTTP/1.1 and HTTP/2. A request with a streamed body
-    /// ([`RequestBuilder::streamed_body`]) is refused with
-    /// [`ErrorKind::Request`], since HTTP/3 requests carry bodies held in
-    /// memory.
+    /// requests stay on HTTP/1.1 and HTTP/2. A streamed request body
+    /// ([`RequestBuilder::streamed_body`]) goes out as it is produced, with
+    /// its trailer fields, while the response is read; the request is sent
+    /// again after a rejection only if nothing of the body was taken yet.
     ///
     /// `quic` carries the TLS settings, which must offer the ALPN protocol
     /// `h3`, and the transport's: its idle timeout is what closes an unused
@@ -1195,25 +1195,8 @@ impl Client {
             && !headers
                 .iter()
                 .any(|(n, _)| n.eq_ignore_ascii_case("accept-encoding"));
-        // A server spoken to by prior knowledge may have no TCP: refused
-        // rather than sent there.
         #[cfg(feature = "unstable-http3")]
-        if let (Some(http3), true, None, true) = (&config.http3, url.https, &route.proxy, streamed)
-        {
-            if http3.prior_knowledge {
-                return Err(Error::request(format!(
-                    "{what}: a streamed request body cannot go over HTTP/3 yet, and this client \
-                     speaks HTTP/3 to https origins by prior knowledge; send the body from \
-                     memory (RequestBuilder::body), or use a client without \
-                     http3_prior_knowledge"
-                )));
-            }
-        }
-        #[cfg(feature = "unstable-http3")]
-        // A streamed request body goes over HTTP/1.1 or HTTP/2: the HTTP/3
-        // client sends bodies it has whole.
-        if let (Some(http3), true, None, false) = (&config.http3, url.https, &route.proxy, streamed)
-        {
+        if let (Some(http3), true, None) = (&config.http3, url.https, &route.proxy) {
             let origin = url.origin();
             let to = if http3.prior_knowledge {
                 Some((origin.port, config.connect_timeout))
@@ -1233,7 +1216,7 @@ impl Client {
             if let Some(to) = to {
                 return self
                     .execute_h3(
-                        http3, to, method, url, headers, body, decompress, trailers, what,
+                        http3, to, method, url, headers, body, source, decompress, trailers, what,
                     )
                     .await;
             }
@@ -1436,19 +1419,21 @@ impl Client {
         url: &Url,
         headers: &[(String, String)],
         body: Option<&[u8]>,
+        source: &mut Option<StreamBody>,
         decompress: bool,
         trailers: bool,
         what: String,
     ) -> Result<Pending, Error> {
         let config = &self.shared.config;
         let origin = url.origin();
+        let streamed = source.is_some();
         let fields = h2_fields(
             method,
             headers,
             body,
             &config.user_agent,
             decompress,
-            false,
+            streamed,
             trailers,
         );
         let authority = headers
@@ -1471,12 +1456,27 @@ impl Client {
             let (conn, reused) = self
                 .h3_connection(&http3.quic, &origin, port, connect_timeout)
                 .await?;
+            let body = source.take().map(|s| Rc::new(h3::BodySource::new(s)));
             let response = async {
-                let mut stream = conn.send(&req).await?;
-                stream.response().await?;
-                Ok(stream)
+                let Some(body) = &body else {
+                    let mut stream = conn.send(&req).await?;
+                    stream.response().await?;
+                    return Ok(stream);
+                };
+                // The response's head is awaited while the body is sent.
+                conn.send_streamed(&req, body).await
             };
-            match response.await {
+            let answered = response.await;
+            // Whether the request can be sent again: always without a
+            // streamed body, with one only if nothing was taken from it.
+            let resend = match &body {
+                None => true,
+                Some(body) => {
+                    *source = body.unused();
+                    source.is_some()
+                }
+            };
+            match answered {
                 // 425 Too Early: the server will take the request once the
                 // handshake is over (RFC 8470, section 5.2).
                 Ok(stream) if stream.head().status == 425 && stream.was_early() && !too_early => {
@@ -1498,6 +1498,15 @@ impl Client {
                     ));
                 }
                 Err(h2::StreamError::Refused(m)) => {
+                    if !resend {
+                        return Err(Error::new(
+                            ErrorKind::Closed,
+                            format!(
+                                "{what}: {m}; part of the streamed request body had been \
+                                 sent, so the request is not sent again by itself"
+                            ),
+                        ));
+                    }
                     refused += 1;
                     if refused > 5 {
                         return Err(Error::new(
@@ -1511,7 +1520,7 @@ impl Client {
                     message,
                 }) if reused && !again => {
                     let e = Error::new(ErrorKind::Closed, format!("{what}: {message}"));
-                    if !is_idempotent(method) {
+                    if !resend || (!streamed && !is_idempotent(method)) {
                         return Err(not_sent_again(e, method));
                     }
                     again = true;

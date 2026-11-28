@@ -346,6 +346,15 @@ impl SendStream {
         self.sh.write(self.h, self.id, data).await
     }
 
+    /// Waits until the peer asks this side to stop sending
+    /// (`STOP_SENDING`) and gives the code it sent: a sender with nothing
+    /// to write yet learns that nothing more is wanted without writing.
+    /// Fails, as [`write_all`](Self::write_all) would, when the connection
+    /// ends first. Cancel safe.
+    pub async fn stopped(&mut self) -> io::Result<u64> {
+        self.sh.stopped(self.h, self.id).await
+    }
+
     /// Ends the stream after what was written.
     pub fn finish(&mut self) -> io::Result<()> {
         self.finished = true;

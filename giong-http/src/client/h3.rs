@@ -17,12 +17,16 @@
 //! or RFC 9204 names.
 
 use std::cell::{Cell, RefCell};
+use std::future::{poll_fn, Future};
 use std::io;
+use std::pin::pin;
 use std::rc::Rc;
+use std::task::Poll;
 
 use giong_quic::{RecvStream, SendStream};
 
 use super::h2::{check_field, Decoded, Request, ResponseHead, StreamError};
+use crate::body::{Next, StreamBody};
 use crate::h2::hpack::Index;
 use crate::h3::frame::{self, kind, Code, Header, Need, On, Settings, StreamType};
 use crate::h3::qpack::{self, Encoder};
@@ -173,6 +177,67 @@ impl Connection {
     /// Sends `req` on a stream of its own, waiting while the server allows
     /// no more streams. `Refused` means nothing of it was processed.
     pub(crate) async fn send(&self, req: &Request<'_>) -> Result<Stream, StreamError> {
+        let (stream, cancel) = self.open(req, false).await?;
+        let mut cancel = cancel;
+        let send = cancel.0.as_mut().expect("held until finished");
+        match send.finish() {
+            Ok(()) => {}
+            Err(e) if giong_quic::reset_code(&e) == Some(Code::NoError as u64) => {}
+            Err(e) => {
+                send.reset(Code::RequestCancelled as u32);
+                let mut stream = stream;
+                return Err(stream.failed(e));
+            }
+        }
+        // Finished: nothing to cancel.
+        drop(cancel.0.take());
+        Ok(stream)
+    }
+
+    /// Sends `req`, whose body comes from a source as it is produced, and
+    /// waits for the head of the response. The body is sent meanwhile, so
+    /// a server may answer before the body is over; what is left of it
+    /// then is sent by a task of its own. A body the producer aborts
+    /// resets the stream with H3_REQUEST_CANCELLED and fails the request.
+    pub(crate) async fn send_streamed(
+        &self,
+        req: &Request<'_>,
+        body: &Rc<BodySource>,
+    ) -> Result<Stream, StreamError> {
+        let (mut stream, cancel) = self.open(req, true).await?;
+        let mut pump = Some(Box::pin(pump(cancel, body.clone())));
+        {
+            let mut response = pin!(stream.response());
+            poll_fn(|cx| {
+                if let Some(p) = pump.as_mut() {
+                    if let Poll::Ready(pumped) = p.as_mut().poll(cx) {
+                        pump = None;
+                        if let Pumped::Aborted = pumped {
+                            return Poll::Ready(Err(StreamError::Reset(
+                                "the request body was aborted (RequestBody::abort), so the \
+                                 request was cancelled"
+                                    .into(),
+                            )));
+                        }
+                    }
+                }
+                response.as_mut().poll(cx)
+            })
+            .await?;
+        }
+        if let Some(pump) = pump {
+            drop(giong::spawn(pump));
+        }
+        Ok(stream)
+    }
+
+    /// Opens a stream for `req` and writes its head, and its body when the
+    /// request holds it whole. `streamed`: a body follows from a source.
+    async fn open(
+        &self,
+        req: &Request<'_>,
+        streamed: bool,
+    ) -> Result<(Stream, Cancel), StreamError> {
         let shared = &self.shared;
         let state = &shared.state;
         if let Some(why) = state.closed.borrow().as_ref() {
@@ -198,7 +263,8 @@ impl Connection {
         // Early data can be replayed (RFC 8470), so only a request that is
         // harmless to repeat goes out in it; others wait for the handshake.
         let mut early = send.is_early();
-        if early && !(req.body.is_none() && matches!(req.method, "GET" | "HEAD" | "OPTIONS")) {
+        let bodiless = req.body.is_none() && !streamed;
+        if early && !(bodiless && matches!(req.method, "GET" | "HEAD" | "OPTIONS")) {
             if let Err(e) = shared.quic.handshake().await {
                 state.lost(&e);
                 return Err(StreamError::Refused(e.to_string()));
@@ -232,7 +298,7 @@ impl Connection {
         if sent.is_ok() && !body.is_empty() {
             sent = send.write_all(body).await;
         }
-        match sent.and_then(|()| send.finish()) {
+        match sent {
             Ok(()) => {}
             // A server that has its answer before the request ends (a 413,
             // say) may stop reading: the answer is what matters then.
@@ -242,10 +308,155 @@ impl Connection {
                 return Err(stream.failed(e));
             }
         }
-        // Finished: nothing to cancel.
-        drop(cancel.0.take());
-        Ok(stream)
+        Ok((stream, cancel))
     }
+}
+
+/// The source of a streamed request body, shared by [`pump`] and the
+/// request: the request takes the source back when the server refused it
+/// before anything of the body was taken, so that it can be sent again.
+pub(crate) struct BodySource {
+    source: RefCell<Option<StreamBody>>,
+    pulled: Cell<bool>,
+}
+
+impl BodySource {
+    pub(crate) fn new(source: StreamBody) -> Self {
+        Self {
+            source: RefCell::new(Some(source)),
+            pulled: Cell::new(false),
+        }
+    }
+
+    /// The source, if nothing was taken from it.
+    pub(crate) fn unused(&self) -> Option<StreamBody> {
+        if self.pulled.get() {
+            return None;
+        }
+        self.source.borrow_mut().take()
+    }
+}
+
+/// How sending a streamed request body ended.
+#[derive(Debug)]
+enum Pumped {
+    /// All of it, and its trailers, went out; or the server, having its
+    /// answer, stopped reading (STOP_SENDING with H3_NO_ERROR).
+    Done,
+    /// The producer aborted the body: the stream was reset with
+    /// H3_REQUEST_CANCELLED.
+    Aborted,
+    /// The stream or the connection failed: the response says how.
+    Failed,
+}
+
+/// Sends a streamed request body: each piece as a DATA frame, then the
+/// trailer fields in a HEADERS frame if the producer gave any, then the
+/// end of the stream.
+async fn pump(mut cancel: Cancel, body: Rc<BodySource>) -> Pumped {
+    let mut frame = Vec::with_capacity(16);
+    let ended: io::Result<()> = loop {
+        let send = cancel.0.as_mut().expect("held until the body ends");
+        // The next piece; or the server, having answered, asks for no more
+        // (RFC 9114, section 4.1.2).
+        let next = {
+            let mut stopped = pin!(send.stopped());
+            poll_fn(|cx| {
+                if let Poll::Ready(stop) = stopped.as_mut().poll(cx) {
+                    return Poll::Ready(Err(stop));
+                }
+                match &*body.source.borrow() {
+                    Some(source) => source.poll_next(cx.waker()).map(Ok),
+                    None => Poll::Ready(Ok(Next::Aborted)),
+                }
+            })
+            .await
+        };
+        let written = match next {
+            Ok(Next::Piece(piece)) => {
+                body.pulled.set(true);
+                if piece.is_empty() {
+                    continue;
+                }
+                frame.clear();
+                Header::write(&mut frame, kind::DATA, piece.len() as u64);
+                match send.write_all(&frame).await {
+                    Ok(()) => send.write_all(&piece).await,
+                    Err(e) => Err(e),
+                }
+            }
+            Ok(Next::End(trailers)) => {
+                body.pulled.set(true);
+                let mut written = Ok(());
+                if let Some(trailers) = trailers.filter(|t| !t.is_empty()) {
+                    frame.clear();
+                    write_trailers(&mut frame, &trailers);
+                    written = send.write_all(&frame).await;
+                }
+                break written.and_then(|()| send.finish());
+            }
+            // Dropping `cancel` resets the stream.
+            Ok(Next::Aborted) => return Pumped::Aborted,
+            // Asked to stop: with H3_NO_ERROR the server has its answer
+            // and the request is complete as far as it cares.
+            Err(Ok(code)) if code == Code::NoError as u64 => {
+                send.reset(Code::NoError as u32);
+                drop(cancel.0.take());
+                drop(body.source.borrow_mut().take());
+                return Pumped::Done;
+            }
+            // Rejected, say: a source nothing was taken from stays, for
+            // the request to be sent again.
+            Err(Ok(_)) => {
+                if body.pulled.get() {
+                    drop(body.source.borrow_mut().take());
+                }
+                return Pumped::Failed;
+            }
+            Err(Err(e)) => Err(e),
+        };
+        if let Err(e) = written {
+            break Err(e);
+        }
+    };
+    // Dropped: the producer's next send fails, nothing more is taken.
+    if body.pulled.get() {
+        drop(body.source.borrow_mut().take());
+    }
+    match ended {
+        Ok(()) => {
+            drop(cancel.0.take());
+            Pumped::Done
+        }
+        Err(e) if giong_quic::reset_code(&e) == Some(Code::NoError as u64) => {
+            if let Some(send) = cancel.0.as_mut() {
+                send.reset(Code::NoError as u32);
+            }
+            drop(cancel.0.take());
+            Pumped::Done
+        }
+        Err(_) => Pumped::Failed,
+    }
+}
+
+/// Appends the HEADERS frame of request trailers. HTTP/3 field names are
+/// lowercase (RFC 9114, section 4.2).
+fn write_trailers(out: &mut Vec<u8>, trailers: &Trailers) {
+    let mut block = Vec::with_capacity(64);
+    let mut name = Vec::new();
+    Encoder::begin(&mut block);
+    for (n, value) in trailers.iter() {
+        name.clear();
+        name.extend(n.bytes().map(|b| b.to_ascii_lowercase()));
+        let index = if value.len() > 256 {
+            Index::No
+        } else {
+            Index::Yes
+        };
+        Encoder::field(&name, value, index, &mut block);
+    }
+    Header::write(out, kind::HEADERS, block.len() as u64);
+    out.extend_from_slice(&block);
 }
 
 /// Holds a request's sending half while it is written: dropped holding
