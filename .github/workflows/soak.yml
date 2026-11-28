@@ -28,6 +28,9 @@ on:
       sim_from:
         description: First seed of the simulated long runs (default changes every night)
         default: ""
+      sandbox:
+        description: GIONG_SANDBOX for the runtime soak on the runner's kernel (read-only or read-write; empty for no sandbox)
+        default: ""
 
 permissions:
   contents: read
@@ -51,6 +54,8 @@ jobs:
     env:
       # The TLS soak must reach the kernel: the module is loaded below.
       GIONG_KTLS_REQUIRED: 1
+      # A run by hand can soak the runtime under giong's sandbox.
+      GIONG_SANDBOX: ${{ matrix.workload == 'runtime' && inputs.sandbox || '' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master

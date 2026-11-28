@@ -902,13 +902,20 @@ impl Driver {
         chosen_by: ChosenBy,
         entries: u32,
         pool: Rc<BufPool>,
-    ) -> io::Result<(Self, DriverChoice)> {
-        let _ = entries;
+        sandbox: Option<&crate::sandbox::Sandbox>,
+    ) -> io::Result<(Self, DriverChoice, Vec<crate::sandbox::LayerReport>)> {
+        let _ = (entries, sandbox);
+        #[allow(unused_mut)]
+        let mut sandbox_lines = Vec::new();
         #[allow(unused_mut)]
         let mut io_uring_error: Option<io::Error> = None;
         let driver = match choice {
             #[cfg(target_os = "linux")]
-            Some(DriverKind::IoUring) => Driver::Uring(uring::Uring::new(entries, pool)?),
+            Some(DriverKind::IoUring) => {
+                let (ring, lines) = uring::Uring::new(entries, pool, sandbox)?;
+                sandbox_lines = lines;
+                Driver::Uring(ring)
+            }
             #[cfg(target_os = "linux")]
             Some(DriverKind::Epoll) => Driver::Epoll(readiness::Readiness::new(pool)?),
             #[cfg(any(target_os = "macos", giong_libkqueue))]
@@ -919,8 +926,11 @@ impl Driver {
             #[allow(unreachable_patterns)]
             Some(other) => return Err(unsupported(other)),
             #[cfg(target_os = "linux")]
-            None => match uring::Uring::new(entries, pool.clone()) {
-                Ok(ring) => Driver::Uring(ring),
+            None => match uring::Uring::new(entries, pool.clone(), sandbox) {
+                Ok((ring, lines)) => {
+                    sandbox_lines = lines;
+                    Driver::Uring(ring)
+                }
                 Err(e) if io_uring_unusable(&e) => {
                     let driver = Driver::Epoll(readiness::Readiness::new(pool)?);
                     report_fallback(&e);
@@ -940,7 +950,7 @@ impl Driver {
             kernel_workarounds: split!(&driver, d => d.workarounds().to_vec(), Vec::new()),
             io_uring_features: split!(&driver, d => d.features().to_vec(), Vec::new()),
         };
-        Ok((driver, choice))
+        Ok((driver, choice, sandbox_lines))
     }
 
     /// Times short waits in [`park`](Self::park) exactly, without the

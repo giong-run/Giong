@@ -41,7 +41,7 @@
 //! go through the ring, as io_uring cannot read directories; its
 //! documentation says what that costs.
 
-use std::ffi::{CString, OsStr, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::io;
 use std::marker::PhantomData;
 use std::mem;
@@ -80,6 +80,7 @@ fn c_path(path: &Path) -> io::Result<KernelBox<CString>> {
 
 /// Runs an operation whose only resource is one path.
 async fn path_op(path: KernelBox<CString>, io: Io) -> io::Result<i32> {
+    sandbox_check(&io, path.get())?;
     // SAFETY: the operation's only pointer is to the path in its
     // `KernelBox`.
     let (res, _, _path) = unsafe { Op::new(io, path) }.await;
@@ -87,6 +88,33 @@ async fn path_op(path: KernelBox<CString>, io: Io) -> io::Result<i32> {
         Err(os_err(res))
     } else {
         Ok(res)
+    }
+}
+
+/// Checks an operation by path against the runtime's sandbox, if it has
+/// one (see [`crate::sandbox`]). Out of line, so that the operations that
+/// call it stay as they were.
+#[inline(never)]
+fn sandbox_check(io: &Io, path: &CStr) -> io::Result<()> {
+    use crate::sandbox::Need;
+    let (need, what) = match *io {
+        Io::OpenAt { flags, .. } => open_need(flags),
+        // An empty path is the descriptor itself (`File::metadata`).
+        Io::Statx { .. } if path.is_empty() => return Ok(()),
+        Io::Statx { .. } => (Need::Read, "read the metadata of"),
+        Io::UnlinkAt { .. } => (Need::Write, "remove"),
+        Io::MkDirAt { .. } => (Need::Write, "create the directory"),
+        Io::RenameAt { .. } => (Need::Write, "rename"),
+        _ => return Ok(()),
+    };
+    crate::sandbox::check(need, what, path)
+}
+
+/// What an open with `flags` needs from the sandbox, and its name.
+fn open_need(flags: i32) -> (crate::sandbox::Need, &'static str) {
+    match crate::sandbox::Need::of_open(flags) {
+        crate::sandbox::Need::Read => (crate::sandbox::Need::Read, "open"),
+        crate::sandbox::Need::Write => (crate::sandbox::Need::Write, "open for writing"),
     }
 }
 
@@ -806,6 +834,8 @@ impl Root {
     async fn open_beneath(&self, path: &Path, flags: i32, mode: u32) -> io::Result<RawFd> {
         self.check(path)?;
         let mut name = c_path(path)?;
+        let (need, what) = open_need(flags);
+        crate::sandbox::check(need, what, name.get())?;
         let mut how = KernelBox::new(sys::open_how(flags, mode));
         let mut attempts = 1;
         loop {
@@ -925,6 +955,7 @@ async fn statx(dir: RawFd, path: KernelBox<CString>, flags: i32) -> io::Result<M
         mask,
         out: out.as_ptr(),
     };
+    sandbox_check(&io, path.get())?;
     // SAFETY: the path and the output are in `KernelBox`es.
     let (res, _, (_path, out)) = unsafe { Op::new(io, (path, out)) }.await;
     if res < 0 {
@@ -1095,6 +1126,7 @@ pub async fn rename<P: AsRef<Path>, Q: AsRef<Path>>(from: P, to: Q) -> io::Resul
         from: paths.0.c_ptr(),
         to: paths.1.c_ptr(),
     };
+    sandbox_check(&io, paths.0.get())?;
     // SAFETY: both paths are in `KernelBox`es.
     let (res, _, _paths) = unsafe { Op::new(io, paths) }.await;
     if res < 0 {

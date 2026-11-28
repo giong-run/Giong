@@ -48,6 +48,9 @@ when it is no longer raised.
 | [GIONG-E0018](E0018.md) | `ActivatedSocket` | the inherited socket cannot be used that way |
 | [GIONG-E0019](E0019.md) | `ChildProcess` | cannot watch the child process |
 | [GIONG-E0020](E0020.md) | `ThreadLimit` | a worker thread could not be started |
+| [GIONG-E0050](E0050.md) | `SandboxUnavailable` | the sandbox cannot be applied here |
+| [GIONG-E0051](E0051.md) | `SandboxDenied` | the sandbox refused the operation |
+| [GIONG-E0052](E0052.md) | `SandboxConflict` | another sandbox is already applied |
 | [GIONG-E0080](E0080.md) | `BudgetFull` | the budget is at its limit |
 | [GIONG-E0081](E0081.md) | `BudgetTooSmall` | a reservation larger than the budget |
 

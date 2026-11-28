@@ -351,6 +351,66 @@ Calls that return the kernel's `ENOBUFS` as it is, with no code, as on Linux:
 
 [All error codes](README.md)
 "#),
+    (50, r#"# GIONG-E0050: the sandbox cannot be applied here
+
+Raised by the runtime when it starts (`Runtime::run`, `Builder::block_on`) with `Builder::sandbox(Sandbox::require())`. In code: `giong::error::Code::SandboxUnavailable`. The error's kind is `Unsupported`.
+
+## What happened
+
+`Sandbox::require()` asks for every layer of the sandbox, and this kernel or platform lacks at least one, so the runtime did not start: no task ran. The message names each missing layer and what the kernel said. The layers (see the `giong::sandbox` module documentation):
+
+- **`RingRestrictions`**: each worker's io_uring ring is limited to the operations giong submits (`IORING_REGISTER_RESTRICTIONS`, every kernel giong's io_uring driver runs on). Missing only if the kernel refused the registration, which no known kernel does. A worker on the epoll driver has no ring and does not need it.
+- **`TaskRestrictions`**: every ring a covered thread creates later is limited the same way. Needs Linux 7.0 (per-task io_uring restrictions). Without it, a compromised process could create a ring of its own that is not restricted, so `require` refuses to start.
+- **`OpenFilters`**: for `FileAccess::ReadOnly` only, classic BPF filters refuse opens for writing in the kernel. Needs Linux 7.0 built with `CONFIG_IO_URING_BPF` (Ubuntu's and Fedora's kernels are).
+- On macOS and Windows there is no io_uring, so no layer can be applied.
+
+## How to fix it
+
+- Run on a kernel that has the layers: Linux 7.0 or newer.
+- Or use `Sandbox::best_effort()`: it applies the layers this kernel has, says once on stderr which it could not, and `giong::sandbox::report()` tells what each worker got.
+- For `OpenFilters` only: `FileAccess::ReadWrite` needs no filter (opens are allowed or refused whole), at the cost of allowing writes.
+
+[All error codes](README.md)
+"#),
+    (51, r#"# GIONG-E0051: the sandbox refused the operation
+
+Raised by `giong::fs` (`File::open`, `File::create`, `OpenOptions::open`, `read`, `write`, `metadata`, `symlink_metadata`, `read_dir`, `remove_file`, `remove_dir`, `create_dir`, `rename`, `Root::new` and the `Root` methods) inside a runtime started with `Builder::sandbox`. In code: `giong::error::Code::SandboxDenied`. The error's kind is `PermissionDenied`.
+
+## What happened
+
+The runtime's sandbox allows operations by path only as far as its `FileAccess` says, and this one needs more:
+
+- `FileAccess::None` (the default of every `Sandbox`): no operation by path at all.
+- `FileAccess::ReadOnly`: opening for reading and reading metadata; not opening for writing, creating or truncating, removing, renaming or creating directories.
+- `FileAccess::ReadWrite`: every operation by path.
+
+giong refused it before asking the kernel, so nothing was opened, created or changed. The message names the operation, the path and the `FileAccess` that would allow it. Operations on files that are already open (reading, writing, `sync_all`, `metadata` of an open `File`) are not limited.
+
+Where the kernel has the sandbox's layers, it refuses the same operations submitted to io_uring by anything else in the process, with `EACCES` (see `giong::sandbox`).
+
+## How to fix it
+
+- If the service needs this operation, allow it: `Sandbox::best_effort().files(FileAccess::ReadOnly)` (or `ReadWrite`) on `Builder::sandbox`. To find everything a service needs, run it once with `Sandbox::audit()`: nothing is refused, and each operation that would be is logged once on stderr as a JSON line with the path.
+- Open what the service needs before the runtime starts (configuration, certificates), and keep the narrower sandbox.
+- If the operation should not happen, find what asked for the path: this is the sandbox doing its job.
+
+[All error codes](README.md)
+"#),
+    (52, r#"# GIONG-E0052: another sandbox is already applied
+
+Raised by the runtime when it starts (`Runtime::run`, `Builder::block_on`) with `Builder::sandbox(Sandbox::require())`. In code: `giong::error::Code::SandboxConflict`. The error's kind is `InvalidInput`.
+
+## What happened
+
+Another runtime of this process already started with a sandbox that allows a different `FileAccess`, and restricted its threads with it. The kernel keeps the first per-task io_uring restriction a thread gets, for the life of the thread, and threads started from a restricted thread inherit it, so this runtime's threads could not be given its own. With `Sandbox::require()` the runtime does not start; with `Sandbox::best_effort()` it starts, and `giong::sandbox::report()` shows `TaskRestrictions` as unavailable.
+
+## How to fix it
+
+- Give every runtime of the process the same `Sandbox` (the widest `FileAccess` any of them needs).
+- Or start the runtime that needs a different sandbox in a process of its own.
+
+[All error codes](README.md)
+"#),
     (60, r#"# GIONG-E0060: a file is already at the Unix socket path
 
 Raised by `UnixListener::bind` on Windows. In code: `giong::error::Code::UnixSocketInUse`. The error kind is `AddrInUse`, and Winsock's `WSAEADDRINUSE` is the `source()`.

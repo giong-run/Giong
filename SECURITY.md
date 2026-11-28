@@ -78,6 +78,13 @@ does giong promise, so that breaking that promise is a vulnerability?
   directory: not with `..`, an absolute path, a symbolic link or junction, or a rename that
   races the lookup. It is refused (`GIONG-E0205`). Paths given to `File::open` and the other
   `fs` functions are opened as given.
+- **The sandbox (`Builder::sandbox`).** A layer that `giong::sandbox::report()` shows as
+  applied must hold: a ring it restricted must not run an operation outside the sandbox's
+  rules, and on a kernel with per-task restrictions no covered thread may create a ring
+  without them. Operations by path that the `FileAccess` refuses must not reach the kernel
+  through giong's API. What the sandbox does not cover yet (system calls made without
+  io_uring, threads started before the runtime and not by giong) is documented in
+  `giong::sandbox` and is not a vulnerability.
 - **giong-mcp.** Reachable only as documented: a Unix socket of mode `0600`, or TCP with a
   bearer token (a server without one does not start unless the code opts out). Its tools
   look and change nothing in the service.

@@ -19,6 +19,9 @@
 //! ```text
 //! GIONG_SOAK_SECS=3600 cargo test --release --test soak -- --ignored --nocapture
 //! ```
+//!
+//! Under `GIONG_SANDBOX=read-only` the file traffic reads instead of writing,
+//! and checks that the sandbox refuses a create now and then.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
@@ -384,6 +387,21 @@ async fn udp(
 }
 
 async fn files(dir: std::path::PathBuf, deadline: Instant, counters: Arc<Counters>) {
+    let report = giong::sandbox::report();
+    // What the sandbox got, once, so that a run's log shows its layers.
+    if let (Some(r), 0) = (&report, giong::worker_id()) {
+        eprintln!("soak: sandbox {:?}, files {:?}", r.mode, r.files);
+        for l in &r.layers {
+            eprintln!(
+                "soak: sandbox layer {:?}: {:?} ({})",
+                l.layer, l.state, l.detail
+            );
+        }
+    }
+    let read_only = report.is_some_and(|r| r.files < giong::sandbox::FileAccess::ReadWrite);
+    if read_only {
+        return files_read_only(dir, deadline, counters).await;
+    }
     let rng = Rng::new(giong::worker_id() as u64 + 77);
     let mut n = 0u64;
     while Instant::now() < deadline {
@@ -420,6 +438,51 @@ async fn files(dir: std::path::PathBuf, deadline: Instant, counters: Arc<Counter
             Err(err) => counters.unexpected("files", err),
         }
     }
+}
+
+/// The file workload under a sandbox that allows no writes
+/// (`GIONG_SANDBOX=read-only`): reads of a file made before, and now and
+/// then a create the sandbox has to refuse.
+async fn files_read_only(dir: std::path::PathBuf, deadline: Instant, counters: Arc<Counters>) {
+    const LEN: usize = 64 * 1024;
+    let rng = Rng::new(giong::worker_id() as u64 + 77);
+    let path = dir.join(format!("r{}", giong::worker_id()));
+    // std's own write, which giong's sandbox does not see.
+    std::fs::write(&path, vec![7u8; LEN]).unwrap();
+    let mut n = 0u64;
+    while Instant::now() < deadline {
+        n += 1;
+        let result = async {
+            if n % 16 == 0 {
+                let refused = dir.join(format!("w{}-{n}", giong::worker_id()));
+                match giong::fs::File::create(&refused).await {
+                    Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {}
+                    Err(e) => return Err(e),
+                    Ok(_) => panic!("a read-only sandbox let a create through"),
+                }
+            }
+            let file = giong::fs::File::open(&path).await?;
+            let len = 1 + rng.below(LEN as u64) as usize;
+            let (res, buf) = file.read_at(vec![0u8; len], 0).await;
+            assert_eq!(res?, len);
+            assert!(buf.iter().all(|&b| b == 7));
+            assert_eq!(file.metadata().await?.len(), LEN as u64);
+            let started = Instant::now();
+            if rng.below(2) == 0 {
+                file.close().await?;
+            } else {
+                drop(file);
+            }
+            Counters::record_max(&counters.file_close_us, started.elapsed());
+            Ok(())
+        }
+        .await;
+        match result {
+            Ok(()) => Counters::bump(&counters.files),
+            Err(err) => counters.unexpected("files", err),
+        }
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Measures how long the worker goes without running its tasks: the
