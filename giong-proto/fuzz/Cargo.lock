@@ -118,7 +118,7 @@ dependencies = [
 
 [[package]]
 name = "giong-grpc-build"
-version = "1.5.6"
+version = "1.5.7"
 dependencies = [
  "prost",
  "prost-types",
@@ -127,7 +127,7 @@ dependencies = [
 
 [[package]]
 name = "giong-proto"
-version = "1.5.6"
+version = "1.5.7"
 
 [[package]]
 name = "giong-proto-conformance"

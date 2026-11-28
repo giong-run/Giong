@@ -8,6 +8,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.5.7] - 2026-11-28
+
 Fixes for `giong dev` and `giong cache` while they start processes, and the first
 machine-checked proofs of Gióng's code. A Verus proof now shows that the `ipc` ring never
 reads or writes outside its mapping, never panics and never loops for ever, whatever the
@@ -23,6 +25,47 @@ for a running build (a process being started holds a copy for a moment, up to 20
 under load), while a running cargo build's lock is still reported at once. `giong cache
 share` and `giong cache fill` give a project they skipped the fix for its cause. No API is
 removed or changed.
+
+### Added
+
+- **giong**: a Verus proof that the `ipc` ring never reads or writes outside its mapping,
+  never panics and never loops for ever, for every capacity and whatever the other process
+  writes into the shared memory, with no bound (`docs/verus.md`). It covers the shipped
+  code itself: CI checks that the proof's copy of `src/ipc/ring.rs` is token for token the
+  source, and that each planted bug is rejected. Nothing changes for users: no new
+  dependency, no new code in the crate ([#540](https://github.com/giong-run/Giong/pull/540)).
+- **giong**: a Verus proof that a worker never forgets a task: in every execution where
+  threads that can run do run, every wake-up of a live task is followed by a poll that
+  sees it, for any number of tasks, waking threads and queued entries. It covers a model
+  of `RunFlag`, the doorbell, the injector, the run queue and the worker's sleep; CI fails
+  when a function the model describes changes until the model is checked against it
+  (`docs/verus.md`) ([#540](https://github.com/giong-run/Giong/pull/540)).
+
+### Fixed
+
+- **giong-cli**: `giong cache share` and `giong cache fill` now give a project they skipped
+  the fix for its cause. A build directory or store that could not be written was told to
+  `rustup update stable` by `share`, and anything but a running build was told to check
+  `cargo generate-lockfile` by `fill`. `fill` also reports a store that cannot link or write
+  as a warning, as `share` does.
+- **giong-cli**: on Linux, `giong dev` no longer reports a running service as unreachable, or
+  drops a dashboard request, when a process it starts at that moment exits. A child that exits
+  sends `SIGCHLD`, which ends a socket read with a timeout early with EINTR when another thread
+  is starting a process; the requests to the service, the dashboard's request reader and the
+  web client took that for a failure. They now read again within their deadline. In a test
+  with 3 threads starting processes, 39 of 40 such reads were ended early
+  ([#537](https://github.com/giong-run/Giong/issues/537)).
+- **giong-cli**: the build store no longer takes a project's lock, just released, for a
+  running build. A process that `giong dev` or `giong cache` starts from another thread holds
+  the lock for a moment, until its program runs, so a first build could skip a project to
+  fill from and `giong cache gc` could leave a build directory alone with no build running. A
+  lock this process let go of in the last 200 ms and finds taken is now tried again until
+  then; a running cargo build's lock is still reported at once
+  ([#535](https://github.com/giong-run/Giong/issues/535)).
+- **giong**: `ipc` receivers report a wrap marker at the start of the ring as corrupt
+  (`GIONG-E0091`) instead of skipping a whole ring; a hostile sender that kept moving its
+  position could otherwise keep a receive, and its worker, looping. Found by the new Verus
+  proof ([#540](https://github.com/giong-run/Giong/pull/540)).
 
 ## [1.5.6] - 2026-11-28
 
@@ -4175,7 +4218,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.6...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.7...HEAD
+[1.5.7]: https://github.com/giong-run/Giong/compare/v1.5.6...v1.5.7
 [1.5.6]: https://github.com/giong-run/Giong/compare/v1.5.5...v1.5.6
 [1.5.5]: https://github.com/giong-run/Giong/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/giong-run/Giong/compare/v1.5.3...v1.5.4

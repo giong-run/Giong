@@ -4,8 +4,8 @@ The I/O traits of Tokio and of the futures crates for [giong](../README.md)'s st
 
 ```toml
 [dependencies]
-giong = "1.5.6"
-giong-compat = "1.5.6"
+giong = "1.5.7"
+giong-compat = "1.5.7"
 ```
 
 ```rust,no_run
