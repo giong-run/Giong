@@ -2028,6 +2028,15 @@ def llms():
              "  (`SET`, `LISTEN`, temporary tables, `USE`). Run those, and transactions, on a\n"
              "  connection from `pool.get().await?`; it comes back with its session reset.\n"
              ) if "giong-postgres" in names else ""
+    task = ("- Time limits: `giong::time::timeout(d, fut)` stops waiting on one future (`GIONG-E0007`).\n"
+            "  For a deadline that everything inside a piece of work obeys, use\n"
+            "  `giong::task::Scope::with_timeout(d).run(async { .. }).await?` (`GIONG-E0024`): on io_uring\n"
+            "  the kernel cancels its waiting reads and connects at the deadline, tasks started there in a\n"
+            "  `TaskGroup` inherit it, and libraries read `giong::task::remaining()`. `giong::spawn`\n"
+            "  starts a detached task that inherits no deadline and no task-local value. For futures that\n"
+            "  borrow local data and must all finish (or all stop at the first error), use\n"
+            "  `let scope = Scope::new(); scope.run(async { scope.spawn(..); .. }).await`.\n"
+            ) if released("src/task/mod.rs") is not None else ""
     if released("src/lane.rs") is not None:
         blocking = ("Never block a worker or compute on it for long:\n"
                     "  `giong::spawn_blocking(f).await` runs blocking calls (`std::fs`, C libraries) on\n"
@@ -2138,7 +2147,7 @@ Facts that are easy to get wrong:
   to do yourself: `Builder::shutdown_on_signals(true)` so that `SIGTERM` stops process 1;
   and in Kubernetes without a CPU limit, set `Builder::workers` from the CPU request.
   examples/rest-api has a Dockerfile and a compose.yaml.
-{pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
+{task}{pools}{mcp}- Install with `cargo add giong` (and `giong-http`, `giong-web`, ...). Libraries need Rust 1.80.
 {cli}
 ## Docs
 

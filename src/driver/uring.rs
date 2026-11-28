@@ -44,6 +44,13 @@ const UD_IGNORE: u64 = u64::MAX;
 const UD_WAKE: u64 = u64::MAX - 1;
 /// `user_data` of batched closes, which must finish before shutdown cancels I/O.
 const UD_CLOSE: u64 = u64::MAX - 2;
+/// `user_data` of the `IORING_OP_LINK_TIMEOUT` that carries a scope's
+/// deadline next to an operation (see [`Uring::submit_op_linked`]). It is
+/// submitted with `IOSQE_CQE_SKIP_SUCCESS`, so no completion comes for it
+/// unless it fires; one that comes is ignored, and the timeout is not
+/// counted in flight: the kernel keeps nothing of ours for it (it copies
+/// the timespec when it reads the SQE).
+const UD_LINK: u64 = u64::MAX - 3;
 
 /// Backpressure for multishot receive. Once a stream has this many
 /// completions its reader has not taken yet:
@@ -257,6 +264,17 @@ pub(crate) struct Uring {
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
+    /// The timespecs of linked timeouts queued since the submission queue
+    /// was last seen empty. The kernel reads them while it takes the SQEs,
+    /// so they stay here until then, at an address that does not move
+    /// (hence the boxes); `ring`, declared first, is dropped before them.
+    #[allow(clippy::vec_box)]
+    link_ts: Vec<Box<types::Timespec>>,
+    /// Timespecs the kernel has read, for reuse.
+    #[allow(clippy::vec_box)]
+    spare_ts: Vec<Box<types::Timespec>>,
+    /// [`IoUringFeature::LinkedDeadlines`] is in use.
+    link_deadlines: bool,
     wake_fd: RawFd,
     /// Owns `wake_fd`; other threads ring it through [`Uring::waker`].
     wake: std::sync::Arc<crate::sys::Bell>,
@@ -1022,6 +1040,12 @@ impl Uring {
         if zero_copy_min.is_some() {
             features.push(IoUringFeature::ZeroCopySend);
         }
+        // Linked timeouts (5.5) and `IOSQE_CQE_SKIP_SUCCESS` (5.17) are in
+        // every kernel giong runs io_uring on (6.0 and newer).
+        let link_deadlines = super::feature_enabled(IoUringFeature::LinkedDeadlines);
+        if link_deadlines {
+            features.push(IoUringFeature::LinkedDeadlines);
+        }
         let recv_limit = recv_backlog_limit(&pool);
         // Linux 6.0 refuses a destination address on `IORING_OP_SEND` with
         // `EINVAL`, which cannot be told from a bad address: go by version.
@@ -1048,6 +1072,9 @@ impl Uring {
             heap_pressure: false,
             turn: 0,
             graveyard: Vec::new(),
+            link_ts: Vec::new(),
+            spare_ts: Vec::new(),
+            link_deadlines,
             wake_fd: wake.read_fd(),
             wake,
             wake_buf: Box::new(0),
@@ -1094,6 +1121,93 @@ impl Uring {
         let sqe = sqe_for(io, self.zero_copy_min.is_some());
         self.push(sqe.user_data(key as u64));
         key
+    }
+
+    /// Submits a single-shot operation followed by an
+    /// `IORING_OP_LINK_TIMEOUT` at `deadline` (an absolute `CLOCK_MONOTONIC`
+    /// time, see [`crate::task`]): if the operation is still waiting then,
+    /// the kernel cancels it by itself and it completes with `-ECANCELED`.
+    /// No timer wake-up and no cancel request from the worker are needed.
+    #[inline(never)]
+    pub(crate) fn submit_op_linked(
+        &mut self,
+        io: &Io,
+        waker: &Waker,
+        deadline: (u64, u32),
+    ) -> usize {
+        // The pair must reach the kernel together: a chain cut by a
+        // submission in between would leave the timeout without its target.
+        self.make_room(2);
+        if self.ring.submission().is_empty() {
+            // The kernel has taken every queued SQE, and read the timespecs
+            // of their timeouts with them (it copies a timespec while it
+            // prepares the SQE, inside the `io_uring_enter` that takes it).
+            // Recycled here, not in `enter`, so that code without deadlines
+            // pays nothing for them.
+            self.spare_ts.append(&mut self.link_ts);
+        }
+        let key = self
+            .ops
+            .insert(OpState::Single(Lifecycle::Waiting(waker.clone())));
+        let mut ts = self
+            .spare_ts
+            .pop()
+            .unwrap_or_else(|| Box::new(types::Timespec::new()));
+        *ts = types::Timespec::new().sec(deadline.0).nsec(deadline.1);
+        let ts_ptr: *const types::Timespec = &*ts;
+        self.link_ts.push(ts);
+        let sqe = sqe_for(io, self.zero_copy_min.is_some())
+            .flags(squeue::Flags::IO_LINK)
+            .user_data(key as u64);
+        let link = opcode::LinkTimeout::new(ts_ptr)
+            .flags(types::TimeoutFlags::ABS)
+            .build()
+            .flags(squeue::Flags::SKIP_SUCCESS)
+            .user_data(UD_LINK);
+        // SAFETY: as in `push` for the operation; the timespec stays in
+        // `link_ts`, boxed, until the submission queue is seen empty (above),
+        // that is until the kernel has taken this SQE and read it.
+        unsafe {
+            let mut sq = self.ring.submission();
+            sq.push(&sqe).expect("room made above");
+            sq.push(&link).expect("room made above");
+        }
+        // The timeout is not counted (see `UD_LINK`).
+        self.inflight += 1;
+        key
+    }
+
+    /// `true` with [`IoUringFeature::LinkedDeadlines`].
+    #[inline]
+    pub(crate) fn links_deadlines(&self) -> bool {
+        self.link_deadlines
+    }
+
+    /// Hands queued SQEs to the kernel until the submission queue has room
+    /// for `n` more.
+    fn make_room(&mut self, n: usize) {
+        let mut attempts = 0u32;
+        loop {
+            {
+                let sq = self.ring.submission();
+                if sq.capacity() - sq.len() >= n {
+                    return;
+                }
+            }
+            match self.enter(0, None) {
+                Ok(()) => {}
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
+                    _ => super::event_loop_failed("io_uring submit", e),
+                },
+            }
+            attempts += 1;
+            assert!(
+                attempts < 100_000,
+                "giong: unable to make progress submitting to io_uring"
+            );
+        }
     }
 
     /// Polls a single-shot operation, consuming its entry when it is done.
@@ -1722,6 +1836,11 @@ impl Uring {
     }
 
     fn dispatch(&mut self, user_data: u64, res: i32, flags: u32) {
+        if user_data == UD_LINK {
+            // A linked timeout that fired, or one the kernel reports
+            // anyway: not counted in flight (see `UD_LINK`).
+            return;
+        }
         let more = cqueue::more(flags);
         if !more {
             self.inflight = self.inflight.saturating_sub(1);

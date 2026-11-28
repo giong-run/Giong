@@ -324,6 +324,53 @@ The workers that had started are stopped again, and `run` returns this error; no
 
 [All error codes](README.md)
 "#),
+    (24, r#"# GIONG-E0024: the deadline passed
+
+Raised by `giong::task::Scope::run` for a scope made with `Scope::with_deadline` or `Scope::with_timeout`, when the scope's `Cancelled` error becomes its error type (`io::Error` by default). The error kind is `TimedOut`. In code: `giong::error::Code::DeadlineExceeded`. A task in a `TaskGroup` whose inherited deadline passes ends with `JoinError::DeadlineExceeded` instead.
+
+## What happened
+
+The work ran under a deadline and did not finish before it. giong dropped the work, which cancels its I/O: on io_uring the kernel had already cancelled every operation that was waiting on a peer at the deadline (they carry it as a linked timeout), and on the other drivers the deadline's timer ended them. Code inside the work never runs after its deadline. Nested deadlines take the earlier one, so the deadline that passed may be an outer one: `giong::task::deadline()` tells which deadline is in force at any point.
+
+## How to fix it
+
+- Give the work more time if the deadline is too tight for it.
+- Otherwise find the slow step: log `giong::task::remaining()` between the steps of the work, or look at the worker in `giong-mcp`. A peer that does not answer, a slow DNS lookup, or another task keeping the worker busy (one worker runs every task on its core) are the usual causes.
+- Background work that must outlive the request should be started with `giong::spawn`, which does not inherit the deadline, rather than in the request's scope or task group.
+- To limit the wait on one future only, without passing the deadline on to the work inside, use `giong::time::timeout` (`GIONG-E0007`).
+
+[All error codes](README.md)
+"#),
+    (25, r#"# GIONG-E0025: the scope was cancelled
+
+Raised by `giong::task::Scope::run` when `Scope::cancel` was called before the scope's body returned, once its `Cancelled` error becomes an `io::Error`. In code: `giong::error::Code::ScopeCancelled`.
+
+## What happened
+
+Some code called `cancel()` on the scope. Every child of the scope and the body were dropped at the next poll of `run`, which cancels their I/O. If the body had already returned its value when the scope was cancelled, `run` returns that value instead of this error.
+
+## How to fix it
+
+- Nothing, if the cancel was meant: match on `giong::error::code(&e) == Some(Code::ScopeCancelled)` and treat it as a normal end.
+- Otherwise find the code that calls `Scope::cancel`. To end a scope because one child failed, return `Err` from that child instead: the scope then returns that error, which says more than this one.
+
+[All error codes](README.md)
+"#),
+    (26, r#"# GIONG-E0026: the scope is already running
+
+Raised by `giong::task::Scope::run`, as a panic. In code: `giong::error::Code::ScopeAlreadyRunning`.
+
+## What happened
+
+Two `run` futures of the same `Scope` were polled at the same time, for example both inside one `join`. A scope's children belong to one run, which polls them and decides when the scope ends, so a second concurrent run is a bug in the calling code and giong panics instead of returning an error. Running a scope again after a run has returned is fine.
+
+## How to fix it
+
+- Await one `run` of a scope at a time. To add work to a running scope, call `scope.spawn` from its body or from a child.
+- For independent groups of work, make one `Scope` for each.
+
+[All error codes](README.md)
+"#),
     (28, r#"# GIONG-E0028: the system ran out of network buffers
 
 Raised by `TcpStream` and `UnixStream` writes and connects (giong-tls streams included) on macOS. In code: `giong::error::Code::NetworkBuffersExhausted`. The error kind is `OutOfMemory`, and the kernel's `ENOBUFS` is the `source()`, so `raw_os_error()` stays reachable.

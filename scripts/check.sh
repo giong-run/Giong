@@ -204,7 +204,7 @@ run_miri() {
     # are marked `#[cfg_attr(miri, ignore = "why")]`. Miri has no sendmsg,
     # SO_REUSEPORT or Unix sockets, so the network tests stay out, except for
     # the file test in cancel.rs.
-    local files=(fs executor channels observe time multi)
+    local files=(fs executor channels observe time multi task)
     for file in "${files[@]}"; do
         echo "== Miri: tests/$file.rs"
         cargo +nightly miri test --quiet --test "$file"
