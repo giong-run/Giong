@@ -784,6 +784,13 @@ impl Server {
     /// connections and requests that were already on their way (default:
     /// 100 ms). Requests in progress are not affected by this: they get the
     /// runtime's [`shutdown_grace`](giong::Builder::shutdown_grace).
+    ///
+    /// Over HTTP/3 the shutdown of a connection goes in two steps (RFC 9114,
+    /// section 5.2): a first GOAWAY stops new requests and refuses none, the
+    /// requests the client sent before it heard of it are taken for this
+    /// long (at least a round trip, which adds at most 1 s on a slow path),
+    /// and then the GOAWAY that names the first request refused. `0` sends
+    /// that GOAWAY at once, as before 1.6.
     pub fn shutdown_linger(mut self, linger: Duration) -> Self {
         self.cfg.shutdown_linger = crate::bounded(linger);
         self

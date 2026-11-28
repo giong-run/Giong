@@ -7,6 +7,7 @@ use std::net::SocketAddr;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use giong_quic::{ClientConfig, Connection, Endpoint, SendStream, ServerConfig, TransportConfig};
 
@@ -908,47 +909,66 @@ fn what_a_client_may_do_on_its_other_streams_is_accepted() {
     });
 }
 
-/// Reads the server's control stream up to and including a GOAWAY frame
-/// and gives the stream ID it announces.
-async fn goaway(conn: &Connection) -> u64 {
-    let mut control = conn.accept_uni().await.unwrap();
-    let mut bytes = Vec::new();
-    loop {
-        // The stream type, then frames.
-        let mut rest = bytes.get(1..).unwrap_or(&[]);
-        while let Some((kind, a)) = read_varint(rest) {
-            let Some((len, b)) = read_varint(&rest[a..]) else {
-                break;
-            };
-            let Some(payload) = rest.get(a + b..a + b + len as usize) else {
-                break;
-            };
-            if kind == kind::GOAWAY {
-                assert_eq!(bytes[0], 0x00, "the control stream");
-                return read_varint(payload).expect("a stream ID").0;
-            }
-            rest = &rest[a + b + len as usize..];
+/// The server's control stream, read as far as the GOAWAY frames asked
+/// for.
+struct ControlStream {
+    stream: giong_quic::RecvStream,
+    bytes: Vec<u8>,
+    /// Where the next frame starts in `bytes`, past the stream type.
+    at: usize,
+}
+
+impl ControlStream {
+    async fn accept(conn: &Connection) -> Self {
+        Self {
+            stream: conn.accept_uni().await.unwrap(),
+            bytes: Vec::new(),
+            at: 1,
         }
-        let piece = control.read().await.unwrap().expect("a GOAWAY");
-        bytes.extend_from_slice(&piece);
+    }
+
+    /// The stream ID the next GOAWAY announces.
+    async fn goaway(&mut self) -> u64 {
+        loop {
+            while let Some(rest) = self.bytes.get(self.at..) {
+                let Some((kind, a)) = read_varint(rest) else {
+                    break;
+                };
+                let Some((len, b)) = read_varint(&rest[a..]) else {
+                    break;
+                };
+                let Some(payload) = rest.get(a + b..a + b + len as usize) else {
+                    break;
+                };
+                self.at += a + b + len as usize;
+                if kind == kind::GOAWAY {
+                    assert_eq!(self.bytes[0], 0x00, "the control stream");
+                    return read_varint(payload).expect("a stream ID").0;
+                }
+            }
+            let piece = self.stream.read().await.unwrap().expect("a GOAWAY");
+            self.bytes.extend_from_slice(&piece);
+        }
     }
 }
 
 #[test]
 fn shutdown_finishes_accepted_requests_and_rejects_later_ones() {
     run(|| async {
-        let client = connect().await;
+        // In one step: GOAWAY at once.
+        let client = connect_to(Server::new().shutdown_linger(Duration::ZERO)).await;
         assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
         // A request in progress when the shutdown is asked for.
         let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
         send.write_all(&get("/sleep")).await.unwrap();
         send.finish().unwrap();
-        giong::time::sleep(std::time::Duration::from_millis(50)).await;
+        giong::time::sleep(Duration::from_millis(50)).await;
         giong::handle().shutdown();
 
         // GOAWAY names the first stream that will not be handled (RFC
         // 9114, section 5.2): streams 0 and 4 were accepted.
-        assert_eq!(goaway(&client.conn).await, 8);
+        let mut control = ControlStream::accept(&client.conn).await;
+        assert_eq!(control.goaway().await, 8);
         // A request after it is rejected so that it can be retried on
         // another connection: H3_REQUEST_REJECTED, 0x10b = 267.
         let error = roundtrip(&client, get("/")).await.expect_err("a reset");
@@ -958,6 +978,40 @@ fn shutdown_finishes_accepted_requests_and_rejects_later_ones() {
         assert_eq!((reply.status(), &reply.body[..]), (200, &b"slept"[..]));
         // ... and then the connection is closed without an error:
         // H3_NO_ERROR, 0x100 = 256.
+        let end = closed_with(&client).await;
+        assert!(end.contains("closed by peer: 256"), "{end}");
+    });
+}
+
+#[test]
+fn shutdown_in_two_steps_takes_the_requests_already_on_their_way() {
+    run(|| async {
+        // Shorter than what is left of the request in progress (/sleep, 200
+        // ms), which keeps the connection open after the second GOAWAY.
+        let linger = Duration::from_millis(100);
+        let client = connect_to(Server::new().shutdown_linger(linger)).await;
+        let mut control = ControlStream::accept(&client.conn).await;
+        // A request in progress when the shutdown is asked for.
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        send.write_all(&get("/sleep")).await.unwrap();
+        send.finish().unwrap();
+        giong::time::sleep(Duration::from_millis(50)).await;
+        let asked = Instant::now();
+        giong::handle().shutdown();
+        // The first GOAWAY refuses nothing: it names the last stream a
+        // client can open.
+        assert_eq!(control.goaway().await, (1 << 62) - 4);
+        // A request sent before the client heard of it (here, just after)
+        // is still taken and answered.
+        assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
+        // Then the GOAWAY that names the first stream refused: streams 0
+        // and 4 were accepted.
+        assert_eq!(control.goaway().await, 8);
+        assert!(asked.elapsed() >= linger, "{:?}", asked.elapsed());
+        let error = roundtrip(&client, get("/")).await.expect_err("a reset");
+        assert!(text(&error).contains("code 267"), "{error}");
+        let reply = parse(&recv.read_to_end(1 << 20).await.unwrap());
+        assert_eq!((reply.status(), &reply.body[..]), (200, &b"slept"[..]));
         let end = closed_with(&client).await;
         assert!(end.contains("closed by peer: 256"), "{end}");
     });
