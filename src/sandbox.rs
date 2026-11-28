@@ -702,6 +702,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[cfg(unix)]
     fn needs_follow_the_open_flags() {
         assert_eq!(Need::of_open(libc::O_RDONLY), Need::Read);
         assert_eq!(Need::of_open(libc::O_RDONLY | libc::O_CLOEXEC), Need::Read);
