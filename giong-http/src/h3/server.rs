@@ -53,6 +53,17 @@ const FILE_PIECE: u64 = 64 * 1024;
 /// A DATA frame up to this size is written together with its header.
 const SMALL_BODY: usize = 1024;
 
+/// The largest identifier of a request stream: what the first GOAWAY of a
+/// shutdown in two steps announces (RFC 9114, section 5.2), so that the
+/// client sends no new requests while those already on their way are
+/// still taken.
+const LAST_REQUEST_ID: u64 = (1 << 62) - 4;
+
+/// The longest the round-trip time makes the first step of a shutdown:
+/// longer than `shutdown_linger` only on a slow path, and never by more
+/// than this.
+const MAX_LINGER_RTT: std::time::Duration = std::time::Duration::from_secs(1);
+
 /// Why work on a stream stops early.
 enum Stop {
     /// A connection error: the connection is closed with its code.
@@ -400,15 +411,15 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
 
     // The lowest request stream not accepted yet: what GOAWAY announces.
     let mut next_id = 0;
+    let take = |send: SendStream, recv: RecvStream, next_id: &mut u64| {
+        *next_id = send.id() + 4;
+        conn.active.set(conn.active.get() + 1);
+        let active = Active(conn.clone());
+        drop(giong::spawn(request(active, send, recv, handler.clone())));
+    };
     loop {
         match giong::until_shutdown(conn.quic.accept_bi()).await {
-            Some(Ok((send, recv))) => {
-                next_id = send.id() + 4;
-                conn.active.set(conn.active.get() + 1);
-                let active = Active(conn.clone());
-                let handler = handler.clone();
-                drop(giong::spawn(request(active, send, recv, handler)));
-            }
+            Some(Ok((send, recv))) => take(send, recv, &mut next_id),
             // The connection is over.
             Some(Err(_)) => return,
             None => break,
@@ -417,19 +428,29 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
 
     // Shutting down (section 5.2): the requests accepted are finished, the
     // client is told which those are, and later ones are refused in a way
-    // that lets it retry them elsewhere.
-    out.clear();
-    frame::write_goaway(&mut out, next_id);
-    // Bounded too, or a client that gives no credit would hold shutdown.
-    match timeout(cfg.write_timeout, control.write_all(&out)).await {
-        Ok(Ok(())) => {}
-        Ok(Err(_)) => return,
-        Err(_) => {
-            if !conn.closed.replace(true) {
-                conn.quic.close(Code::NoError as u32, b"");
-            }
+    // that lets it retry them elsewhere. With a `shutdown_linger`, in two
+    // steps: a first GOAWAY that refuses nothing stops new requests, and
+    // those already on their way, sent before the client heard of it, are
+    // still taken for that long (at least a round trip) before the GOAWAY
+    // that names the first one refused.
+    let linger = cfg.shutdown_linger;
+    if !linger.is_zero() {
+        if !goaway(&conn, &mut control, LAST_REQUEST_ID).await {
             return;
         }
+        let rtt = conn.quic.stats().rtt.min(MAX_LINGER_RTT);
+        let deadline = Instant::now() + linger.max(rtt);
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            match timeout(left, conn.quic.accept_bi()).await {
+                Ok(Ok((send, recv))) => take(send, recv, &mut next_id),
+                Ok(Err(_)) => return,
+                Err(_) => break,
+            }
+        }
+    }
+    if !goaway(&conn, &mut control, next_id).await {
+        return;
     }
     loop {
         let idle = poll_fn(|cx| {
@@ -451,6 +472,24 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
     }
     if !conn.closed.replace(true) {
         conn.quic.close(Code::NoError as u32, b"");
+    }
+}
+
+/// Sends GOAWAY with `id` on the control stream. False when the connection
+/// is over: the write failed, or took longer than `write_timeout`, which
+/// bounds it so that a client that gives no credit cannot hold a shutdown.
+async fn goaway(conn: &Conn, control: &mut SendStream, id: u64) -> bool {
+    let mut out = Vec::with_capacity(16);
+    frame::write_goaway(&mut out, id);
+    match timeout(conn.cfg.write_timeout, control.write_all(&out)).await {
+        Ok(Ok(())) => true,
+        Ok(Err(_)) => false,
+        Err(_) => {
+            if !conn.closed.replace(true) {
+                conn.quic.close(Code::NoError as u32, b"");
+            }
+            false
+        }
     }
 }
 
