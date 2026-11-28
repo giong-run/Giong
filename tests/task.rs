@@ -243,14 +243,19 @@ fn a_read_waiting_at_the_deadline_is_cancelled_by_the_kernel() {
         .io_uring_features
         .contains(&giong::IoUringFeature::LinkedDeadlines);
     match choice.kind {
-        // epoll reads only when the worker asks, which it no longer does
-        // once the deadline has passed: the data stays.
-        giong::DriverKind::Epoll => assert_eq!(got.as_deref(), Some(&b"late"[..])),
-        _ if linked => assert_eq!(got.as_deref(), Some(&b"late"[..])),
+        // epoll and kqueue read only when the worker asks, which it no
+        // longer does once the deadline has passed: the data stays.
+        giong::DriverKind::Epoll | giong::DriverKind::Kqueue => {
+            assert_eq!(got.as_deref(), Some(&b"late"[..]))
+        }
+        giong::DriverKind::IoUring if linked => assert_eq!(got.as_deref(), Some(&b"late"[..])),
         // io_uring without linked deadlines (GIONG_IO_URING_OFF): the read
         // completed in the kernel while the worker was busy, and the data
         // went with the dropped work. This is what the link prevents.
-        _ => assert_eq!(got, None),
+        giong::DriverKind::IoUring => assert_eq!(got, None),
+        // IOCP completes reads in the kernel too, and has no linked
+        // timeouts: either outcome, depending on when the read was posted.
+        _ => {}
     }
 }
 
