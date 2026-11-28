@@ -378,7 +378,20 @@ fn scram_keys_are_derived_once_and_off_the_worker() {
         let started = Instant::now();
         Client::connect(&config.clone()).await.unwrap();
         let second = started.elapsed();
-        assert!(second < first / 3, "{first:?}, then {second:?}");
+        // Compared without what any connection costs, measured with a
+        // password sent in clear (no derivation): on Windows the server
+        // starts a process for each connection, and a CI runner took 721 ms
+        // for a connect that skipped the derivation (#530).
+        let mut base = Duration::MAX;
+        for _ in 0..2 {
+            let started = Instant::now();
+            Client::connect(&s.tcp(CLEAR_USER)).await.unwrap();
+            base = base.min(started.elapsed());
+        }
+        assert!(
+            second.saturating_sub(base) < first.saturating_sub(base) / 3,
+            "{first:?}, then {second:?}, with {base:?} for a connection without SCRAM"
+        );
         // A different password is not served from the cache.
         let e = Client::connect(&config.clone().password("wrong"))
             .await
