@@ -17,6 +17,11 @@
 #                     prototype: GRO receive, GSO send of up to 10 datagrams,
 #                     ECN.
 #       giong-epoll   giong with the offloads on the epoll driver.
+#       giong-quic    the giong-quic crate (what users run): one task per
+#                     connection and per stream, write_all from a slice.
+#       quinn-copy    quinn writing with write_all from a slice too, so the
+#                     copy into quinn-proto matches giong-quic's (quinn's
+#                     default here is the zero-copy write_chunk).
 #     proto-tokio against giong is the I/O layer alone; quinn against
 #     proto-tokio is quinn's own architecture.
 #   * Client: quinn on a multi-threaded Tokio runtime on CLIENT_CPUS, one
@@ -59,6 +64,8 @@ server_cmd() {
     giong-plain) echo "$BIN/server-proto-giong --offload 0" ;;
     giong) echo "$BIN/server-proto-giong --offload 1" ;;
     giong-epoll) echo "$BIN/server-proto-giong --offload 1 --epoll 1" ;;
+    giong-quic) echo "$BIN/server-giong-quic" ;;
+    quinn-copy) echo "$BIN/server-quinn --copy 1" ;;
   esac
 }
 workload_args() {

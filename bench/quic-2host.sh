@@ -16,6 +16,12 @@
 #   giong-seg44    giong with 44 datagrams per GSO send instead of 10.
 #   giong-plain    giong without offloads (1 worker only).
 #   giong-epoll    giong on its epoll driver.
+#   giong-quic     the giong-quic crate, workers pinned (the default).
+#   giong-quic-nopin  giong-quic with workers not pinned: tests whether a
+#                  worker on the core that takes the NIC's interrupts is
+#                  the 1-worker rr gap.
+#   quinn-copy     quinn writing from a slice (write_all), the copy
+#                  giong-quic makes.
 # Workloads (WORKLOADS): rr (8 conns x 16 streams, 100 B), bulk (4 conns x
 # 1 stream, 16 MiB), many (256 conns x 4 streams, 1 KiB: spreads over
 # workers).
@@ -55,6 +61,9 @@ server_cmd() { # server workers
     giong-seg44) echo "$b/server-proto-giong --offload 1 --segments 44 --workers $w" ;;
     giong-plain) echo "$b/server-proto-giong --offload 0" ;;
     giong-epoll) echo "$b/server-proto-giong --offload 1 --epoll 1 --workers $w" ;;
+    giong-quic) echo "$b/server-giong-quic --workers $w" ;;
+    giong-quic-nopin) echo "$b/server-giong-quic --workers $w --pin 0" ;;
+    quinn-copy) echo "$b/server-quinn --copy 1 --threads $w" ;;
   esac
 }
 single_only() { [[ $1 == proto-tokio || $1 == giong-plain ]]; }

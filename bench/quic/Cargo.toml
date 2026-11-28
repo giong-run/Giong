@@ -9,6 +9,7 @@ publish = false
 
 [dependencies]
 giong = { path = "../..", features = ["unstable-udp-offload"] }
+giong-quic = { path = "../../giong-quic" }
 quinn = { version = "0.11", default-features = false, features = ["runtime-tokio", "rustls-ring"] }
 quinn-proto = { version = "0.11", default-features = false, features = ["rustls-ring"] }
 quinn-udp = { version = "0.5", default-features = false, features = ["tracing"] }
