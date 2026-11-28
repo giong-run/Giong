@@ -17,7 +17,11 @@ transfers are still behind quinn: a 16 MiB answer costs 5.9% less CPU per KiB th
 but quinn's zero-copy `write_chunk` sends it with 21% less. giong-http's HTTP/1.1 write
 timeout now waits on the connection's alarm instead of a timer per write, so a request under
 load costs 3.8% fewer instructions (5,381 instead of 5,593). `Endpoint::connect` no longer
-fails a connection whose handshake finished when the server closed it at once. No API is
+fails a connection whose handshake finished when the server closed it at once. HTTP/3 may
+now use a QPACK dynamic table, opt-in under the `unstable-http3` feature and off by default
+(`Server::qpack_table_size`, `ClientBuilder::qpack_table_size`): with aioquic, 50 requests
+carrying a 200-byte cookie took 90.5% fewer field-section bytes and the server 13% fewer
+instructions per request, and 100 response heads took 92.6% fewer bytes. No stable API is
 removed or changed.
 
 ## [1.5.7] - 2026-11-28
