@@ -213,7 +213,7 @@ fn settings_are_parsed_strictly() {
 
     // Ours reads back.
     let mut out = Vec::new();
-    Settings::write_frame(&mut out, 65_536);
+    Settings::write_frame(&mut out, 65_536, 0);
     let Ok(Need::Got(h)) = Header::read(&out, On::Control) else {
         panic!("our SETTINGS frame has a header");
     };
@@ -528,4 +528,278 @@ fn static_named_finds_what_a_scan_of_the_table_finds() {
     ] {
         assert!(qpack::static_named(name.as_bytes()).is_empty(), "{name:?}");
     }
+}
+
+fn dyn_fields(table: &qpack::Table, block: &[u8]) -> Result<Vec<(String, String)>, frame::Error> {
+    let prefix = table.prefix(block)?;
+    assert!(
+        prefix.required <= table.inserted(),
+        "the section would wait"
+    );
+    let mut out = Vec::new();
+    table.decode(block, prefix, |n, v| {
+        out.push((
+            String::from_utf8_lossy(n).into_owned(),
+            String::from_utf8_lossy(v).into_owned(),
+        ));
+    })?;
+    Ok(out)
+}
+
+fn pairs(list: &[(&str, &str)]) -> Vec<(String, String)> {
+    list.iter()
+        .map(|(n, v)| (n.to_string(), v.to_string()))
+        .collect()
+}
+
+/// The examples of RFC 9204, appendix B.2 to B.5, in order, on one table
+/// of capacity 220: the encoder stream, the field sections that use what
+/// it inserted, the table's size after each step, and what our decoder
+/// stream says.
+#[test]
+fn the_dynamic_table_follows_rfc_9204_appendix_b() {
+    let mut t = qpack::Table::new(220);
+    // B.2: two insertions, then a section that refers to both.
+    let enc = hex("3fbd01 c00f7777772e6578616d706c652e636f6d c10c2f73616d706c652f70617468");
+    assert_eq!(t.encoder_stream(&enc), Ok(enc.len()));
+    assert_eq!((t.inserted(), t.size()), (2, 106));
+    let block = hex("0381 10 11");
+    assert_eq!(
+        dyn_fields(&t, &block).unwrap(),
+        pairs(&[(":authority", "www.example.com"), (":path", "/sample/path")])
+    );
+    let mut out = Vec::new();
+    t.acknowledge(4, t.prefix(&block).unwrap().required, &mut out);
+    assert_eq!(out, hex("84"));
+    // B.3: a speculative insertion, told with an Insert Count Increment.
+    let enc = hex("4a637573746f6d2d6b65790c637573746f6d2d76616c7565");
+    assert_eq!(t.encoder_stream(&enc), Ok(enc.len()));
+    assert_eq!((t.inserted(), t.size()), (3, 160));
+    out.clear();
+    t.increment(&mut out);
+    assert_eq!(out, hex("01"));
+    // B.4: Duplicate, then a section using dynamic and static entries.
+    assert_eq!(t.encoder_stream(&hex("02")), Ok(1));
+    assert_eq!((t.inserted(), t.size()), (4, 217));
+    assert_eq!(
+        dyn_fields(&t, &hex("0500 80 c1 81")).unwrap(),
+        pairs(&[
+            (":authority", "www.example.com"),
+            (":path", "/"),
+            ("custom-key", "custom-value"),
+        ])
+    );
+    out.clear();
+    qpack::cancel_stream(8, &mut out);
+    assert_eq!(out, hex("48"));
+    // B.5: an insertion that names a dynamic entry and evicts the oldest.
+    let enc = hex("810d637573746f6d2d76616c756532");
+    assert_eq!(t.encoder_stream(&enc), Ok(enc.len()));
+    assert_eq!((t.inserted(), t.size()), (5, 215));
+    out.clear();
+    t.increment(&mut out);
+    // The duplicate of B.4 was never told (its stream was cancelled), so
+    // the increment covers both insertions.
+    assert_eq!(out, hex("02"));
+    // Entry 0 is gone; entry 4 is the new one.
+    assert_eq!(
+        dyn_fields(&t, &hex("0600 80")).unwrap(),
+        pairs(&[("custom-key", "custom-value2")])
+    );
+    assert!(dyn_fields(&t, &hex("0200 80"))
+        .unwrap_err()
+        .what
+        .contains("evicted"));
+}
+
+/// Instructions arrive in pieces: only whole ones are read, and what was
+/// read is the same whatever the pieces.
+#[test]
+fn encoder_stream_instructions_are_read_whole() {
+    let enc = hex(
+        "3fbd01 c00f7777772e6578616d706c652e636f6d c10c2f73616d706c652f70617468 \
+         4a637573746f6d2d6b65790c637573746f6d2d76616c7565 02 810d637573746f6d2d76616c756532",
+    );
+    for cut in 0..=enc.len() {
+        let mut t = qpack::Table::new(220);
+        let used = t.encoder_stream(&enc[..cut]).unwrap();
+        assert!(used <= cut);
+        assert_eq!(t.encoder_stream(&enc[used..]), Ok(enc.len() - used));
+        assert_eq!((t.inserted(), t.size()), (5, 215), "cut at {cut}");
+    }
+}
+
+#[test]
+fn encoder_streams_that_break_rfc_9204_are_refused() {
+    let refused = |max: u64, enc: &str| {
+        let mut t = qpack::Table::new(max);
+        let e = t.encoder_stream(&hex(enc)).unwrap_err();
+        assert_eq!(e.code, Code::QpackEncoderStreamError, "{enc}: {e}");
+    };
+    // A capacity above the one allowed.
+    refused(220, "3fbe01");
+    // An insertion before any capacity was set (the table holds 0 bytes).
+    refused(220, "c00f7777772e6578616d706c652e636f6d");
+    // An entry larger than the capacity set: 32 + 10 + 30 > 64.
+    refused(
+        220,
+        "3f21 c0 1e 787878787878787878787878787878787878787878787878787878787878",
+    );
+    // A string longer than the table could ever hold, refused on its
+    // length alone, before its bytes arrive.
+    refused(220, "3fbd01 c0 7f e0 07");
+    // A static index past the table, a relative index past the newest.
+    refused(220, "3fbd01 ff 40 00");
+    refused(220, "3fbd01 80 00");
+    refused(220, "3fbd01 00");
+    // A bad Huffman string.
+    refused(220, "3fbd01 c0 81 ff");
+}
+
+#[test]
+fn sections_that_misuse_the_dynamic_table_are_refused() {
+    let mut t = qpack::Table::new(220);
+    let enc = hex("3fbd01 c00f7777772e6578616d706c652e636f6d c10c2f73616d706c652f70617468");
+    t.encoder_stream(&enc).unwrap();
+    let refused = |block: &str| {
+        let block = hex(block);
+        let e = match t.prefix(&block) {
+            Ok(p) if p.required <= t.inserted() => t.decode(&block, p, |_, _| {}).unwrap_err(),
+            Ok(p) => panic!("{p:?} would wait"),
+            Err(e) => e,
+        };
+        assert_eq!(e.code, Code::QpackDecompressionFailed, "{block:?}: {e}");
+    };
+    // An encoded Required Insert Count above twice the most entries (12).
+    refused("0d00");
+    // Base below zero.
+    refused("0382");
+    // A reference at or past the Required Insert Count (1 here).
+    refused("0200 10");
+    refused("0201 80");
+    // A Required Insert Count larger than what the section uses.
+    refused("0300 81");
+    refused("0300 c1");
+    // Post-base literal name reference past the count.
+    refused("0200 01 00");
+    // A cut field line.
+    refused("0381 1f");
+}
+
+/// What a peer may insert is bounded by the capacity we allow, whatever it
+/// sends: old entries are evicted, and the table never counts above it.
+#[test]
+fn a_table_never_holds_more_than_its_capacity() {
+    let mut t = qpack::Table::new(4096);
+    let mut enc = hex("3fe11f");
+    for i in 0..10_000u32 {
+        // Insert with literal name: 01 0 length(5).
+        let name = format!("x-{i}");
+        let value = "v".repeat((i % 200) as usize);
+        enc.push(0x40 | name.len() as u8);
+        enc.extend_from_slice(name.as_bytes());
+        let mut v = Vec::new();
+        write_prefixed(&mut v, value.len());
+        enc.extend_from_slice(&v);
+        enc.extend_from_slice(value.as_bytes());
+    }
+    assert_eq!(t.encoder_stream(&enc), Ok(enc.len()));
+    assert_eq!(t.inserted(), 10_000);
+    assert!(t.size() <= 4096);
+}
+
+/// A 7-bit prefixed integer with the top bit clear.
+fn write_prefixed(out: &mut Vec<u8>, n: usize) {
+    if n < 127 {
+        out.push(n as u8);
+    } else {
+        out.push(127);
+        let mut rest = n - 127;
+        while rest >= 128 {
+            out.push((rest as u8 & 0x7f) | 0x80);
+            rest >>= 7;
+        }
+        out.push(rest as u8);
+    }
+}
+
+/// The Required Insert Count wraps modulo twice the most entries
+/// (RFC 9204, section 4.5.1.1): a table that has seen many insertions
+/// still decodes the counts its encoder sends.
+#[test]
+fn the_required_insert_count_wraps() {
+    // 64 bytes: at most 2 entries, counts modulo 4.
+    let mut t = qpack::Table::new(64);
+    t.encoder_stream(&hex("3f21")).unwrap();
+    for i in 0..9u8 {
+        // Insert with literal name "a" = digit: 32 + 2 bytes.
+        t.encoder_stream(&[0x41, b'a', 0x01, b'0' + i]).unwrap();
+        let required = u64::from(i) + 1;
+        let encoded = (required % 4) + 1;
+        // Indexed, dynamic, relative 0 from Base = Required Insert Count.
+        let block = [encoded as u8, 0x00, 0x80];
+        let prefix = t.prefix(&block).unwrap();
+        assert_eq!(prefix.required, required);
+        let mut got = Vec::new();
+        t.decode(&block, prefix, |n, v| got.push((n.to_vec(), v.to_vec())))
+            .unwrap();
+        assert_eq!(got, vec![(b"a".to_vec(), vec![b'0' + i])]);
+    }
+    // One insertion ahead of the table: the section waits for it.
+    let block = [((10 % 4) + 1) as u8, 0x00, 0x80];
+    assert_eq!(t.prefix(&block).unwrap().required, 10);
+}
+
+/// The dynamic table's invariants (`qpack::check_table`) on the appendix B
+/// stream and sections, and on random mutations of them.
+#[test]
+fn random_tables_keep_the_invariants() {
+    let mut state = 0x2545_f491_4f6c_dd1du64;
+    let mut next = move || {
+        state ^= state << 13;
+        state ^= state >> 7;
+        state ^= state << 17;
+        state
+    };
+    let stream = hex(
+        "3fbd01 c00f7777772e6578616d706c652e636f6d c10c2f73616d706c652f70617468 \
+         4a637573746f6d2d6b65790c637573746f6d2d76616c7565 02 810d637573746f6d2d76616c756532",
+    );
+    let sections = [
+        hex("0381 10 11"),
+        hex("0500 80 c1 81"),
+        hex("0600 80"),
+        hex("0000 d1"),
+    ];
+    // Capacity byte 3: 32 * 4 * 2 = 256 bytes, room for appendix B's 220.
+    let mut seed = vec![3];
+    seed.extend_from_slice(&(stream.len() as u16).to_be_bytes());
+    seed.extend_from_slice(&stream);
+    for s in &sections {
+        seed.push(s.len() as u8);
+        seed.extend_from_slice(s);
+    }
+    // Through the fuzz target's entry point.
+    use crate::invariants::check_qpack_table;
+    assert!(
+        check_qpack_table(&seed),
+        "appendix B decodes with the table"
+    );
+    let mut used = 0;
+    for _ in 0..100_000 {
+        let mut input = seed.clone();
+        for _ in 0..(1 + next() % 4) {
+            let at = 3 + next() as usize % (input.len() - 3);
+            match next() % 3 {
+                0 => input[at] ^= 1 << (next() % 8),
+                1 => input[at] = next() as u8,
+                _ => {
+                    let cut = at.min(input.len() - 1);
+                    input.truncate(cut.max(4));
+                }
+            }
+        }
+        used += usize::from(check_qpack_table(&input));
+    }
+    assert!(used > 1000, "only {used} inputs used the table");
 }

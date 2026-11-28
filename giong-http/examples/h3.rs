@@ -6,10 +6,13 @@
 //!     h3spec localhost 8443
 //!
 //! Without `GIONG_CERT` and `GIONG_KEY` (PEM files), a self-signed
-//! certificate for `localhost` is made at start. `GIONG_EARLY_DATA=1` takes
-//! 0-RTT requests from resuming clients (h3spec's 0-RTT case needs it). One worker serves the
+//! certificate for `localhost` is made at start. One worker serves the
 //! port, which keeps the example short; a server can run an endpoint on
 //! every worker, on the same port.
+//!
+//! `GIONG_EARLY_DATA=1` takes 0-RTT requests from resuming clients
+//! (h3spec's 0-RTT case needs it). `GIONG_QPACK_TABLE=<bytes>` allows
+//! clients a QPACK dynamic table.
 //!
 //! Routes: `/` (a small page), `/bytes?n=<len>`, `/echo` (the request body
 //! back), `/stream?n=<pieces>` (16 KiB pieces, produced as they are sent).
@@ -109,8 +112,13 @@ fn main() {
         async move {
             let endpoint =
                 Endpoint::server(addr.parse().expect("an address"), config).expect("bind");
+            let qpack = std::env::var("GIONG_QPACK_TABLE")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
             Server::new()
                 .max_body_size(16 << 20)
+                .qpack_table_size(qpack)
                 .serve_h3(endpoint, handle)
                 .await;
         }
