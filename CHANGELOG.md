@@ -8,6 +8,8 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+## [1.5.6] - 2026-11-28
+
 A fast first build for new projects, and a faster HTTP server. `giong dev` starts a new
 project's first build from the dependency builds your other projects already made: eight
 projects from `giong new`, built one after another, took 58.7 s for their first builds and
@@ -19,6 +21,73 @@ open: on one worker, giong-http serves 5.7% fewer requests than a hand-rolled To
 (518,001). Over HTTP/1.1, `min_body_rate` now credits the body bytes that arrive with the
 request head, so it no longer cuts a client that sent them together and keeps the rate. No
 API is removed or changed.
+
+### Added
+
+- **giong-cli**: a new project's first dev build takes the dependency builds your other
+  projects already made. Before a dev build, `giong dev` adds them to the project's
+  `target/debug`: cargo's own unit hash names each one, and cargo checks each fingerprint and
+  builds again whatever differs. A unit comes only with its dependencies from the same project,
+  or when the dependencies here have the same bytes. Then cargo compiles only what is left.
+  Eight projects from `giong new` built one after another: first build plus first test build
+  of all eight went from 131.0 s to 58.7 s (-55%). The seven after the first went from
+  109.0 s to 34.7 s (-68%). A second web + SQLite project went from 23.6 s to 3.1 s.
+  Edit-and-rebuild times stay the same, and release builds are always cargo's own.
+  `giong cache fill` does it by hand.
+
+### Changed
+
+- **giong-http** (performance): a keep-alive connection's idle and request timeouts and its
+  shutdown signal are one alarm in its worker's timer wheel, armed once for the connection and
+  moved to each new deadline (a later deadline only changes the one its entry keeps), instead
+  of a timer armed and cancelled and a shutdown waker registered and removed around every wait.
+  An HTTP/1.1 request costs 6.3% fewer instructions (`bench/instr`'s `http1`: 6,971 instead of
+  7,439 on io_uring; the server alone 5,123 instead of 5,566, 8.0% fewer), giong-web's router
+  4.5%, the client over HTTP/1.1 2.4%, HTTPS 1.6%; no case of `bench/instr` went up. The
+  connections of a worker share one copy of the server's settings instead of a copy each, so
+  every idle connection takes 112 bytes less (on io_uring: HTTP/1.1 1,150 bytes, HTTP/2 2,398,
+  HTTPS 5,029, HTTP/2 over TLS 6,277). The idle timeout counts from the worker's clock of the
+  current turn of its event loop, so it can end as much earlier as the turn has run. Method and
+  raw data: `bench/results/http-conn-alarm/`.
+- **giong-http** (performance): the server reads a request line and every well-formed header
+  line in one pass over their bytes, with the checks it made one after the other (a token
+  method, a visible-ASCII target without `#`, `HTTP/1.1` or `HTTP/1.0`, a token name, a value
+  without control bytes, CRLF), and goes through the separate checks only for anything else,
+  to say what is wrong with it; it accepts and refuses exactly the heads it did. The server
+  alone answers `/json` in 3.9% fewer instructions (4,934 instead of 5,137); `bench/instr`'s
+  `http1` 1.8% fewer, giong-web's router 1.9%, the client over HTTP/1.1 1.7%, HTTPS 1.1%.
+  Method and raw data: `bench/results/http-parse-head/`.
+- **giong-http** (performance): an HTTP/1.1 request costs 8.9% fewer instructions
+  (`bench/instr`'s `http1`: 7,439 instead of 8,169 on io_uring, server and raw client; 12.9%
+  fewer for the server alone, 5,566 instead of 6,387) and no allocation (one before):
+  `Response::json` and `Response::text` keep their constant `Content-Type` line borrowed
+  instead of checking it and copying it into a new buffer, a `200 OK` status line is written
+  in one copy, and the `Date` header is read from the worker's clock of the current turn of
+  its event loop rather than from a clock read of its own (the text still changes with the
+  second; it can lag by as long as the turn has run, as nginx's cached time does). The other
+  HTTP cases went down too: giong-web's router 6.1%, the client over HTTP/1.1 3.7%, HTTP/2
+  1.8% (2.3% for ten requests at once), HTTPS 2.2%, each with one allocation fewer per
+  request; no case of `bench/instr` went up. Method and raw data:
+  `bench/results/http-response-path/`.
+- **giong** (performance): a `ShutdownSignal` (and so `until_shutdown`, which giong-http puts
+  around every wait of a keep-alive connection) holds no reference to the runtime: making
+  and dropping one touches no reference count shared by the workers, and it is 24 bytes
+  instead of 32, which makes an idle HTTP/2 connection 8 bytes smaller.
+
+### Fixed
+
+- **giong-grpc**: `Metadata::add` refuses `keep-alive`, `proxy-connection`,
+  `transfer-encoding` and `upgrade` with `GIONG-E4101`, as it already refused `connection`.
+  HTTP/2 forbids these fields, so they could never be sent: a client call failed at send
+  time with `GIONG-E4103`, whose fix text blamed the other end, and a server dropped them
+  without a word ([#522](https://github.com/giong-run/Giong/issues/522)).
+- **giong-http**: over HTTP/1.1, the body bytes that arrive with the request head now count
+  toward `Server::min_body_rate`, as they already did over HTTP/2 and HTTP/3. A client that
+  sent the head and the start of the body in one write got only the grace period before its
+  next piece, not the grace plus what those bytes earn, and was cut with `GIONG-E1112` while
+  keeping the rate. With `min_body_rate(1000, 200 ms)`, 1,000 bytes sent with the head then
+  a 600 ms pause got 400 before and 200 now
+  ([#525](https://github.com/giong-run/Giong/issues/525)).
 
 ## [1.5.5] - 2026-11-27
 
@@ -4090,7 +4159,8 @@ timers and cross-thread messaging. Not production-tested; see the limitations in
 - The declared minimum Rust version (1.80) and the fallback paths for kernel 6.0 have not
   been exercised yet.
 
-[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.5...HEAD
+[Unreleased]: https://github.com/giong-run/Giong/compare/v1.5.6...HEAD
+[1.5.6]: https://github.com/giong-run/Giong/compare/v1.5.5...v1.5.6
 [1.5.5]: https://github.com/giong-run/Giong/compare/v1.5.4...v1.5.5
 [1.5.4]: https://github.com/giong-run/Giong/compare/v1.5.3...v1.5.4
 [1.5.3]: https://github.com/giong-run/Giong/compare/v1.5.2...v1.5.3

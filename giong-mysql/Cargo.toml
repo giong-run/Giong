@@ -1,6 +1,6 @@
 [package]
 name = "giong-mysql"
-version = "1.5.5"
+version = "1.5.6"
 edition = "2021"
 rust-version = "1.80"
 description = "A MySQL client and connection pool for the giong thread-per-core runtime"
@@ -12,8 +12,8 @@ keywords = ["mysql", "database", "io-uring", "async"]
 categories = ["database", "network-programming", "asynchronous"]
 
 [dependencies]
-giong = { path = "..", version = "1.5.5" }
-giong-tls = { path = "../giong-tls", version = "1.5.5" }
+giong = { path = "..", version = "1.5.6" }
+giong-tls = { path = "../giong-tls", version = "1.5.6" }
 # SHA-1 and SHA-256 for the password scrambles, and the random padding of
 # RSA-OAEP. Already compiled in through rustls, so it adds nothing to the
 # build.
