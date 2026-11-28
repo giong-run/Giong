@@ -1337,7 +1337,7 @@ fn a_request_that_gives_up_waiting_is_cancelled_for_the_encoder() {
         send.write_all(&dynamic_get()).await.unwrap();
         // The request times out while it waits: Stream Cancellation of
         // stream 0 (01 stream id(6)).
-        let (_decoder, said) = server_stream(&client.conn, 0x03, 1).await;
+        let (mut decoder, said) = server_stream(&client.conn, 0x03, 1).await;
         assert_eq!(said, [0x40]);
         // And no longer counts as waiting: 16 more may wait.
         let mut streams = Vec::new();
@@ -1347,6 +1347,13 @@ fn a_request_that_gives_up_waiting_is_cancelled_for_the_encoder() {
             streams.push((send, recv));
         }
         let _encoder = encoder_stream(&client, INSERTS).await;
+        // The Insert Count Increment comes before anything else the
+        // decoder says of these insertions: once it is here, a request
+        // that needs them does not wait. Sent before it, the request could
+        // reach the server ahead of the insertions, as a 17th waiting.
+        let piece = decoder.read().await.unwrap().expect("an increment");
+        // Insert Count Increment: 00 increment(6), here 2 (or 1 and 1).
+        assert_eq!(piece[0] & 0xc0, 0, "{piece:02x?}");
         let reply = roundtrip(&client, dynamic_get()).await.unwrap();
         assert_eq!(reply.status(), 200);
     });
