@@ -185,7 +185,8 @@ commits the new baseline the job prints, see `bench/instr/README.md`), `kani` (t
 in `docs/kani.md`; a change to the slab, the buffer pool, `KernelBox` or the io_uring
 operation lifecycle keeps them passing), `verus` (the proofs in `docs/verus.md`: a change
 to `src/ipc/ring.rs` is made in its mirror in `verify/ipc_ring.rs` too, or `lint`'s drift
-check fails), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
+check fails; a change to a function `verify/pins.txt` lists is checked against the model
+in `verify/wakeups.rs`, then its pin updated), `miri`, `loom`, the `kernels` jobs, the tests inside Docker's default seccomp
 profile (`docker`), HTTP/2 conformance with h2spec (`h2spec`), HTTP/3 and QUIC with h3spec
 (`h3spec`) and the database crates against other server versions (`servers`) on every pull
 request, every crate's tests on macOS 15 and 26 (`macos.yml`) and on Windows Server 2022
@@ -312,6 +313,14 @@ is loaded.
   request that does not touch their platform. A failure there ejects the pull request from
   the queue. A test that fails there on code the pull request did not touch goes into
   `.github/known-flakes.txt` with an issue within the hour, then gets fixed; never skipped.
+
+- **A Verus proof that stops verifying after a harmless-looking edit.** Verus's syntax
+  still moves between releases (the pinned one wants `final(self)` for the new value of
+  `&mut self` in an `ensures`); a `broadcast use` of axioms at module level must name them
+  from another module (`mem::` in `verify/ipc_ring.rs`), or Verus reports a cycle; and a
+  quantifier Verus cannot find a trigger for needs `#[trigger]`. `scripts/verus.py planted`
+  failing with "MISSED" means the proof accepts a bug it used to reject: the proof has
+  become vacuous somewhere, which is worse than a failure (docs/verus.md).
 
 - **TCP keeps no message boundaries.** On Linux 6.12 and newer, streams receive through
   packed buffer rings, and a receive ends wherever a shared buffer fills up: a test that

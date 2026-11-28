@@ -46,7 +46,7 @@ VERUS_URL = (
 )
 
 # Each proof is a crate root Verus checks on its own.
-PROOFS = ["ipc_ring.rs"]
+PROOFS = ["ipc_ring.rs", "wakeups.rs"]
 
 # Proof file -> the source file its `verus-mirror` section must equal.
 MIRRORS = {"ipc_ring.rs": "src/ipc/ring.rs"}
@@ -74,11 +74,47 @@ TRUSTED = {
 # Verus must report). Each must make the proof fail.
 PLANTED = [
     (
+        "wakeups.rs",
+        "run_batch polls a task without RunFlag::begin_poll (the flag stays set)",
+        "tasks: s.tasks.insert(u, Task { queued: false, ..s.tasks[u] }),",
+        "tasks: s.tasks,",
+        "assertion failed",
+    ),
+    (
+        "wakeups.rs",
+        "prepare_park does not look at pending after announcing the sleep",
+        """        Pc::ParkRead => if s.pending {
+            State { pc: Pc::Unpark, ..s }
+        } else {
+            State { pc: Pc::Parked, ..s }
+        },""",
+        """        Pc::ParkRead => State { pc: Pc::Parked, ..s },""",
+        "postcondition not satisfied",
+    ),
+    (
+        "wakeups.rs",
+        "Doorbell::ring takes the sleeping flag but writes no eventfd",
+        "State { sleeping: false, wakers: s.wakers.insert(w, WPc::Write), ..s }",
+        "State { sleeping: false, wakers: s.wakers.insert(w, WPc::Idle), ..s }",
+        "postcondition not satisfied",
+    ),
+    (
+        "wakeups.rs",
+        "the worker sleeps with tasks still in its run queue",
+        """        Pc::AfterBatch => if s.q.len() > 0 {
+            State { pc: Pc::Loop, ..s }
+        } else {
+            State { pc: Pc::ParkSet, ..s }
+        },""",
+        """        Pc::AfterBatch => State { pc: Pc::ParkSet, ..s },""",
+        "postcondition not satisfied",
+    ),
+    (
         "ipc_ring.rs",
         "checked_head accepts a head more than a ring behind the tail",
         "if head > self.pos || used > self.capacity || used % 8 != 0 {",
         "if head > self.pos || used % 8 != 0 {",
-        "error",
+        "postcondition not satisfied",
     ),
     (
         "ipc_ring.rs",

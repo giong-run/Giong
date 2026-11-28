@@ -1,7 +1,7 @@
 # Verus proofs
 
 [Kani](kani.md) proves the unsafe core for every input within stated bounds (5 slots, 2
-buffers). [Verus](https://github.com/verus-lang/verus) proves properties for *every* input
+buffers), and loom checks the wake-up handshakes for two or three threads. [Verus](https://github.com/verus-lang/verus) proves properties for *every* input
 with no bound at all: it turns the code and its specification into formulas that an SMT
 solver (Z3) checks once for all values. The proofs live in `verify/`, outside every crate:
 no user of giong compiles them, downloads Verus or gets a new dependency, and the code
@@ -15,13 +15,14 @@ scripts/check.sh verus             # the same
 
 CI: the `lint` job runs `scripts/verus.py drift` on every pull request (Python only, under a
 second); the `verus` job installs Verus and runs `all` in the merge queue, and on a pull
-request that changes `verify/` or `scripts/verus.py`. It takes about 1 minute, most of it
-the runner's setup.
+request that changes `verify/` or `scripts/verus.py`. Both proofs take 5 seconds, the
+eight planted bugs about 20 more; the job's minutes are mostly the runner's setup.
 
 ## What is proven
 
 | Proof | Property | Bounds | Time |
 | --- | --- | --- | --- |
+| `verify/wakeups.rs` | **A worker never forgets a task.** In every execution in which the worker and each waking thread get to run (weak fairness), every wake-up of a live task is followed by a poll of that task that sees it, unless the task finishes first. The model has `RunFlag` (`try_enqueue`, `begin_poll`), `Doorbell` (`ring`, `take`, `prepare_park`, `unpark`), the injector, the run queue and its batches, the eventfd and the worker's sleep, with spawns, wake-ups from the worker's own thread and spurious returns from the kernel allowed at any time. Under it, an invariant (no task is queued without being in a queue or on its way; no unseen wake-up is uncovered; injected work is announced; a sleeping worker is woken) holds in every reachable state. | None: any number of tasks, waking threads, queued entries and steps (unbounded executions, infinite time) | 3 s |
 | `verify/ipc_ring.rs` | For every capacity from 4 KiB to 1 GiB, any sequence of calls and **any value the peer process writes** into the shared memory (both positions and every record head): `push`, `has_room`, `peek`, `release` and `has_data` never read or write outside the direction's data area; never panic (no arithmetic overflow or underflow, no division by zero, the `debug_assert!` in `push` holds); `peek`'s loop ends; the record `peek` returns lies inside the data area, before the producer's checked tail, and is aligned; each side's position only grows, stays 8-byte aligned and at most one ring apart from the other side's checked position; a producer never moves past the consumer's checked head plus the capacity. | None: all capacities, all sequence lengths (the invariant is inductive), all peer behaviour | 2 s |
 
 The untrusted peer is modelled exactly as it is: vstd specifies the standard atomics with
@@ -41,16 +42,63 @@ as corrupt (`GIONG-E0091`), and the loop runs at most twice. The test
 fails unless Verus rejects it, so a proof that has become vacuous (proving anything) is
 caught by CI:
 
+- `run_batch` polling a task without `RunFlag::begin_poll` (the flag stays set, so every
+  later wake-up skips the queue);
+- `prepare_park` not looking at `pending` after announcing the sleep;
+- `Doorbell::ring` taking the `sleeping` flag but writing no eventfd;
+- the worker sleeping with tasks still in its run queue;
 - `checked_head` accepting a head more than one ring behind the tail (the producer's room
   underflows);
 - `peek` following a wrap marker at offset 0 (the loop does not end);
 - `peek` returning a record that runs past the end of the data area;
 - `push` forgetting the room a wrap marker skips (it would pass the consumer's head).
 
-Proof size: 213 lines of code in `src/ipc/ring.rs` (without its tests), 248 lines of
-specification, proof and trusted model in `verify/ipc_ring.rs`: 1.2 lines of proof per
-line of code. The Verus-verified systems in the literature range from about 3:1 (Atmosphere)
-to 12:1 (a runtime's liveness, Lion); a ring of integer positions is at the easy end.
+## A worker never forgets a task
+
+`verify/wakeups.rs` is a model, not the code: one step per atomic operation of the code,
+under sequential consistency. The C++ memory model's weaker outcomes for the same
+handshakes are loom's job (`scripts/check.sh loom`, `src/notify.rs`), for two or three
+threads; Verus covers what loom cannot, any number of tasks, threads and steps, forever.
+
+The worker's steps follow `Worker::drive` and `run_batch`: `drain_injected` (`take`, then
+the injector's contents onto the run queue), the batch (its budget is the queue's length;
+each entry popped is skipped if its task is gone, else `begin_poll` and a poll that reads
+the task's state and may finish it), then either another turn (tasks are runnable) or
+`prepare_park` (swap `sleeping`, read `pending`) and a sleep until the eventfd is written,
+and `unpark`. A waking thread's steps follow `wake_by_ref` and `inject`: publish the task's
+new state, `try_enqueue` (a swap), push into the injector, `ring` (swap `pending`, load
+`sleeping`, swap it to elect one writer), write the eventfd.
+
+The property is liveness, so it needs an assumption about scheduling: **weak fairness**,
+the worker and each waking thread, when able to take a step, eventually take it. Nothing
+else: other threads may start wake-ups or not, the worker's own wake-ups and spawns and the
+kernel's spurious returns may come at any time and as often as they like. The proof
+follows the classic WF1 rule from a wake-up to the poll: a waker that published calls
+`try_enqueue`; a task that won it is pushed into the injector; the waker that pushed rings
+the doorbell; a worker asleep after the ring is woken because one waker saw `sleeping` and
+writes the eventfd; the worker comes round to `drain_injected`; and a task in the run queue
+gets nearer the front with each pop (entries are only ever added behind it) until its poll
+reads the new state. `assumptions_are_satisfiable` builds an execution that meets every
+assumption with a task waiting, so the theorem is not vacuously true.
+
+The code it models is pinned: `verify/pins.txt` holds a hash of the tokens of each
+function the model describes (`RunFlag`, `Doorbell`, `wake_by_ref`, `task_waker`,
+`run_batch`, `inject`, `drive`, `drain_injected`). A change to any of them fails the `lint`
+job's drift check until someone has checked the model against it and updated the line
+(`scripts/verus.py pins` prints the new ones). That is a prompt for review, not a proof
+that model and code agree.
+
+Proof size: the model is 202 lines for about 223 lines of pinned code (much of `drive` and
+`run_batch` is timers, profiling and I/O the model leaves out); the invariant, the fairness
+rules, the liveness chain and the witness are 1,370 lines: about 6 lines of proof per line
+of code, between Atmosphere (about 3:1) and Lion's liveness proof of a runtime (about
+12:1).
+
+## Proof size of the ring
+
+213 lines of code in `src/ipc/ring.rs` (without its tests), 248 lines of specification,
+proof and trusted model in `verify/ipc_ring.rs`: 1.2 lines of proof per line of code. A
+ring of integer positions is at the easy end.
 
 ## How the code and the proof stay one
 
@@ -91,10 +139,19 @@ What Verus takes on faith, in `verify/ipc_ring.rs`'s `mem` module and in `TRUSTE
   `Dir`; its `ensures` restates its `# Safety` contract (a mapping of the right length, a
   capacity in range).
 - **`Ring::dir`**: dereferences the shared `Dir`. Only its atomics are read through it.
+- **The wake-up model** (`verify/wakeups.rs`) is trusted to describe the pinned code; see
+  above.
 - **Verus, Z3 and rustc** themselves.
 
 ## What is not covered
 
+- **Weak memory orderings** in the wake-up handshakes: loom checks those, for small
+  bounds. Verus assumes each atomic operation takes effect at once, in one order.
+- **What the wake-up model leaves out**: the balanced jobs (`JobCount`, `spawn_balanced`),
+  `Inject::Run`, `Shutdown` and `Poke`, a closed injector, aborts, the spin loop and
+  probes before a sleep, the reuse of slots and of waker states (a stale entry that polls
+  the slot's next task is an extra poll, harmless), and polls that never return (a task
+  that blocks its worker is outside any runtime's promise).
 - **The callers in `src/ipc.rs`.** That `release` gets the length `peek` returned, that a
   message is at most `max_message` long (checked there before `push`), and the sleeping
   handshakes, are not proven. Each is a precondition the proof states (`release`'s
