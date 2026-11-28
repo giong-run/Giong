@@ -1651,9 +1651,7 @@ impl Client {
             let addrs = giong::net::lookup_host((&*origin.host, port))
                 .await
                 .map_err(failed)?;
-            self.h3_open_any(quic, origin, &addrs, connect_timeout)
-                .await
-                .map_err(failed)
+            self.h3_open_any(quic, origin, &addrs).await.map_err(failed)
         };
         match giong::time::timeout(connect_timeout, connect).await {
             Ok(result) => result,
@@ -1668,23 +1666,27 @@ impl Client {
         }
     }
 
-    /// Connects to the first of `addrs` that answers, each in its turn.
+    /// Connects to the first of `addrs` that answers, racing them as Happy
+    /// Eyeballs does (RFC 8305, section 5): the first attempt starts at
+    /// once, and while no attempt has answered the next address starts
+    /// alongside after [`ATTEMPT_DELAY`], or as soon as an attempt fails.
+    /// The first connection made wins; the attempts still running are
+    /// dropped, which closes their connections. Nothing answers a QUIC
+    /// packet sent to an address that does not listen, so a dead first
+    /// address (`localhost` resolving to ::1 first while the server listens
+    /// on 127.0.0.1, say) costs one delay, not a share of the connect
+    /// timeout.
     #[cfg(feature = "unstable-http3")]
     async fn h3_open_any(
         &self,
         quic: &giong_quic::ClientConfig,
         origin: &url::Origin,
         addrs: &[std::net::SocketAddr],
-        connect_timeout: Duration,
     ) -> io::Result<h3::Connection> {
         let config = &self.shared.config;
         let pool = &self.shared.h3;
-        // Nothing answers a QUIC packet sent to an address that does not
-        // listen, so each address gets its share of the time and the next
-        // one is tried when it has passed.
-        let share = connect_timeout / addrs.len().max(1) as u32;
-        let mut last = None;
-        for &addr in addrs {
+        let many = addrs.len() > 1;
+        let attempt = |addr: std::net::SocketAddr| async move {
             let (slot, any) = if addr.is_ipv4() {
                 (&pool.v4, "0.0.0.0:0")
             } else {
@@ -1694,50 +1696,29 @@ impl Client {
                 Some(endpoint) => endpoint,
                 None => {
                     let any = any.parse().expect("a literal address");
-                    match giong_quic::Endpoint::client(any) {
-                        Ok(endpoint) => slot.get_or_init(|| endpoint),
-                        Err(e) => {
-                            last = Some(e);
-                            continue;
-                        }
-                    }
+                    let endpoint = giong_quic::Endpoint::client(any)?;
+                    slot.get_or_init(|| endpoint)
                 }
             };
-            let made = async {
-                let conn = endpoint.connect_early(addr, &origin.host, quic).await?;
-                let conn =
-                    h3::Connection::start(conn, config.max_head_size, config.qpack_table_size)
-                        .await?;
-                // With a ticket the connection opens before any packet
-                // comes back. When there are other addresses to try, this
-                // one counts only once it has answered, or a dead first
-                // address (an unreachable IPv6 one before a working IPv4
-                // one, say) would be the only one ever tried.
-                if addrs.len() > 1 {
-                    conn.handshake().await;
-                    if !conn.is_open() {
-                        return Err(io::Error::new(
-                            io::ErrorKind::ConnectionAborted,
-                            format!("the handshake with {addr} failed"),
-                        ));
-                    }
-                }
-                Ok(conn)
-            };
-            match giong::time::timeout(share, made).await {
-                Ok(Ok(conn)) => return Ok(conn),
-                Ok(Err(e)) => last = Some(e),
-                Err(_) => {
-                    last = Some(io::Error::new(
-                        io::ErrorKind::TimedOut,
-                        format!("no answer from {addr} within {share:?}"),
+            let conn = endpoint.connect_early(addr, &origin.host, quic).await?;
+            let conn =
+                h3::Connection::start(conn, config.max_head_size, config.qpack_table_size).await?;
+            // With a ticket the connection opens before any packet comes
+            // back. When there are other addresses to try, this one counts
+            // only once it has answered, or a dead address would win the
+            // race.
+            if many {
+                conn.handshake().await;
+                if !conn.is_open() {
+                    return Err(io::Error::new(
+                        io::ErrorKind::ConnectionAborted,
+                        format!("the handshake with {addr} failed"),
                     ));
                 }
             }
-        }
-        Err(last.unwrap_or_else(|| {
-            io::Error::new(io::ErrorKind::NotFound, "the host name has no address")
-        }))
+            Ok(conn)
+        };
+        race(addrs, attempt).await
     }
 
     /// The UDP port `origin` advertised HTTP/3 on, while that holds and the
@@ -1898,6 +1879,81 @@ impl Client {
             hops += 1;
         }
     }
+}
+
+/// How long a connection attempt runs alone before the next address starts
+/// alongside it (RFC 8305, section 5).
+#[cfg(feature = "unstable-http3")]
+const ATTEMPT_DELAY: Duration = Duration::from_millis(250);
+
+/// Runs `attempt` for each of `addrs`, families alternating from the first
+/// address's (RFC 8305, section 4): the next one starts after
+/// [`ATTEMPT_DELAY`] while none has succeeded, or at once when one fails.
+/// Gives the first success, or the last error once every attempt failed.
+#[cfg(feature = "unstable-http3")]
+async fn race<T, F, Fut>(addrs: &[std::net::SocketAddr], attempt: F) -> io::Result<T>
+where
+    F: Fn(std::net::SocketAddr) -> Fut,
+    Fut: std::future::Future<Output = io::Result<T>>,
+{
+    use std::pin::Pin;
+    use std::task::Poll;
+
+    let first_v6 = addrs.first().is_some_and(std::net::SocketAddr::is_ipv6);
+    // Alternate: one of each family while both last.
+    let mut order = Vec::with_capacity(addrs.len());
+    {
+        let (mut a, mut b): (Vec<_>, Vec<_>) =
+            addrs.iter().copied().partition(|a| a.is_ipv6() == first_v6);
+        let (mut a, mut b) = (a.drain(..), b.drain(..));
+        loop {
+            match (a.next(), b.next()) {
+                (None, None) => break,
+                (x, y) => order.extend(x.into_iter().chain(y)),
+            }
+        }
+    }
+    let mut queue = order.into_iter();
+    let Some(first) = queue.next() else {
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "the host name has no address",
+        ));
+    };
+    let mut running: Vec<Pin<Box<Fut>>> = vec![Box::pin(attempt(first))];
+    let mut alarm = giong::time::Alarm::new();
+    let mut next_at = Instant::now() + ATTEMPT_DELAY;
+    let mut last = None;
+    std::future::poll_fn(|cx| loop {
+        let mut start = false;
+        let mut i = 0;
+        while i < running.len() {
+            match running[i].as_mut().poll(cx) {
+                Poll::Ready(Ok(won)) => return Poll::Ready(Ok(won)),
+                Poll::Ready(Err(e)) => {
+                    last = Some(e);
+                    drop(running.swap_remove(i));
+                    start = true;
+                }
+                Poll::Pending => i += 1,
+            }
+        }
+        if !start && queue.len() > 0 && alarm.poll_deadline(next_at, cx).is_ready() {
+            start = true;
+        }
+        if start {
+            if let Some(addr) = queue.next() {
+                running.push(Box::pin(attempt(addr)));
+                next_at = Instant::now() + ATTEMPT_DELAY;
+                continue;
+            }
+        }
+        if running.is_empty() {
+            return Poll::Ready(Err(last.take().expect("an attempt failed")));
+        }
+        return Poll::Pending;
+    })
+    .await
 }
 
 /// A response whose head has arrived, with the connection its body comes
