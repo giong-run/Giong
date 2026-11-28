@@ -228,6 +228,8 @@ comparisons and harnesses that are never published.
 | a soak path: the drivers, the scheduler, cancellation, sockets, channels, timers, files, the HTTP/2 or TLS state of the servers | the gate (both drivers, TSan), `scripts/check.sh fallback` | 2 to 4 hours per driver |
 | the unsafe core: `src/driver/`, `src/op.rs`, `src/buf.rs`, `src/kbox.rs`, `src/slab.rs` | the above, `scripts/valgrind.sh`, `scripts/check.sh kani` | 2 to 4 hours per driver |
 | cross-thread wake-ups: `src/notify.rs`, the injector, `TaskWaker` | the above (the gate runs loom) | 2 to 4 hours per driver |
+| a proven file: `src/ipc/ring.rs` | the same edit in its mirror in `verify/`, `scripts/check.sh verus` ([verus.md](verus.md)) | as for the file's row |
+| a function `verify/pins.txt` lists (wake-ups, the run queue, the worker's sleep) | check the model in `verify/wakeups.rs` against the change, update the pin (`scripts/verus.py pins`), `scripts/check.sh verus` | as for the file's row |
 
 The soak tiers are defined in [RELEASING.md](RELEASING.md#how-long-to-soak); a major
 release soaks for 72 hours whatever changed. The merge queue runs every job whatever the

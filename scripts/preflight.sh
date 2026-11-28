@@ -27,6 +27,10 @@
 #                             scripts/check.sh tsan, one round
 #   wake-ups (src/notify.rs, the executor's injector)
 #                             scripts/check.sh loom
+#   a proof, or a file one proves or models (verify/, scripts/verus.py, src/ipc/ring.rs,
+#   the pinned files of verify/pins.txt)
+#                             scripts/verus.py drift (also --quick), then
+#                             scripts/verus.py all (scripts/verus.py install)
 #   code that parses bytes from the network
 #                             every fuzz target of that crate for FUZZ_SECS (30) seconds
 #   a Cargo.toml, Cargo.lock or deny.toml
@@ -60,7 +64,8 @@ install_tools() {
     cargo install --locked cargo-fuzz
     cargo install --locked cargo-semver-checks --version "$SEMVER_CHECKS"
     cargo install --locked cargo-deny --version "$CARGO_DENY"
-    echo "ok: $STABLE (CI's stable), $MSRV, nightly with rust-src, cargo-fuzz, cargo-semver-checks $SEMVER_CHECKS and cargo-deny $CARGO_DENY"
+    python3 scripts/verus.py install
+    echo "ok: $STABLE (CI's stable), $MSRV, nightly with rust-src, cargo-fuzz, cargo-semver-checks $SEMVER_CHECKS, cargo-deny $CARGO_DENY and Verus"
 }
 
 install_hook() {
@@ -130,6 +135,7 @@ ALL=0                  # the runtime changed: every crate is built on it
 SEMVER=0               # a published crate's library code changed
 TSAN=0                 # ThreadSanitizer applies
 LOOM=0                 # the loom models apply
+VERUS=0                # a Verus proof, or what one proves (docs/verus.md)
 DEPS=0                 # dependencies or the supply-chain policy changed
 SOAK=()                # files on a soak path (docs/RELEASING.md, "How long to soak")
 CHANGELOG_ENTRY=0
@@ -177,6 +183,10 @@ for f in "${FILES[@]}"; do
         src/notify.rs|src/executor.rs) LOOM=1 ;;
     esac
     case "$f" in
+        verify/*|scripts/verus.py|src/ipc/ring.rs) VERUS=1 ;;
+    esac
+    if [ -f verify/pins.txt ] && grep -q " $f " verify/pins.txt; then VERUS=1; fi
+    case "$f" in
         src/net/dns.rs|src/net/dns/*|fuzz/*) FUZZ[.]=1 ;;
         giong-http/src/*|giong-http/fuzz/*) FUZZ[giong-http]=1 ;;
         giong-tls/src/ktls*|giong-tls/fuzz/*) FUZZ[giong-tls]=1 ;;
@@ -212,6 +222,7 @@ GATE=()
 [ "$SEMVER" = 1 ] && GATE+=("semver (scripts/semver.sh)")
 [ "$TSAN" = 1 ] && GATE+=("ThreadSanitizer, one round (scripts/check.sh tsan)")
 [ "$LOOM" = 1 ] && GATE+=("loom (scripts/check.sh loom)")
+[ "$VERUS" = 1 ] && GATE+=("Verus proofs and planted bugs (scripts/verus.py all)")
 [ "$DEPS" = 1 ] && GATE+=("supply chain (cargo deny --workspace check)")
 for d in "${!FUZZ[@]}"; do GATE+=("fuzz ${d/#./giong}: every target, ${FUZZ_SECS}s each"); done
 if [ ${#GATE[@]} -gt 0 ]; then
@@ -275,6 +286,7 @@ if [ -n "$AGAINST" ]; then
 fi
 
 step "release.py check" python3 scripts/release.py check
+[ "$VERUS" = 1 ] && step "verus drift" python3 scripts/verus.py drift
 if [ "$RUST" = 1 ]; then
     step "fmt" cargo fmt --all --check
     step "clippy" cargo clippy --workspace --all-targets --all-features --quiet -- -D warnings
@@ -297,6 +309,9 @@ if [ "$MODE" = gate ]; then
     fi
     if [ "$DEPS" = 1 ] && need "cargo deny --version" "cargo-deny"; then
         step "supply chain (cargo deny)" cargo deny --workspace check
+    fi
+    if [ "$VERUS" = 1 ] && need "test -x target/verus/verus-x86-linux/verus || test -x \"\${VERUS:-}\"" "Verus (pinned in scripts/verus.py)"; then
+        step "verus" python3 scripts/verus.py all
     fi
     if [ "$SEMVER" = 1 ] && need "cargo semver-checks --version" "cargo-semver-checks"; then
         step "semver" scripts/semver.sh

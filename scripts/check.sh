@@ -28,6 +28,11 @@
 #                               0.68.0 && cargo kani setup`): the slab, the
 #                               receive buffer pool, KernelBox and the lifetime
 #                               of an io_uring operation (docs/kani.md)
+#   scripts/check.sh verus      prove with Verus, for every input with no bound, what
+#                               docs/verus.md lists (the ipc ring against any peer);
+#                               checks that the proofs still mirror the code, and
+#                               that each planted bug is rejected
+#                               (`python3 scripts/verus.py install` first)
 #   scripts/check.sh soak       connection churn for SOAK_SECS seconds (default 300),
 #                               then checks for leaked descriptors, memory and
 #                               driver state (tests/soak.rs); then the same over
@@ -50,7 +55,7 @@
 #                               SIM_LONG_FROM (default 0), SIM_LONG_DAYS
 #                               (default 3650) split over every seed, one
 #                               process per CPU; a failure prints its seed
-#   scripts/check.sh all        everything above except seccomp, asan, soak, miri, kani, sim and sim-long
+#   scripts/check.sh all        everything above except seccomp, asan, soak, miri, kani, verus, sim and sim-long
 #
 # ROUNDS=n changes how often each test binary is repeated.
 # GIONG_TEST_EXPECT_DRIVER=io_uring (as CI sets it) makes the tests fail where
@@ -287,6 +292,10 @@ run_kani() {
         --harness slab::proofs --harness kbox::proofs --harness buf::proofs
 }
 
+run_verus() {
+    python3 scripts/verus.py all
+}
+
 case "${1:-all}" in
     test) run_test ;;
     fallback) run_fallback "${2:-all}" ;;
@@ -303,6 +312,7 @@ case "${1:-all}" in
         ;;
     miri) run_miri ;;
     kani) run_kani ;;
+    verus) run_verus ;;
     sim) run_sim ;;
     sim-long) run_sim_long ;;
     all) run_test; run_fallback all; run_tsan; run_loom ;;

@@ -70,6 +70,7 @@ jobs:
       rounds: ${{ steps.plan.outputs.rounds }}
       tsan: ${{ steps.plan.outputs.tsan }}
       fallback: ${{ steps.plan.outputs.fallback }}
+      verus: ${{ steps.plan.outputs.verus }}
     steps:
       # On a pull request the checked-out commit merges the head into the base, so its
       # first parent is the base and the diff between the two is the pull request.
@@ -118,6 +119,11 @@ jobs:
       - run: python3 scripts/test_ci_gate.py
       # What a pull request and a merge group run (scripts/ci-scope.py, Workflow v2).
       - run: python3 scripts/test_ci_scope.py
+      # The Verus proofs still describe the code (docs/verus.md): each mirrored
+      # source file is token for token what its proof verifies, and each
+      # function a model describes is unchanged. Python only; the proofs run in
+      # the `verus` job.
+      - run: python3 scripts/verus.py drift
       - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
       - run: cargo doc --workspace --all-features --no-deps
         env:
@@ -863,6 +869,25 @@ jobs:
       # the largest alone).
       - run: KANI_JOBS=2 scripts/check.sh kani
 
+  # Verus proofs (docs/verus.md): for every capacity, any number of calls and
+  # anything the peer writes, the ipc ring stays inside its mapping, never
+  # panics and never loops for ever; each planted bug must be rejected.
+  # Verus is pinned in scripts/verus.py and runs on the toolchain it was built
+  # with, which is RUST_STABLE. On a pull request only when it changes a proof.
+  verus:
+    needs: plan
+    if: needs.plan.outputs.verus == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8 # master
+        with:
+          toolchain: ${{ env.RUST_STABLE }}
+      - name: "net: install Verus"
+        run: scripts/ci-net.sh retry -n 4 -t 300 -- python3 scripts/verus.py install
+      - run: python3 scripts/verus.py all
+
   # giong-quic by itself, as a user who depends on it alone builds it:
   # format, lints, docs, and its tests, which run its own client against
   # its own server and quinn against it.
@@ -974,7 +999,7 @@ jobs:
   # left out may be skipped; `plan`, `lint` and `msrv` must pass in any case, and in a
   # merge group with code every job must.
   all-checks:
-    needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, sim, quic, musl, macos, windows]
+    needs: [plan, lint, msrv, default-features, build, test, h2spec, h3spec, servers, fallback, docker, gvisor, slow-uploads, tsan, miri, loom, minimal-versions, kernels, semver, instr, kani, verus, sim, quic, musl, macos, windows]
     if: always()
     runs-on: ubuntu-24.04
     timeout-minutes: 5

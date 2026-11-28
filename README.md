@@ -771,6 +771,15 @@ Also:
   dropped operation's memory and slab entry outlive the kernel's last completion in every
   order of events, and that `KernelBox` pointers survive moves; in CI on every change. No
   bug found; each proof caught a planted one.
+- **Verus proofs** (`scripts/check.sh verus`, [docs/verus.md](docs/verus.md)): with no
+  bound at all, that the IPC ring between two processes never reads or writes outside
+  its mapping, never panics and never loops for ever, whatever the other process writes
+  into the shared memory; the proof covers the shipped code itself, kept identical by a
+  drift check in CI. It found a wrap marker a hostile peer could use to keep a worker
+  inside one receive; fixed. A second proof shows that a worker never forgets a task:
+  under fair scheduling, every wake-up of a live task is followed by a poll that sees
+  it, for any number of tasks and waking threads (a model of `src/notify.rs` and the run
+  queue, pinned to the code). Each proof catches planted bugs in CI.
 - **Soak** (`scripts/check.sh soak`, `tests/soak.rs`): TCP clients on every worker that
   close cleanly, abort, half-close or cancel receives, with UDP, file and cross-worker
   traffic alongside; afterwards no descriptor, memory or driver state may be left over.

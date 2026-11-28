@@ -23,6 +23,10 @@ Prints `key=value` lines for $GITHUB_OUTPUT:
     tsan    the ThreadSanitizer matrix, as JSON
     fallback  the tiers of scripts/check.sh fallback to run, as JSON
     platform  with --platform: whether that platform's workflow runs (see below)
+    verus   whether the Verus proofs run (docs/verus.md): every job of scope full, and
+            a pull request that changes a proof or scripts/verus.py (a change to a
+            proven source file changes its proof too: the lint job's drift check
+            fails until it does)
 
 `--relevant PREFIX...` narrows a workflow to the files it tests: a pull request that
 changes none of them gets scope `docs` (that workflow's tests skip).
@@ -81,6 +85,8 @@ PLATFORM_WORDS = {
     "windows": re.compile(r'cfg(_attr)?\([^\n]*\bwindows\b|target_os\s*=\s*"windows"'
                           r'|std::os::windows|windows_sys::|\bWSA[A-Z]'),
 }
+# The files that make a pull request run the Verus proofs.
+VERUS_PATHS = ("verify/", "scripts/verus.py")
 MANIFESTS = ("Cargo.toml", "Cargo.lock", "rust-toolchain.toml", ".cargo/config.toml")
 
 
@@ -135,6 +141,10 @@ def touches_platform(files, name, root=ROOT):
     return False
 
 
+def runs_verus(scope, code):
+    return scope == "full" or (scope in ("pr", "draft") and any(f.startswith(VERUS_PATHS) for f in code))
+
+
 def plan(files, event, draft, relevant=None):
     included = included_markdown()
     code = [f for f in files if not is_docs(f, included)]
@@ -176,6 +186,7 @@ def main():
     # Never empty: a matrix of nothing is an error even in a job that is skipped.
     fallback = FALLBACK_FULL if scope == "full" else FALLBACK_PR
     print(f"fallback={json.dumps(fallback)}")
+    print(f"verus={'true' if runs_verus(scope, code) else 'false'}")
     if args.platform:
         on = scope == "full" or (scope == "pr" and touches_platform(code, args.platform))
         print(f"platform={'true' if on else 'false'}")

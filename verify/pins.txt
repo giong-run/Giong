@@ -1,0 +1,17 @@
+# Functions that verify/wakeups.rs models (docs/verus.md), with a hash of their
+# tokens. `scripts/verus.py drift` fails when one changes: check the model
+# against the change, then replace the line with the one `scripts/verus.py pins`
+# prints. Format: <hash> <file> <Type::fn or fn>.
+2ff56971a9c58094 src/notify.rs RunFlag::try_enqueue
+f66a85fa2af52d77 src/notify.rs RunFlag::begin_poll
+8cfebf3194039eba src/notify.rs RunFlag::reset
+1117568d74073677 src/notify.rs Doorbell::ring
+225759a890af6f9f src/notify.rs Doorbell::take
+d210ba489ad42722 src/notify.rs Doorbell::prepare_park
+8d07938ceb4b92ba src/notify.rs Doorbell::unpark
+80f58a3058670071 src/executor.rs TaskWaker::wake_by_ref
+0cf2b585e2474892 src/executor.rs Worker::task_waker
+9d0b2bc83b61dc5e src/executor.rs Worker::run_batch
+a2faa8844680e7b8 src/runtime.rs WorkerShared::inject
+99f5a5adb88e6fc1 src/runtime.rs Worker::drive
+d9233bff0752e278 src/runtime.rs Worker::drain_injected
