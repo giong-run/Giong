@@ -461,6 +461,11 @@ pub(crate) enum Io {
     },
     /// `close(2)`, reporting its result.
     Close { fd: RawFile },
+    /// `CloseHandle` on a blocking thread, reporting its result: the close
+    /// of a file written to, which runs the file system's cleanup and may
+    /// wait for the disk.
+    #[cfg(windows)]
+    CloseFile { fd: RawFile },
     /// `statx(2)` on Linux, `fstatat(2)` elsewhere (see `sys::stat_at`).
     #[cfg(unix)]
     Statx {
@@ -528,6 +533,10 @@ impl Io {
     /// their future is dropped: a close the caller gave up on must still
     /// close, or the descriptor stays open with nobody owning it.
     pub(crate) fn finishes_when_dropped(&self) -> bool {
+        #[cfg(windows)]
+        if matches!(self, Io::CloseFile { .. }) {
+            return true;
+        }
         matches!(self, Io::Close { .. })
     }
 
@@ -1174,6 +1183,13 @@ impl Driver {
     /// Closes a descriptor the caller gives up.
     pub(crate) fn close_fd(&mut self, fd: RawFile) {
         each!(self, d => d.close_fd(fd))
+    }
+
+    /// Closes a file handle the caller gives up, on a blocking thread: the
+    /// close of a file written to may wait for the disk.
+    #[cfg(windows)]
+    pub(crate) fn close_file(&mut self, fd: RawFile) {
+        each!(self, d => d.close_file(fd))
     }
 
     /// Closes a socket the caller gives up: a descriptor like any other on
