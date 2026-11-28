@@ -1021,11 +1021,15 @@ impl Shared {
         poll_fn(|cx| {
             let mut st = self.st.borrow_mut();
             let c = st.conn(h);
-            if let Some(e) = &c.lost {
-                return Poll::Ready(Err(error::connect(e)));
-            }
+            // A handshake that finished is a connection, even if the peer
+            // closed it before this task ran (a server that closes right
+            // after accepting): the caller gets it, and its first use
+            // reports the close, as `handshake` does.
             if c.connected {
                 return Poll::Ready(Ok(()));
+            }
+            if let Some(e) = &c.lost {
+                return Poll::Ready(Err(error::connect(e)));
             }
             add_waker(&mut c.waiters, cx.waker());
             Poll::Pending

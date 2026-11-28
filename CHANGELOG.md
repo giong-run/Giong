@@ -8,6 +8,18 @@ version is `0.x`, a minor release (`0.1` → `0.2`) may contain breaking changes
 
 ## [Unreleased]
 
+A faster QUIC endpoint and a cheaper HTTP/1.1 write path. giong-quic's driver sends
+datagrams from the buffer quinn-proto built them in, sends a batch in its own turn when the
+socket has room, and keeps one alarm armed for its connections' deadlines: a stream round
+trip costs the server 7.4% fewer instructions (28,308; quinn 0.11 takes 29,354) and a request
+under load 21% fewer syscalls (0.48; quinn 0.58). HTTP/3 in giong-http runs on it. Bulk
+transfers are still behind quinn: a 16 MiB answer costs 5.9% less CPU per KiB than in 1.5.7,
+but quinn's zero-copy `write_chunk` sends it with 21% less. giong-http's HTTP/1.1 write
+timeout now waits on the connection's alarm instead of a timer per write, so a request under
+load costs 3.8% fewer instructions (5,381 instead of 5,593). `Endpoint::connect` no longer
+fails a connection whose handshake finished when the server closed it at once. No API is
+removed or changed.
+
 ## [1.5.7] - 2026-11-28
 
 Fixes for `giong dev` and `giong cache` while they start processes, and the first
