@@ -359,6 +359,12 @@ fn offset_out_of_range(offset: u64) -> io::Error {
 ///
 /// All methods take `&self` and name the offset they work at, so a file can
 /// be shared (e.g. in an `Rc`) by any number of tasks.
+///
+/// On Windows, dropping a file that was written to returns before the file
+/// is closed: the close waits for the disk, so it runs on a blocking thread.
+/// Until it has run, Windows may refuse to rename or remove the file or its
+/// directory, or to open it without sharing. Await [`File::close`] first,
+/// as when a temporary file you wrote is renamed over another.
 pub struct File {
     handle: RawHandle,
     /// Opened for overlapped I/O, so reads and writes go through the
@@ -738,6 +744,11 @@ impl File {
     /// closes it too, without the error.
     ///
     /// Cancel safe: the handle is closed even if the future is dropped.
+    ///
+    /// On Windows, the file is closed when this returns, while dropping a
+    /// file that was written to closes it later, on a blocking thread (see
+    /// [`File`]): await this before renaming, removing or reopening a file
+    /// you wrote.
     pub async fn close(self) -> io::Result<()> {
         let handle = self.handle;
         // A file written to may wait for the disk as it closes: that runs

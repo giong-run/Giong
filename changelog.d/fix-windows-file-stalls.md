@@ -10,3 +10,6 @@
   295-1192 ms to 18-100 ms, and the soak moved 20% more datagrams. Writing a new file is
   slower: 64 MiB in 64 KiB writes took 60 ms instead of 22 ms on `windows-2022`. A write
   inside the file, and the close of a file opened only for reading, stay on the worker.
+  Dropping a file that was written to now returns before the file is closed: until the
+  blocking thread has closed it, Windows may refuse to rename it, remove it or its directory,
+  or open it without sharing, so await `File::close` before that.
