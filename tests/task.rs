@@ -192,11 +192,18 @@ fn a_retry_loop_ends_at_the_deadline() {
 fn a_read_waiting_at_the_deadline_is_cancelled_by_the_kernel() {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
     let addr = listener.local_addr().unwrap();
+    // The order is fixed by hand-offs, not by sleeps from the start, so a
+    // slow scheduler cannot let the data in before the read is waiting.
+    let (blocked_tx, blocked_rx) = std::sync::mpsc::channel::<()>();
+    let (written_tx, written_rx) = std::sync::mpsc::channel::<()>();
     let peer = std::thread::spawn(move || {
         let (mut conn, _) = listener.accept().unwrap();
+        // The worker is blocked, so the read is in the kernel.
+        let _ = blocked_rx.recv();
         // Well after the deadline, while the worker is still blocked.
-        std::thread::sleep(Duration::from_millis(150));
+        std::thread::sleep(Duration::from_millis(100));
         conn.write_all(b"late").unwrap();
+        let _ = written_tx.send(());
         let mut buf = [0u8; 1];
         let _ = conn.read(&mut buf);
     });
@@ -204,11 +211,14 @@ fn a_read_waiting_at_the_deadline_is_cancelled_by_the_kernel() {
         let stream = TcpStream::connect(addr).await.unwrap();
         let stream = Rc::new(stream);
         let reader = stream.clone();
-        let blocker = giong::spawn(async {
+        let blocker = giong::spawn(async move {
+            // A timer, so the worker has parked and submitted the read.
             sleep(Duration::from_millis(5)).await;
             // Keeps the worker from running anything, past the deadline
             // and past the moment the data arrives.
-            std::thread::sleep(Duration::from_millis(250));
+            let _ = blocked_tx.send(());
+            let _ = written_rx.recv();
+            std::thread::sleep(Duration::from_millis(20));
         });
         let out = within(Duration::from_millis(40), async move {
             reader.read(vec![0u8; 16]).await.0
