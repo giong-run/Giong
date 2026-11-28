@@ -55,7 +55,7 @@ jobs:
   # What this run needs (scripts/ci-scope.py; docs/WORKFLOW.md, Workflow v2). The merge
   # queue, a dispatch and a push to main run everything, repeated, macOS and Windows
   # included. A pull request runs the fast set (lint, msrv, default features, the build,
-  # one round of the tests on io_uring and on epoll), and only `lint` and `msrv` when it
+  # one round of the tests on io_uring and on epoll, instr), and only `lint` and `msrv` when it
   # changes nothing that is built, tested or read by a test (the site, changelog.d/,
   # prose); so does a merge group made only of such files. Whatever a pull request ran,
   # the merge queue runs the full set on main with the change merged before main moves:
@@ -97,7 +97,7 @@ jobs:
           {
               echo "### CI plan: \`$(sed -n 's/^scope=//p' "$GITHUB_OUTPUT" | tail -n 1)\`"
               echo
-              echo "docs: lint and msrv only. draft and pr: lint, msrv, default features, build, tests once on io_uring and on epoll."
+              echo "docs: lint and msrv only. draft and pr: lint, msrv, default features, build, tests once on io_uring and on epoll, instr."
               echo "full (merge queue): every job, every repetition, macOS and Windows. See docs/WORKFLOW.md."
           } >> "$GITHUB_STEP_SUMMARY"
 
@@ -801,7 +801,9 @@ jobs:
   # repeat within 0.1% on a shared runner, so a hot path made 1% slower fails.
   instr:
     needs: plan
-    if: needs.plan.outputs.heavy == 'true'
+    # On every pull request too, since Workflow v2.1 (docs/WORKFLOW.md): a change that
+    # moves the counts should learn it before the merge queue, and the job is short.
+    if: needs.plan.outputs.scope != 'docs'
     runs-on: ubuntu-24.04
     timeout-minutes: 20
     steps:

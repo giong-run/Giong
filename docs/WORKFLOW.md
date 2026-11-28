@@ -6,7 +6,7 @@ faster without lowering the bar. This page holds the current version, what chang
 the last one, and the numbers. [DEVELOPMENT.md](DEVELOPMENT.md) holds the day-to-day
 rules that follow from it; [AGENTS.md](../AGENTS.md) the rules for the code.
 
-**Current: Workflow v2** (2026-11-26).
+**Current: Workflow v2.1** (2026-11-28): v2 with `instr` back in the fast set.
 
 **Numbering.** A small change to the current version (a setting, a tier, a rule) is a
 minor version: v2.1, v2.2. A change to how work flows (what runs where, how pull requests
@@ -20,6 +20,14 @@ pull request in the merge queue. Before anything with code in it lands, every jo
 every repetition, ThreadSanitizer, Miri, Kani, the kernels, macOS and Windows. A version
 may move a job between the pull request and the queue; it never removes one from the
 queue. No merge on red, no test skipped or rerun to green (the one exception is below).
+
+## Workflow v2.1
+
+One change to v2, from v2's measurement ([data](workflow/data/v2/README.md)): the
+`instr` job (instruction, heap and RSS counts against `bench/instr/baseline.csv`, 200
+seconds on one runner) runs on every pull request again, in the fast set. In v2's first
+34 hours it caused 3 of the 7 queue ejections, two of them by changes that moved the
+counts themselves and found out only in the queue. Everything else is v2, below.
 
 ## Workflow v2
 
@@ -52,7 +60,7 @@ kept the queue at two groups.
 | The run | What runs |
 |---|---|
 | Pull request, draft or ready, that changes no file a build or test reads (`site/`, `changelog.d/`, `bench/results/`, `docs/workflow/`, prose, `.github/known-flakes.txt`) | `lint` (fmt, clippy, docs, `release.py check`) and `msrv` |
-| Any other pull request | the above, `default-features`, `build`, `test` (one round, io_uring), `fallback (epoll)` (one round); not Miri, Kani, TSan, the kernels, the servers, instr, semver, h2spec, h3spec, musl, Docker, gVisor |
+| Any other pull request | the above, `default-features`, `build`, `test` (one round, io_uring), `fallback (epoll)` (one round), `instr` (since v2.1); not Miri, Kani, TSan, the kernels, the servers, semver, h2spec, h3spec, musl, Docker, gVisor |
 | ...that is ready for review and touches macOS or Windows code | also the macOS or Windows workflow, as in v1 |
 | Merge queue, group with code; a dispatch of CI; a push to `main` no queue run tested | every job with every repetition (five rounds, four fallback tiers, three TSan runs), macOS and Windows, as in v1 |
 | Merge queue, group with only docs | `lint` and `msrv` |
@@ -126,7 +134,7 @@ Repository Settings, Rules or Branches, `main`:
 ### How v2 is measured
 
 After v2 has merged and the settings are in, take a window of at least 30 merged pull
-requests with no release in it, and run:
+requests (release pull requests left out), and run:
 
     python3 scripts/workflow-metrics.py fetch --since <start> --until <end> --out docs/workflow/data/v2
     python3 scripts/workflow-metrics.py report docs/workflow/data/v2 --csv docs/workflow/data/v2/prs.csv
@@ -136,9 +144,26 @@ ejections and their causes, runner time on pull requests and in the queue. The r
 goes below, losses included. A number v2 makes worse is either fixed in v2.1 or the
 change behind it is reverted.
 
-**Expected, not yet measured**: the fast set takes about a sixth of the runner time of a
-v1 ready run (#218 measured a draft at 1,018 runner-seconds against 8,366); the queue
-time should fall the most, from twice the building capacity and fewer ejections.
+### v2, measured
+
+Over its first 34 hours (2026-11-26 16:14 to 2026-11-28 03:00 UTC), the 42 pull requests
+ready after it landed, release pull requests left out ([data](workflow/data/v2/README.md)):
+
+| Per pull request | v1 | v2 |
+|---|---|---|
+| ready to merged, median | 201 min | **62 min** |
+| ready to merged, p90 | 449 min | **141 min** |
+| time in the merge queue, median | 162 min | **39 min** |
+| ready to first queue entry, p90 | 54 min | **86 min (worse)** |
+| ejections per 100 merges | 25 | 17 |
+| runner time on pull-request runs | 5.9 h | **1.9 h** |
+| runner time in the queue | 9.4 h | 7.2 h |
+
+Kept: everything. Changed in v2.1: `instr` back on pull requests (3 of 7 ejections).
+Open: the slower p90 to the first queue entry fell in a window with five releases, when
+pull requests are held back for the release's queue run; the next window will show
+whether it is CI or the releases. Build concurrency 4 has not yet been tested at full
+load (at most three groups built at once).
 
 ## Workflow v1 (2026-11-15 to 2026-11-26): the baseline
 
@@ -151,6 +176,9 @@ request of its own. Measured over 1.5.0 to 1.5.1: [workflow/data/v1](workflow/da
 
 ## Changelog
 
+- **v2.1** (2026-11-28): `instr` runs on every pull request again (v2 measured: 3 of 7
+  queue ejections were `instr`). v2 measured: ready to merged 201 to 62 minutes (median),
+  queue 162 to 39, runner time on pull requests 5.9 to 1.9 hours each.
 - **v2** (2026-11-26): fast set on pull requests, the full set in the queue only;
   macOS and Windows on pull requests only for platform code; docs-only merge groups run
   lint and MSRV; `CI gate` the only required check; queue concurrency 2 to 4; batched

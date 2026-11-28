@@ -13,7 +13,7 @@ Prints `key=value` lines for $GITHUB_OUTPUT:
                    workflows (Fuzz, gRPC, Proto, macOS, Windows) skip drafts
             pr     a pull request ready for review: the fast set (lint, msrv, default
                    features, the build, one round of the tests on io_uring and of the
-                   epoll tier). Since Workflow v2 (docs/WORKFLOW.md) every other job runs
+                   epoll tier, instr since v2.1). Since Workflow v2 (docs/WORKFLOW.md) every other job runs
                    in the merge queue only, before anything lands
             full   the merge queue, a dispatch, a push to main: every job, every
                    repetition (ROUNDS=5, every fallback tier, three ThreadSanitizer

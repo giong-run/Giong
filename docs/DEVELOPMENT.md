@@ -6,7 +6,7 @@ the flow of work, so that many agents in parallel stay fast without lowering the
 Everything here applies to people too. Where it and [CONTRIBUTING.md](../CONTRIBUTING.md)
 disagree, CONTRIBUTING.md wins: report the difference.
 
-The process has a version: **Workflow v2**, described with its measurements in
+The process has a version: **Workflow v2.1**, described with its measurements in
 [WORKFLOW.md](WORKFLOW.md). A change to the process goes there first (a new minor or
 major version, measured against the last), then here.
 
@@ -51,9 +51,9 @@ v2 ([WORKFLOW.md](WORKFLOW.md#ci-tiers) has the full table and the reasons):
 | The run | What runs |
 |---|---|
 | Pull request that changes no file a build or test reads: `site/`, `changelog.d/`, `bench/results/`, `docs/workflow/`, `assets/`, `skills/`, `.github/known-flakes.txt`, prose | `lint` (fmt, clippy, docs, `release.py check`, which builds the site) and `msrv` |
-| Any other pull request, draft or ready | the above, default features, the release build, one round of the tests on io_uring and of the epoll tier |
+| Any other pull request, draft or ready | the above, default features, the release build, one round of the tests on io_uring and of the epoll tier, `instr` |
 | ...ready for review, touching macOS or Windows code (`ci-scope.py --platform`) | also the macOS or Windows workflow |
-| Merge queue, a push to `main` that no queue run tested, a dispatch of CI | every job with every repetition: five rounds per tier, three ThreadSanitizer runs, Miri, Kani, the kernels, the server versions, instr, semver; macOS and Windows, called from `ci.yml` so that `all-checks` fails when they do |
+| Merge queue, a push to `main` that no queue run tested, a dispatch of CI | every job with every repetition: five rounds per tier, three ThreadSanitizer runs, Miri, Kani, the kernels, the server versions, semver; macOS and Windows, called from `ci.yml` so that `all-checks` fails when they do |
 | Merge queue, a group of only such docs files | `lint` and `msrv` |
 
 **Runners are the scarce resource**: the organisation gets 60 jobs at a time (5 on
