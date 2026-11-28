@@ -298,6 +298,12 @@ if [ "$RUST" = 1 ]; then
         for c in "${!CRATES[@]}"; do TEST_ARGS+=(-p "$c"); done
     fi
     step "tests (io_uring)" cargo test "${TEST_ARGS[@]}" --all-features --quiet
+    # giong's documentation checks read every crate's sources, so a change to
+    # any crate can fail them (an async fn without "Cancel safe" in giong-quic
+    # failed CI on #551 after a gate that tested only giong-quic and giong-http).
+    if [ "$ALL" != 1 ] && [ -z "${CRATES[giong]+x}" ]; then
+        step "workspace doc checks" cargo test -p giong --test cancel_docs --quiet
+    fi
     [ "$MODE" = gate ] && \
         step "tests (epoll)" env GIONG_DRIVER=epoll cargo test "${TEST_ARGS[@]}" --all-features --quiet
 fi

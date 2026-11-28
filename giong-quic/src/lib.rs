@@ -350,7 +350,10 @@ impl SendStream {
     /// (`STOP_SENDING`) and gives the code it sent: a sender with nothing
     /// to write yet learns that nothing more is wanted without writing.
     /// Fails, as [`write_all`](Self::write_all) would, when the connection
-    /// ends first. Cancel safe.
+    /// ends first.
+    ///
+    /// Cancel safe: it only waits, and a dropped future leaves the stream
+    /// as it was.
     pub async fn stopped(&mut self) -> io::Result<u64> {
         self.sh.stopped(self.h, self.id).await
     }
