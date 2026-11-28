@@ -387,8 +387,18 @@ async fn udp(
 }
 
 async fn files(dir: std::path::PathBuf, deadline: Instant, counters: Arc<Counters>) {
-    let read_only =
-        giong::sandbox::report().is_some_and(|r| r.files < giong::sandbox::FileAccess::ReadWrite);
+    let report = giong::sandbox::report();
+    // What the sandbox got, once, so that a run's log shows its layers.
+    if let (Some(r), 0) = (&report, giong::worker_id()) {
+        eprintln!("soak: sandbox {:?}, files {:?}", r.mode, r.files);
+        for l in &r.layers {
+            eprintln!(
+                "soak: sandbox layer {:?}: {:?} ({})",
+                l.layer, l.state, l.detail
+            );
+        }
+    }
+    let read_only = report.is_some_and(|r| r.files < giong::sandbox::FileAccess::ReadWrite);
     if read_only {
         return files_read_only(dir, deadline, counters).await;
     }
