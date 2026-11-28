@@ -233,7 +233,7 @@ async fn open_control(
 ) -> io::Result<SendStream> {
     let mut control = quic.open_uni().await?;
     let mut out = vec![StreamType::CONTROL as u8];
-    Settings::write_frame(&mut out, max_head_size as u64);
+    Settings::write_frame(&mut out, max_head_size as u64, 0);
     control.write_all(&out).await?;
     Ok(control)
 }

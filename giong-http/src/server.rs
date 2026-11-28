@@ -510,6 +510,9 @@ pub(crate) struct Config {
     pub(crate) http2: bool,
     pub(crate) http2_prior_knowledge: bool,
     pub(crate) max_concurrent_streams: u32,
+    /// The QPACK dynamic table HTTP/3 clients may fill, in bytes; 0 for
+    /// none.
+    pub(crate) qpack_table_size: u32,
     /// What an HTTP/2 connection may hold of request bodies and of
     /// responses not sent yet, instead of the larger of `max_body_size`
     /// and 1 MiB: for the fuzz harness, which needs a small one. `0` for
@@ -647,6 +650,7 @@ impl Server {
                 http2: true,
                 http2_prior_knowledge: true,
                 max_concurrent_streams: 100,
+                qpack_table_size: 0,
                 http2_budget: 0,
                 max_buffered_request_bytes: BufferedLimit::AUTO,
                 min_body_rate: crate::body::MinRate {
@@ -1179,6 +1183,25 @@ impl Server {
             |stream, _| drop(stream),
         )
         .await;
+    }
+
+    /// The dynamic table an HTTP/3 client's QPACK encoder may fill, in
+    /// bytes (default: 0, none). Needs the `unstable-http3` feature.
+    ///
+    /// With a table, a client sends a field it repeats (a cookie, its
+    /// `user-agent`, the `:authority`) once and refers to it after, so
+    /// requests take fewer bytes and the server decodes fewer literals. A
+    /// connection holds at most this many bytes of table, counted as RFC
+    /// 9204 counts them (each field's name and value and 32 bytes), and is
+    /// charged for it only once the client inserts something. At most 16
+    /// requests of a connection may wait for insertions at once; one more
+    /// is a connection error, as RFC 9204 says.
+    ///
+    /// Responses still use the static table alone.
+    #[cfg(feature = "unstable-http3")]
+    pub fn qpack_table_size(mut self, bytes: u32) -> Self {
+        self.cfg.qpack_table_size = bytes;
+        self
     }
 
     /// Serves HTTP/3 (RFC 9114) on a QUIC endpoint until a shutdown is

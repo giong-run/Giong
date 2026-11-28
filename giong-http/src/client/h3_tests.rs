@@ -408,7 +408,7 @@ fn preconnect_opens_the_quic_connection_requests_then_use() {
 async fn control(conn: &Connection) -> SendStream {
     let mut control = conn.open_uni().await.unwrap();
     let mut out = vec![0x00];
-    Settings::write_frame(&mut out, 1 << 20);
+    Settings::write_frame(&mut out, 1 << 20, 0);
     control.write_all(&out).await.unwrap();
     control
 }
@@ -650,7 +650,7 @@ fn a_response_that_breaks_the_protocol_closes_the_connection_with_its_code() {
     broken_response(261, ping);
     // A control frame on a request stream.
     let mut settings = Vec::new();
-    Settings::write_frame(&mut settings, 1 << 20);
+    Settings::write_frame(&mut settings, 1 << 20, 0);
     broken_response(261, settings);
     // A stream that ends inside a frame: H3_FRAME_ERROR (0x106 = 262).
     let mut cut = headers(Some(200), &[("server", "x")]);
@@ -726,12 +726,12 @@ fn a_server_stream_that_breaks_the_protocol_closes_the_connection_with_its_code(
     broken_stream(266, false, out);
     // A second control stream: H3_STREAM_CREATION_ERROR (0x103 = 259).
     let mut out = vec![0x00];
-    Settings::write_frame(&mut out, 1 << 20);
+    Settings::write_frame(&mut out, 1 << 20, 0);
     broken_stream(259, true, out);
     // SETTINGS twice: H3_FRAME_UNEXPECTED (0x105 = 261).
     let mut out = vec![0x00];
-    Settings::write_frame(&mut out, 1 << 20);
-    Settings::write_frame(&mut out, 1 << 20);
+    Settings::write_frame(&mut out, 1 << 20, 0);
+    Settings::write_frame(&mut out, 1 << 20, 0);
     broken_stream(261, false, out);
     // A setting of HTTP/2: H3_SETTINGS_ERROR (0x109 = 265).
     let mut out = vec![0x00];
@@ -740,19 +740,19 @@ fn a_server_stream_that_breaks_the_protocol_closes_the_connection_with_its_code(
     broken_stream(265, false, out);
     // MAX_PUSH_ID from a server: H3_FRAME_UNEXPECTED.
     let mut out = vec![0x00];
-    Settings::write_frame(&mut out, 1 << 20);
+    Settings::write_frame(&mut out, 1 << 20, 0);
     Header::write(&mut out, kind::MAX_PUSH_ID, 1);
     out.push(0x01);
     broken_stream(261, false, out);
     // GOAWAY going up, and one that names no request stream: H3_ID_ERROR
     // (0x108 = 264).
     let mut out = vec![0x00];
-    Settings::write_frame(&mut out, 1 << 20);
+    Settings::write_frame(&mut out, 1 << 20, 0);
     out.extend(goaway(400));
     out.extend(goaway(404));
     broken_stream(264, false, out);
     let mut out = vec![0x00];
-    Settings::write_frame(&mut out, 1 << 20);
+    Settings::write_frame(&mut out, 1 << 20, 0);
     out.extend(goaway(3));
     broken_stream(264, false, out);
     // A push stream, when no push was allowed: H3_ID_ERROR.

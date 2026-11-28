@@ -1,0 +1,15 @@
+# callgrind total Ir of the h3 example server (one worker), dumped live after
+# n requests from aioquic 1.2.0 (pylsqpack 0.3.24) on one connection, each GET /
+# with user-agent (63 B), cookie (207 B) and x-trace (64 B). Linux 6.18, 4-vCPU VM.
+# round table n Ir
+1 0    100 9964981
+1 0    600 39351320
+1 4096 100 9232685
+1 4096 600 34717872
+2 0    100 10009793
+2 0    600 39176374
+2 4096 100 9205229
+2 4096 600 34658882
+# client-side counters, 50 requests (h3req.py): field section bytes + encoder stream bytes
+table=0    header block bytes 12350 enc stream bytes 0   dec bytes recv 0
+table=4096 header block bytes 926   enc stream bytes 242 dec bytes recv 67
