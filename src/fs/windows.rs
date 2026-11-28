@@ -613,11 +613,20 @@ impl File {
                 Err(e) => return (Err(e), buf),
             };
             let from = SendPtr(ptr.cast_mut());
+            let overlapped = self.overlapped;
             let call = move || {
                 let from = from;
                 // SAFETY: `from` names `len` bytes of the buffer, which is
                 // kept until this returns; they are only read.
-                unsafe { sys::write_at(file.as_raw_handle(), from.0, len, offset) }
+                let res = unsafe { sys::write_at(file.as_raw_handle(), from.0, len, offset) };
+                if overlapped {
+                    // A write that extends a file opened through the port:
+                    // the event it waited on goes now rather than with the
+                    // thread, so that a pool thread that lives on does not
+                    // hold one more handle for it.
+                    sys::release_thread_event();
+                }
+                res
             };
             // SAFETY: as above.
             unsafe { blocking_with(buf, call) }.await
