@@ -63,9 +63,12 @@ threads; Verus covers what loom cannot, any number of tasks, threads and steps, 
 The worker's steps follow `Worker::drive` and `run_batch`: `drain_injected` (`take`, then
 the injector's contents onto the run queue), the batch (its budget is the queue's length;
 each entry popped is skipped if its task is gone, else `begin_poll` and a poll that reads
-the task's state and may finish it), then either another turn (tasks are runnable) or
-`prepare_park` (swap `sleeping`, read `pending`) and a sleep until the eventfd is written,
-and `unpark`. A waking thread's steps follow `wake_by_ref` and `inject`: publish the task's
+the task's state and may finish it), then either another turn (tasks are runnable, or the
+spin loop, a probe or a timer found work) or `prepare_park` (swap `sleeping`, read
+`pending`; a waiting balanced job also stops the sleep) and a sleep until the eventfd is
+written, and `unpark`. Where the code's path depends on something the model leaves out
+(a poll's result, what the spin loop sees, balanced jobs), the model lets either path
+happen. A waking thread's steps follow `wake_by_ref` and `inject`: publish the task's
 new state, `try_enqueue` (a swap), push into the injector, `ring` (swap `pending`, load
 `sleeping`, swap it to elect one writer), write the eventfd.
 
@@ -147,11 +150,13 @@ What Verus takes on faith, in `verify/ipc_ring.rs`'s `mem` module and in `TRUSTE
 
 - **Weak memory orderings** in the wake-up handshakes: loom checks those, for small
   bounds. Verus assumes each atomic operation takes effect at once, in one order.
-- **What the wake-up model leaves out**: the balanced jobs (`JobCount`, `spawn_balanced`),
-  `Inject::Run`, `Shutdown` and `Poke`, a closed injector, aborts, the spin loop and
-  probes before a sleep, the reuse of slots and of waker states (a stale entry that polls
-  the slot's next task is an extra poll, harmless), and polls that never return (a task
-  that blocks its worker is outside any runtime's promise).
+- **What the wake-up model leaves out**: that a balanced job itself is taken (`JobCount`,
+  `spawn_balanced`; only its effect on the sleep is modelled), `Inject::Run`, `Shutdown`
+  and `Poke`, a closed injector, the reuse of slots and of waker states (a stale entry that
+  polls the slot's next task is an extra poll, harmless), and polls that never return (a
+  task that blocks its worker is outside any runtime's promise). Completions the driver
+  handles on the way out of a sleep wake tasks before `unpark`; the model has them just
+  after it, which is the same (they touch neither `pending` nor `sleeping`).
 - **The callers in `src/ipc.rs`.** That `release` gets the length `peek` returned, that a
   message is at most `max_message` long (checked there before `push`), and the sleeping
   handshakes, are not proven. Each is a precondition the proof states (`release`'s

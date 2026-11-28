@@ -92,8 +92,13 @@ pub struct State {
 }
 
 pub enum Action {
-    /// The worker's next step; `finish` chooses a poll's outcome.
-    Worker { finish: bool },
+    /// The worker's next step. `choice` is what the model leaves open: whether
+    /// a poll finishes its task; whether, with nothing runnable after a
+    /// batch, the worker goes round again instead of preparing to sleep (the
+    /// spin loop, a probe or a timer found work: `spin_for_work`,
+    /// `before_park`); whether, having announced its sleep, it polls instead
+    /// (`jobs_len.any()`: a balanced job waits).
+    Worker { choice: bool },
     /// The kernel returns from a sleep for another reason (I/O, a timer).
     Spurious,
     /// A wake-up on the worker's own thread (a poll, a timer, I/O):
@@ -142,7 +147,7 @@ pub open spec fn running(s: State) -> bool {
     !(s.pc is ParkSet) && !(s.pc is ParkRead) && !(s.pc is Parked)
 }
 
-pub open spec fn worker_next(s: State, finish: bool) -> State {
+pub open spec fn worker_next(s: State, choice: bool) -> State {
     match s.pc {
         // drain_injected: `if !self.shared.bell.take() { return; }`
         Pc::Loop => if s.pending {
@@ -176,21 +181,23 @@ pub open spec fn worker_next(s: State, finish: bool) -> State {
         Pc::Polling { t, left } => State {
             tasks: s.tasks.insert(
                 t,
-                Task { seen: s.tasks[t].events, live: s.tasks[t].live && !finish, ..s.tasks[t] },
+                Task { seen: s.tasks[t].events, live: s.tasks[t].live && !choice, ..s.tasks[t] },
             ),
             pc: Pc::Batch { left },
             ..s
         },
-        // `if !self.queue.borrow().is_empty() { ...; continue; }`
-        Pc::AfterBatch => if s.q.len() > 0 {
+        // `if !self.queue.borrow().is_empty() { ...; continue; }`, or the
+        // spin loop or `before_park` found work.
+        Pc::AfterBatch => if s.q.len() > 0 || choice {
             State { pc: Pc::Loop, ..s }
         } else {
             State { pc: Pc::ParkSet, ..s }
         },
         // prepare_park: `self.sleeping.swap(true)`, fence,
         Pc::ParkSet => State { sleeping: true, pc: Pc::ParkRead, ..s },
-        // `self.pending.load()`: work arrived, do not sleep.
-        Pc::ParkRead => if s.pending {
+        // `self.pending.load()`: work arrived, do not sleep (nor with a
+        // balanced job waiting).
+        Pc::ParkRead => if s.pending || choice {
             State { pc: Pc::Unpark, ..s }
         } else {
             State { pc: Pc::Parked, ..s }
@@ -287,7 +294,7 @@ pub open spec fn waker_next(s: State, w: nat, t: nat) -> State {
 
 pub open spec fn next(s: State, a: Action, s2: State) -> bool {
     match a {
-        Action::Worker { finish } => worker_enabled(s) && s2 == worker_next(s, finish),
+        Action::Worker { choice } => worker_enabled(s) && s2 == worker_next(s, choice),
         Action::Spurious => s.pc is Parked && s2 == State { pc: Pc::Unpark, ..s },
         Action::LocalWake { u } => running(s) && s2 == local_wake(s, u),
         Action::Spawn => running(s) && s2 == spawn(s),
@@ -446,7 +453,7 @@ proof fn lemma_next(s: State, a: Action, s2: State)
         inv(s2),
 {
     match a {
-        Action::Worker { finish } => lemma_worker(s, finish),
+        Action::Worker { choice } => lemma_worker(s, choice),
         Action::Spurious => {
             lemma_same_wakers(s, s2);
             assert forall|t: nat| #[trigger] live(s2, t) && s2.tasks[t].seen < s2.tasks[t].events implies covered(s2, t) by {
@@ -465,14 +472,14 @@ proof fn lemma_next(s: State, a: Action, s2: State)
     }
 }
 
-proof fn lemma_worker(s: State, finish: bool)
+proof fn lemma_worker(s: State, choice: bool)
     requires
         inv(s),
         worker_enabled(s),
     ensures
-        inv(worker_next(s, finish)),
+        inv(worker_next(s, choice)),
 {
-    let s2 = worker_next(s, finish);
+    let s2 = worker_next(s, choice);
     lemma_same_wakers(s, s2);
     match s.pc {
         Pc::Draining => {
@@ -835,7 +842,7 @@ proof fn wf1_worker(ex: Ex, p: spec_fn(State) -> bool, q: spec_fn(State) -> bool
     } else {
         lemma_always(ex, k);
         lemma_step(ex, k);
-        let f = (ex.act)(k)->Worker_finish;
+        let f = (ex.act)(k)->Worker_choice;
         assert(q(worker_next((ex.st)(k), f)));
         k + 1
     }
@@ -1063,8 +1070,8 @@ proof fn lemma_in_queue(ex: Ex, t: nat, e: nat, i: nat, k: nat) -> (j: nat)
         inv(s) && p(s) && next(s, a, s2) && !q(s2) implies p(s2) by {
         lemma_task_grows(s, a, s2, t);
         match a {
-            Action::Worker { finish } => {
-                lemma_queue_turn(s, finish, t, e, k, m);
+            Action::Worker { choice } => {
+                lemma_queue_turn(s, choice, t, e, k, m);
             },
             Action::Spurious => {},
             _ => {
@@ -1125,7 +1132,7 @@ proof fn lemma_inj_frame(s: State, a: Action, s2: State, t: nat)
         s.q.contains(t) && !(a is Worker) ==> s2.q.contains(t),
 {
     match a {
-        Action::Worker { finish } => {
+        Action::Worker { choice } => {
             if s.pc is Draining {
                 lemma_contains_append(s.inj, s.inj, t);
                 let k = choose|k: int| 0 <= k < s.inj.len() && s.inj[k] == t;
@@ -1191,7 +1198,7 @@ proof fn lemma_step_worker_inj(s: State, f: bool, t: nat)
             s2.inj.contains(t) || (s.pc is Draining && s2.q.contains(t))
         }),
 {
-    lemma_inj_frame(s, Action::Worker { finish: f }, worker_next(s, f), t);
+    lemma_inj_frame(s, Action::Worker { choice: f }, worker_next(s, f), t);
 }
 
 /// How far the worker is from taking the injector's contents, with the
@@ -1274,8 +1281,8 @@ proof fn lemma_rung(ex: Ex, t: nat, e: nat, i: nat) -> (j: nat)
         lemma_task_grows(s, a, s2, t);
         lemma_inj_frame(s, a, s2, t);
         match a {
-            Action::Worker { finish } => {
-                lemma_take_turn(s, finish, t, e, r);
+            Action::Worker { choice } => {
+                lemma_take_turn(s, choice, t, e, r);
             },
             Action::Spurious => {},
             _ => {
@@ -1343,7 +1350,7 @@ proof fn lemma_efd(ex: Ex, t: nat, e: nat, i: nat) -> (j: nat)
         inv(s) && p(s) && next(s, a, s2) && !q(s2) implies p(s2) by {
         lemma_parked_frame(s, a, s2, t, e);
         if a is Worker {
-            lemma_step_worker_inj(s, a->Worker_finish, t);
+            lemma_step_worker_inj(s, a->Worker_choice, t);
         }
     }
     assert forall|s: State, f: bool| #[trigger] p(s) && inv(s) implies q(#[trigger] worker_next(s, f)) by {
@@ -1375,7 +1382,7 @@ proof fn lemma_writer(ex: Ex, t: nat, e: nat, i: nat) -> (j: nat)
         inv(s) && p(s) && next(s, a, s2) && !q(s2) implies p(s2) by {
         lemma_parked_frame(s, a, s2, t, e);
         if a is Worker {
-            lemma_step_worker_inj(s, a->Worker_finish, t);
+            lemma_step_worker_inj(s, a->Worker_choice, t);
         }
     }
     assert forall|s: State, t0: nat| #[trigger] p(s) && inv(s) implies q(#[trigger] waker_next(s, w, t0)) by {
@@ -1408,7 +1415,7 @@ proof fn lemma_swapper(ex: Ex, t: nat, e: nat, i: nat, w: nat) -> (j: nat)
         inv(s) && p(s) && next(s, a, s2) && !q(s2) implies p(s2) by {
         lemma_parked_frame(s, a, s2, t, e);
         if a is Worker {
-            lemma_step_worker_inj(s, a->Worker_finish, t);
+            lemma_step_worker_inj(s, a->Worker_choice, t);
         }
         if a is Waker && a->Waker_w == w {
             lemma_swap_step(s, w, a->Waker_t, t, e);
@@ -1456,7 +1463,7 @@ proof fn lemma_checker(ex: Ex, t: nat, e: nat, i: nat, w: nat) -> (j: nat)
         inv(s) && p(s) && next(s, a, s2) && !q(s2) implies p(s2) by {
         lemma_parked_frame(s, a, s2, t, e);
         if a is Worker {
-            lemma_step_worker_inj(s, a->Worker_finish, t);
+            lemma_step_worker_inj(s, a->Worker_choice, t);
         }
         if a is Waker && a->Waker_w == w {
             lemma_swap_step(s, w, a->Waker_t, t, e);
@@ -1530,8 +1537,8 @@ proof fn lemma_unrung(ex: Ex, t: nat, e: nat, i: nat) -> (j: nat)
         lemma_task_grows(s, a, s2, t);
         lemma_inj_frame(s, a, s2, t);
         match a {
-            Action::Worker { finish } => {
-                lemma_step_worker_inj(s, finish, t);
+            Action::Worker { choice } => {
+                lemma_step_worker_inj(s, choice, t);
                 if s.pc is Polling && s.pc->Polling_t == t {
                     assert(goal(s2, t, e));
                 }
@@ -1618,7 +1625,7 @@ proof fn lemma_inject_waker(ex: Ex, t: nat, e: nat, i: nat, w: nat) -> (j: nat)
         inv(s) && p(s) && next(s, a, s2) && !q(s2) implies p(s2) by {
         lemma_task_grows(s, a, s2, t);
         match a {
-            Action::Worker { finish } => {
+            Action::Worker { choice } => {
                 if s.pc is Polling && s.pc->Polling_t == t {
                     assert(goal(s2, t, e));
                 }
@@ -1626,7 +1633,7 @@ proof fn lemma_inject_waker(ex: Ex, t: nat, e: nat, i: nat, w: nat) -> (j: nat)
                     assert(polling(s2, t));
                 }
                 lemma_same_wakers(s, s2);
-                lemma_worker_keeps_others(s, finish, t);
+                lemma_worker_keeps_others(s, choice, t);
             },
             Action::Waker { w: v, t: t0 } => {
                 lemma_waker_frame(s, v, t0);
@@ -1792,7 +1799,7 @@ pub open spec fn witness_act(i: nat) -> Action {
     if i == 0 {
         Action::Spawn
     } else if worker_enabled(witness_st(i)) {
-        Action::Worker { finish: false }
+        Action::Worker { choice: false }
     } else {
         Action::Stutter
     }

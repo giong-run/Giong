@@ -83,12 +83,8 @@ PLANTED = [
     (
         "wakeups.rs",
         "prepare_park does not look at pending after announcing the sleep",
-        """        Pc::ParkRead => if s.pending {
-            State { pc: Pc::Unpark, ..s }
-        } else {
-            State { pc: Pc::Parked, ..s }
-        },""",
-        """        Pc::ParkRead => State { pc: Pc::Parked, ..s },""",
+        "        Pc::ParkRead => if s.pending || choice {",
+        "        Pc::ParkRead => if choice {",
         "postcondition not satisfied",
     ),
     (
@@ -101,12 +97,8 @@ PLANTED = [
     (
         "wakeups.rs",
         "the worker sleeps with tasks still in its run queue",
-        """        Pc::AfterBatch => if s.q.len() > 0 {
-            State { pc: Pc::Loop, ..s }
-        } else {
-            State { pc: Pc::ParkSet, ..s }
-        },""",
-        """        Pc::AfterBatch => State { pc: Pc::ParkSet, ..s },""",
+        "        Pc::AfterBatch => if s.q.len() > 0 || choice {",
+        "        Pc::AfterBatch => if choice {",
         "postcondition not satisfied",
     ),
     (
