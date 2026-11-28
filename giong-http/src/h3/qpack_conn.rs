@@ -124,6 +124,18 @@ impl Decoder {
         Ok(())
     }
 
+    /// Stream `stream` is given up with a field section never decoded (too
+    /// large, or the stream cancelled before it came): the encoder is told,
+    /// so that it stops counting the section's references (RFC 9204,
+    /// section 4.4.2). Telling it about a stream whose sections did not use
+    /// the table, or that sent none, is harmless.
+    pub(crate) fn cancel(&self, stream: u64) {
+        if !self.over.get() {
+            qpack::cancel_stream(stream, &mut self.out.borrow_mut());
+            self.said();
+        }
+    }
+
     /// The connection is over: streams that wait stop waiting, and the
     /// writer ends.
     pub(crate) fn end(&self) {
@@ -182,9 +194,8 @@ impl Drop for Waiting<'_> {
     fn drop(&mut self) {
         let d = self.decoder;
         d.blocked.set(d.blocked.get() - 1);
-        if !self.done && !d.over.get() {
-            qpack::cancel_stream(self.stream, &mut d.out.borrow_mut());
-            d.said();
+        if !self.done {
+            d.cancel(self.stream);
         }
     }
 }

@@ -13,3 +13,21 @@
 # client-side counters, 50 requests (h3req.py): field section bytes + encoder stream bytes
 table=0    header block bytes 12350 enc stream bytes 0   dec bytes recv 0
 table=4096 header block bytes 926   enc stream bytes 242 dec bytes recv 67
+
+# Client decoder (ClientBuilder::qpack_table_size). callgrind total Ir of the
+# h3_get example (giong-http client), n GETs of / on one connection to
+# h3srv.py (aioquic 1.2.0, pylsqpack 0.3.24 encoder), whose responses carry
+# server, content-type, cache-control, a 150-byte set-cookie,
+# strict-transport-security, x-request-id and content-length.
+# round table n Ir
+1 0    100 9585384
+1 0    600 36990647
+1 4096 100 8904773
+1 4096 600 32792400
+2 0    100 9590315
+2 0    600 37134262
+2 4096 100 8979259
+2 4096 600 33189488
+# server-side counters (h3srv.py), 100 requests, same in both rounds:
+table=0    response header block bytes 23391 encoder stream bytes 0   decoder bytes received 0
+table=4096 response header block bytes 1512  encoder stream bytes 225 decoder bytes received 198

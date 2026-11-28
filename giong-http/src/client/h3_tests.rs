@@ -575,6 +575,187 @@ fn a_malformed_response_fails_its_request_alone() {
     });
 }
 
+/// Bytes the client sent on a unidirectional stream of type `kind`, as
+/// they arrive.
+type Heard = Rc<RefCell<Vec<u8>>>;
+
+/// Reads the client's next unidirectional stream of type `kind` into
+/// `heard`, for as long as it lasts.
+fn listen(conn: Rc<Connection>, kind: u8, heard: Heard) {
+    drop(giong::spawn(async move {
+        loop {
+            let Ok(mut stream) = conn.accept_uni().await else {
+                return;
+            };
+            let mut first = Vec::new();
+            while first.is_empty() {
+                match stream.read().await {
+                    Ok(Some(piece)) => first.extend_from_slice(&piece),
+                    _ => break,
+                }
+            }
+            if first.first() != Some(&kind) {
+                // The client's control stream: kept so that it stays open.
+                drop(giong::spawn(async move {
+                    while let Ok(Some(_)) = stream.read().await {}
+                }));
+                continue;
+            }
+            heard.borrow_mut().extend_from_slice(&first[1..]);
+            while let Ok(Some(piece)) = stream.read().await {
+                heard.borrow_mut().extend_from_slice(&piece);
+            }
+            return;
+        }
+    }));
+}
+
+/// Waits up to two seconds for `heard` to hold `len` bytes.
+async fn heard_len(heard: &Heard, len: usize) {
+    for _ in 0..400 {
+        if heard.borrow().len() >= len {
+            return;
+        }
+        giong::time::sleep(Duration::from_millis(5)).await;
+    }
+}
+
+/// What a server's encoder stream says to fill a table of 4096 bytes:
+/// Set Dynamic Table Capacity 4096, `server: giong` (a name of the static
+/// table, index 92) and `x-tag: dyn` (a literal name).
+const SERVER_INSERTS: &[u8] = b"\x02\x3f\xe1\x1f\xff\x1d\x05giong\x45x-tag\x03dyn";
+
+/// A response head that refers to both [`SERVER_INSERTS`] entries:
+/// Required Insert Count 2 (encoded 3 for a table of 4096 bytes), Base 2,
+/// `:status 200` (static index 25), then relative indexes 1 and 0.
+fn dynamic_response() -> Vec<u8> {
+    let block = [0x03, 0x00, 0xd9, 0x81, 0x80];
+    let mut out = Vec::new();
+    Header::write(&mut out, kind::HEADERS, block.len() as u64);
+    out.extend_from_slice(&block);
+    out
+}
+
+/// A server that answers one request with [`dynamic_response`], sending
+/// [`SERVER_INSERTS`] before it or, when `late`, 50 ms after it. Records
+/// the client's SETTINGS frame in `settings` and what the client's
+/// decoder stream says in `decoder`.
+fn dynamic_server(endpoint: Endpoint, late: bool, settings: Heard, decoder: Heard) {
+    drop(giong::spawn(async move {
+        let conn = Rc::new(endpoint.accept().await.unwrap());
+        let _control = control(&conn).await;
+        // The client's control stream comes first, then its decoder stream.
+        let mut stream = conn.accept_uni().await.unwrap();
+        while settings.borrow().len() < 13 {
+            let Ok(Some(piece)) = stream.read().await else {
+                break;
+            };
+            settings.borrow_mut().extend_from_slice(&piece);
+        }
+        listen(conn.clone(), 0x03, decoder);
+        let mut encoder = conn.open_uni().await.unwrap();
+        if !late {
+            encoder.write_all(SERVER_INSERTS).await.unwrap();
+        }
+        let mut send = request(&conn).await;
+        send.write_all(&dynamic_response()).await.unwrap();
+        send.finish().unwrap();
+        if late {
+            giong::time::sleep(Duration::from_millis(50)).await;
+            encoder.write_all(SERVER_INSERTS).await.unwrap();
+        }
+        answer_until_closed(&conn, &Told::default()).await;
+        drop((stream, encoder));
+    }));
+}
+
+#[test]
+fn a_server_may_use_the_dynamic_table_the_client_allows() {
+    for late in [false, true] {
+        run(|| async move {
+            let (endpoint, url, client) = pair_with(|b| b.qpack_table_size(4096));
+            let (settings, decoder) = (Heard::default(), Heard::default());
+            dynamic_server(endpoint, late, settings.clone(), decoder.clone());
+            let res = client.get(&format!("{url}/")).send().await.unwrap();
+            assert_eq!(res.status(), 200);
+            assert_eq!(res.header("server"), Some("giong"));
+            assert_eq!(res.header("x-tag"), Some("dyn"));
+            // The control stream type, then SETTINGS: a field section of up
+            // to 64 KiB, a table of 4096 bytes, 16 blocked streams.
+            assert_eq!(
+                settings.borrow()[..13],
+                [0x00, 0x04, 0x0a, 0x06, 0x80, 0x01, 0x00, 0x00, 0x01, 0x50, 0x00, 0x07, 0x10]
+            );
+            // Insert Count Increment 2 (in one instruction or two, as the
+            // insertions arrived), then Section Acknowledgment of stream 0.
+            heard_len(&decoder, 2).await;
+            let heard = decoder.borrow().clone();
+            assert!(
+                heard == [0x02, 0x80] || heard == [0x01, 0x01, 0x80],
+                "late {late}: {heard:02x?}"
+            );
+        });
+    }
+}
+
+#[test]
+fn a_response_given_up_while_it_waits_is_cancelled_for_the_encoder() {
+    run(|| async {
+        let (endpoint, url, client) = pair_with(|b| b.qpack_table_size(4096));
+        let decoder = Heard::default();
+        let heard = decoder.clone();
+        drop(giong::spawn(async move {
+            let conn = Rc::new(endpoint.accept().await.unwrap());
+            let _control = control(&conn).await;
+            listen(conn.clone(), 0x03, heard);
+            // Refers to insertions that never come.
+            let mut send = request(&conn).await;
+            send.write_all(&dynamic_response()).await.unwrap();
+            send.finish().unwrap();
+            answer_until_closed(&conn, &Told::default()).await;
+        }));
+        let error = client
+            .get(&format!("{url}/"))
+            .timeout(Duration::from_millis(200))
+            .send()
+            .await
+            .unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::Timeout, "{error}");
+        // Stream Cancellation of stream 0, once.
+        heard_len(&decoder, 1).await;
+        giong::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(*decoder.borrow(), [0x40]);
+        // The connection goes on: the next request is answered.
+        let res = client.get(&format!("{url}/")).send().await.unwrap();
+        assert_eq!(res.status(), 200);
+    });
+}
+
+#[test]
+fn a_response_head_too_large_to_decode_is_cancelled_for_the_encoder() {
+    run(|| async {
+        let (endpoint, url, client) = pair_with(|b| b.max_head_size(4096).qpack_table_size(4096));
+        let decoder = Heard::default();
+        let heard = decoder.clone();
+        drop(giong::spawn(async move {
+            let conn = Rc::new(endpoint.accept().await.unwrap());
+            let _control = control(&conn).await;
+            listen(conn.clone(), 0x03, heard);
+            let mut send = request(&conn).await;
+            let value = "v".repeat(20_000);
+            send.write_all(&headers(Some(200), &[("x-large", &value)]))
+                .await
+                .unwrap();
+            send.finish().unwrap();
+            answer_until_closed(&conn, &Told::default()).await;
+        }));
+        let error = client.get(&format!("{url}/")).send().await.unwrap_err();
+        assert_eq!(error.kind(), ErrorKind::TooLarge, "{error}");
+        heard_len(&decoder, 1).await;
+        assert_eq!(*decoder.borrow(), [0x40]);
+    });
+}
+
 #[test]
 fn a_response_head_larger_than_allowed_is_refused() {
     run(|| async {

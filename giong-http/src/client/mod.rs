@@ -288,6 +288,8 @@ pub struct ClientBuilder {
     http2_prior_knowledge: bool,
     #[cfg(feature = "unstable-http3")]
     http3: Option<Http3>,
+    #[cfg(feature = "unstable-http3")]
+    qpack_table_size: u32,
 }
 
 /// The QUIC settings HTTP/3 is spoken with, and to whom.
@@ -343,6 +345,8 @@ impl Default for ClientBuilder {
             http2_prior_knowledge: false,
             #[cfg(feature = "unstable-http3")]
             http3: None,
+            #[cfg(feature = "unstable-http3")]
+            qpack_table_size: 0,
         }
     }
 }
@@ -483,6 +487,26 @@ impl ClientBuilder {
             quic,
             prior_knowledge: true,
         });
+        self
+    }
+
+    /// The dynamic table an HTTP/3 server's QPACK encoder may fill for its
+    /// responses, in bytes (default: 0, none). Needs the `unstable-http3`
+    /// feature.
+    ///
+    /// With a table, a server sends a field it repeats in its responses
+    /// (`server`, `content-type`, a `set-cookie`) once and refers to it
+    /// after, so response heads take fewer bytes. A connection holds at
+    /// most this many bytes of table, counted as RFC 9204 counts them
+    /// (each field's name and value and 32 bytes), and is charged for it
+    /// only once the server inserts something. At most 16 responses of a
+    /// connection may wait for insertions at once; one more is a
+    /// connection error, as RFC 9204 says.
+    ///
+    /// Requests still use the static table alone.
+    #[cfg(feature = "unstable-http3")]
+    pub fn qpack_table_size(mut self, bytes: u32) -> Self {
+        self.qpack_table_size = bytes;
         self
     }
 
@@ -1670,7 +1694,9 @@ impl Client {
             };
             let made = async {
                 let conn = endpoint.connect_early(addr, &origin.host, quic).await?;
-                let conn = h3::Connection::start(conn, config.max_head_size).await?;
+                let conn =
+                    h3::Connection::start(conn, config.max_head_size, config.qpack_table_size)
+                        .await?;
                 // With a ticket the connection opens before any packet
                 // comes back. When there are other addresses to try, this
                 // one counts only once it has answered, or a dead first

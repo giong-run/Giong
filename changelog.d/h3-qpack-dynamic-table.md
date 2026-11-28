@@ -8,3 +8,9 @@
   connection holds at most the configured bytes of table, at most 16 requests may wait for
   insertions, and a request that gives up waiting is cancelled for the client's encoder.
   Responses still use the static table alone.
+- **giong-http**: `ClientBuilder::qpack_table_size` (feature `unstable-http3`) does the same for
+  responses: an HTTP/3 server may fill a dynamic table of that size, off by default. Against an
+  aioquic server repeating `server`, `cache-control`, a 150-byte `set-cookie` and more, 100
+  response heads took 1,737 bytes instead of 23,391 (−92.6%), and the client spent 12% fewer
+  instructions per request. Requests still use the static table alone.
+- **giong-http**: the `h3_get` example, an HTTP/3 client for trying other servers.

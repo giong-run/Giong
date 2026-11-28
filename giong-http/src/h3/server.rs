@@ -717,12 +717,15 @@ async fn body_piece(
             kind::DATA if header.len > 0 => st.left = header.len,
             kind::HEADERS => {
                 st.trailers = true;
+                let id = r.recv.id();
                 if header.len > max_head as u64 {
+                    if let Some(decoder) = qpack {
+                        decoder.cancel(id);
+                    }
                     return Err(Stop::Stream(Code::ExcessiveLoad));
                 }
                 let block = r.exact(header.len as usize).await?;
                 let mut trailers = TrailerBlock::new(st.keep);
-                let id = r.recv.id();
                 decode_section(qpack, id, &block, |name, value| trailers.field(name, value))
                     .await?;
                 if trailers.error.is_some() {
@@ -776,12 +779,15 @@ async fn read_head(conn: &Conn, r: &mut Reader) -> Result<Built, Stop> {
     // limit that was announced. Answered at once: the rest of the stream,
     // which a client may announce as a gigabyte, is not read (the stream
     // is stopped once the answer is out).
+    let id = r.recv.id();
     if header.len > max_head as u64 {
+        if let Some(decoder) = conn.qpack.as_deref() {
+            decoder.cancel(id);
+        }
         return Ok(Built::Status(431));
     }
     let block = r.exact(header.len as usize).await?;
     let mut builder = Builder::with_scratch(max_head, Vec::new()).http3();
-    let id = r.recv.id();
     decode_section(conn.qpack.as_deref(), id, &block, |name, value| {
         builder.field(name, value)
     })

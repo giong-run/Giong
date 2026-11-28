@@ -1353,6 +1353,24 @@ fn a_request_that_gives_up_waiting_is_cancelled_for_the_encoder() {
 }
 
 #[test]
+fn a_section_answered_431_undecoded_is_cancelled_for_the_encoder() {
+    run(|| async {
+        let client = connect_to(Server::new().qpack_table_size(220)).await;
+        let (mut send, mut recv) = client.conn.open_bi().await.unwrap();
+        let mut out = Vec::new();
+        Header::write(&mut out, kind::HEADERS, 1 << 30);
+        out.extend_from_slice(&[0; 100]);
+        send.write_all(&out).await.unwrap();
+        let reply = recv.read_to_end(1 << 20).await.unwrap();
+        assert_eq!(parse(&reply).status(), 431);
+        // Stream Cancellation of stream 0: the encoder stops counting the
+        // references of a section nobody decoded.
+        let (_decoder, said) = server_stream(&client.conn, 0x03, 1).await;
+        assert_eq!(said, [0x40]);
+    });
+}
+
+#[test]
 fn an_encoder_stream_that_breaks_rfc_9204_closes_the_connection() {
     run(|| async {
         // A capacity above the one allowed: QPACK_ENCODER_STREAM_ERROR
