@@ -313,11 +313,19 @@ jobs:
             c3c5f497153f4ba81f82023791ba7f9a4bc46d4141211e614196f141c5996830 h3spec
           chmod +x h3spec
       - run: cargo build --release -p giong-http --features unstable-http3 --example h3
+      # 0-RTT on, so h3spec's 0-RTT case runs too. A case h3spec cannot
+      # run is reported "pending" with exit status 0: that fails the job,
+      # the same as a failure, so no case goes quietly unchecked.
       - name: Run h3spec
         run: |
-          target/release/examples/h3 127.0.0.1:8443 &
+          set -o pipefail
+          GIONG_EARLY_DATA=1 target/release/examples/h3 127.0.0.1:8443 &
           sleep 2
-          ./h3spec --no-validate --timeout 5000 127.0.0.1 8443
+          ./h3spec --no-validate --timeout 5000 127.0.0.1 8443 | tee h3spec.log
+          if grep -q pending h3spec.log; then
+            echo "::error::h3spec left a case pending (not run)"
+            exit 1
+          fi
 
   # The database crates against the other server versions they support; the
   # jobs above use the runner's PostgreSQL 16, MySQL 8.0 and Ubuntu's Redis

@@ -6,7 +6,8 @@
 //!     h3spec localhost 8443
 //!
 //! Without `GIONG_CERT` and `GIONG_KEY` (PEM files), a self-signed
-//! certificate for `localhost` is made at start. One worker serves the
+//! certificate for `localhost` is made at start. `GIONG_EARLY_DATA=1` takes
+//! 0-RTT requests from resuming clients (h3spec's 0-RTT case needs it). One worker serves the
 //! port, which keeps the example short; a server can run an endpoint on
 //! every worker, on the same port.
 //!
@@ -90,7 +91,10 @@ fn main() {
         .with_single_cert(chain, key)
         .expect("certificate and key");
     tls.alpn_protocols = vec![b"h3".to_vec()];
-    let config = ServerConfig::new(tls).expect("a QUIC server configuration");
+    let early = std::env::var("GIONG_EARLY_DATA").is_ok_and(|v| v == "1");
+    let config = ServerConfig::new(tls)
+        .expect("a QUIC server configuration")
+        .early_data(early);
 
     let rt = giong::Builder::new()
         .workers(1)
