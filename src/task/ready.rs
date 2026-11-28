@@ -84,6 +84,18 @@ impl MemberWaker {
         (state, waker)
     }
 
+    /// A waker for member `id`, not marked woken: for a member polled
+    /// right away.
+    pub(crate) fn idle(id: usize, ready: &Arc<Ready>) -> (Arc<MemberWaker>, Waker) {
+        let state = Arc::new(MemberWaker {
+            id,
+            ready: ready.clone(),
+            queued: AtomicBool::new(false),
+        });
+        let waker = Waker::from(state.clone());
+        (state, waker)
+    }
+
     /// Called right before the member is polled.
     pub(crate) fn clear(&self) {
         self.queued.store(false, Ordering::Release);

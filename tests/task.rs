@@ -36,14 +36,14 @@ fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
 /// `fut` under a deadline `d` from now: a scope with a deadline and no
 /// children, with `Cancelled` as its error type.
 async fn within<T>(d: Duration, fut: impl Future<Output = T>) -> Result<T, Cancelled> {
-    Scope::<Cancelled>::with_timeout(d)
+    Scope::<Cancelled>::typed(Some(Instant::now() + d))
         .run(async { Ok(fut.await) })
         .await
 }
 
 /// `fut` under the deadline `at`.
 async fn until<T>(at: Instant, fut: impl Future<Output = T>) -> Result<T, Cancelled> {
-    Scope::<Cancelled>::with_deadline(at)
+    Scope::<Cancelled>::typed(Some(at))
         .run(async { Ok(fut.await) })
         .await
 }
@@ -353,7 +353,7 @@ fn the_first_error_cancels_the_other_children_and_the_body() {
     giong::block_on(async {
         let sibling_dropped = Rc::new(Cell::new(false));
         let body_dropped = Rc::new(Cell::new(false));
-        let scope: Scope<'_, Failure> = Scope::new();
+        let scope: Scope<'_, Failure> = Scope::typed(None);
         let flag = DropFlag(sibling_dropped.clone());
         let body_flag = DropFlag(body_dropped.clone());
         let out: Result<(), Failure> = scope

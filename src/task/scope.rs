@@ -1,4 +1,4 @@
-use std::cell::{Cell, RefCell};
+use std::cell::{Cell, OnceCell, RefCell};
 use std::fmt;
 use std::future::Future;
 use std::io;
@@ -77,7 +77,10 @@ use crate::time::{sleep_until, Sleep};
 /// [`Handle::spawn_on`](crate::Handle::spawn_on) and await the handles
 /// from children.
 pub struct Scope<'env, E: 'env = io::Error> {
-    shared: Rc<Shared<E>>,
+    /// Made by the first [`spawn`](Self::spawn), [`cancel`](Self::cancel)
+    /// or [`cancel_handle`](Self::cancel_handle): a scope used only for its
+    /// deadline allocates nothing for it.
+    shared: OnceCell<Rc<Shared<E>>>,
     children: RefCell<Slab<Child<'env>>>,
     deadline: Option<Instant>,
     running: Cell<bool>,
@@ -134,35 +137,60 @@ impl<E> Shared<E> {
 /// The run-queue id of the body among the children.
 const BODY: usize = usize::MAX;
 
-impl<'env, E: 'env> Scope<'env, E> {
+impl<'env> Scope<'env> {
     /// A scope without a deadline of its own (one in force around
-    /// [`run`](Self::run) still holds).
+    /// [`run`](Self::run) still holds), whose body and children fail with
+    /// [`io::Error`]. For another error type, see [`typed`](Self::typed).
     pub fn new() -> Self {
+        Self::typed(None)
+    }
+
+    /// A scope whose [`run`](Self::run) ends at `at`, with
+    /// [`io::Error`] as its error type.
+    pub fn with_deadline(at: Instant) -> Self {
+        Self::typed(Some(at))
+    }
+
+    /// A scope whose [`run`](Self::run) ends `duration` after this call,
+    /// with [`io::Error`] as its error type.
+    pub fn with_timeout(duration: Duration) -> Self {
+        Self::typed(Some(after(duration)))
+    }
+}
+
+impl<'env, E: 'env> Scope<'env, E> {
+    /// A scope whose body and children fail with `E` rather than
+    /// [`io::Error`] (which [`new`](Scope::new),
+    /// [`with_deadline`](Scope::with_deadline) and
+    /// [`with_timeout`](Scope::with_timeout) make), with the deadline
+    /// `deadline` if it is `Some`:
+    /// `Scope::<MyError>::typed(None)`. `E` must convert from
+    /// [`Cancelled`].
+    pub fn typed(deadline: Option<Instant>) -> Self {
         Self {
-            shared: Rc::new(Shared {
+            shared: OnceCell::new(),
+            children: RefCell::new(Slab::new()),
+            deadline,
+            running: Cell::new(false),
+        }
+    }
+
+    fn shared(&self) -> &Rc<Shared<E>> {
+        self.shared.get_or_init(|| {
+            Rc::new(Shared {
                 flags: Rc::new(Flags {
                     ready: Arc::new(Ready::default()),
                     cancelled: Cell::new(false),
                     failed: Cell::new(false),
                 }),
                 failure: RefCell::new(None),
-            }),
-            children: RefCell::new(Slab::new()),
-            deadline: None,
-            running: Cell::new(false),
-        }
+            })
+        })
     }
 
-    /// A scope whose [`run`](Self::run) ends at `at`.
-    pub fn with_deadline(at: Instant) -> Self {
-        let mut scope = Self::new();
-        scope.deadline = Some(at);
-        scope
-    }
-
-    /// A scope whose [`run`](Self::run) ends `duration` after this call.
-    pub fn with_timeout(duration: Duration) -> Self {
-        Self::with_deadline(after(duration))
+    /// `true` once the scope was cancelled or failed.
+    fn stopped(&self) -> bool {
+        self.shared.get().is_some_and(|s| s.stopped())
     }
 
     /// Starts `fut` as a child of the scope. Its `Ok` value comes out of
@@ -178,7 +206,7 @@ impl<'env, E: 'env> Scope<'env, E> {
             done: Cell::new(false),
         });
         let child_slot = slot.clone();
-        let shared = self.shared.clone();
+        let shared = self.shared().clone();
         let fut = Box::pin(async move {
             match fut.await {
                 Ok(value) => child_slot.set(value),
@@ -191,28 +219,28 @@ impl<'env, E: 'env> Scope<'env, E> {
             waker: None,
         });
         children.get_mut(id).expect("just inserted").waker =
-            Some(MemberWaker::new(id, &self.shared.flags.ready));
+            Some(MemberWaker::new(id, &shared_ready(self)));
         ScopeHandle { slot }
     }
 
     /// Cancels the scope: every child is dropped at the next poll of
     /// [`run`](Self::run), and so is the body if it has not returned yet.
     pub fn cancel(&self) {
-        self.shared.flags.cancel();
+        self.shared().flags.cancel();
     }
 
     /// A handle that cancels this scope, for a child to keep: a child
     /// cannot borrow the scope it runs in (it is stored inside it).
     pub fn cancel_handle(&self) -> CancelHandle {
         CancelHandle {
-            flags: self.shared.flags.clone(),
+            flags: self.shared().flags.clone(),
         }
     }
 
     /// `true` once [`cancel`](Self::cancel) was called or a child or the
     /// body returned an error, during the current or last run.
     pub fn is_cancelled(&self) -> bool {
-        self.shared.stopped()
+        self.stopped()
     }
 
     /// Runs `body` and every child until all have finished: see the type
@@ -235,6 +263,7 @@ impl<'env, E: 'env> Scope<'env, E> {
             armed: None,
             kernel: None,
             started: false,
+            body_solo: false,
             woken: Vec::new(),
             body_waker: None,
         }
@@ -243,15 +272,19 @@ impl<'env, E: 'env> Scope<'env, E> {
     /// Drops every child (outside of the borrow: their destructors may use
     /// the scope).
     fn drop_children(&self) {
-        let children = self.children.borrow_mut().take_all();
-        drop(children);
-        self.shared.flags.ready.clear();
+        if self.children.borrow().len() != 0 {
+            let children = self.children.borrow_mut().take_all();
+            drop(children);
+        }
+        if let Some(shared) = self.shared.get() {
+            shared.flags.ready.clear();
+        }
     }
 }
 
 impl<'env, E: 'env> Default for Scope<'env, E> {
     fn default() -> Self {
-        Self::new()
+        Self::typed(None)
     }
 }
 
@@ -365,8 +398,13 @@ pub struct Run<'s, 'env, E: 'env, T, B> {
     armed: Option<Waker>,
     kernel: Option<DeadlineAt>,
     started: bool,
+    /// The body was last polled with the run's own waker, as it is while
+    /// the scope has no children: it is then polled at every poll of the
+    /// run, which is woken by whatever wakes the body.
+    body_solo: bool,
     woken: Vec<usize>,
-    /// The body's waker: it marks the body as woken, like a child's.
+    /// The body's waker while the scope has children: it marks the body as
+    /// woken, like a child's. Made when first needed.
     body_waker: Option<(Arc<MemberWaker>, Waker)>,
 }
 
@@ -395,7 +433,6 @@ where
 
     fn poll(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Result<T, E>> {
         let scope = self.scope;
-        let shared = &*scope.shared;
         if !self.started {
             if scope.running.replace(true) {
                 already_running();
@@ -403,10 +440,13 @@ where
             // SAFETY: only unpinned fields are written.
             let this = unsafe { self.as_mut().get_unchecked_mut() };
             this.started = true;
-            shared.failure.borrow_mut().take();
-            shared.flags.cancelled.set(false);
-            shared.flags.failed.set(false);
-            this.body_waker = Some(MemberWaker::new(BODY, &shared.flags.ready));
+            // The body has not been polled yet.
+            this.body_solo = true;
+            if let Some(shared) = scope.shared.get() {
+                shared.failure.borrow_mut().take();
+                shared.flags.cancelled.set(false);
+                shared.flags.failed.set(false);
+            }
         }
         if let Some(at) = scope.deadline {
             if Instant::now() >= at {
@@ -414,7 +454,6 @@ where
                 return Poll::Ready(Err(E::from(Cancelled::deadline())));
             }
         }
-        shared.flags.ready.set_parent(cx.waker());
         {
             // SAFETY: `body` is structurally pinned (see `finish`); the other
             // fields are not.
@@ -422,36 +461,24 @@ where
             let _deadline = scope.deadline.map(|at| {
                 context::enter_deadline(*this.kernel.get_or_insert_with(|| DeadlineAt::new(at)))
             });
-            shared.flags.ready.take(&mut this.woken);
-            // Oldest first; members woken while these run wait for the
-            // next poll, so a child that keeps waking itself cannot hold the
-            // others back.
-            this.woken.reverse();
+            let had_shared = scope.shared.get().is_some();
+            if let Some(shared) = scope.shared.get() {
+                shared.flags.ready.set_parent(cx.waker());
+                shared.flags.ready.take(&mut this.woken);
+                // Oldest first; members woken while these run wait for the
+                // next poll, so a child that keeps waking itself cannot hold
+                // the others back.
+                this.woken.reverse();
+            }
+            if this.body_solo {
+                this.poll_body(cx);
+            }
             while let Some(id) = this.woken.pop() {
-                if shared.stopped() {
+                if scope.stopped() {
                     break;
                 }
                 if id == BODY {
-                    // SAFETY: as above.
-                    let mut body = unsafe { Pin::new_unchecked(&mut this.body) };
-                    let Some(fut) = body.as_mut().as_pin_mut() else {
-                        continue;
-                    };
-                    let Some((state, waker)) = &this.body_waker else {
-                        continue;
-                    };
-                    state.clear();
-                    match fut.poll(&mut Context::from_waker(waker)) {
-                        Poll::Ready(Ok(value)) => {
-                            this.output = Some(value);
-                            body.set(None);
-                        }
-                        Poll::Ready(Err(e)) => {
-                            body.set(None);
-                            shared.fail(e);
-                        }
-                        Poll::Pending => {}
-                    }
+                    this.poll_body(cx);
                     continue;
                 }
                 let taken = {
@@ -479,17 +506,28 @@ where
                     child.fut = Some(fut);
                 }
             }
+            this.woken.clear();
+            if !had_shared {
+                if let Some(shared) = scope.shared.get() {
+                    // The body spawned the first children (or cancelled)
+                    // during this poll: they are polled at the next one.
+                    shared.flags.ready.set_parent(cx.waker());
+                    cx.waker().wake_by_ref();
+                }
+            }
         }
-        let failure = shared.failure.borrow_mut().take();
-        if let Some(e) = failure {
-            self.as_mut().finish();
-            return Poll::Ready(Err(e));
-        }
-        if shared.flags.cancelled.get() {
-            // SAFETY: `output` is not pinned.
-            let output = unsafe { self.as_mut().get_unchecked_mut() }.output.take();
-            self.as_mut().finish();
-            return Poll::Ready(output.ok_or_else(|| E::from(Cancelled::requested())));
+        if let Some(shared) = scope.shared.get() {
+            let failure = shared.failure.borrow_mut().take();
+            if let Some(e) = failure {
+                self.as_mut().finish();
+                return Poll::Ready(Err(e));
+            }
+            if shared.flags.cancelled.get() {
+                // SAFETY: `output` is not pinned.
+                let output = unsafe { self.as_mut().get_unchecked_mut() }.output.take();
+                self.as_mut().finish();
+                return Poll::Ready(output.ok_or_else(|| E::from(Cancelled::requested())));
+            }
         }
         if self.body.is_none() && scope.children.borrow().len() == 0 {
             // SAFETY: `output` is not pinned.
@@ -512,6 +550,60 @@ where
         }
         Poll::Pending
     }
+}
+
+impl<'s, 'env, E, T, B> Run<'s, 'env, E, T, B>
+where
+    E: 'env,
+    B: Future<Output = Result<T, E>>,
+{
+    /// Polls the body, if it has not returned: with the run's own waker
+    /// while the scope has no children, so that a scope used only for its
+    /// deadline costs no waker of its own; with the body's member waker
+    /// otherwise.
+    ///
+    /// Only reached through the pinned `Run` in `poll`: `body` is
+    /// structurally pinned there.
+    fn poll_body(&mut self, cx: &mut Context<'_>) {
+        // SAFETY: `self` is the pinned `Run` (see above); `body` is never
+        // moved out of it.
+        let mut body = unsafe { Pin::new_unchecked(&mut self.body) };
+        let Some(fut) = body.as_mut().as_pin_mut() else {
+            self.body_solo = false;
+            return;
+        };
+        let scope = self.scope;
+        let solo = scope.children.borrow().len() == 0;
+        let polled = if solo {
+            fut.poll(cx)
+        } else {
+            let ready = shared_ready(scope);
+            let (state, waker) = self
+                .body_waker
+                .get_or_insert_with(|| MemberWaker::idle(BODY, &ready));
+            state.clear();
+            fut.poll(&mut Context::from_waker(waker))
+        };
+        self.body_solo = solo;
+        match polled {
+            Poll::Ready(Ok(value)) => {
+                self.output = Some(value);
+                body.set(None);
+                self.body_solo = false;
+            }
+            Poll::Ready(Err(e)) => {
+                body.set(None);
+                self.body_solo = false;
+                scope.shared().fail(e);
+            }
+            Poll::Pending => {}
+        }
+    }
+}
+
+/// The ready list of `scope`'s members.
+fn shared_ready<E>(scope: &Scope<'_, E>) -> Arc<Ready> {
+    scope.shared().flags.ready.clone()
 }
 
 impl<'s, 'env, E: 'env, T, B> Drop for Run<'s, 'env, E, T, B> {

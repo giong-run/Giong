@@ -1,0 +1,21 @@
+# bench/scope.sh, 2026-11-28T09:50Z, 6.18.44-fc-v880, 4 CPUs
+# ns per child (median of 7 runs), instructions per child (callgrind, R vs 2R rounds)
+driver     mode     children ns       instr
+io_uring   spawn    1        245      1794
+io_uring   group    1        512      3221
+io_uring   scope    1        793      4611
+io_uring   spawn    10       104      1032
+io_uring   group    10       342      2231
+io_uring   scope    10       316      2089
+io_uring   spawn    1000     116      1071
+io_uring   group    1000     412      2287
+io_uring   scope    1000     274      1967
+epoll      spawn    1        204      1638
+epoll      group    1        626      3065
+epoll      scope    1        690      4455
+epoll      spawn    10       111      1022
+epoll      group    10       340      2221
+epoll      scope    10       322      2076
+epoll      spawn    1000     126      1071
+epoll      group    1000     346      2287
+epoll      scope    1000     278      1968
