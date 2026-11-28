@@ -1579,6 +1579,61 @@ fn a_hostile_server_made_of_fuzz_data_neither_hangs_nor_fools_the_client() {
     });
 }
 
+/// A dead first address (`localhost` resolving to ::1 first while the
+/// server listens on 127.0.0.1, as on Windows) costs one attempt delay,
+/// not a share of the connect timeout: the next address starts alongside.
+#[test]
+fn a_dead_first_address_costs_one_attempt_delay() {
+    run(|| async {
+        let (server_tls, client_tls) = tls();
+        let endpoint = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerConfig::new(server_tls).unwrap(),
+        )
+        .unwrap();
+        let addr: SocketAddr = endpoint.local_addr().unwrap();
+        drop(giong::spawn(async move {
+            Server::new().serve_h3(endpoint, App).await
+        }));
+        let client = Client::builder()
+            .http3_prior_knowledge(ClientConfig::new(client_tls).unwrap())
+            .connect_timeout(Duration::from_secs(10))
+            .build();
+        let url = format!("https://{addr}");
+        let dead = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let quic = client.shared.config.http3.as_ref().unwrap().quic.clone();
+        let origin = super::url::Url::parse(&url).unwrap().origin();
+        for addrs in [
+            vec![dead.local_addr().unwrap(), addr],
+            vec![dead.local_addr().unwrap(), dead.local_addr().unwrap(), addr],
+        ] {
+            let started = std::time::Instant::now();
+            let conn = giong::time::timeout(
+                Duration::from_secs(4),
+                client.h3_open_any(&quic, &origin, &addrs),
+            )
+            .await
+            .expect("a dead address held the others back")
+            .expect("no address answered");
+            assert!(conn.is_open());
+            // One delay per dead address before the live one, plus the
+            // handshake; serial shares of 10 s took 5 s and 6.7 s here.
+            let took = started.elapsed();
+            assert!(took < Duration::from_secs(2), "{took:?} for {addrs:?}");
+        }
+        // Every address dead: the last error, once every attempt failed or
+        // the caller's timeout passes.
+        let all_dead = [dead.local_addr().unwrap()];
+        let gave_up = giong::time::timeout(
+            Duration::from_millis(600),
+            client.h3_open_any(&quic, &origin, &all_dead),
+        )
+        .await;
+        assert!(gave_up.is_err(), "a dead address answered");
+        assert!(client.h3_open_any(&quic, &origin, &[]).await.is_err());
+    });
+}
+
 /// With prior knowledge and a ticket, a connection opens before any packet
 /// comes back: a host whose first address does not answer still gets its
 /// next one tried.
@@ -1612,7 +1667,7 @@ fn a_dead_first_address_does_not_hide_the_next_one_with_a_ticket() {
         let origin = super::url::Url::parse(&url).unwrap().origin();
         let conn = giong::time::timeout(
             Duration::from_secs(3),
-            client.h3_open_any(&quic, &origin, &addrs, Duration::from_secs(2)),
+            client.h3_open_any(&quic, &origin, &addrs),
         )
         .await
         .expect("the addresses took too long")
