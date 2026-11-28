@@ -21,6 +21,13 @@
 #     from its own thread (they time out under valgrind); the unit tests in
 #     src/net/dns.rs cover the parsing and the query ids
 #
+# Run on the epoll driver (GIONG_DRIVER=epoll), for the same reason: a std
+# socket on its own thread is the other side, and on io_uring it never runs
+# while the test waits (the reply is "lost", the reset client never connects):
+#   * udp::a_reply_to_a_send_after_a_cancelled_read_from_is_not_lost and
+#     udp::a_reply_to_a_batched_send_after_a_cancelled_read_from_is_not_lost
+#   * net::connections_reset_before_they_are_accepted_do_not_end_the_accept_loop
+#
 # Note that valgrind cannot see the kernel writing into memory, so a clean run
 # does not by itself prove cancellation safety; tests/cancel.rs covers that.
 set -uo pipefail
@@ -35,6 +42,9 @@ SKIP="interoperates_with_blocking_std_clients"
 SKIP+=" works_with_the_standard_library_on_the_other_side"
 SKIP+=" every_worker_can_bind_the_same_port"
 SKIP+=" a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies"
+EPOLL="a_reply_to_a_send_after_a_cancelled_read_from_is_not_lost"
+EPOLL+=" a_reply_to_a_batched_send_after_a_cancelled_read_from_is_not_lost"
+EPOLL+=" connections_reset_before_they_are_accepted_do_not_end_the_accept_loop"
 TIMEOUT=${TIMEOUT:-300}
 
 total=0
@@ -51,8 +61,10 @@ for suite in "${SUITES[@]}"; do
   fi
   for t in $("$bin" --list 2>/dev/null | sed -n 's/: test$//p'); do
     case " $SKIP " in *" $t "*) continue ;; esac
+    driver=()
+    case " $EPOLL " in *" $t "*) driver=(env GIONG_DRIVER=epoll) ;; esac
     log=$(mktemp)
-    timeout -s KILL "$TIMEOUT" valgrind -q \
+    timeout -s KILL "$TIMEOUT" "${driver[@]}" valgrind -q \
       --undef-value-errors=no --leak-check=full --show-leak-kinds=definite \
       "$bin" --exact "$t" --test-threads=1 >"$log" 2>&1
     rc=$?
