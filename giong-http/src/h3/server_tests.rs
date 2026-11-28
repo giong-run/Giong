@@ -870,6 +870,82 @@ fn breaking_the_protocol_closes_the_connection_with_its_code() {
     });
 }
 
+/// A PRIORITY_UPDATE frame (RFC 9218, section 7.1) for element `id`.
+fn priority_update(kind: u64, id: u64, value: &str) -> Vec<u8> {
+    let mut payload = Vec::new();
+    write_varint(&mut payload, id);
+    payload.extend_from_slice(value.as_bytes());
+    let mut out = Vec::new();
+    Header::write(&mut out, kind, payload.len() as u64);
+    out.extend_from_slice(&payload);
+    out
+}
+
+#[test]
+fn priority_updates_follow_rfc_9218() {
+    run(|| async {
+        // For requests, those to come and those answered, with values
+        // valid or not, and for a push that was allowed: accepted. The
+        // requests are answered.
+        let mut client = connect().await;
+        let mut out = Vec::new();
+        let mut max_push = Vec::new();
+        write_varint(&mut max_push, 3);
+        Header::write(&mut out, kind::MAX_PUSH_ID, max_push.len() as u64);
+        out.extend_from_slice(&max_push);
+        for (id, value) in [(0, "u=0"), (4, "u=7, i"), (8, "nonsense"), (400, "u=1")] {
+            out.extend(priority_update(kind::PRIORITY_UPDATE_REQUEST, id, value));
+        }
+        out.extend(priority_update(kind::PRIORITY_UPDATE_PUSH, 2, "u=1"));
+        // Too long to be read: skipped as a frame not understood would be.
+        out.extend(priority_update(
+            kind::PRIORITY_UPDATE_REQUEST,
+            12,
+            &"u=1,".repeat(100),
+        ));
+        client.control.write_all(&out).await.unwrap();
+        for _ in 0..4 {
+            assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
+        }
+        client
+            .control
+            .write_all(&priority_update(kind::PRIORITY_UPDATE_REQUEST, 0, "u=2"))
+            .await
+            .unwrap();
+        assert_eq!(roundtrip(&client, get("/")).await.unwrap().status(), 200);
+
+        // For a stream that is not a request stream: H3_ID_ERROR (0x108).
+        let mut client = connect().await;
+        let out = priority_update(kind::PRIORITY_UPDATE_REQUEST, 2, "u=1");
+        client.control.write_all(&out).await.unwrap();
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x108") || seen.contains("264"), "{seen}");
+
+        // For a push the client did not allow: H3_ID_ERROR.
+        let mut client = connect().await;
+        let out = priority_update(kind::PRIORITY_UPDATE_PUSH, 0, "u=1");
+        client.control.write_all(&out).await.unwrap();
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x108") || seen.contains("264"), "{seen}");
+
+        // Without an ID: H3_FRAME_ERROR (0x106).
+        let mut client = connect().await;
+        let mut out = Vec::new();
+        Header::write(&mut out, kind::PRIORITY_UPDATE_REQUEST, 0);
+        client.control.write_all(&out).await.unwrap();
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x106") || seen.contains("262"), "{seen}");
+
+        // On a request stream: H3_FRAME_UNEXPECTED (0x105).
+        let client = connect().await;
+        let mut request = priority_update(kind::PRIORITY_UPDATE_REQUEST, 0, "u=1");
+        request.extend(get("/"));
+        let _ = roundtrip(&client, request).await;
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x105") || seen.contains("261"), "{seen}");
+    });
+}
+
 #[test]
 fn what_a_client_may_do_on_its_other_streams_is_accepted() {
     run(|| async {

@@ -34,6 +34,7 @@ use crate::body::{Failure, Next, Pipe, RateClock};
 use crate::budget::{self, Charge};
 use crate::h2::hpack::Index;
 use crate::h2::request::{Builder, Built, TrailerBlock};
+use crate::priority::{self, DEFAULT_URGENCY};
 use crate::request::BodyBytes;
 use crate::response::{Body, Response};
 use crate::server::{catching, drop_quietly, panicked, Config, Handler};
@@ -58,6 +59,16 @@ const SMALL_BODY: usize = 1024;
 /// client sends no new requests while those already on their way are
 /// still taken.
 const LAST_REQUEST_ID: u64 = (1 << 62) - 4;
+
+/// PRIORITY_UPDATE frames kept for requests whose head has not been read
+/// yet (RFC 9218, section 7: a server buffers a limited number); the
+/// oldest goes when one more comes.
+const MAX_PENDING_PRIORITIES: usize = 64;
+
+/// The longest PRIORITY_UPDATE frame read: a stream ID and a short
+/// dictionary. Longer ones are skipped, as frames this server does not
+/// understand are.
+const MAX_PRIORITY_UPDATE: u64 = 256;
 
 /// The longest the round-trip time makes the first step of a shutdown:
 /// longer than `shutdown_linger` only on a slow path, and never by more
@@ -114,9 +125,45 @@ struct Conn {
     /// The QPACK decoder, when the client is allowed a dynamic table
     /// (`Server::qpack_table_size`).
     qpack: Option<Rc<Decoder>>,
+    /// Urgencies from PRIORITY_UPDATE frames, by request stream, that the
+    /// request takes when its head is read: such a frame may come first,
+    /// and overrides the request's `priority` field (RFC 9218, section
+    /// 7). At most [`MAX_PENDING_PRIORITIES`].
+    priorities: RefCell<Vec<(u64, u8)>>,
 }
 
 impl Conn {
+    /// A PRIORITY_UPDATE for request stream `id`: applied now to a stream
+    /// QUIC has, and kept for the request to take when its head is read,
+    /// so that the request's `priority` field does not override it.
+    fn update_priority(&self, id: u64, urgency: u8) {
+        self.quic.set_priority(id, priority::quic_priority(urgency));
+        let mut pending = self.priorities.borrow_mut();
+        if let Some(entry) = pending.iter_mut().find(|(s, _)| *s == id) {
+            entry.1 = urgency;
+            return;
+        }
+        if pending.len() == MAX_PENDING_PRIORITIES {
+            pending.remove(0);
+        }
+        pending.push((id, urgency));
+    }
+
+    /// Schedules the response on `send` by `urgency`, the request's, or
+    /// by a PRIORITY_UPDATE that came for it.
+    fn prioritize(&self, send: &mut SendStream, mut urgency: u8) {
+        let mut pending = self.priorities.borrow_mut();
+        if !pending.is_empty() {
+            let id = send.id();
+            if let Some(at) = pending.iter().position(|&(s, _)| s == id) {
+                urgency = pending.remove(at).1;
+            }
+        }
+        if urgency != DEFAULT_URGENCY {
+            send.set_priority(priority::quic_priority(urgency));
+        }
+    }
+
     fn fail(&self, e: Error) {
         if !self.closed.replace(true) {
             self.quic.close(e.code as u32, e.what.as_bytes());
@@ -368,6 +415,7 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
         unsent_budget: crate::h2::budget(&cfg),
         parked: RefCell::new(Vec::new()),
         qpack: (cfg.qpack_table_size > 0).then(|| Rc::new(Decoder::new(cfg.qpack_table_size))),
+        priorities: RefCell::new(Vec::new()),
     });
     // The decoder's stream writer and the requests waiting for insertions
     // end with the connection, however `serve` ends.
@@ -396,7 +444,11 @@ pub(crate) async fn serve<H: Handler>(quic: Connection, cfg: Config, handler: Rc
     })
     .await;
     let mut control = match opened {
-        Ok(Ok(control)) => control,
+        Ok(Ok(mut control)) => {
+            // Ahead of every response: a GOAWAY is not held back by them.
+            control.set_priority(i32::MAX);
+            control
+        }
         Ok(Err(_)) => return,
         Err(_) => {
             conn.closed.set(true);
@@ -631,6 +683,36 @@ async fn control_stream(conn: &Conn, r: &mut Reader) -> Result<(), Stop> {
                 }
                 conn.max_push_id.set(Some(id));
             }
+            kind::PRIORITY_UPDATE_REQUEST | kind::PRIORITY_UPDATE_PUSH
+                if header.len <= MAX_PRIORITY_UPDATE =>
+            {
+                // Counted as unknown frames are: each costs a little.
+                if !unknown.take() {
+                    return Err(fatal(Code::ExcessiveLoad, "too many frames in a second"));
+                }
+                let payload = critical_payload(r, header.len as usize).await?;
+                let Some((id, used)) = frame::read_varint(&payload) else {
+                    return Err(fatal(Code::FrameError, "PRIORITY_UPDATE without an ID"));
+                };
+                let value = &payload[used..];
+                if header.kind == kind::PRIORITY_UPDATE_PUSH {
+                    // This server never pushes: a push ID it did not allow
+                    // is an error, any other names nothing (section 7.2).
+                    if conn.max_push_id.get().map_or(true, |max| id > max) {
+                        return Err(fatal(
+                            Code::IdError,
+                            "PRIORITY_UPDATE for a push id that was not allowed",
+                        ));
+                    }
+                } else if id % 4 != 0 {
+                    return Err(fatal(
+                        Code::IdError,
+                        "PRIORITY_UPDATE for a stream that is not a request stream",
+                    ));
+                } else if let Some(urgency) = priority::urgency(value) {
+                    conn.update_priority(id, urgency);
+                }
+            }
             kind::CANCEL_PUSH => {
                 // This server never pushes, so no push id was ever used:
                 // one the client did not allow is an error, any other is
@@ -789,8 +871,8 @@ async fn body_piece(
 }
 
 /// Reads the HEADERS frame a request starts with and makes the request of
-/// it.
-async fn read_head(conn: &Conn, r: &mut Reader) -> Result<Built, Stop> {
+/// it, with the urgency its `priority` fields give (RFC 9218).
+async fn read_head(conn: &Conn, r: &mut Reader) -> Result<(Built, u8), Stop> {
     let max_head = conn.cfg.max_head_size;
     let mut unknown = 0;
     let header = loop {
@@ -823,7 +905,7 @@ async fn read_head(conn: &Conn, r: &mut Reader) -> Result<Built, Stop> {
         if let Some(decoder) = conn.qpack.as_deref() {
             decoder.cancel(id);
         }
-        return Ok(Built::Status(431));
+        return Ok((Built::Status(431), DEFAULT_URGENCY));
     }
     let block = r.exact(header.len as usize).await?;
     let mut builder = Builder::with_scratch(max_head, Vec::new()).http3();
@@ -834,7 +916,8 @@ async fn read_head(conn: &Conn, r: &mut Reader) -> Result<Built, Stop> {
     // Read for each request: a client that moves (a NAT rebinding, or a
     // new network) is seen where it is now. For a request that came in
     // 0-RTT data the address is not validated yet and may be forged.
-    Ok(builder.finish(Some(conn.quic.remote_addr())))
+    let urgency = builder.urgency();
+    Ok((builder.finish(Some(conn.quic.remote_addr())), urgency))
 }
 
 /// Decodes a field section of request stream `id`: with the dynamic
@@ -914,7 +997,11 @@ async fn exchange<H: Handler>(
 ) -> Result<(), Stop> {
     let cfg = &conn.cfg;
     let built = match timeout(cfg.request_timeout, read_head(conn, r)).await {
-        Ok(built) => built?,
+        Ok(read) => {
+            let (built, urgency) = read?;
+            conn.prioritize(send, urgency);
+            built
+        }
         Err(_) => return respond(conn, send, Response::new(408), false).await,
     };
     let mut req = match built {
@@ -1195,8 +1282,10 @@ fn decimal(mut n: u64, buf: &mut [u8; 20]) -> &[u8] {
     }
 }
 
-/// Appends the HEADERS frame of `resp` to `out`.
-fn write_head(out: &mut Vec<u8>, resp: &Response, content_length: Option<u64>) {
+/// Appends the HEADERS frame of `resp`, and gives the urgency its own
+/// `priority` field names, if any.
+fn write_head(out: &mut Vec<u8>, resp: &Response, content_length: Option<u64>) -> Option<u8> {
+    let mut urgency = None;
     let mut block = Vec::with_capacity(256);
     Encoder::begin(&mut block);
     Encoder::status(resp.status(), &mut block);
@@ -1229,12 +1318,16 @@ fn write_head(out: &mut Vec<u8>, resp: &Response, content_length: Option<u64>) {
         let index = if name == b"set-cookie" {
             Index::Never
         } else {
+            if name == b"priority" {
+                urgency = priority::urgency(v).or(urgency);
+            }
             Index::Yes
         };
         Encoder::field(&name, v, index, &mut block);
     }
     Header::write(out, kind::HEADERS, block.len() as u64);
     out.extend_from_slice(&block);
+    urgency
 }
 
 /// Appends a HEADERS frame of the trailer fields to `out` (RFC 9114,
@@ -1276,7 +1369,11 @@ async fn respond(
         held.add(bytes.len());
     }
     let mut out = Vec::with_capacity(512);
-    write_head(&mut out, &resp, length);
+    // A handler that knows better than the client (RFC 9218, section 8)
+    // sets the response's own `priority` field.
+    if let Some(urgency) = write_head(&mut out, &resp, length) {
+        send.set_priority(priority::quic_priority(urgency));
+    }
     if head_only || bodiless || length == Some(0) {
         // A streamed body that is not sent is dropped here, which tells
         // its sender.

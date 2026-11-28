@@ -132,6 +132,10 @@ pub(crate) mod kind {
     pub(crate) const PUSH_PROMISE: u64 = 0x05;
     pub(crate) const GOAWAY: u64 = 0x07;
     pub(crate) const MAX_PUSH_ID: u64 = 0x0d;
+    /// PRIORITY_UPDATE for a request stream and for a push (RFC 9218,
+    /// section 7).
+    pub(crate) const PRIORITY_UPDATE_REQUEST: u64 = 0xf0700;
+    pub(crate) const PRIORITY_UPDATE_PUSH: u64 = 0xf0701;
 }
 
 /// `true` for the frame types of HTTP/2 that HTTP/3 has no use for
@@ -196,6 +200,13 @@ impl Header {
                 On::Request | On::Response,
             ) => {
                 return unexpected("a control frame on a request stream");
+            }
+            // Only on the client's control stream (RFC 9218, section 7.1).
+            (
+                kind::PRIORITY_UPDATE_REQUEST | kind::PRIORITY_UPDATE_PUSH,
+                On::Request | On::Response,
+            ) => {
+                return unexpected("PRIORITY_UPDATE on a request stream");
             }
             // The client allows no push (it sends no MAX_PUSH_ID), so any
             // push ID is one too many (section 7.2.5).

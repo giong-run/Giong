@@ -61,6 +61,9 @@ pub(crate) struct Builder {
     /// The fields are those of an HTTP/3 request: the same rules, another
     /// version on the request.
     h3: bool,
+    /// The urgency its `priority` fields give (RFC 9218), which the HTTP/3
+    /// server schedules the response by.
+    urgency: u8,
 }
 
 /// The fields HTTP/2 forbids because they are about one connection
@@ -125,7 +128,14 @@ impl Builder {
             error: None,
             status: None,
             h3: false,
+            urgency: crate::priority::DEFAULT_URGENCY,
         }
+    }
+
+    /// The urgency the request's `priority` fields give, or the default.
+    #[cfg_attr(not(feature = "unstable-http3"), allow(dead_code))]
+    pub(crate) fn urgency(&self) -> u8 {
+        self.urgency
     }
 
     /// The same builder for the fields of an HTTP/3 request, which follow
@@ -249,6 +259,7 @@ impl Builder {
                 let start = self.scratch.len() - self.lines_from + name.len() + 2;
                 self.host = Some(start..start + value.len());
             }
+            b"priority" => self.urgency = crate::priority::update(self.urgency, value),
             b"cookie" => {
                 if !self.cookies.is_empty() {
                     self.cookies.extend_from_slice(b"; ");
