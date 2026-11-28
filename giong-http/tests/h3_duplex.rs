@@ -20,7 +20,7 @@ fn provider() -> Arc<rustls::crypto::CryptoProvider> {
 }
 
 fn tls() -> (rustls::ServerConfig, rustls::ClientConfig) {
-    let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
+    let cert = rcgen::generate_simple_self_signed(vec!["127.0.0.1".into()]).unwrap();
     let der = cert.cert.der().clone();
     let key = rustls::pki_types::PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der());
     let mut server = rustls::ServerConfig::builder_with_provider(provider())
@@ -168,7 +168,10 @@ fn serve(app: App) -> (String, Client) {
         .http3_prior_knowledge(ClientConfig::new(client_tls).unwrap())
         .timeout(Duration::from_secs(10))
         .build();
-    (format!("https://localhost:{}", addr.port()), client)
+    // An address, not `localhost`: Windows resolves that to ::1 first,
+    // where nothing listens, and the client gives each address its share
+    // of the connect timeout.
+    (format!("https://{addr}"), client)
 }
 
 fn run<F: std::future::Future<Output = ()>>(test: impl FnOnce() -> F) {
