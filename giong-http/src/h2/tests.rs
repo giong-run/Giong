@@ -1716,9 +1716,14 @@ fn a_streamed_body_that_keeps_the_minimum_rate_is_not_cut() {
     let mut c = server.client();
     let id = c.open("POST", "/pipe", &[], false);
     let body = pattern(2000);
-    // 200 bytes every 50 ms: 4,000 bytes a second.
-    for piece in body.chunks(200) {
-        std::thread::sleep(Duration::from_millis(50));
+    // 200 bytes every 50 ms: 4,000 bytes a second. The first piece goes
+    // right after the head: before it, only the 200 ms grace stands between
+    // a sleep the machine stretches and a cut (a macOS runner stretched one
+    // past it, #532); after it, each 50 ms gap has at least 350 ms to spare.
+    for (i, piece) in body.chunks(200).enumerate() {
+        if i > 0 {
+            std::thread::sleep(Duration::from_millis(50));
+        }
         c.send_body(id, piece, false);
     }
     c.send_body(id, &[], true);
