@@ -6,7 +6,7 @@
 #   scripts/valgrind.sh [suite ...]
 #
 # A suite is a file in tests/ of the giong crate, or CRATE:SUITE for another
-# crate in the workspace. Default: executor time net cancel fs udp unix
+# crate in the workspace. Default: executor time net cancel fs udp unix task
 # giong-compat:compat giong-compat:memory
 #
 # Not covered, because valgrind (3.22) treats io_uring_enter as non-blocking
@@ -17,6 +17,8 @@
 #     works_with_the_standard_library_on_the_other_side in tests/udp.rs and
 #     tests/unix.rs: a std socket on its own thread is the other side
 #   * udp::every_worker_can_bind_the_same_port, which runs three workers
+#   * task::a_read_waiting_at_the_deadline_is_cancelled_by_the_kernel and
+#     task::a_child_woken_from_another_thread_runs: a std thread is the peer
 #   * the tests in tests/dns.rs that ask the fake DNS server, which answers
 #     from its own thread (they time out under valgrind); the unit tests in
 #     src/net/dns.rs cover the parsing and the query ids
@@ -36,12 +38,14 @@ cd "$(dirname "$0")/.."
 command -v valgrind >/dev/null || { echo "valgrind is not installed" >&2; exit 2; }
 
 SUITES=("$@")
-[ ${#SUITES[@]} -eq 0 ] && SUITES=(executor time net cancel fs udp unix
+[ ${#SUITES[@]} -eq 0 ] && SUITES=(executor time net cancel fs udp unix task
   giong-compat:compat giong-compat:memory)
 SKIP="interoperates_with_blocking_std_clients"
 SKIP+=" works_with_the_standard_library_on_the_other_side"
 SKIP+=" every_worker_can_bind_the_same_port"
 SKIP+=" a_reader_that_keeps_up_gets_a_bulk_transfer_without_copies"
+SKIP+=" a_read_waiting_at_the_deadline_is_cancelled_by_the_kernel"
+SKIP+=" a_child_woken_from_another_thread_runs"
 EPOLL="a_reply_to_a_send_after_a_cancelled_read_from_is_not_lost"
 EPOLL+=" a_reply_to_a_batched_send_after_a_cancelled_read_from_is_not_lost"
 EPOLL+=" connections_reset_before_they_are_accepted_do_not_end_the_accept_loop"

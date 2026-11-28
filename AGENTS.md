@@ -53,6 +53,7 @@ Where the code is:
 | `src/pool.rs`, `src/lane.rs` | the growable thread pool (FIFO, or fair queues per budget for the compute lane); the public blocking and compute lanes on it (`spawn_blocking`, `spawn_compute`) |
 | `src/budget.rs` | `Budget`: per-tenant limits on tasks, memory, I/O in flight and compute closures; the thread-local current budget, inherited by `spawn` |
 | `src/op.rs` | `Op`: an in-flight operation that owns its buffers until the kernel is done |
+| `src/task/` | `giong::task`: `Scope` and its deadline (`scope.rs`; the thread-local deadline and task-locals in `context.rs`), `TaskGroup` (`group.rs`), `task_local!` (`local.rs`); io_uring links the deadline in `Driver::start` and `Uring::submit_op_linked` |
 | `src/net.rs`, `src/net/` | TCP, UDP, Unix sockets; `src/net/addr.rs` for addresses and `ToSocketAddrs`, `src/net/dns.rs` for `lookup_host` and `Resolver`, `src/net/share.rs` for the ports `bind` shares between workers only, `src/net/balance.rs` for `TcpListener::bind_balanced` |
 | `src/fs.rs`, `src/time.rs`, `src/sync.rs`, `src/buf.rs` | files, timers, channels, buffer pool |
 | `src/process.rs`, `src/process/` | `Command` and `Child` (waited for through a pidfd), pipes and the process's own stdio (`pipe.rs`), the Linux calls (`sys.rs`) |
@@ -359,6 +360,14 @@ is loaded.
   (Linux reads it when the next socket binds), its `somaxconn` is 1024, and it has no
   `SO_COOKIE` and no io_uring giong can use. Socket code that relies on when Linux reads
   an option needs a run of `scripts/gvisor.sh` (CI's `gvisor` job).
+- **Deadlines reach only some operations.** Inside a `giong::task::Scope` with a deadline,
+  the io_uring driver links the deadline (`IORING_OP_LINK_TIMEOUT`) to the operations that
+  wait on a peer (`Io::links_deadline`: connect, one-off reads, waiting for a writable or
+  readable descriptor). Multishot receive and accept cannot carry a linked timeout, and sends
+  and file I/O are left out on purpose (about 0.3 µs each, `bench/deadline.sh`); the scope's
+  timer ends those. Keep this split when adding an `Io` variant.
+- **Children of a `Scope` cannot borrow the scope.** They are stored inside it. Tests and
+  examples give a child `scope.cancel_handle()` or open a `Scope` inside the child.
 - **Benchmarks are not tests.** Do not run `bench/*.sh` to check a change unless the task
   is about performance: they take long and need a quiet machine.
 

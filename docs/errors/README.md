@@ -48,6 +48,9 @@ when it is no longer raised.
 | [GIONG-E0018](E0018.md) | `ActivatedSocket` | the inherited socket cannot be used that way |
 | [GIONG-E0019](E0019.md) | `ChildProcess` | cannot watch the child process |
 | [GIONG-E0020](E0020.md) | `ThreadLimit` | a worker thread could not be started |
+| [GIONG-E0024](E0024.md) | `DeadlineExceeded` | the deadline passed |
+| [GIONG-E0025](E0025.md) | `ScopeCancelled` | the scope was cancelled |
+| [GIONG-E0026](E0026.md) | `ScopeAlreadyRunning` | the scope is already running |
 | [GIONG-E0080](E0080.md) | `BudgetFull` | the budget is at its limit |
 | [GIONG-E0081](E0081.md) | `BudgetTooSmall` | a reservation larger than the budget |
 

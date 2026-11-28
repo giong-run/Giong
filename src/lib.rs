@@ -116,6 +116,7 @@ pub mod process;
 #[cfg(unix)]
 pub mod signal;
 pub mod sync;
+pub mod task;
 pub mod time;
 
 pub use buf::{IoBuf, IoBufMut, RecvBuf};

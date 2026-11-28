@@ -1,0 +1,10 @@
+# bench/deadline.sh, 2026-11-28T09:48Z, 6.18.44-fc-v880, 4 CPUs
+# ns per round trip (median of 7 runs of 200000), instructions per round trip (callgrind, 20000 vs 40000)
+driver     mode       ns         instr
+io_uring   plain      4876       5300
+io_uring   per-call   6190       7239
+io_uring   whole      5551       6424
+io_uring   whole-unlinked 5723       6301
+epoll      plain      5088       4648
+epoll      per-call   5931       6286
+epoll      whole      5797       5479

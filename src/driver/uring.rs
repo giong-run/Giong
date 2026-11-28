@@ -44,6 +44,13 @@ const UD_IGNORE: u64 = u64::MAX;
 const UD_WAKE: u64 = u64::MAX - 1;
 /// `user_data` of batched closes, which must finish before shutdown cancels I/O.
 const UD_CLOSE: u64 = u64::MAX - 2;
+/// `user_data` of the `IORING_OP_LINK_TIMEOUT` that carries a scope's
+/// deadline next to an operation (see [`Uring::submit_op_linked`]). It is
+/// submitted with `IOSQE_CQE_SKIP_SUCCESS`, so no completion comes for it
+/// unless it fires; one that comes is ignored, and the timeout is not
+/// counted in flight: the kernel keeps nothing of ours for it (it copies
+/// the timespec when it reads the SQE).
+const UD_LINK: u64 = u64::MAX - 3;
 
 /// Backpressure for multishot receive. Once a stream has this many
 /// completions its reader has not taken yet:
@@ -257,6 +264,16 @@ pub(crate) struct Uring {
     /// Resources of cancelled operations, handed to the event loop to drop
     /// outside of the driver borrow.
     graveyard: Vec<Box<dyn Any>>,
+    /// The timespecs of linked timeouts, used in turn (`link_next`),
+    /// allocated on the first linked timeout. The kernel copies a timespec
+    /// while it takes the SQE, inside an `io_uring_enter`; a slot is reused
+    /// only once that has happened for certain (see `submit_op_linked`).
+    /// `ring`, declared first, is dropped before them.
+    link_ts: Box<[types::Timespec]>,
+    /// The slot of `link_ts` the next linked timeout takes.
+    link_next: usize,
+    /// [`IoUringFeature::LinkedDeadlines`] is in use.
+    link_deadlines: bool,
     wake_fd: RawFd,
     /// Owns `wake_fd`; other threads ring it through [`Uring::waker`].
     wake: std::sync::Arc<crate::sys::Bell>,
@@ -286,6 +303,23 @@ fn first_tier() -> RingTier {
         Ok("basic") => RingTier::Basic,
         _ => RingTier::Defer,
     }
+}
+
+/// The timespec slots for linked timeouts, for a submission queue of
+/// `sq_capacity` entries.
+///
+/// Each linked operation pushes two SQEs (the operation and its timeout)
+/// after `make_room(2)`, and the kernel consumes SQEs in order, copying a
+/// timespec as it takes it (no SQPOLL here: only inside `io_uring_enter`).
+/// When slot `i` comes round again, `k - 1` linked operations, that is
+/// `2k - 2` SQEs, were pushed after the timeout that last used it, and at
+/// most `sq_capacity - 2` SQEs are unconsumed. Were that timeout still in
+/// the queue, so would be the `2k - 2` after it: `2k - 1` in all, which is
+/// more than `sq_capacity - 2` with `k = sq_capacity / 2 + 1` slots. So
+/// the kernel has read it. (A `Vec` refilled when the queue was seen empty
+/// grew for ever in a busy worker, where it rarely is.)
+fn link_slots(sq_capacity: usize) -> Box<[types::Timespec]> {
+    vec![types::Timespec::new(); sq_capacity / 2 + 1].into_boxed_slice()
 }
 
 fn build_ring(entries: u32) -> io::Result<IoUring> {
@@ -1022,6 +1056,12 @@ impl Uring {
         if zero_copy_min.is_some() {
             features.push(IoUringFeature::ZeroCopySend);
         }
+        // Linked timeouts (5.5) and `IOSQE_CQE_SKIP_SUCCESS` (5.17) are in
+        // every kernel giong runs io_uring on (6.0 and newer).
+        let link_deadlines = super::feature_enabled(IoUringFeature::LinkedDeadlines);
+        if link_deadlines {
+            features.push(IoUringFeature::LinkedDeadlines);
+        }
         let recv_limit = recv_backlog_limit(&pool);
         // Linux 6.0 refuses a destination address on `IORING_OP_SEND` with
         // `EINVAL`, which cannot be told from a bad address: go by version.
@@ -1048,6 +1088,9 @@ impl Uring {
             heap_pressure: false,
             turn: 0,
             graveyard: Vec::new(),
+            link_ts: Box::new([]),
+            link_next: 0,
+            link_deadlines,
             wake_fd: wake.read_fd(),
             wake,
             wake_buf: Box::new(0),
@@ -1094,6 +1137,85 @@ impl Uring {
         let sqe = sqe_for(io, self.zero_copy_min.is_some());
         self.push(sqe.user_data(key as u64));
         key
+    }
+
+    /// Submits a single-shot operation followed by an
+    /// `IORING_OP_LINK_TIMEOUT` at `deadline` (an absolute `CLOCK_MONOTONIC`
+    /// time, see [`crate::task`]): if the operation is still waiting then,
+    /// the kernel cancels it by itself and it completes with `-ECANCELED`.
+    /// No timer wake-up and no cancel request from the worker are needed.
+    #[inline(never)]
+    pub(crate) fn submit_op_linked(
+        &mut self,
+        io: &Io,
+        waker: &Waker,
+        deadline: (u64, u32),
+    ) -> usize {
+        // The pair must reach the kernel together: a chain cut by a
+        // submission in between would leave the timeout without its target.
+        self.make_room(2);
+        if self.link_ts.is_empty() {
+            self.link_ts = link_slots(self.ring.submission().capacity());
+        }
+        let key = self
+            .ops
+            .insert(OpState::Single(Lifecycle::Waiting(waker.clone())));
+        let slot = self.link_next;
+        self.link_next = (slot + 1) % self.link_ts.len();
+        self.link_ts[slot] = types::Timespec::new().sec(deadline.0).nsec(deadline.1);
+        let ts_ptr: *const types::Timespec = &self.link_ts[slot];
+        let sqe = sqe_for(io, self.zero_copy_min.is_some())
+            .flags(squeue::Flags::IO_LINK)
+            .user_data(key as u64);
+        let link = opcode::LinkTimeout::new(ts_ptr)
+            .flags(types::TimeoutFlags::ABS)
+            .build()
+            .flags(squeue::Flags::SKIP_SUCCESS)
+            .user_data(UD_LINK);
+        // SAFETY: as in `push` for the operation; the timespec is not
+        // written again before the kernel has taken this SQE and read it
+        // (`link_slots`), and `link_ts` is never reallocated once made.
+        unsafe {
+            let mut sq = self.ring.submission();
+            sq.push(&sqe).expect("room made above");
+            sq.push(&link).expect("room made above");
+        }
+        // The timeout is not counted (see `UD_LINK`).
+        self.inflight += 1;
+        key
+    }
+
+    /// `true` with [`IoUringFeature::LinkedDeadlines`].
+    #[inline]
+    pub(crate) fn links_deadlines(&self) -> bool {
+        self.link_deadlines
+    }
+
+    /// Hands queued SQEs to the kernel until the submission queue has room
+    /// for `n` more.
+    fn make_room(&mut self, n: usize) {
+        let mut attempts = 0u32;
+        loop {
+            {
+                let sq = self.ring.submission();
+                if sq.capacity() - sq.len() >= n {
+                    return;
+                }
+            }
+            match self.enter(0, None) {
+                Ok(()) => {}
+                Err(e) => match e.raw_os_error() {
+                    Some(libc::EINTR) => {}
+                    Some(libc::EBUSY) | Some(libc::EAGAIN) => self.reap(),
+                    _ => super::event_loop_failed("io_uring submit", e),
+                },
+            }
+            attempts += 1;
+            assert!(
+                attempts < 100_000,
+                "giong: unable to make progress submitting to io_uring"
+            );
+        }
     }
 
     /// Polls a single-shot operation, consuming its entry when it is done.
@@ -1722,6 +1844,11 @@ impl Uring {
     }
 
     fn dispatch(&mut self, user_data: u64, res: i32, flags: u32) {
+        if user_data == UD_LINK {
+            // A linked timeout that fired, or one the kernel reports
+            // anyway: not counted in flight (see `UD_LINK`).
+            return;
+        }
         let more = cqueue::more(flags);
         if !more {
             self.inflight = self.inflight.saturating_sub(1);
@@ -2174,6 +2301,94 @@ mod tests {
                         !reported,
                         "a stale IORING_SQ_TASKRUN counted as completions"
                     );
+                });
+            });
+        match run {
+            Err(e) if crate::driver::io_uring_unusable(&e) => {
+                eprintln!("skipped: {e}");
+            }
+            other => other.unwrap(),
+        }
+    }
+
+    /// Linked timeouts keep a fixed set of timespecs however busy the
+    /// worker is. They were kept until the submission queue was seen empty
+    /// at the next linked operation, which in a worker that queues other
+    /// work first (here an open) it never was: one more per operation, for
+    /// ever. A small ring makes the slots come round many times.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot run io_uring")]
+    fn linked_timeouts_reuse_a_fixed_set_of_timespecs() {
+        use crate::driver::Driver;
+        use std::future::{poll_fn, Future};
+        use std::pin::pin;
+        use std::task::Poll;
+        use std::time::{Duration, Instant};
+
+        let run = crate::runtime::Builder::new()
+            .driver(crate::DriverKind::IoUring)
+            .ring_entries(8)
+            .block_on(async {
+                let linked = crate::runtime::driver_choice()
+                    .io_uring_features
+                    .contains(&crate::IoUringFeature::LinkedDeadlines);
+                if crate::runtime::driver_kind() != crate::DriverKind::IoUring || !linked {
+                    eprintln!("skipped: no io_uring with linked deadlines");
+                    return;
+                }
+                let listener = crate::net::TcpListener::bind("127.0.0.1:0").unwrap();
+                let a = crate::net::TcpStream::connect(listener.local_addr().unwrap())
+                    .await
+                    .unwrap();
+                let b = listener.accept().await.unwrap();
+                let deadline = Instant::now() + Duration::from_secs(60);
+                crate::task::Scope::<crate::task::Cancelled>::typed(Some(deadline))
+                    .run(async {
+                        for _ in 0..300 {
+                            let mut write = pin!(a.write_all(&b"x"[..]));
+                            let mut open = pin!(crate::fs::File::open("/dev/null"));
+                            let mut read = pin!(b.read(vec![0u8; 1]));
+                            let (mut w, mut o, mut r) = (false, false, None);
+                            poll_fn(|cx| {
+                                if !w {
+                                    if let Poll::Ready(x) = write.as_mut().poll(cx) {
+                                        x.0.unwrap();
+                                        w = true;
+                                    }
+                                }
+                                // Queued before the read: the submission
+                                // queue is not empty when the read goes in.
+                                if !o {
+                                    if let Poll::Ready(x) = open.as_mut().poll(cx) {
+                                        x.unwrap();
+                                        o = true;
+                                    }
+                                }
+                                if r.is_none() {
+                                    if let Poll::Ready((n, buf)) = read.as_mut().poll(cx) {
+                                        r = Some(buf[..n.unwrap()].to_vec());
+                                    }
+                                }
+                                if w && o && r.is_some() {
+                                    Poll::Ready(())
+                                } else {
+                                    Poll::Pending
+                                }
+                            })
+                            .await;
+                            assert_eq!(r.as_deref(), Some(&b"x"[..]));
+                        }
+                        Ok(())
+                    })
+                    .await
+                    .unwrap();
+                crate::runtime::with_worker(|w| {
+                    let mut driver = w.driver.borrow_mut();
+                    let Driver::Uring(d) = &mut *driver else {
+                        unreachable!()
+                    };
+                    let capacity = d.ring.submission().capacity();
+                    assert_eq!(d.link_ts.len(), capacity / 2 + 1);
                 });
             });
         match run {

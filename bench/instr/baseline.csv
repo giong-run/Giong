@@ -2,7 +2,7 @@
 # rustc: rustc 1.97.0 (2d8144b78 2026-07-07)
 # valgrind: valgrind-3.22.0
 # kernel: 7.0.0-1014-aws
-# driver io_uring: io_uring (named by GIONG_DRIVER), using packed-buffers, registered-ring, zero-copy-send
+# driver io_uring: io_uring (named by GIONG_DRIVER), using packed-buffers, registered-ring, zero-copy-send, linked-deadlines
 # driver epoll: epoll (named by GIONG_DRIVER)
 # cpu: Intel(R) Xeon(R) 6975P-C
 # The median of the rounds; a measurement more than tolerance_pct away from
@@ -169,8 +169,14 @@
 # -0.3% / -0.2%, and 24 heap bytes fewer per idle HTTP/1.1 connection (the
 # connection's future keeps an Option<Instant> and a reference to its alarm
 # instead of an Option<Sleep>).
+# Instruction rows that giong::task moved (changelog.d/task-scopes.md), and the
+# io_uring features: scripts/instr.py on a 4-vCPU cloud VM (Linux 6.18, the same
+# rustc and valgrind), main 8e0f0b8 against the branch merged with it; a row is
+# replaced where the two differ by more than 0.05%. io_uring up to +0.3% (a test
+# and a thread-local read for waiting operations); epoll down to -2% from inlining
+# around Driver::start, which runs no new code there. Memory rows unchanged.
 driver,case,metric,value,tolerance_pct
-io_uring,spawn,instructions,1100.4,1
+io_uring,spawn,instructions,1097.4,1
 io_uring,spawn,allocations,1.000,1
 io_uring,yield,instructions,358.2,1
 io_uring,yield,allocations,0.000,1
@@ -180,29 +186,29 @@ io_uring,channel,instructions,1444.4,1
 io_uring,channel,allocations,0.000,1
 io_uring,timeout,instructions,98.1,1
 io_uring,timeout,allocations,0.000,1
-io_uring,tcp-echo,instructions,3196.0,1
+io_uring,tcp-echo,instructions,3203.0,1
 io_uring,tcp-echo,allocations,1.000,1
-io_uring,udp-echo,instructions,3712.4,1
+io_uring,udp-echo,instructions,3720.4,1
 io_uring,udp-echo,allocations,1.000,1
 io_uring,file-read,instructions,190.2,1
 io_uring,file-read,allocations,0.000,1
-io_uring,http1,instructions,6821.3,1
+io_uring,http1,instructions,6825.7,1
 io_uring,http1,allocations,0.000,1
 io_uring,http1-client,instructions,18357.1,1
 io_uring,http1-client,allocations,6.008,1
-io_uring,h2,instructions,27554.5,1
+io_uring,h2,instructions,27525.1,1
 io_uring,h2,allocations,13.001,1
-io_uring,h2-streams,instructions,216483.1,0.5
+io_uring,h2-streams,instructions,216893.0,0.5
 io_uring,h2-streams,allocations,140.005,0.5
 io_uring,https,instructions,29221.9,1
 io_uring,https,allocations,12.035,1
-io_uring,web,instructions,9345.6,1
+io_uring,web,instructions,9352.9,1
 io_uring,web,allocations,2.000,1
-io_uring,redis-get,instructions,7723.1,1
+io_uring,redis-get,instructions,7730.1,1
 io_uring,redis-get,allocations,2.000,1
-io_uring,postgres-query,instructions,9541.5,1
+io_uring,postgres-query,instructions,9550.6,1
 io_uring,postgres-query,allocations,14.000,1
-io_uring,mysql-query,instructions,13033.6,1
+io_uring,mysql-query,instructions,13034.6,1
 io_uring,mysql-query,allocations,23.000,1
 io_uring,idle-http1,heap_bytes,1080.0,1
 io_uring,idle-http1,rss_bytes,1185.8,10
@@ -216,7 +222,7 @@ io_uring,idle-https,allocations,121.180,1
 io_uring,idle-h2-tls,heap_bytes,6276.8,1
 io_uring,idle-h2-tls,rss_bytes,6848.5,10
 io_uring,idle-h2-tls,allocations,141.220,1
-epoll,spawn,instructions,996.5,1
+epoll,spawn,instructions,993.5,1
 epoll,spawn,allocations,1.000,1
 epoll,yield,instructions,306.2,1
 epoll,yield,allocations,0.000,1
@@ -226,29 +232,29 @@ epoll,channel,instructions,1341.5,1
 epoll,channel,allocations,0.000,1
 epoll,timeout,instructions,98.1,1
 epoll,timeout,allocations,0.000,1
-epoll,tcp-echo,instructions,4134.4,1
+epoll,tcp-echo,instructions,4050.4,1
 epoll,tcp-echo,allocations,1.000,1
-epoll,udp-echo,instructions,4453.6,1
+epoll,udp-echo,instructions,4440.6,1
 epoll,udp-echo,allocations,1.000,1
-epoll,file-read,instructions,241.9,3
+epoll,file-read,instructions,242.1,3
 epoll,file-read,allocations,0.016,1
-epoll,http1,instructions,7735.1,1
+epoll,http1,instructions,7647.3,1
 epoll,http1,allocations,0.000,1
-epoll,http1-client,instructions,19446.6,1
+epoll,http1-client,instructions,19340.6,1
 epoll,http1-client,allocations,6.000,1
-epoll,h2,instructions,28679.2,1
+epoll,h2,instructions,28566.3,1
 epoll,h2,allocations,13.000,1
 epoll,h2-streams,instructions,217742.9,0.5
 epoll,h2-streams,allocations,140.003,0.5
-epoll,https,instructions,30310.4,1
+epoll,https,instructions,30201.8,1
 epoll,https,allocations,12.000,1
-epoll,web,instructions,10259.8,1
+epoll,web,instructions,10179.8,1
 epoll,web,allocations,2.000,1
-epoll,redis-get,instructions,8499.8,1
+epoll,redis-get,instructions,8382.8,1
 epoll,redis-get,allocations,2.000,1
-epoll,postgres-query,instructions,10367.7,1
+epoll,postgres-query,instructions,10242.7,1
 epoll,postgres-query,allocations,14.000,1
-epoll,mysql-query,instructions,13860.7,1
+epoll,mysql-query,instructions,13727.7,1
 epoll,mysql-query,allocations,23.000,1
 epoll,idle-http1,heap_bytes,1192.6,1
 epoll,idle-http1,rss_bytes,1312.8,10

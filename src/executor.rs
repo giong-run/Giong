@@ -131,6 +131,10 @@ pub enum JoinError {
     Cancelled,
     /// The task panicked; the payload is the panic value.
     Panic(Box<dyn Any + Send + 'static>),
+    /// The task was started in a [`TaskGroup`](crate::task::TaskGroup)
+    /// under a [deadline](crate::task#deadlines), which passed before it
+    /// finished. [`is_cancelled`](Self::is_cancelled) is `true` for it too.
+    DeadlineExceeded,
 }
 
 impl JoinError {
@@ -139,9 +143,16 @@ impl JoinError {
         matches!(self, JoinError::Panic(_))
     }
 
-    /// `true` if the task was cancelled.
+    /// `true` if the task was cancelled, by an abort, a shutdown or its
+    /// deadline.
     pub fn is_cancelled(&self) -> bool {
-        matches!(self, JoinError::Cancelled)
+        matches!(self, JoinError::Cancelled | JoinError::DeadlineExceeded)
+    }
+
+    /// `true` if the task's deadline passed (see
+    /// [`JoinError::DeadlineExceeded`]).
+    pub fn is_deadline_exceeded(&self) -> bool {
+        matches!(self, JoinError::DeadlineExceeded)
     }
 
     /// Returns the panic payload, or `self` if the task did not panic.
@@ -158,6 +169,7 @@ impl fmt::Debug for JoinError {
         match self {
             JoinError::Cancelled => f.write_str("JoinError::Cancelled"),
             JoinError::Panic(_) => f.write_str("JoinError::Panic(..)"),
+            JoinError::DeadlineExceeded => f.write_str("JoinError::DeadlineExceeded"),
         }
     }
 }
@@ -167,6 +179,7 @@ impl fmt::Display for JoinError {
         match self {
             JoinError::Cancelled => f.write_str("task was cancelled"),
             JoinError::Panic(_) => f.write_str("task panicked"),
+            JoinError::DeadlineExceeded => f.write_str("task's deadline passed"),
         }
     }
 }

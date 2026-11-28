@@ -181,6 +181,19 @@ codes! {
     /// (`WouldBlock` for `EAGAIN`) is kept.
     ThreadLimit = 20, WouldBlock, "a worker thread could not be started";
 
+    // --------------------------------------------------------------- tasks
+    /// The deadline of a [`Scope`](crate::task::Scope) made with
+    /// [`Scope::with_deadline`](crate::task::Scope::with_deadline) or
+    /// [`Scope::with_timeout`](crate::task::Scope::with_timeout) passed
+    /// before its work finished; the work was dropped.
+    DeadlineExceeded = 24, TimedOut, "the deadline passed";
+    /// [`Scope::cancel`](crate::task::Scope::cancel) was called before the
+    /// scope's body returned.
+    ScopeCancelled = 25, Other, "the scope was cancelled";
+    /// [`Scope::run`](crate::task::Scope::run) was polled while another run
+    /// of the same scope was going. It panics with this code.
+    ScopeAlreadyRunning = 26, Other, "the scope is already running";
+
     // -------------------------------------------------------------- macOS
     /// macOS had no network buffer for a send or connect (`ENOBUFS`), for
     /// longer than giong waits: sockets holding much unread data bring it

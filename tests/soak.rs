@@ -29,6 +29,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use giong::net::{TcpListener, TcpStream, UdpSocket};
+use giong::task::Scope;
 use giong::time::{sleep, timeout};
 
 mod common;
@@ -56,6 +57,13 @@ struct Counters {
     connections: AtomicU64,
     round_trips: AtomicU64,
     cancelled_recvs: AtomicU64,
+    /// One-off reads cut by a scope's deadline (linked to the read on
+    /// io_uring), whose late reply was then read whole and intact.
+    deadline_cuts: AtomicU64,
+    /// Round trips run inside a scope whose deadline they beat.
+    deadline_trips: AtomicU64,
+    /// Cut reads not checked: the worker stalled until the reply was due.
+    deadline_unchecked: AtomicU64,
     datagrams: AtomicU64,
     files: AtomicU64,
     cross_worker: AtomicU64,
@@ -231,6 +239,21 @@ async fn recv_exact(stream: &TcpStream, len: usize) -> std::io::Result<Vec<u8>> 
     Ok(got)
 }
 
+/// Reads exactly `len` bytes with one-off reads (the operations a scope's
+/// deadline is linked to on io_uring).
+async fn read_exact(stream: &TcpStream, len: usize) -> std::io::Result<Vec<u8>> {
+    let mut got = Vec::with_capacity(len);
+    while got.len() < len {
+        let (n, buf) = stream.read(vec![0u8; len - got.len()]).await;
+        let n = n?;
+        if n == 0 {
+            return Err(std::io::ErrorKind::UnexpectedEof.into());
+        }
+        got.extend_from_slice(&buf[..n]);
+    }
+    Ok(got)
+}
+
 /// Waits for `fut`, but not forever: a server that never answers or never
 /// closes is a bug the soak test must report, not hang on.
 async fn within<T>(
@@ -284,7 +307,7 @@ async fn client(addr: SocketAddr, deadline: Instant, rng: Rng, counters: Arc<Cou
         Counters::bump(&counters.connections);
         let len = HEADER + rng.below(3000) as usize;
         let mut msg = message(ECHO, len, rng.below(256) as u8);
-        match rng.below(4) {
+        match rng.below(5) {
             // Some round trips, then a clean close.
             0 | 1 => {
                 for _ in 0..1 + rng.below(8) {
@@ -317,6 +340,63 @@ async fn client(addr: SocketAddr, deadline: Instant, rng: Rng, counters: Arc<Cou
                     Counters::bump(&counters.cancelled_recvs);
                 }
                 // Dropped with the reply still on its way.
+            }
+            // Deadlines: round trips inside a scope that they beat, or a
+            // slow reply whose read the scope's deadline cuts (in the
+            // kernel, on io_uring), then read whole afterwards: nothing of
+            // it went with the cut read.
+            4 => {
+                if rng.below(2) == 0 {
+                    let rounds = 1 + rng.below(4);
+                    let res = Scope::with_timeout(Duration::from_secs(10))
+                        .run(async {
+                            for _ in 0..rounds {
+                                msg[0] = ECHO;
+                                let (res, back) = stream.write_all(msg.clone()).await;
+                                drop(back);
+                                res?;
+                                let reply = read_exact(&stream, len).await?;
+                                if reply != msg {
+                                    return Err(std::io::Error::other("reply differs"));
+                                }
+                            }
+                            Ok(())
+                        })
+                        .await;
+                    match res {
+                        Ok(()) => Counters::bump(&counters.deadline_trips),
+                        Err(err) => counters.unexpected("deadline echo", err),
+                    }
+                } else {
+                    msg[0] = STALL;
+                    let asked = Instant::now();
+                    let (res, back) = stream.write_all(msg).await;
+                    msg = back;
+                    if let Err(err) = res {
+                        counters.unexpected("write", err);
+                        continue;
+                    }
+                    let cut = Scope::with_timeout(Duration::from_millis(2))
+                        .run(async { stream.read(vec![0u8; len]).await.0 })
+                        .await;
+                    if cut.is_ok() || asked.elapsed() >= Duration::from_millis(15) {
+                        // The worker stalled for about as long as the server
+                        // takes to reply: the read may have reached the
+                        // kernel only once the reply was there, and taken
+                        // it, as a dropped read does (see `giong::task`).
+                        // Nothing to check.
+                        Counters::bump(&counters.deadline_unchecked);
+                        continue;
+                    }
+                    match within(&counters, "late reply", read_exact(&stream, len)).await {
+                        Some(Ok(reply)) if reply[1..] == msg[1..] => {
+                            Counters::bump(&counters.deadline_cuts)
+                        }
+                        Some(Ok(_)) => counters.unexpected("late reply", "reply differs"),
+                        Some(Err(err)) => counters.unexpected("late reply", err),
+                        None => {}
+                    }
+                }
             }
             // Half-close, or have the server hang up on unread data.
             _ => {
@@ -916,6 +996,8 @@ fn soak() {
     );
     assert!(c.connections.load(Ordering::Relaxed) > 0);
     assert!(c.cancelled_recvs.load(Ordering::Relaxed) > 0);
+    assert!(c.deadline_cuts.load(Ordering::Relaxed) > 0);
+    assert!(c.deadline_trips.load(Ordering::Relaxed) > 0);
 
     // 2. Every worker's driver went back to idle.
     for (worker, stats, quiet) in &idle {
@@ -1150,12 +1232,16 @@ fn run(workers: usize, secs: u64) -> Run {
     let c = &counters;
     eprintln!(
         "soak: done after {secs}s on {workers} workers: {} connections, {} echoes, \
-         {} cancelled receives, {} messages received in pieces, {} datagrams, {} files, \
+         {} cancelled receives, {} reads cut by a deadline ({} more not checked after a \
+         stall), {} round trips under a deadline, {} messages received in pieces, {} datagrams, {} files, \
          {} cross-worker hops, {} connects refused by the kernel, {} connects that \
          found no free local port",
         c.connections.load(Ordering::Relaxed),
         c.round_trips.load(Ordering::Relaxed),
         c.cancelled_recvs.load(Ordering::Relaxed),
+        c.deadline_cuts.load(Ordering::Relaxed),
+        c.deadline_unchecked.load(Ordering::Relaxed),
+        c.deadline_trips.load(Ordering::Relaxed),
         c.split.load(Ordering::Relaxed),
         c.datagrams.load(Ordering::Relaxed),
         c.files.load(Ordering::Relaxed),
