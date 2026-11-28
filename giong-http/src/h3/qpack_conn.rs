@@ -33,6 +33,14 @@ pub(crate) struct Decoder {
     over: Cell<bool>,
 }
 
+/// The most our decoder stream may have to say and not have said: a peer
+/// that gives that stream no flow-control credit while it goes on inserting
+/// and sending field sections would otherwise make it grow for as long as
+/// the connection lasts. Past it, the connection is closed with
+/// H3_EXCESSIVE_LOAD. Acknowledgments take a byte or two each, so a peer
+/// that reads its stream never comes near.
+const MAX_UNSENT: usize = if cfg!(test) { 64 } else { 16 * 1024 };
+
 fn failed(what: &'static str) -> Error {
     Error::new(Code::QpackDecompressionFailed, what)
 }
@@ -48,6 +56,17 @@ impl Decoder {
             writer: Cell::new(None),
             over: Cell::new(false),
         }
+    }
+
+    /// What our decoder stream holds is over [`MAX_UNSENT`].
+    fn unread(&self) -> Result<(), Error> {
+        if self.out.borrow().len() > MAX_UNSENT {
+            return Err(Error::new(
+                Code::ExcessiveLoad,
+                "the peer does not read our QPACK decoder stream",
+            ));
+        }
+        Ok(())
     }
 
     fn said(&self) {
@@ -73,6 +92,7 @@ impl Decoder {
             for waker in self.waiting.borrow_mut().drain(..) {
                 waker.wake();
             }
+            self.unread()?;
         }
         Ok(used)
     }
@@ -87,6 +107,9 @@ impl Decoder {
         block: &[u8],
         field: impl FnMut(&[u8], &[u8]),
     ) -> Result<(), Error> {
+        // Checked first as well: Stream Cancellations, which a peer can
+        // cause without a section ever decoded, add to it too.
+        self.unread()?;
         let prefix = self.table.borrow().prefix(block)?;
         if prefix.required > self.table.borrow().inserted() {
             if self.blocked.get() >= BLOCKED_STREAMS {
@@ -121,7 +144,7 @@ impl Decoder {
         if prefix.required > 0 {
             self.said();
         }
-        Ok(())
+        self.unread()
     }
 
     /// Stream `stream` is given up with a field section never decoded (too

@@ -6,7 +6,9 @@
   encoder, 50 requests carrying a 200-byte cookie took 1,168 bytes of field sections and encoder
   stream instead of 12,350 (−90.5%), and the server spent 13% fewer instructions per request. A
   connection holds at most the configured bytes of table, at most 16 requests may wait for
-  insertions, and a request that gives up waiting is cancelled for the client's encoder.
+  insertions, a request that gives up waiting is cancelled for the client's encoder, and a
+  client that leaves more than 16 KiB of acknowledgments unread has its connection closed
+  (`H3_EXCESSIVE_LOAD`).
   Responses still use the static table alone.
 - **giong-http**: `ClientBuilder::qpack_table_size` (feature `unstable-http3`) does the same for
   responses: an HTTP/3 server may fill a dynamic table of that size, off by default. Against an

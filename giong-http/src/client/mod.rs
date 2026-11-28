@@ -501,7 +501,9 @@ impl ClientBuilder {
     /// (each field's name and value and 32 bytes), and is charged for it
     /// only once the server inserts something. At most 16 responses of a
     /// connection may wait for insertions at once; one more is a
-    /// connection error, as RFC 9204 says.
+    /// connection error, as RFC 9204 says, and so is a server that leaves
+    /// more than 16 KiB of the client's acknowledgments unread
+    /// (`H3_EXCESSIVE_LOAD`).
     ///
     /// Requests still use the static table alone.
     #[cfg(feature = "unstable-http3")]

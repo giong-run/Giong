@@ -757,6 +757,56 @@ fn a_response_head_too_large_to_decode_is_cancelled_for_the_encoder() {
 }
 
 #[test]
+fn a_server_that_never_reads_the_decoder_stream_cannot_grow_it() {
+    run(|| async {
+        let (server_tls, client_tls) = tls();
+        // 32 bytes of credit on each stream the client opens: what the
+        // client's decoder stream says past that waits, since the server
+        // reads none of it.
+        let transport = giong_quic::TransportConfig::default().windows(32, 1 << 20);
+        let endpoint = Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            ServerConfig::new(server_tls).unwrap().transport(transport),
+        )
+        .unwrap();
+        let addr: SocketAddr = endpoint.local_addr().unwrap();
+        let client = Client::builder()
+            .http3_prior_knowledge(ClientConfig::new(client_tls).unwrap())
+            .qpack_table_size(4096)
+            .timeout(Duration::from_secs(10))
+            .build();
+        let told = Told::default();
+        let seen = told.clone();
+        drop(giong::spawn(async move {
+            let conn = endpoint.accept().await.unwrap();
+            let _control = control(&conn).await;
+            let mut encoder = conn.open_uni().await.unwrap();
+            encoder.write_all(SERVER_INSERTS).await.unwrap();
+            // Each Duplicate (000 index(5)) read on its own is one more
+            // Insert Count Increment to say: past the cap (64 bytes in
+            // tests, 16 KiB otherwise), H3_EXCESSIVE_LOAD (0x107).
+            for _ in 0..200 {
+                if encoder.write_all(&[0x00]).await.is_err() {
+                    break;
+                }
+                giong::time::sleep(Duration::from_millis(1)).await;
+            }
+            answer_until_closed(&conn, &told).await;
+        }));
+        // The request opens the connection; its answer does not matter.
+        let _ = client.get(&format!("https://{addr}/")).send().await;
+        for _ in 0..400 {
+            if !seen.borrow().is_empty() {
+                break;
+            }
+            giong::time::sleep(Duration::from_millis(5)).await;
+        }
+        let seen = seen.borrow();
+        assert!(seen.contains("263"), "{seen}");
+    });
+}
+
+#[test]
 fn a_response_head_larger_than_allowed_is_refused() {
     run(|| async {
         let (endpoint, url, client) = pair_with(|b| b.max_head_size(4096));

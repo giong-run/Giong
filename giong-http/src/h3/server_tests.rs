@@ -1378,6 +1378,29 @@ fn a_section_answered_431_undecoded_is_cancelled_for_the_encoder() {
 }
 
 #[test]
+fn a_client_that_never_reads_the_decoder_stream_cannot_grow_it() {
+    run(|| async {
+        // 32 bytes of credit on each stream the server opens: what the
+        // decoder stream says past that waits, since the client reads none
+        // of it.
+        let transport = TransportConfig::default().windows(32, 1 << 20);
+        let client = connect_with(Server::new().qpack_table_size(220), transport).await;
+        let mut encoder = encoder_stream(&client, INSERTS).await;
+        // Each Duplicate (000 index(5)) read on its own is one more Insert
+        // Count Increment to say: past the cap (64 bytes in tests, 16 KiB
+        // otherwise), H3_EXCESSIVE_LOAD (0x107).
+        for _ in 0..200 {
+            if encoder.write_all(&[0x00]).await.is_err() {
+                break;
+            }
+            giong::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+        let seen = closed_with(&client).await;
+        assert!(seen.contains("0x107") || seen.contains("263"), "{seen}");
+    });
+}
+
+#[test]
 fn an_encoder_stream_that_breaks_rfc_9204_closes_the_connection() {
     run(|| async {
         // A capacity above the one allowed: QPACK_ENCODER_STREAM_ERROR
