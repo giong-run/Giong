@@ -364,29 +364,15 @@ fn the_trailers_of_a_streamed_response_are_read_over_http3() {
 }
 
 #[test]
-fn a_streamed_request_body_is_refused_with_prior_knowledge() {
+fn a_streamed_request_body_goes_over_http3_with_prior_knowledge() {
     run(|| async {
         let (url, client) = served();
-        // The HTTP/3 client sends bodies it has whole, and a server known to
-        // speak HTTP/3 may have no TCP: refused, with nothing sent.
         let (request, body) = client.post(&format!("{url}/echo")).streamed_body();
         body.send("piece").await.unwrap();
         drop(body);
-        let err = request.send().await.unwrap_err();
-        assert_eq!(err.kind(), ErrorKind::Request, "{err}");
-        assert!(err.to_string().contains("streamed request body"), "{err}");
-        assert!(
-            PEERS.with(|p| p.borrow().is_empty()),
-            "nothing reached the server"
-        );
-        // Whole bodies go over HTTP/3.
-        let res = client
-            .post(&format!("{url}/echo"))
-            .body("whole")
-            .send()
-            .await
-            .unwrap();
-        assert_eq!((res.version(), res.body()), (Version::Http3, &b"whole"[..]));
+        let res = request.send().await.unwrap();
+        assert_eq!((res.version(), res.body()), (Version::Http3, &b"piece"[..]));
+        assert_eq!(PEERS.with(|p| p.borrow().len()), 1);
     });
 }
 
@@ -484,6 +470,70 @@ fn a_request_the_server_rejected_unprocessed_is_sent_again() {
             .await
             .unwrap();
         assert_eq!(res.body(), b"2");
+    });
+}
+
+/// A server that rejects its first request with H3_REQUEST_REJECTED,
+/// before or after reading it to its end, then answers the next with the
+/// length of its body.
+fn rejects_first(endpoint: Endpoint, read_first: bool) {
+    drop(giong::spawn(async move {
+        let conn = endpoint.accept().await.unwrap();
+        let _control = control(&conn).await;
+        let (mut send, mut recv) = conn.accept_bi().await.unwrap();
+        if read_first {
+            let _ = recv.read_to_end(1 << 20).await;
+        }
+        send.reset(0x10b);
+        recv.stop(0x10b);
+        while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+            let bytes = recv.read_to_end(1 << 20).await.unwrap_or_default();
+            // The HEADERS frame, then the body's DATA frames.
+            let mut rest = &bytes[..];
+            let mut len = 0;
+            while let Some((kind, a)) = frame::read_varint(rest) {
+                let (n, b) = frame::read_varint(&rest[a..]).unwrap();
+                if kind == kind::DATA {
+                    len += n;
+                }
+                rest = &rest[a + b + n as usize..];
+            }
+            let mut out = headers(Some(200), &[]);
+            out.extend(data(len.to_string().as_bytes()));
+            let _ = send.write_all(&out).await;
+            let _ = send.finish();
+        }
+    }));
+}
+
+#[test]
+fn a_streamed_request_rejected_before_its_body_was_taken_is_sent_again() {
+    run(|| async {
+        let (endpoint, url, client) = pair();
+        rejects_first(endpoint, false);
+        let (request, body) = client.post(&format!("{url}/")).streamed_body();
+        let producer = giong::spawn(async move {
+            // After the rejection: the source is still whole.
+            giong::time::sleep(Duration::from_millis(100)).await;
+            body.send("abc").await.unwrap();
+        });
+        let res = request.send().await.unwrap();
+        producer.await.unwrap();
+        assert_eq!(res.body(), b"3");
+    });
+}
+
+#[test]
+fn a_streamed_request_rejected_after_its_body_was_taken_is_not_sent_again() {
+    run(|| async {
+        let (endpoint, url, client) = pair();
+        rejects_first(endpoint, true);
+        let (request, body) = client.post(&format!("{url}/")).streamed_body();
+        body.send("abc").await.unwrap();
+        drop(body);
+        let err = request.send().await.unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Closed, "{err}");
+        assert!(err.to_string().contains("not sent again"), "{err}");
     });
 }
 

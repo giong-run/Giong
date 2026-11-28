@@ -1216,6 +1216,32 @@ impl Shared {
         .await
     }
 
+    pub(crate) async fn stopped(self: &Rc<Self>, h: usize, s: Sid) -> io::Result<u64> {
+        poll_fn(|cx| {
+            let mut st = self.st.borrow_mut();
+            let c = st.conn(h);
+            if c.stale(s) {
+                return Poll::Ready(Err(error::early_rejected()));
+            }
+            match c.c.send_stream(s.id).stopped() {
+                Ok(Some(code)) => Poll::Ready(Ok(code.into_inner())),
+                Ok(None) => match &c.lost {
+                    Some(e) => Poll::Ready(Err(error::lost(e))),
+                    None => {
+                        // `StreamEvent::Stopped` wakes the writer.
+                        c.streams.entry(s.id).or_default().write = Some(cx.waker().clone());
+                        Poll::Pending
+                    }
+                },
+                Err(_) => Poll::Ready(Err(match &c.lost {
+                    Some(e) => error::lost(e),
+                    None => error::lost(&ConnectionError::LocallyClosed),
+                })),
+            }
+        })
+        .await
+    }
+
     pub(crate) fn finish(&self, h: usize, s: Sid) -> io::Result<()> {
         let mut st = self.st.borrow_mut();
         let c = st.conn(h);
