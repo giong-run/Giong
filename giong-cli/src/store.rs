@@ -252,8 +252,19 @@ mod lock {
     #[cfg(not(giong_file_lock))]
     pub const AVAILABLE: bool = false;
 
+    /// How long a lock found taken is tried again before it counts as
+    /// held. A Unix lock is released when the last descriptor of its open
+    /// file closes, and a process this one starts holds a copy of every
+    /// descriptor until its program runs (even the ones that close then): a
+    /// lock this process has just let go of can be taken for that long by a
+    /// process another thread is starting (#535). That lasted up to 20 ms on
+    /// a Linux machine with 3 busy threads per core; a cargo build holds its
+    /// lock for seconds.
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
+
     /// An exclusive lock on `path` (made if missing when `create`), or
-    /// `None` when someone else holds a lock on it.
+    /// `None` when someone else holds a lock on it (still, after
+    /// [`SETTLE`]).
     pub fn try_exclusive(path: &Path, create: bool) -> io::Result<Option<File>> {
         let file = std::fs::OpenOptions::new()
             .read(true)
@@ -263,10 +274,16 @@ mod lock {
             .open(path)?;
         #[cfg(giong_file_lock)]
         {
-            match file.try_lock() {
-                Ok(()) => Ok(Some(file)),
-                Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-                Err(std::fs::TryLockError::Error(e)) => Err(e),
+            let started = std::time::Instant::now();
+            loop {
+                match file.try_lock() {
+                    Ok(()) => return Ok(Some(file)),
+                    Err(std::fs::TryLockError::WouldBlock) if started.elapsed() < SETTLE => {
+                        std::thread::sleep(std::time::Duration::from_millis(2));
+                    }
+                    Err(std::fs::TryLockError::WouldBlock) => return Ok(None),
+                    Err(std::fs::TryLockError::Error(e)) => return Err(e),
+                }
             }
         }
         #[cfg(not(giong_file_lock))]
@@ -1766,6 +1783,46 @@ mod tests {
         let _ = fs::remove_dir_all(&d);
         fs::create_dir_all(&d).unwrap();
         d
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lock_let_go_of_is_not_taken_by_a_process_starting_meanwhile() {
+        if !lock::AVAILABLE {
+            return;
+        }
+        // A process started while this one holds a lock holds it too, until
+        // its program runs: the next try must not find it taken (#535).
+        let t = temp("settle");
+        let path = t.join(".cargo-build-lock");
+        fs::write(&path, "").unwrap();
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let starters: Vec<_> = (0..3)
+            .map(|_| {
+                let stop = stop.clone();
+                std::thread::spawn(move || {
+                    while !stop.load(Ordering::Relaxed) {
+                        let _ = std::process::Command::new("true").status();
+                    }
+                })
+            })
+            .collect();
+        let started = std::time::Instant::now();
+        let mut tries = 0;
+        let mut taken = 0;
+        while started.elapsed() < Duration::from_secs(2) {
+            drop(lock::try_exclusive(&path, false).unwrap());
+            if lock::try_exclusive(&path, false).unwrap().is_none() {
+                taken += 1;
+            }
+            tries += 1;
+        }
+        stop.store(true, Ordering::Relaxed);
+        for s in starters {
+            s.join().unwrap();
+        }
+        assert_eq!(taken, 0, "found taken {taken} times in {tries}");
+        fs::remove_dir_all(&t).unwrap();
     }
 
     #[test]
