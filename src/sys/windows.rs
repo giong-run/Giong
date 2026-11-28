@@ -164,6 +164,19 @@ fn thread_event() -> io::Result<HANDLE> {
     })
 }
 
+/// Closes the calling thread's [`thread_event`], if it has one; the next
+/// transfer makes another.
+pub(crate) fn release_thread_event() {
+    EVENT.with(|event| {
+        let made = event.0.replace(std::ptr::null_mut());
+        if !made.is_null() {
+            // SAFETY: the event this thread made; no transfer of this
+            // thread is in progress, and only those wait on it.
+            unsafe { windows_sys::Win32::Foundation::CloseHandle(made) };
+        }
+    });
+}
+
 thread_local! {
     static EVENT: ThreadEvent = const { ThreadEvent(std::cell::Cell::new(std::ptr::null_mut())) };
 }

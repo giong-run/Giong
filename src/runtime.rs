@@ -420,6 +420,9 @@ struct Deferred {
     /// Sockets given up, where a socket is not a descriptor.
     #[cfg(windows)]
     sock_closes: Vec<sys::RawSock>,
+    /// File handles given up that are closed on a blocking thread.
+    #[cfg(windows)]
+    file_closes: Vec<sys::RawFile>,
 }
 
 impl Deferred {
@@ -432,9 +435,11 @@ impl Deferred {
             closes,
             #[cfg(windows)]
             sock_closes,
+            #[cfg(windows)]
+            file_closes,
         } = self;
         #[cfg(windows)]
-        if !sock_closes.is_empty() {
+        if !sock_closes.is_empty() || !file_closes.is_empty() {
             return false;
         }
         multis.is_empty() && cancels.is_empty() && closes.is_empty()
@@ -1028,6 +1033,14 @@ impl Worker {
         self.deferred_waiting.set(true);
     }
 
+    /// [`defer_close`](Self::defer_close) for a file handle that is closed
+    /// on a blocking thread (see `Driver::close_file`).
+    #[cfg(windows)]
+    pub(crate) fn defer_close_file(&self, fd: sys::RawFile) {
+        self.deferred.borrow_mut().file_closes.push(fd);
+        self.deferred_waiting.set(true);
+    }
+
     /// [`defer_close`](Self::defer_close) for a socket.
     pub(crate) fn defer_close_sock(&self, sock: sys::RawSock) {
         #[cfg(unix)]
@@ -1114,6 +1127,10 @@ impl Worker {
         }
         for fd in deferred.closes {
             driver.close_fd(fd);
+        }
+        #[cfg(windows)]
+        for fd in deferred.file_closes {
+            driver.close_file(fd);
         }
         #[cfg(windows)]
         for sock in deferred.sock_closes {
@@ -2758,6 +2775,9 @@ mod tests {
         {
             let mut deferred = Deferred::default();
             deferred.sock_closes.push(super::sys::RawSock::MAX);
+            assert!(!deferred.is_empty());
+            let mut deferred = Deferred::default();
+            deferred.file_closes.push(std::ptr::null_mut());
             assert!(!deferred.is_empty());
         }
     }

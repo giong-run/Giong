@@ -7,6 +7,14 @@
 //! listings), so those run on a pool of blocking threads and report to the
 //! worker's port, with the same API and the same cancellation rules.
 //!
+//! Two calls that look overlapped can still wait for the disk, and run on
+//! the blocking threads too: a write that extends the file (NTFS runs a
+//! write past the data already written synchronously, even on an
+//! overlapped handle), and the close of a file opened for writing (the file
+//! system's cleanup and the filter drivers' scans run inside
+//! `CloseHandle`). In CI either took up to 0.85 s, during which the worker
+//! served nothing else.
+//!
 //! ```no_run
 //! use giong::fs::{self, File};
 //!
@@ -38,6 +46,7 @@
 //! (permission bits, inode numbers, `open(2)` flags), and with handles in
 //! place of descriptors.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::ffi::{OsStr, OsString};
 use std::io;
@@ -264,7 +273,7 @@ impl OpenOptions {
         // A file the caller never receives is closed where it is dropped:
         // with the operation's resources.
         let file = blocking(move || options.open(path)).await?;
-        Ok(File::from_std_opened(file))
+        Ok(File::from_std_opened(file, self.writes()))
     }
 
     /// Opens `path` beneath `root` with these options, refusing a path
@@ -276,7 +285,7 @@ impl OpenOptions {
         let file = root
             .open_beneath(path.as_ref(), Want::File(self.clone()))
             .await?;
-        Ok(File::from_std_opened(file))
+        Ok(File::from_std_opened(file, self.writes()))
     }
 
     /// The standard library's options for these, with `extra` flags.
@@ -291,6 +300,17 @@ impl OpenOptions {
             .create_new(self.create_new)
             .custom_flags(self.custom_flags | sys::FILE_FLAG_OVERLAPPED | extra);
         options
+    }
+
+    /// How a file opened with these options is written to.
+    fn writes(&self) -> Writes {
+        if self.append {
+            Writes::Append
+        } else if self.write {
+            Writes::At
+        } else {
+            Writes::None
+        }
     }
 
     /// Whether opening with these options may create or empty a file.
@@ -339,13 +359,37 @@ fn offset_out_of_range(offset: u64) -> io::Error {
 ///
 /// All methods take `&self` and name the offset they work at, so a file can
 /// be shared (e.g. in an `Rc`) by any number of tasks.
+///
+/// On Windows, dropping a file that was written to returns before the file
+/// is closed: the close waits for the disk, so it runs on a blocking thread.
+/// Until it has run, Windows may refuse to rename or remove the file or its
+/// directory, or to open it without sharing. Await [`File::close`] first,
+/// as when a temporary file you wrote is renamed over another.
 pub struct File {
     handle: RawHandle,
     /// Opened for overlapped I/O, so reads and writes go through the
     /// completion port. A file from [`File::from_std`] may not be: its reads
     /// and writes run on the blocking threads.
     overlapped: bool,
+    /// How the file was opened for writing.
+    writes: Writes,
+    /// Where a write starts to extend the file, as far as this handle
+    /// knows: the length at open, then the end of the furthest write. A
+    /// write that ends past it runs on a blocking thread, since NTFS runs it
+    /// synchronously, overlapped handle or not.
+    grows_from: Cell<u64>,
     _not_send: PhantomData<*const ()>,
+}
+
+/// How a [`File`] was opened for writing.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Writes {
+    /// Not at all.
+    None,
+    /// At the offsets the caller names.
+    At,
+    /// Always at the end: every write extends the file.
+    Append,
 }
 
 impl File {
@@ -381,24 +425,40 @@ impl File {
     /// blocking threads; a file opened through [`File::options`] reads and
     /// writes through the worker's completion port.
     pub fn from_std(file: std::fs::File) -> Self {
-        Self::from_handle(file.into_raw_handle(), false)
+        // How it was opened is not known: it may have been written to, so
+        // it is closed as such.
+        Self::from_handle(file.into_raw_handle(), false, Writes::At, 0)
     }
 
     /// A file `OpenOptions` opened, for overlapped I/O.
-    fn from_std_opened(file: std::fs::File) -> Self {
+    fn from_std_opened(file: std::fs::File, writes: Writes) -> Self {
+        // The length lives in memory with the open file: reading it does not
+        // wait for the disk. Unknown, every write counts as extending.
+        let len = match writes {
+            Writes::At => file.metadata().map_or(0, |m| m.len()),
+            Writes::None | Writes::Append => 0,
+        };
         let handle = file.into_raw_handle();
         // A console (`CONIN$`, `CONOUT$`) ignores the overlapped flag and
         // cannot join the completion port: its calls block, so they go to
         // the blocking threads.
-        Self::from_handle(handle, !sys::is_char_device(handle))
+        Self::from_handle(handle, !sys::is_char_device(handle), writes, len)
     }
 
-    fn from_handle(handle: RawHandle, overlapped: bool) -> Self {
+    fn from_handle(handle: RawHandle, overlapped: bool, writes: Writes, len: u64) -> Self {
         Self {
             handle,
             overlapped,
+            writes,
+            grows_from: Cell::new(len),
             _not_send: PhantomData,
         }
+    }
+
+    /// Whether `len` bytes written at `offset` may extend the file.
+    fn extends(&self, offset: u64, len: u32) -> bool {
+        self.writes == Writes::Append
+            || offset.saturating_add(u64::from(len)) > self.grows_from.get()
     }
 
     /// The handle, as a standard file that does not close it.
@@ -520,7 +580,25 @@ impl File {
         let len = (buf.len() - skip).min(i32::MAX as usize) as u32;
         // SAFETY: `skip <= len`, so the pointer stays within the buffer.
         let ptr = unsafe { buf.as_ptr().add(skip) };
-        if self.overlapped {
+        let (res, buf) = self.write_raw(buf, ptr, len, offset).await;
+        if let Ok(n) = res {
+            let end = offset.saturating_add(n as u64);
+            if end > self.grows_from.get() {
+                self.grows_from.set(end);
+            }
+        }
+        (res, buf)
+    }
+
+    /// Writes the `len` bytes at `ptr`, inside `buf`, at `offset`.
+    async fn write_raw<B: IoBuf>(
+        &self,
+        buf: B,
+        ptr: *const u8,
+        len: u32,
+        offset: u64,
+    ) -> (io::Result<usize>, B) {
+        if self.overlapped && !self.extends(offset, len) {
             let io = Io::Write {
                 fd: self.handle,
                 buf: ptr,
@@ -541,11 +619,20 @@ impl File {
                 Err(e) => return (Err(e), buf),
             };
             let from = SendPtr(ptr.cast_mut());
+            let overlapped = self.overlapped;
             let call = move || {
                 let from = from;
                 // SAFETY: `from` names `len` bytes of the buffer, which is
                 // kept until this returns; they are only read.
-                unsafe { sys::write_at(file.as_raw_handle(), from.0, len, offset) }
+                let res = unsafe { sys::write_at(file.as_raw_handle(), from.0, len, offset) };
+                if overlapped {
+                    // A write that extends a file opened through the port:
+                    // the event it waited on goes now rather than with the
+                    // thread, so that a pool thread that lives on does not
+                    // hold one more handle for it.
+                    sys::release_thread_event();
+                }
+                res
             };
             // SAFETY: as above.
             unsafe { blocking_with(buf, call) }.await
@@ -657,11 +744,23 @@ impl File {
     /// closes it too, without the error.
     ///
     /// Cancel safe: the handle is closed even if the future is dropped.
+    ///
+    /// On Windows, the file is closed when this returns, while dropping a
+    /// file that was written to closes it later, on a blocking thread (see
+    /// [`File`]): await this before renaming, removing or reopening a file
+    /// you wrote.
     pub async fn close(self) -> io::Result<()> {
         let handle = self.handle;
+        // A file written to may wait for the disk as it closes: that runs
+        // on a blocking thread.
+        let io = if self.writes == Writes::None {
+            Io::Close { fd: handle }
+        } else {
+            Io::CloseFile { fd: handle }
+        };
         mem::forget(self);
         // SAFETY: the operation has no pointers.
-        let (res, _, ()) = unsafe { Op::new(Io::Close { fd: handle }, ()) }.await;
+        let (res, _, ()) = unsafe { Op::new(io, ()) }.await;
         if res < 0 {
             Err(os_err(res))
         } else {
@@ -681,8 +780,13 @@ impl Drop for File {
         let handle = self.handle;
         // Through the current worker's driver, which forgets the handle
         // too; directly if there is none.
+        // A file written to may wait for the disk as it closes: that runs
+        // on a blocking thread.
+        let off_worker = self.writes != Writes::None;
         let closed = runtime::try_with_worker(|w| match w.driver.try_borrow_mut() {
+            Ok(mut driver) if off_worker => driver.close_file(handle),
             Ok(mut driver) => driver.close_fd(handle),
+            Err(_) if off_worker => w.defer_close_file(handle),
             Err(_) => w.defer_close(handle),
         })
         .is_some();
@@ -1405,5 +1509,80 @@ impl DirEntry {
     /// Cancel safe: if the future is dropped, nothing changes.
     pub async fn metadata(&self) -> io::Result<Metadata> {
         symlink_metadata(self.path()).await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_write_that_may_extend_the_file_is_told_from_one_that_cannot() {
+        let dir = std::env::temp_dir().join(format!("giong-extends-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("f");
+        crate::block_on(async {
+            // A new file: every write extends it until bytes are written.
+            let f = File::create(&path).await.unwrap();
+            assert!(f.extends(0, 1));
+            let (res, _) = f.write_all_at(vec![7u8; 8192], 0).await;
+            res.unwrap();
+            assert!(!f.extends(0, 8192));
+            assert!(!f.extends(4096, 4096));
+            assert!(f.extends(4096, 4097));
+            f.close().await.unwrap();
+
+            // Opened again for writing, it knows its length.
+            let f = File::options().write(true).open(&path).await.unwrap();
+            assert!(!f.extends(0, 8192));
+            assert!(f.extends(8191, 2));
+            // A write in place goes through the completion port and keeps
+            // the bytes around it.
+            let (res, _) = f.write_all_at(vec![1u8; 4], 100).await;
+            res.unwrap();
+            drop(f);
+
+            // Appending always extends.
+            let f = File::options().append(true).open(&path).await.unwrap();
+            assert!(f.extends(0, 1));
+            f.close().await.unwrap();
+
+            let back = std::fs::read(&path).unwrap();
+            assert_eq!(back.len(), 8192);
+            assert_eq!(&back[96..108], &[7, 7, 7, 7, 1, 1, 1, 1, 7, 7, 7, 7]);
+        });
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn a_file_written_to_is_closed_whether_closed_or_dropped() {
+        let dir = std::env::temp_dir().join(format!("giong-close-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        crate::block_on(async {
+            for i in 0..64 {
+                let path = dir.join(format!("f{i}"));
+                let f = File::create(&path).await.unwrap();
+                let (res, _) = f.write_all_at(vec![i as u8; 100], 0).await;
+                res.unwrap();
+                if i % 2 == 0 {
+                    f.close().await.unwrap();
+                } else {
+                    drop(f);
+                }
+            }
+        });
+        // Closed on blocking threads: each file can be removed once they
+        // are done, which a handle still open would refuse.
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        loop {
+            match std::fs::remove_dir_all(&dir) {
+                Ok(()) => break,
+                Err(e) if std::time::Instant::now() < give_up => {
+                    let _ = e;
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("a file is still open after 10 s: {e}"),
+            }
+        }
     }
 }

@@ -513,6 +513,20 @@ impl Iocp {
         unsafe { CloseHandle(handle) };
     }
 
+    /// Closes a file handle the caller gives up, on a blocking thread:
+    /// `CloseHandle` on a file written to runs the file system's cleanup
+    /// and the filter drivers' scans, which took up to 0.85 s in CI. The
+    /// handle leaves the registered set first, so a new handle that gets its
+    /// value is registered afresh.
+    pub(crate) fn close_file(&mut self, handle: HANDLE) {
+        self.registered.remove(&(handle as usize));
+        let handle = handle as usize;
+        super::blocking::spawn(Box::new(move || {
+            // SAFETY: the caller gave the handle up; it is closed once.
+            unsafe { CloseHandle(handle as HANDLE) };
+        }));
+    }
+
     /// Closes a socket the caller gives up.
     pub(crate) fn close_sock(&mut self, socket: SOCKET) {
         self.registered.remove(&socket);
@@ -588,6 +602,20 @@ impl Iocp {
                 // SAFETY: the caller owns the handle and gives it up here.
                 let ok = unsafe { CloseHandle(fd) };
                 return Start::Done(if ok != 0 { 0 } else { -last_error() }, 0);
+            }
+            Io::CloseFile { fd } => {
+                self.registered.remove(&(fd as usize));
+                let record = Self::record(ptr::null_mut(), false, State::Waiting(waker.clone()), 0);
+                self.inflight += 1;
+                let (port, fd, at) = (self.port.clone(), fd as usize, record as usize);
+                // No cancel: a close the caller gave up on still closes.
+                super::blocking::spawn(Box::new(move || {
+                    // SAFETY: the caller gave the handle up; it is closed
+                    // once.
+                    let ok = unsafe { CloseHandle(fd as HANDLE) };
+                    port.report(at, if ok != 0 { 0 } else { -last_error() });
+                }));
+                return Start::Submitted(self.ops.insert(Slot::Single(record)));
             }
             Io::Blocking { job } => {
                 let record = Self::record(ptr::null_mut(), false, State::Waiting(waker.clone()), 0);
