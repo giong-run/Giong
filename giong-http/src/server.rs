@@ -1762,18 +1762,30 @@ fn fd_of<S>(_: &S) -> i32 {
 /// A transport's write only completes, so its progress is seen from outside:
 /// a write future that returns `Pending` waits for the socket, and is polled
 /// again when the socket took bytes (a send completed, or the socket became
-/// writable). So every poll after the first that the timer did not cause is
+/// writable). So every poll after the first that the alarm did not cause is
 /// progress. Something else waking the connection's task counts as progress
 /// too, which can only make the wait longer, by `idle` at most for each
-/// such wake. A write done at its first poll arms no timer.
+/// such wake. A write done at its first poll does not touch the alarm.
+///
+/// The wait is on the connection's alarm (the one its reads wait on), not a
+/// timer of its own: a write that waits once, as every write does while a
+/// busy worker batches its sends, then only moves the alarm's deadline
+/// instead of arming a timer and cancelling it. The alarm is left armed
+/// after the write, as after a read (see `recv_until`), and a shutdown wakes
+/// it, which counts as progress here: a write goes on through a shutdown.
 ///
 /// A future of its own, not an `async fn`: it lives in every connection's
 /// future, and an `async fn` would keep the write future twice.
-fn until_stalled<F: Future>(idle: &Duration, write: F) -> UntilStalled<'_, F> {
+fn until_stalled<'a, F: Future>(
+    idle: &'a Duration,
+    alarm: &'a mut Alarm,
+    write: F,
+) -> UntilStalled<'a, F> {
     UntilStalled {
         write,
         idle,
-        timer: None,
+        alarm,
+        deadline: None,
     }
 }
 
@@ -1782,8 +1794,10 @@ struct UntilStalled<'a, F> {
     write: F,
     /// Borrowed: one word less in every connection's future.
     idle: &'a Duration,
-    /// From the first wait on: runs out `idle` after the write last moved.
-    timer: Option<giong::time::Sleep>,
+    /// The connection's alarm.
+    alarm: &'a mut Alarm,
+    /// From the first wait on: `idle` after the write last moved.
+    deadline: Option<Instant>,
 }
 
 impl<F: Future> Future for UntilStalled<'_, F> {
@@ -1799,30 +1813,21 @@ impl<F: Future> Future for UntilStalled<'_, F> {
         if let Poll::Ready(done) = write.poll(cx) {
             return Poll::Ready(Some(done));
         }
-        let now = Instant::now();
-        match &mut this.timer {
-            None => {
-                // The write waits for the first time: count from now.
-                let timer = this
-                    .timer
-                    .insert(giong::time::sleep_until(now + *this.idle));
-                if Pin::new(timer).poll(cx).is_ready() {
-                    return Poll::Ready(None);
-                }
-            }
-            Some(timer) => {
-                if now < timer.deadline() {
-                    // Woken before the timer: the write moved. Counting
-                    // from now re-arms the timer, which costs only a write
-                    // that does not complete at once.
-                    timer.reset(now + *this.idle);
-                }
-                if Pin::new(timer).poll(cx).is_ready() {
-                    return Poll::Ready(None);
-                }
-            }
+        // The alarm compares with the worker's clock of the turn, so this
+        // reads the same clock: no second read of the real one.
+        let now = giong::time::turn_clock();
+        let deadline = match this.deadline {
+            // Woken before the deadline: the write moved, so it counts from
+            // now again, which only changes the deadline the alarm keeps.
+            Some(at) if now >= at => at,
+            // The write waits for the first time, or moved: count from now.
+            _ => now + *this.idle,
+        };
+        this.deadline = Some(deadline);
+        match this.alarm.poll_deadline(deadline, cx) {
+            Poll::Ready(_) => Poll::Ready(None),
+            Poll::Pending => Poll::Pending,
         }
-        Poll::Pending
     }
 }
 
@@ -3385,23 +3390,25 @@ impl<T: Transport> Conn<T> {
         // No `match` on the body taken out of `self.body` around the plain
         // write: the value matched would be kept across its `.await` too.
         let wrote = if matches!(self.body, Body::Empty) {
-            until_stalled(idle, self.stream.write_all(out)).await
+            until_stalled(idle, &mut self.alarm, self.stream.write_all(out)).await
         } else {
+            let (stream, alarm) = (&self.stream, &mut self.alarm);
             match mem::take(&mut self.body) {
                 Body::File(f) => {
-                    let stream = &self.stream;
                     HeapFuture::with(|| {
                         until_stalled(
                             idle,
+                            alarm,
                             stream.write_all_with_file(out, &f.file, f.offset, f.len),
                         )
                     })
                     .await
                 }
                 body => {
-                    let stream = &self.stream;
-                    HeapFuture::with(|| until_stalled(idle, stream.write_all_with_body(out, body)))
-                        .await
+                    HeapFuture::with(|| {
+                        until_stalled(idle, alarm, stream.write_all_with_body(out, body))
+                    })
+                    .await
                 }
             }
         };
