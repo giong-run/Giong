@@ -79,6 +79,9 @@ use crate::signal::SignalKind;
 /// ...), use [`as_std_mut`](Self::as_std_mut).
 pub struct Command {
     std: std::process::Command,
+    /// The `pre_exec` that gives the child the open-files limit from before
+    /// the runtime raised it is added (once, by the first `spawn`).
+    nofile_restore: bool,
     kill_on_drop: bool,
     stdin_set: bool,
     stdout_set: bool,
@@ -203,9 +206,20 @@ impl Command {
     /// kernel gives no pidfd for the child (Linux older than 5.3, or a
     /// seccomp profile that blocks `pidfd_open`), in which case the child
     /// is killed and reaped.
+    ///
+    /// When a runtime raised this process's soft limit on open files
+    /// ([`Builder::raise_open_files_limit`](crate::Builder::raise_open_files_limit)),
+    /// the child gets the soft limit from before, unless a `pre_exec` of
+    /// yours sets one of its own.
     pub fn spawn(&mut self) -> io::Result<Child> {
         // Panics here, with GIONG-E0011, rather than after the child runs.
         runtime::with_worker(|_| ());
+        if !self.nofile_restore {
+            if let Some((before, raised)) = runtime::open_files_raised() {
+                restore_open_files_limit(&mut self.std, before, raised);
+                self.nofile_restore = true;
+            }
+        }
         let mut child = self.std.spawn()?;
         let pid = child.id();
         let pidfd = match sys::pidfd_open(pid) {
@@ -280,10 +294,48 @@ impl Command {
     }
 }
 
+/// Gives a child the soft open-files limit (`RLIMIT_NOFILE`) the process
+/// had before the runtime raised it (`Builder::raise_open_files_limit`): a
+/// child that uses `select(2)` must not get descriptors of 1,024 and more.
+/// Only when the child still has the raised limit, so that a `pre_exec` of
+/// the caller's that set a limit of its own, before or after this one, keeps
+/// it. A `pre_exec` makes the standard library start the child with `fork`
+/// and `exec` instead of `posix_spawn`, so this is added only in a process
+/// whose limit was raised.
+fn restore_open_files_limit(
+    std: &mut std::process::Command,
+    before: libc::rlim_t,
+    raised: libc::rlim_t,
+) {
+    use std::os::unix::process::CommandExt;
+    let restore = move || {
+        let mut lim = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        // SAFETY: `getrlimit` and `setrlimit` are async-signal-safe system
+        // calls, allowed between `fork` and `exec`; each is given a struct
+        // of its type. Nothing is allocated here.
+        unsafe {
+            if libc::getrlimit(libc::RLIMIT_NOFILE, &mut lim) == 0 && lim.rlim_cur == raised {
+                lim.rlim_cur = before;
+                libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+            }
+        }
+        Ok(())
+    };
+    // SAFETY: the closure makes only async-signal-safe system calls (see
+    // above) and touches no lock or allocator.
+    unsafe {
+        std.pre_exec(restore);
+    }
+}
+
 impl From<std::process::Command> for Command {
     fn from(std: std::process::Command) -> Self {
         Self {
             std,
+            nofile_restore: false,
             kill_on_drop: false,
             stdin_set: false,
             stdout_set: false,

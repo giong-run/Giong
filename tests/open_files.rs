@@ -88,3 +88,46 @@ fn a_runtime_told_not_to_keeps_the_soft_limit() {
         .unwrap();
     assert_eq!(limits(), (256, max));
 }
+
+/// What `sh -c 'ulimit -n'` prints when started with `giong::process`.
+async fn child_soft_limit(cmd: &mut giong::process::Command) -> String {
+    let out = cmd.output().await.unwrap();
+    assert!(out.status.success(), "{out:?}");
+    String::from_utf8(out.stdout).unwrap().trim().to_owned()
+}
+
+/// A child gets the soft limit the process had before the runtime raised
+/// it (issue #372): a child that uses `select(2)` needs descriptors below
+/// 1,024. A limit the caller's own `pre_exec` sets is kept, and spawning a
+/// command twice adds nothing twice.
+#[test]
+fn a_child_process_gets_the_soft_limit_from_before_it_was_raised() {
+    if std::env::var_os(CHILD).is_none() {
+        return run_child("a_child_process_gets_the_soft_limit_from_before_it_was_raised");
+    }
+    let max = lower_soft_limit();
+    giong::block_on(async move {
+        assert_eq!(limits(), (raised(max), max));
+        let mut sh = giong::process::Command::new("sh");
+        sh.args(["-c", "ulimit -n"]);
+        assert_eq!(child_soft_limit(&mut sh).await, "256");
+        assert_eq!(child_soft_limit(&mut sh).await, "256");
+
+        let mut own = giong::process::Command::new("sh");
+        own.args(["-c", "ulimit -n"]);
+        // SAFETY: only `setrlimit`, async-signal-safe, between fork and exec.
+        unsafe {
+            std::os::unix::process::CommandExt::pre_exec(own.as_std_mut(), move || {
+                let lim = libc::rlimit {
+                    rlim_cur: 300,
+                    rlim_max: max,
+                };
+                libc::setrlimit(libc::RLIMIT_NOFILE, &lim);
+                Ok(())
+            });
+        }
+        assert_eq!(child_soft_limit(&mut own).await, "300");
+    });
+    // The process itself keeps the raised limit.
+    assert_eq!(limits(), (raised(max), max));
+}
