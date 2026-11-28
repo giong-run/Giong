@@ -308,6 +308,9 @@ impl Pool {
     }
 
     fn work(self: Arc<Self>) {
+        // A thread started by a thread the sandbox does not cover (a
+        // `Handle` used from elsewhere) gets the sandbox here.
+        crate::sandbox::cover_thread();
         if self.cfg.nice != 0 {
             crate::sys::lower_thread_priority(self.cfg.nice);
         }

@@ -60,6 +60,7 @@ Where the code is:
 | `src/net/fds.rs`, `src/net/activation.rs` | passing descriptors over Unix sockets (`SCM_RIGHTS`), Unix addresses and peer credentials; socket activation (`LISTEN_FDS`) |
 | `src/error.rs` | `Code`: every `GIONG-Exxxx` code, of every crate |
 | `src/notify.rs` | the cross-thread wake-up handshakes, model-checked with loom |
+| `src/sandbox.rs`, `src/sandbox/linux.rs` | `Builder::sandbox`: io_uring restrictions on each worker's ring, Linux 7.0's per-task restrictions and open filters, the check `giong::fs` makes before an operation by path, audit mode |
 | `src/observe.rs` | `Handle::pulse`, `snapshot`, profiles and `Source`s: what giong-mcp reads |
 | `src/observe/requests.rs` | request tracing: `RequestTrace`, `wait`, `set_route`, `take_requests` |
 | `tests/` | integration tests, one file per area; `tests/cancel.rs` for dropped operations |
@@ -200,7 +201,10 @@ minute on every pull request.
 run, `GIONG_IO_URING_OFF=all` (or a list of names such as `packed-buffers`) turns off the
 optional io_uring features that newer kernels have (`giong::IoUringFeature`), and
 `GIONG_DRIVER=epoll` picks the epoll driver; `scripts/check.sh fallback` does all three for
-you. `GIONG_ZERO_COPY_MIN=<bytes>` moves the size from which TCP sends from bytes that cannot
+you. `GIONG_SANDBOX=read-write` runs every runtime of a test run in a best-effort sandbox
+(`giong::sandbox`): a new io_uring operation or SQE flag the driver submits needs its rule in
+`src/sandbox/linux.rs` (`every_operation_giong_submits_has_a_sandbox_rule` checks the opcodes),
+or the suite fails under it with `EACCES`. `GIONG_ZERO_COPY_MIN=<bytes>` moves the size from which TCP sends from bytes that cannot
 change (`&'static [u8]`, `Rc<[u8]>`, `Arc<[u8]>`) go out without a copy (16 KiB), for
 benchmarks.
 

@@ -25,7 +25,10 @@
 # GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS set (names separated by commas, or empty
 # for none), it also checks which kernel bugs giong had to work around, and
 # with GIONG_TEST_EXPECT_IO_URING_FEATURES which optional io_uring features it
-# found.
+# found. GIONG_TEST_EXPECT_SANDBOX=complete makes tests/sandbox.rs fail where
+# the kernel lacks a layer of giong's sandbox (Linux 7.0 has them all), and
+# GIONG_SANDBOX=read-write runs the tests in the guest under the sandbox, as
+# scripts/check.sh fallback sandbox does on the host.
 #
 # The test binaries are built on the host, then packed into an initramfs with
 # a static busybox and the shared libraries they need; the guest boots that
@@ -132,13 +135,15 @@ for arg in $(cat /proc/cmdline); do
         giong.expect_driver=*) export GIONG_TEST_EXPECT_DRIVER="${arg#*=}" ;;
         giong.expect_workarounds=*) export GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS="${arg#*=}" ;;
         giong.expect_features=*) export GIONG_TEST_EXPECT_IO_URING_FEATURES="${arg#*=}" ;;
+        giong.expect_sandbox=*) export GIONG_TEST_EXPECT_SANDBOX="${arg#*=}" ;;
+        giong.sandbox=*) export GIONG_SANDBOX="${arg#*=}" ;;
         giong.ktls=1) ktls=1 ;;
         giong.soak=*) soak="${arg#*=}" ;;
     esac
 done
 # A line of its own: the console's escape codes end up in front of the first one.
 echo
-echo "GIONG-EXPECT driver=${GIONG_TEST_EXPECT_DRIVER:-} workarounds=${GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS-unchecked} features=${GIONG_TEST_EXPECT_IO_URING_FEATURES-unchecked}"
+echo "GIONG-EXPECT driver=${GIONG_TEST_EXPECT_DRIVER:-} workarounds=${GIONG_TEST_EXPECT_KERNEL_WORKAROUNDS-unchecked} features=${GIONG_TEST_EXPECT_IO_URING_FEATURES-unchecked} sandbox=${GIONG_TEST_EXPECT_SANDBOX:-unchecked}"
 if [ -n "${ktls:-}" ]; then
     # Kernel TLS: the modules came in a second archive.
     depmod
@@ -306,6 +311,12 @@ for version in "${VERSIONS[@]}"; do
     fi
     if [ -n "${GIONG_TEST_EXPECT_IO_URING_FEATURES+set}" ]; then
         cmdline+=" giong.expect_features=$GIONG_TEST_EXPECT_IO_URING_FEATURES"
+    fi
+    if [ -n "${GIONG_TEST_EXPECT_SANDBOX:-}" ]; then
+        cmdline+=" giong.expect_sandbox=$GIONG_TEST_EXPECT_SANDBOX"
+    fi
+    if [ -n "${GIONG_SANDBOX:-}" ]; then
+        cmdline+=" giong.sandbox=$GIONG_SANDBOX"
     fi
     if [ -n "${SOAK_SECS:-}" ]; then
         cmdline+=" giong.soak=$SOAK_SECS"

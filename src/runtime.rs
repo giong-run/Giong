@@ -104,6 +104,10 @@ pub(crate) struct WorkerShared {
     wake: OnceLock<crate::driver::WakeHandle>,
     /// How the worker's driver was chosen; set once the driver is up.
     driver_choice: OnceLock<DriverChoice>,
+    /// The runtime's sandbox and what this worker got (see
+    /// [`crate::sandbox`]); empty without one. Set once, when the worker
+    /// starts.
+    sandbox: OnceLock<crate::sandbox::WorkerSandbox>,
 }
 
 impl WorkerShared {
@@ -118,6 +122,7 @@ impl WorkerShared {
             idle_seen: AtomicU64::new(0),
             wake: OnceLock::new(),
             driver_choice: OnceLock::new(),
+            sandbox: OnceLock::new(),
         }))
     }
 
@@ -400,6 +405,8 @@ struct Config {
     buf_size: usize,
     shutdown_grace: Duration,
     precise_timers: bool,
+    /// See [`Builder::sandbox`].
+    sandbox: Option<crate::sandbox::Sandbox>,
 }
 
 /// Everything a worker thread owns. Reached through a thread-local.
@@ -609,8 +616,25 @@ impl Worker {
     fn new(index: usize, rt: Arc<RuntimeShared>, cfg: &Config) -> io::Result<Rc<Self>> {
         let shared = rt.workers[index].clone();
         let pool = BufPool::new(cfg.buf_count, cfg.buf_size)?;
-        let (mut driver, choice) =
-            Driver::new(cfg.driver, cfg.chosen_by, cfg.ring_entries, pool.clone())?;
+        let (mut driver, choice, ring_lines) = Driver::new(
+            cfg.driver,
+            cfg.chosen_by,
+            cfg.ring_entries,
+            pool.clone(),
+            cfg.sandbox.as_ref(),
+        )?;
+        // The worker's ring is restricted by now; the thread's own layers
+        // come next, before any task runs.
+        if let Some(s) = &cfg.sandbox {
+            let mut ring = ring_lines;
+            if ring.is_empty() {
+                ring.push(crate::sandbox::no_ring(s));
+            }
+            let thread = crate::sandbox::apply_thread(s)?;
+            // A worker instance is built once, so the slot is always empty
+            // here.
+            let _ = shared.sandbox.set(crate::sandbox::finish(s, ring, thread)?);
+        }
         driver.set_precise_timers(cfg.precise_timers);
         // A worker instance is built once, so the slots are always empty
         // here.
@@ -659,6 +683,11 @@ impl Worker {
             worker.timers.borrow_mut().watch_growth(flag, PARK_TRIM);
         }
         Ok(worker)
+    }
+
+    /// The runtime's sandbox and what this worker got, if it has one.
+    pub(crate) fn sandbox(&self) -> Option<&crate::sandbox::WorkerSandbox> {
+        self.shared.sandbox.get()
     }
 
     /// Runs `fut` to completion on this thread, then tears the worker down.
@@ -1309,6 +1338,7 @@ pub struct Builder {
     compute_backlog: Option<usize>,
     open_files: bool,
     precise_timers: bool,
+    sandbox: Option<crate::sandbox::Sandbox>,
     /// Makes this worker panic before it reports that it started. A field
     /// of the builder, not a static, so that the runtimes of other tests
     /// running at the same time are not touched.
@@ -1343,6 +1373,7 @@ impl Builder {
             compute_backlog: None,
             open_files: true,
             precise_timers: false,
+            sandbox: None,
             #[cfg(test)]
             panic_on_start: None,
         }
@@ -1587,6 +1618,38 @@ impl Builder {
         self
     }
 
+    /// Runs the runtime in a sandbox that keeps io_uring: each worker's ring
+    /// runs only the operations giong submits for what `sandbox` allows,
+    /// and, on Linux 7.0, so does every ring a covered thread creates later
+    /// (see [`crate::sandbox`] for the layers and which threads are
+    /// covered). Operations by path that the sandbox does not allow fail
+    /// with [`Code::SandboxDenied`](crate::error::Code::SandboxDenied).
+    ///
+    /// Off by default, and nothing is paid for it then. The kernel keeps
+    /// the restrictions for the life of each covered thread, after the
+    /// runtime ends, and sets `no_new_privs` on it with the per-task
+    /// restrictions: a program it starts cannot gain privileges through
+    /// set-user-ID files. [`Sandbox::require`](crate::sandbox::Sandbox::require)
+    /// makes [`build`](Self::build)'s runtime fail to start, with
+    /// [`Code::SandboxUnavailable`](crate::error::Code::SandboxUnavailable),
+    /// on a kernel that lacks a layer it needs.
+    ///
+    /// ```no_run
+    /// use giong::sandbox::{FileAccess, Sandbox};
+    ///
+    /// giong::Builder::new()
+    ///     .sandbox(Sandbox::best_effort().files(FileAccess::ReadOnly))
+    ///     .block_on(async {
+    ///         let report = giong::sandbox::report().expect("a sandbox");
+    ///         println!("{report:?}");
+    ///     })?;
+    /// # Ok::<(), std::io::Error>(())
+    /// ```
+    pub fn sandbox(mut self, sandbox: crate::sandbox::Sandbox) -> Self {
+        self.sandbox = Some(sandbox);
+        self
+    }
+
     /// The lane settings, with the defaults filled in.
     fn lane_config(&self) -> LaneConfig {
         let compute_threads = self
@@ -1623,6 +1686,10 @@ impl Builder {
             buf_size: self.buf_size,
             shutdown_grace: self.shutdown_grace,
             precise_timers: self.precise_timers,
+            sandbox: match self.sandbox {
+                Some(s) => Some(s),
+                None => crate::sandbox::from_env()?,
+            },
         })
     }
 
@@ -1860,6 +1927,17 @@ impl Runtime {
                     first_err.get_or_insert(e);
                 }
                 Err(_) => break,
+            }
+        }
+        // The calling thread is covered by the sandbox too, once every
+        // worker has its own: it is the thread that started them.
+        if first_err.is_none() {
+            if let Some(s) = &cfg.sandbox {
+                if let Err(e) = crate::sandbox::apply_thread(s).and_then(|lines| {
+                    crate::sandbox::finish(s, vec![crate::sandbox::no_ring(s)], lines)
+                }) {
+                    first_err = Some(e);
+                }
             }
         }
         // A thread that ended without reporting panicked while it started:

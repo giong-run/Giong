@@ -36,6 +36,7 @@ use super::{
 };
 use crate::buf::{BufPool, Received, RecvBuf, RingId};
 use crate::error::{Code, Error};
+use crate::sandbox::{self, LayerReport, Sandbox};
 use crate::slab::Slab;
 
 /// `user_data` of operations whose completion nobody waits for, such as cancels.
@@ -288,10 +289,27 @@ fn first_tier() -> RingTier {
     }
 }
 
-fn build_ring(entries: u32) -> io::Result<IoUring> {
-    build_ring_from(entries, first_tier())
+fn build_ring(entries: u32, disabled: bool) -> io::Result<IoUring> {
+    build_ring_from(entries, first_tier(), disabled)
         .map_err(explain_setup_error)
         .map_err(|e| explain_out_of_memory(e, "rings"))
+}
+
+/// Builds the worker's ring under `sandbox` (see [`crate::sandbox`]): an
+/// enforcing sandbox gets a ring created disabled, restricted, then
+/// enabled. Returns the ring and the sandbox's report lines for it.
+fn build_sandboxed_ring(
+    entries: u32,
+    sandbox: Option<&Sandbox>,
+) -> io::Result<(IoUring, Vec<LayerReport>)> {
+    let restrict = sandbox.filter(|s| s.mode() != sandbox::Mode::Audit);
+    let ring = build_ring(entries, restrict.is_some())?;
+    let lines = match (sandbox, restrict) {
+        (_, Some(s)) => sandbox::linux::restrict_ring(ring.as_raw_fd(), s.file_access())?,
+        (Some(s), None) => vec![sandbox::no_ring(s)],
+        (None, None) => Vec::new(),
+    };
+    Ok((ring, lines))
 }
 
 /// `io_uring_setup` fails with `EPERM` when a seccomp profile blocks it (as
@@ -430,7 +448,9 @@ fn bytes(n: u64) -> String {
     }
 }
 
-fn build_ring_from(entries: u32, first: RingTier) -> io::Result<IoUring> {
+/// `disabled`: create the ring with `IORING_SETUP_R_DISABLED`, for the
+/// sandbox to restrict before it enables it.
+fn build_ring_from(entries: u32, first: RingTier, disabled: bool) -> io::Result<IoUring> {
     let cq = entries.saturating_mul(4);
 
     // Preferred (kernel >= 6.1): completions are only processed when *we* enter
@@ -443,6 +463,9 @@ fn build_ring_from(entries: u32, first: RingTier) -> io::Result<IoUring> {
             .setup_submit_all()
             .setup_cqsize(cq)
             .setup_clamp();
+        if disabled {
+            b.setup_r_disabled();
+        }
         if let Ok(ring) = b.build(entries) {
             return Ok(ring);
         }
@@ -456,6 +479,9 @@ fn build_ring_from(entries: u32, first: RingTier) -> io::Result<IoUring> {
             .setup_submit_all()
             .setup_cqsize(cq)
             .setup_clamp();
+        if disabled {
+            b.setup_r_disabled();
+        }
         if let Ok(ring) = b.build(entries) {
             return Ok(ring);
         }
@@ -463,6 +489,9 @@ fn build_ring_from(entries: u32, first: RingTier) -> io::Result<IoUring> {
 
     let mut b = IoUring::builder();
     b.setup_cqsize(cq).setup_clamp();
+    if disabled {
+        b.setup_r_disabled();
+    }
     b.build(entries)
 }
 
@@ -994,8 +1023,14 @@ impl Uring {
         super::WakeHandle::Bell(self.wake.clone())
     }
 
-    pub(crate) fn new(entries: u32, pool: Rc<BufPool>) -> io::Result<Self> {
-        let ring = build_ring(entries)?;
+    /// A worker's ring, with what `sandbox` got for it (see
+    /// [`crate::sandbox::report`]; empty without a sandbox).
+    pub(crate) fn new(
+        entries: u32,
+        pool: Rc<BufPool>,
+        sandbox: Option<&Sandbox>,
+    ) -> io::Result<(Self, Vec<LayerReport>)> {
+        let (ring, sandbox_lines) = build_sandboxed_ring(entries, sandbox)?;
         // The worker's wake-up: an eventfd the ring reads.
         let wake = std::sync::Arc::new(crate::sys::Bell::new_worker()?);
         // SAFETY: the ring memory is page aligned, holds `count` entries and is
@@ -1026,7 +1061,7 @@ impl Uring {
         // Linux 6.0 refuses a destination address on `IORING_OP_SEND` with
         // `EINVAL`, which cannot be told from a bad address: go by version.
         let send_to = kernel_version(&kernel_release()).is_some_and(|v| v >= (6, 1));
-        Ok(Self {
+        let uring = Self {
             workarounds,
             features,
             registered_ring,
@@ -1053,7 +1088,8 @@ impl Uring {
             wake_buf: Box::new(0),
             wake_armed: false,
             closing: false,
-        })
+        };
+        Ok((uring, sandbox_lines))
     }
 
     // ---------------------------------------------------------------- submit
@@ -2286,7 +2322,7 @@ mod tests {
     /// the probe finds that check: never on a correct kernel.
     #[test]
     fn the_buffer_ring_registers_with_a_workaround_only_where_needed() {
-        let Ok(ring) = build_ring_from(64, RingTier::Basic) else {
+        let Ok(ring) = build_ring_from(64, RingTier::Basic, false) else {
             eprintln!("skipped: io_uring is not available here");
             return;
         };
@@ -2385,7 +2421,7 @@ mod tests {
         // Where io_uring is blocked (a container's seccomp profile, a
         // sandbox) there is no ring to build; giong runs on epoll there, and
         // tests/blocked.rs covers that.
-        if let Err(e) = build_ring_from(64, RingTier::Basic) {
+        if let Err(e) = build_ring_from(64, RingTier::Basic, false) {
             if matches!(
                 e.raw_os_error(),
                 Some(libc::EPERM | libc::EACCES | libc::ENOSYS)
@@ -2395,15 +2431,211 @@ mod tests {
             }
         }
         // `SINGLE_ISSUER` is only requested by the preferred tier.
-        let coop = build_ring_from(64, RingTier::Coop).expect("coop tier");
+        let coop = build_ring_from(64, RingTier::Coop, false).expect("coop tier");
         assert!(!coop.params().is_setup_single_issuer());
 
-        let basic = build_ring_from(64, RingTier::Basic).expect("basic tier");
+        let basic = build_ring_from(64, RingTier::Basic, false).expect("basic tier");
         assert!(!basic.params().is_setup_single_issuer());
 
         // The preferred tier may legitimately fall back on an old kernel, but
         // it must always yield a ring.
-        build_ring_from(64, RingTier::Defer).expect("default tier");
+        build_ring_from(64, RingTier::Defer, false).expect("default tier");
+    }
+
+    /// Every SQE giong builds runs on a ring the sandbox restricted for
+    /// `FileAccess::ReadWrite`, and the operations by path are exactly the
+    /// ones `FileAccess::None` takes away: a new operation needs its rule in
+    /// `sandbox::linux` (see `crate::sandbox`), or this fails.
+    #[test]
+    fn every_operation_giong_submits_has_a_sandbox_rule() {
+        use crate::sandbox::{linux::allowed_ops, FileAccess};
+        let p: *mut u8 = std::ptr::null_mut();
+        let by_descriptor = [
+            Io::Connect {
+                fd: 3,
+                addr: p.cast(),
+                len: 0,
+            },
+            Io::Recv {
+                fd: 3,
+                buf: p,
+                len: 0,
+            },
+            Io::Send {
+                fd: 3,
+                buf: p,
+                len: 0,
+                flags: 0,
+                zero_copy: false,
+            },
+            Io::Send {
+                fd: 3,
+                buf: p,
+                len: 0,
+                flags: 0,
+                zero_copy: true,
+            },
+            Io::Writable { fd: 3 },
+            Io::SendMsg {
+                fd: 3,
+                msg: p.cast(),
+                flags: 0,
+                zero_copy: false,
+            },
+            Io::SendMsg {
+                fd: 3,
+                msg: p.cast(),
+                flags: 0,
+                zero_copy: true,
+            },
+            Io::SendTo {
+                fd: 3,
+                buf: p,
+                len: 0,
+                addr: p.cast(),
+                addr_len: 0,
+            },
+            Io::RecvMsg {
+                fd: 3,
+                msg: p.cast(),
+                flags: 0,
+            },
+            Io::Readable { fd: 3 },
+            Io::ReadReady {
+                fd: 3,
+                buf: p,
+                len: 0,
+            },
+            Io::Read {
+                fd: 3,
+                buf: p,
+                len: 0,
+                offset: 0,
+            },
+            Io::Write {
+                fd: 3,
+                buf: p,
+                len: 0,
+                offset: 0,
+            },
+            Io::Close { fd: 3 },
+            Io::Statx {
+                dir: 3,
+                path: p.cast(),
+                flags: 0,
+                mask: 0,
+                out: p.cast(),
+            },
+            Io::Fsync {
+                fd: 3,
+                datasync: false,
+            },
+            Io::Fallocate {
+                fd: 3,
+                offset: 0,
+                len: 0,
+            },
+        ];
+        let by_path = [
+            Io::OpenAt {
+                path: p.cast(),
+                flags: 0,
+                mode: 0,
+            },
+            Io::OpenBeneath {
+                dir: 3,
+                path: p.cast(),
+                how: p.cast(),
+            },
+            Io::UnlinkAt {
+                path: p.cast(),
+                flags: 0,
+            },
+            Io::MkDirAt {
+                path: p.cast(),
+                mode: 0,
+            },
+            Io::RenameAt {
+                from: p.cast(),
+                to: p.cast(),
+            },
+        ];
+        let none = allowed_ops(FileAccess::None);
+        let all = allowed_ops(FileAccess::ReadWrite);
+        let op = |e: squeue::Entry| e.get_opcode() as u8;
+        for io in &by_descriptor {
+            for zc in [false, true] {
+                assert!(
+                    none.contains(&op(sqe_for(io, zc))),
+                    "no rule for {:?}",
+                    op(sqe_for(io, zc))
+                );
+            }
+        }
+        for io in &by_path {
+            assert!(!none.contains(&op(sqe_for(io, false))));
+            assert!(all.contains(&op(sqe_for(io, false))));
+        }
+        // What the driver builds outside `sqe_for`.
+        for code in [
+            opcode::AcceptMulti::CODE,
+            opcode::RecvMulti::CODE,
+            opcode::RecvMsgMulti::CODE,
+            opcode::AsyncCancel::CODE,
+            opcode::Read::CODE,
+        ] {
+            assert!(none.contains(&code));
+        }
+    }
+
+    /// A ring the sandbox restricted runs what it allows and refuses the
+    /// rest in the kernel, with `EACCES`.
+    #[test]
+    #[cfg_attr(miri, ignore = "Miri cannot run io_uring")]
+    fn a_restricted_ring_refuses_what_the_sandbox_does_not_allow() {
+        use crate::sandbox::{linux::restrict_ring, FileAccess, LayerState};
+        let mut ring = match build_ring_from(8, RingTier::Basic, true) {
+            Ok(ring) => ring,
+            Err(e) => {
+                eprintln!("skipped: io_uring is blocked here ({e})");
+                return;
+            }
+        };
+        let lines = restrict_ring(ring.as_raw_fd(), FileAccess::None).unwrap();
+        assert_eq!(lines[0].state, LayerState::Applied, "{lines:?}");
+        let path = c"/";
+        let mut buf = [0u8; 8];
+        let (r, w) = {
+            let mut fds = [0; 2];
+            // SAFETY: `pipe` fills the two descriptors.
+            assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+            (fds[0], fds[1])
+        };
+        // SAFETY: one byte from a valid buffer to our pipe.
+        assert_eq!(unsafe { libc::write(w, b"x".as_ptr().cast(), 1) }, 1);
+        let open = opcode::OpenAt::new(types::Fd(libc::AT_FDCWD), path.as_ptr())
+            .build()
+            .user_data(1);
+        let read = opcode::Read::new(types::Fd(r), buf.as_mut_ptr(), 1)
+            .build()
+            .user_data(2);
+        let nop = opcode::Nop::new().build().user_data(3);
+        // One at a time: without `SUBMIT_ALL` the kernel stops a batch at
+        // the first entry it refuses.
+        let mut results = Vec::new();
+        for sqe in [open, read, nop] {
+            // SAFETY: the path, the buffer and the pipe outlive the
+            // submission, which is waited for here.
+            unsafe { ring.submission().push(&sqe).unwrap() };
+            ring.submit_and_wait(1).unwrap();
+            results.extend(ring.completion().map(|c| (c.user_data(), c.result())));
+        }
+        assert_eq!(results, [(1, -libc::EACCES), (2, 1), (3, -libc::EACCES)]);
+        // SAFETY: both ends are ours.
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
     }
 }
 

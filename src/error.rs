@@ -192,6 +192,23 @@ codes! {
     /// `raw_os_error` stays reachable.
     NetworkBuffersExhausted = 28, OutOfMemory, "the system ran out of network buffers";
 
+    // ------------------------------------------------------------ sandbox
+    /// [`Sandbox::require`](crate::sandbox::Sandbox::require) asked for a
+    /// layer of the sandbox that this kernel or platform does not have
+    /// (per-task io_uring restrictions and open filters need Linux 7.0; the
+    /// sandbox is Linux only), so the runtime did not start. The message
+    /// names each missing layer and what the kernel said.
+    SandboxUnavailable = 50, Unsupported, "the sandbox cannot be applied here";
+    /// The runtime's [`Sandbox`](crate::sandbox::Sandbox) does not allow
+    /// this operation by path (its [`FileAccess`](crate::sandbox::FileAccess)),
+    /// so giong refused it before asking the kernel. Nothing was opened or
+    /// changed.
+    SandboxDenied = 51, PermissionDenied, "the sandbox refused the operation";
+    /// Another runtime of this process already restricted its threads with
+    /// a different [`Sandbox`](crate::sandbox::Sandbox), and a thread keeps
+    /// the first restriction it gets.
+    SandboxConflict = 52, InvalidInput, "another sandbox is already applied";
+
     // ------------------------------------------------------------ Windows
     /// `UnixListener::bind` on Windows found a file already at the path. A
     /// listener does not remove its socket file when it closes (as on

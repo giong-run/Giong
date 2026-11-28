@@ -333,6 +333,35 @@ giong needs nothing in the image besides the program.
 
 ## Sandboxes
 
+### giong's own sandbox
+
+A seccomp profile cannot see io_uring's operations, which is why Docker's default profile
+blocks io_uring and giong falls back to epoll there. `Builder::sandbox` restricts io_uring
+itself instead, so a service keeps it: each worker's ring runs only the operations giong
+submits, and on Linux 7.0 every ring a covered thread creates later is restricted too. Start
+with `Sandbox::audit()` to see which operations by path the service makes, then run it with
+`Sandbox::best_effort()` or `Sandbox::require()` and the `FileAccess` it needs:
+
+```rust,no_run
+use giong::sandbox::{FileAccess, Sandbox};
+
+giong::Builder::new()
+    .sandbox(Sandbox::best_effort().files(FileAccess::ReadOnly))
+    .build()?
+    .run(|_| async {
+        // ...
+    })?;
+# Ok::<(), std::io::Error>(())
+```
+
+Open what the service writes (a log file, a SQLite database) before the runtime starts, or
+allow `FileAccess::ReadWrite`. The layers, what each kernel has and which threads are covered
+are in the `giong::sandbox` documentation; `giong::sandbox::report()` tells what a worker got.
+The sandbox restricts io_uring only for now: keep a seccomp profile and the container's other
+limits for system calls made without it.
+
+### User-space kernels
+
 Runtimes that put a user-space kernel between the container and Linux, such as gVisor
 (used by GKE Sandbox), do not offer io_uring by default. giong runs on epoll there; run it
 outside such a sandbox for io_uring. gVisor's optional io_uring (`runsc --iouring`) takes

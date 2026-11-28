@@ -64,7 +64,7 @@ CODE_PROSE = ("docs/errors/",)
 TSAN_FULL = [{"driver": "io_uring", "run": 1}, {"driver": "io_uring", "run": 2},
              {"driver": "epoll", "run": 1}]
 TSAN_PR = [{"driver": "io_uring", "run": 1}, {"driver": "epoll", "run": 1}]
-FALLBACK_FULL = ["no-features", "coop", "basic", "epoll"]
+FALLBACK_FULL = ["no-features", "coop", "basic", "epoll", "sandbox"]
 # On a pull request: the second driver, one round. The other tiers run in the queue.
 FALLBACK_PR = ["epoll"]
 

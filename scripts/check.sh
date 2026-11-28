@@ -10,7 +10,11 @@
 #                               (GIONG_DRIVER=epoll)
 #   scripts/check.sh fallback <tier>
 #                               one of those four only: no-features, coop, basic
-#                               or epoll (CI runs them side by side)
+#                               or epoll (CI runs them side by side); or sandbox:
+#                               every runtime in a best-effort sandbox
+#                               (GIONG_SANDBOX=read-write), so that an io_uring
+#                               operation without its rule in src/sandbox/linux.rs
+#                               fails
 #   scripts/check.sh epoll      the tests on the epoll driver only
 #   scripts/check.sh seccomp    the tests with io_uring blocked as in Docker's
 #                               default seccomp profile (scripts/no-io-uring.py),
@@ -81,12 +85,13 @@ run_fallback() {
         no-features) GIONG_IO_URING_OFF=all repeat_tests "io_uring without optional features" ;;
         coop | basic) GIONG_IO_URING_OFF=all GIONG_RING_TIER="$1" repeat_tests "ring tier '$1'" ;;
         epoll) run_epoll ;;
+        sandbox) GIONG_SANDBOX=read-write repeat_tests "sandbox (read-write)" ;;
         all)
-            for tier in no-features coop basic epoll; do
+            for tier in no-features coop basic epoll sandbox; do
                 run_fallback "$tier"
             done
             ;;
-        *) echo "usage: $0 fallback [no-features|coop|basic|epoll]" >&2; exit 2 ;;
+        *) echo "usage: $0 fallback [no-features|coop|basic|epoll|sandbox]" >&2; exit 2 ;;
     esac
 }
 

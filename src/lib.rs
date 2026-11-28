@@ -113,6 +113,7 @@ pub mod net;
 pub mod observe;
 #[cfg(target_os = "linux")]
 pub mod process;
+pub mod sandbox;
 #[cfg(unix)]
 pub mod signal;
 pub mod sync;
