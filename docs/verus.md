@@ -175,8 +175,11 @@ What Verus takes on faith, in `verify/ipc_ring.rs`'s `mem` module and in `TRUSTE
 
 ## Verus version
 
-`VERUS_VERSION` in `scripts/verus.py` pins the release (0.2026.11.22.1ce6a59); each Verus
-release is built against one Rust toolchain (`VERUS_TOOLCHAIN`, 1.100.0, CI's
-`RUST_STABLE`). To move to a newer Verus: change both, run `scripts/verus.py install` and
+`VERUS_VERSION` in `scripts/verus.py` pins the release (0.2026.11.22.1ce6a59), and
+`VERUS_SHA256` the sha256 of its archive: `install` refuses an archive with another hash,
+or one with a file outside `verus-x86-linux/`, so a replaced release asset never runs in
+CI or on a developer's machine. Each Verus release is built against one Rust toolchain
+(`VERUS_TOOLCHAIN`, 1.100.0, CI's `RUST_STABLE`). To move to a newer Verus: change all
+three (the new archive's sha256 from a download you have checked), run `scripts/verus.py install` and
 `all`, and fix what the new version rejects (its syntax still moves: this release wants
 `final(self)` for the value of `&mut self` in an `ensures`).

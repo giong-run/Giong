@@ -31,7 +31,7 @@ import tempfile
 import time
 import urllib.request
 import zipfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 
 ROOT = Path(__file__).resolve().parent.parent
 VERIFY = ROOT / "verify"
@@ -40,6 +40,10 @@ VERIFY = ROOT / "verify"
 # installed with rustup (it is CI's RUST_STABLE as well).
 VERUS_VERSION = "0.2026.11.22.1ce6a59"
 VERUS_TOOLCHAIN = "1.100.0"
+# The sha256 of the release archive below. `install` refuses any other archive, so a
+# replaced release asset never runs here or in CI. To move to a newer Verus, download
+# the archive, check it, and put its sha256 here with the new version.
+VERUS_SHA256 = "c955d5958877f4f907cce80aa996d4239a481984829d82e325938c7bf242b0db"
 VERUS_URL = (
     "https://github.com/verus-lang/verus/releases/download/"
     f"release/{VERUS_VERSION}/verus-{VERUS_VERSION}-x86-linux.zip"
@@ -456,9 +460,23 @@ def install():
             shutil.rmtree(dest / "verus-x86-linux")
     dest.mkdir(parents=True, exist_ok=True)
     archive = dest / "verus.zip"
+    digest = hashlib.sha256()
     with urllib.request.urlopen(VERUS_URL, timeout=300) as r, open(archive, "wb") as f:
-        shutil.copyfileobj(r, f)
+        while chunk := r.read(1 << 20):
+            digest.update(chunk)
+            f.write(chunk)
+    if digest.hexdigest() != VERUS_SHA256:
+        archive.unlink()
+        fail(
+            f"the Verus archive from {VERUS_URL} has sha256 {digest.hexdigest()}, "
+            f"{VERUS_SHA256} pinned (VERUS_SHA256 in scripts/verus.py): not installing it"
+        )
     with zipfile.ZipFile(archive) as z:
+        for name in z.namelist():
+            parts = PurePosixPath(name).parts
+            if name.startswith(("/", "\\")) or ".." in parts or not parts or parts[0] != "verus-x86-linux":
+                archive.unlink()
+                fail(f"the Verus archive holds {name!r}, outside verus-x86-linux/: not installing it")
         z.extractall(dest)
     archive.unlink()
     for f in (dest / "verus-x86-linux").iterdir():
