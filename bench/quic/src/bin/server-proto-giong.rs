@@ -39,6 +39,12 @@ fn main() {
     // kernel spreads clients over them by address.
     let workers: usize = arg("workers", 1);
     let mut b = giong::Builder::new().workers(workers);
+    // `--pin 0` leaves the workers to the kernel's scheduler instead of
+    // pinning each to a CPU (giong's default).
+    if let Some(pin) = std::env::args().position(|a| a == "--pin") {
+        let on = std::env::args().nth(pin + 1).is_some_and(|v| v != "0");
+        b = b.pin_cores(on);
+    }
     if offload {
         b = b.recv_buffers(256, giong::net::GRO_RECV_BUFFER);
     }

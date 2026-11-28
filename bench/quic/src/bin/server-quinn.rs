@@ -9,6 +9,10 @@ static ZEROS: [u8; 65536] = [0; 65536];
 
 fn main() {
     let addr: SocketAddr = arg("addr", "127.0.0.1:4433".parse().unwrap());
+    // `--copy 1`: write each answer from a borrowed slice (`write_all`,
+    // which copies it into the stream) instead of handing over `Bytes`
+    // without a copy: the call giong-quic has.
+    let copy: bool = arg("copy", 0u8) == 1;
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -33,7 +37,12 @@ fn main() {
                         let mut left = u64::from_be_bytes(req);
                         while left > 0 {
                             let n = left.min(body.len() as u64) as usize;
-                            if send.write_chunk(body.slice(..n)).await.is_err() {
+                            let sent = if copy {
+                                send.write_all(&ZEROS[..n]).await.is_ok()
+                            } else {
+                                send.write_chunk(body.slice(..n)).await.is_ok()
+                            };
+                            if !sent {
                                 return;
                             }
                             left -= n as u64;

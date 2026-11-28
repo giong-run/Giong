@@ -433,6 +433,8 @@ impl State {
     /// Timers, events and transmits of every connection that needs it.
     /// Returns the next deadline.
     fn process(&mut self, now: Instant) -> Option<Instant> {
+        #[cfg(test)]
+        tests::TURNS.with(|n| n.set(n.get() + 1));
         self.wake = false;
         while let Some(&Reverse((at, i))) = self.timers.peek() {
             if at > now {
@@ -593,8 +595,12 @@ impl State {
                 self.scratch.clear();
                 match conn.c.poll_transmit(now, self.segments, &mut self.scratch) {
                     Some(t) => {
-                        let mut v = self.spare.pop().unwrap_or_default();
-                        v.extend_from_slice(&self.scratch[..t.size]);
+                        // The packets go out from the buffer they were
+                        // built in: it is swapped for a spare one rather
+                        // than copied (a GSO batch is up to 10 datagrams).
+                        let spare = self.spare.pop().unwrap_or_default();
+                        let mut v = std::mem::replace(&mut self.scratch, spare);
+                        v.truncate(t.size);
                         self.sends.push(Send {
                             data: v,
                             to: t.destination,
@@ -652,6 +658,11 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, Inbox)>) {
         Some((member, inbox)) => (Some(member), Some(inbox)),
         None => (None, None),
     };
+    // The next deadline of the connections. It moves on almost every turn
+    // (acknowledgement and loss timers); an alarm stays armed from one wait
+    // to the next and only retargets its entry, where a new sleep per wait
+    // inserted a timer and removed it again.
+    let mut alarm = giong::time::Alarm::new();
     loop {
         let now = Instant::now();
         let (deadline, sends, done) = {
@@ -661,35 +672,18 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, Inbox)>) {
             (deadline, std::mem::take(&mut st.sends), done)
         };
         for s in sends {
-            let sh = sh.clone();
-            giong::spawn(async move {
-                let mut options = SendOptions::new().segment_size(s.segment).ecn(s.ecn);
-                if let Some(src) = s.src {
-                    options = options.source(src);
-                }
-                let (sent, mut v) = sh.sock.send_to_with(s.data, s.to, &options).await;
-                if s.segment > 0 && s.segment < v.len() && gso_refused(&sent) {
-                    // The route may refuse segmentation offload (no
-                    // checksum offload on a tun, VPN or veth device). EINVAL
-                    // also comes from a source address the machine no
-                    // longer has, so one datagram is sent alone first: if
-                    // that goes, it was the offload, and every send is one
-                    // datagram from now on.
-                    let options = options.segment_size(0);
-                    let mut ones = v.chunks(s.segment);
-                    let first = ones.next().unwrap_or_default().to_vec();
-                    let (alone, _) = sh.sock.send_to_with(first, s.to, &options).await;
-                    if alone.is_ok() {
-                        sh.st.borrow_mut().segments = 1;
-                        for one in ones {
-                            let _ = sh.sock.send_to_with(one.to_vec(), s.to, &options).await;
-                        }
-                    }
-                }
-                // Other send errors are losses, which QUIC recovers from.
-                v.clear();
-                sh.st.borrow_mut().spare.push(v);
-            });
+            // Polled once here: a send the socket has room for completes in
+            // that poll (giong sends a datagram at once when it can), which
+            // spares a task per datagram batch. One that has to wait goes on
+            // in a task of its own; that task's first poll registers its
+            // waker, so the no-op one used here is never needed.
+            let mut send = Box::pin(send(sh.clone(), s));
+            let mut cx = std::task::Context::from_waker(Waker::noop());
+            if send.as_mut().poll(&mut cx).is_pending() {
+                #[cfg(test)]
+                tests::SPAWNED_SENDS.with(|n| n.set(n.get() + 1));
+                giong::spawn(send);
+            }
         }
         if done {
             return;
@@ -705,8 +699,6 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, Inbox)>) {
                 }
             };
             let mut passed = pin!(passed);
-            let sleep = deadline.map(giong::time::sleep_until);
-            let mut sleep = pin!(sleep);
             poll_fn(|cx| {
                 if let Poll::Ready(r) = recv.as_mut().poll(cx) {
                     return Poll::Ready(Woke::Datagram(r));
@@ -714,8 +706,10 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, Inbox)>) {
                 if let Poll::Ready(Some(datagram)) = passed.as_mut().poll(cx) {
                     return Poll::Ready(Woke::Forwarded(datagram));
                 }
-                if let Some(s) = sleep.as_mut().as_pin_mut() {
-                    if s.poll(cx).is_ready() {
+                // Without a deadline an armed alarm may still go off at
+                // its old one: a spare turn, nothing more.
+                if let Some(at) = deadline {
+                    if alarm.poll_deadline(at, cx).is_ready() {
                         return Poll::Ready(Woke::Other);
                     }
                 }
@@ -789,6 +783,36 @@ async fn drive(sh: Rc<Shared>, route: Option<(Member, Inbox)>) {
             }
         }
     }
+}
+
+/// Sends one transmit, then gives its buffer back to the spare ones.
+async fn send(sh: Rc<Shared>, s: Send) {
+    let mut options = SendOptions::new().segment_size(s.segment).ecn(s.ecn);
+    if let Some(src) = s.src {
+        options = options.source(src);
+    }
+    let (sent, mut v) = sh.sock.send_to_with(s.data, s.to, &options).await;
+    if s.segment > 0 && s.segment < v.len() && gso_refused(&sent) {
+        // The route may refuse segmentation offload (no
+        // checksum offload on a tun, VPN or veth device). EINVAL
+        // also comes from a source address the machine no
+        // longer has, so one datagram is sent alone first: if
+        // that goes, it was the offload, and every send is one
+        // datagram from now on.
+        let options = options.segment_size(0);
+        let mut ones = v.chunks(s.segment);
+        let first = ones.next().unwrap_or_default().to_vec();
+        let (alone, _) = sh.sock.send_to_with(first, s.to, &options).await;
+        if alone.is_ok() {
+            sh.st.borrow_mut().segments = 1;
+            for one in ones {
+                let _ = sh.sock.send_to_with(one.to_vec(), s.to, &options).await;
+            }
+        }
+    }
+    // Other send errors are losses, which QUIC recovers from.
+    v.clear();
+    sh.st.borrow_mut().spare.push(v);
 }
 
 /// A receive of a server endpoint: handled here, or passed on to the
@@ -1466,14 +1490,21 @@ mod tests {
     use std::cell::Cell;
     use std::time::Duration;
 
+    /// Driver turns of both endpoints for one stream round trip, at most.
+    const TURNS_A_ROUND_TRIP: u64 = 4;
+
     thread_local! {
         /// How many times the drivers of this thread asked a connection
         /// for its next deadline.
         pub(super) static LOOKS: Cell<u64> = const { Cell::new(0) };
+        /// How many times the drivers of this thread ran their connections.
+        pub(super) static TURNS: Cell<u64> = const { Cell::new(0) };
+        /// Sends that could not complete at once and went on in a task.
+        pub(super) static SPAWNED_SENDS: Cell<u64> = const { Cell::new(0) };
     }
 
-    #[test]
-    fn a_busy_connection_costs_no_look_at_the_idle_ones() {
+    /// TLS configurations of a server and a client that trusts it.
+    fn tls() -> (rustls::ServerConfig, rustls::ClientConfig) {
         let provider = Arc::new(rustls::crypto::ring::default_provider());
         let cert = rcgen::generate_simple_self_signed(vec!["localhost".into()]).unwrap();
         let der = cert.cert.der().clone();
@@ -1493,26 +1524,38 @@ mod tests {
             .with_root_certificates(roots)
             .with_no_client_auth();
         client_tls.alpn_protocols = vec![b"t".to_vec()];
+        (server_tls, client_tls)
+    }
+
+    /// An echo server on this worker: its address.
+    fn echo_server(server_tls: rustls::ServerConfig) -> std::net::SocketAddr {
+        let server = crate::Endpoint::server(
+            "127.0.0.1:0".parse().unwrap(),
+            crate::ServerConfig::new(server_tls).unwrap(),
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+        giong::spawn(async move {
+            while let Some(conn) = server.accept().await {
+                giong::spawn(async move {
+                    while let Ok((mut send, mut recv)) = conn.accept_bi().await {
+                        let data = recv.read_to_end(64).await.unwrap();
+                        send.write_all(&data).await.unwrap();
+                        send.finish().unwrap();
+                    }
+                });
+            }
+        });
+        addr
+    }
+
+    #[test]
+    fn a_busy_connection_costs_no_look_at_the_idle_ones() {
+        let (server_tls, client_tls) = tls();
         giong::Builder::new()
             .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
             .block_on(async move {
-                let server = crate::Endpoint::server(
-                    "127.0.0.1:0".parse().unwrap(),
-                    crate::ServerConfig::new(server_tls).unwrap(),
-                )
-                .unwrap();
-                let addr = server.local_addr().unwrap();
-                giong::spawn(async move {
-                    while let Some(conn) = server.accept().await {
-                        giong::spawn(async move {
-                            while let Ok((mut send, mut recv)) = conn.accept_bi().await {
-                                let data = recv.read_to_end(64).await.unwrap();
-                                send.write_all(&data).await.unwrap();
-                                send.finish().unwrap();
-                            }
-                        });
-                    }
-                });
+                let addr = echo_server(server_tls);
                 let client = crate::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
                 let config = crate::ClientConfig::new(client_tls).unwrap();
                 let mut idle = Vec::new();
@@ -1534,6 +1577,43 @@ mod tests {
                 let looks = (LOOKS.with(Cell::get) - before) / 100;
                 assert!(looks < 40, "{looks} looks at deadlines a round trip");
                 drop(idle);
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn a_round_trip_costs_few_driver_turns_and_sends_at_once() {
+        let (server_tls, client_tls) = tls();
+        giong::Builder::new()
+            .recv_buffers(64, giong::net::GRO_RECV_BUFFER)
+            .block_on(async move {
+                let addr = echo_server(server_tls);
+                let client = crate::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+                let config = crate::ClientConfig::new(client_tls).unwrap();
+                let conn = client.connect(addr, "localhost", &config).await.unwrap();
+                giong::time::sleep(Duration::from_millis(100)).await;
+                let turns = TURNS.with(Cell::get);
+                let spawned = SPAWNED_SENDS.with(Cell::get);
+                for _ in 0..100 {
+                    let (mut send, mut recv) = conn.open_bi().await.unwrap();
+                    send.write_all(b"ping").await.unwrap();
+                    send.finish().unwrap();
+                    assert_eq!(recv.read_to_end(64).await.unwrap(), b"ping");
+                }
+                // Both endpoints' drivers: two turns each (the datagram
+                // in, the stream's answer out).
+                let turns = (TURNS.with(Cell::get) - turns) / 100;
+                assert!(
+                    turns <= TURNS_A_ROUND_TRIP,
+                    "{turns} driver turns a round trip"
+                );
+                // A socket with room takes every send in the driver's own
+                // turn: none needs a task of its own.
+                let spawned = SPAWNED_SENDS.with(Cell::get) - spawned;
+                assert!(
+                    spawned < 10,
+                    "{spawned} of about 400 sends went on in a task"
+                );
             })
             .unwrap();
     }

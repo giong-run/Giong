@@ -91,6 +91,15 @@ fn main() {
         tokio::time::sleep(Duration::from_secs_f64(warmup)).await;
         let cpu0 = bench_quic::cpu_ticks_on(ssh.as_deref(), server_pid);
         let me0 = bench_quic::cpu_ticks(std::process::id());
+        // What the server sent the client, counted over the window: its
+        // datagrams and the ACK frames in them (how often it acknowledges).
+        let seen = |held: &[quinn::Connection]| {
+            held.iter().fold((0u64, 0u64), |(d, a), c| {
+                let s = c.stats();
+                (d + s.udp_rx.datagrams, a + s.frame_rx.acks)
+            })
+        };
+        let rx0 = seen(&held);
         let t0 = Instant::now();
         phase.store(1, Relaxed);
         tokio::time::sleep(Duration::from_secs_f64(secs)).await;
@@ -99,6 +108,9 @@ fn main() {
         let cpu1 = bench_quic::cpu_ticks_on(ssh.as_deref(), server_pid);
         let me1 = bench_quic::cpu_ticks(std::process::id());
         let (r, b) = (reqs.load(Relaxed), bytes.load(Relaxed));
+        let rx1 = seen(&held);
+        let per_req = |n: u64| if r > 0 { n as f64 / r as f64 } else { 0.0 };
+        let (srv_dgrams, srv_acks) = (per_req(rx1.0 - rx0.0), per_req(rx1.1 - rx0.1));
         // Let the loops notice the stop and hand in their latencies.
         for t in tasks {
             let _ = tokio::time::timeout(Duration::from_secs(5), t).await;
@@ -119,11 +131,14 @@ fn main() {
             rtt = rtt.max(path.rtt);
         }
         println!(
-            "req_s={:.0} gbit_s={:.3} p50_us={} p99_us={} srv_cpu_pct={:.1} srv_us_per_req={:.2} srv_ns_per_kib={:.1} cli_cpu_pct={:.1} errors={} cli_lost_packets={lost} cli_congestion_events={cut} cli_max_rtt_us={}",
+            "req_s={:.0} gbit_s={:.3} p50_us={} p99_us={} p999_us={} max_us={} mean_us={:.0} srv_cpu_pct={:.1} srv_us_per_req={:.2} srv_ns_per_kib={:.1} cli_cpu_pct={:.1} errors={} cli_lost_packets={lost} cli_congestion_events={cut} cli_max_rtt_us={} srv_dgrams_per_req={srv_dgrams:.3} srv_acks_per_req={srv_acks:.3}",
             r as f64 / el,
             b as f64 * 8.0 / el / 1e9,
             pct(0.50),
             pct(0.99),
+            pct(0.999),
+            l.last().copied().unwrap_or(0),
+            if l.is_empty() { 0.0 } else { l.iter().map(|&x| x as f64).sum::<f64>() / l.len() as f64 },
             srv_cpu / el * 100.0,
             if r > 0 { srv_cpu * 1e6 / r as f64 } else { 0.0 },
             if b > 0 { srv_cpu * 1e9 / (b as f64 / 1024.0) } else { 0.0 },
