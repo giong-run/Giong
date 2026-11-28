@@ -1257,6 +1257,31 @@ impl Shared {
         })
     }
 
+    pub(crate) fn set_priority(&self, h: usize, s: Sid, priority: i32) {
+        let mut st = self.st.borrow_mut();
+        let c = st.conn(h);
+        if !c.stale(s) {
+            let _ = c.c.send_stream(s.id).set_priority(priority);
+        }
+    }
+
+    /// The priority of stream `id` by its number: false when the stream has
+    /// no sending side here (a unidirectional stream the peer opened, or
+    /// one not opened yet), or is over.
+    pub(crate) fn set_priority_of(&self, h: usize, id: u64, priority: i32) -> bool {
+        let Ok(id) = quinn_proto::VarInt::from_u64(id) else {
+            return false;
+        };
+        let id = StreamId::from(id);
+        let mut st = self.st.borrow_mut();
+        let c = st.conn(h);
+        // quinn-proto panics on a stream with no sending side.
+        if id.dir() == Dir::Uni && id.initiator() != c.c.side() {
+            return false;
+        }
+        c.c.send_stream(id).set_priority(priority).is_ok()
+    }
+
     pub(crate) fn reset(&self, h: usize, s: Sid, code: u32) {
         let mut st = self.st.borrow_mut();
         let c = st.conn(h);

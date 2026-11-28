@@ -1,0 +1,12 @@
+round 1 base table=0 n=100 Ir=9995278 statuses {b'200': 100} secs 0.233 max_tabl
+round 1 base table=0 n=600 Ir=39353384 statuses {b'200': 600} secs 0.789 max_tab
+round 1 priorities table=0 n=100 Ir=9964237 statuses {b'200': 100} secs 0.209 ma
+round 1 priorities table=0 n=600 Ir=39866729 statuses {b'200': 600} secs 0.933 m
+round 2 base table=0 n=100 Ir=10003948 statuses {b'200': 100} secs 0.213 max_tab
+round 2 base table=0 n=600 Ir=39515958 statuses {b'200': 600} secs 0.874 max_tab
+round 2 priorities table=0 n=100 Ir=10046473 statuses {b'200': 100} secs 0.253 m
+round 2 priorities table=0 n=600 Ir=38931416 statuses {b'200': 600} secs 0.66 ma
+round 3 base table=0 n=100 Ir=9954837 statuses {b'200': 100} secs 0.198 max_tabl
+round 3 base table=0 n=600 Ir=39065830 statuses {b'200': 600} secs 0.644 max_tab
+round 3 priorities table=0 n=100 Ir=10063576 statuses {b'200': 100} secs 0.273 m
+round 3 priorities table=0 n=600 Ir=39514214 statuses {b'200': 600} secs 0.78 ma

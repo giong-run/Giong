@@ -251,6 +251,16 @@ impl Connection {
         self.sh.stats(self.h)
     }
 
+    /// Sets the priority of stream `id`, by its number (see
+    /// [`SendStream::set_priority`]): for a protocol that learns of a
+    /// stream's priority apart from the stream, such as HTTP/3's
+    /// PRIORITY_UPDATE frame (RFC 9218). False when the stream has no
+    /// sending side on this end (a unidirectional stream the peer opened,
+    /// or one not opened yet), or is over; nothing changes then.
+    pub fn set_priority(&self, id: u64, priority: i32) -> bool {
+        self.sh.set_priority_of(self.h, id, priority)
+    }
+
     /// Closes the connection with an application error code and reason.
     pub fn close(&self, code: u32, reason: &[u8]) {
         self.sh.close_conn(self.h, code, reason);
@@ -336,6 +346,15 @@ impl SendStream {
     pub fn reset(&mut self, code: u32) {
         self.finished = true;
         self.sh.reset(self.h, self.id, code);
+    }
+
+    /// Sets the stream's priority: of the streams that have data to send,
+    /// those with the highest priority go first, and those of equal
+    /// priority share the connection in turn. All start at 0. What was
+    /// already written takes the new priority the next time the stream is
+    /// picked.
+    pub fn set_priority(&mut self, priority: i32) {
+        self.sh.set_priority(self.h, self.id, priority);
     }
 
     /// Sends all of `data`, waiting while flow control holds it back.
