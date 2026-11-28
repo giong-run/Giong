@@ -8,5 +8,6 @@
   written, and what is left of the body after the response head goes out from a task of its own.
   A body the producer aborts resets the stream with `H3_REQUEST_CANCELLED`; a server that answers
   without reading (STOP_SENDING with `H3_NO_ERROR`) gets no more of it and the producer is told;
-  a request rejected before anything of its body was taken is sent again. Such requests used to
+  a request rejected before anything of its body was taken is sent again. A response given up
+  before it ends (dropped, or the request timed out) cancels the rest of the body too. Such requests used to
   be refused with prior knowledge and sent over TCP otherwise.

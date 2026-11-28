@@ -1,7 +1,8 @@
 //! Streamed request bodies over HTTP/3: giong-http's client against
 //! giong-http's `Server::serve_h3`, on one giong worker. Trailer fields
 //! both ways, a response read while its request is still being written,
-//! a body the producer aborts, and a server that answers without reading.
+//! a body the producer aborts, a server that answers without reading, and
+//! a response given up while its request is still being written.
 
 use std::cell::RefCell;
 use std::net::SocketAddr;
@@ -110,6 +111,24 @@ impl Handler for App {
                     while let Ok(Some(piece)) = body.chunk().await {
                         if sender.send(piece.to_ascii_uppercase()).await.is_err() {
                             return;
+                        }
+                    }
+                });
+                Response::new(200).body(out)
+            }
+            // Answers at once with a body that never comes, and goes on
+            // reading the request: the client gives up on the response.
+            "/hold" => {
+                let body = req.body_stream().expect("a streamed body");
+                let app = self.clone();
+                let (sender, out) = Body::channel();
+                giong::spawn(async move {
+                    let _never = sender;
+                    loop {
+                        match body.chunk().await {
+                            Ok(Some(piece)) => app.record(format!("hold got {}", piece.len())),
+                            Ok(None) => return app.record("hold ended"),
+                            Err(e) => return app.record(format!("hold cut: {e}")),
                         }
                     }
                 });
@@ -301,5 +320,62 @@ fn a_server_that_answers_without_reading_gets_no_more_of_the_body() {
             sleep(Duration::from_millis(5)).await;
         }
         assert!(body.is_closed(), "the producer was not told");
+    });
+}
+
+/// Polls `done` for up to a second.
+async fn eventually(done: impl Fn() -> bool) -> bool {
+    for _ in 0..200 {
+        if done() {
+            return true;
+        }
+        sleep(Duration::from_millis(5)).await;
+    }
+    done()
+}
+
+#[test]
+fn a_response_given_up_mid_upload_ends_the_upload() {
+    run(|| async {
+        let app = App::default();
+        let (base, client) = serve(app.clone());
+        let (request, body) = client.post(&format!("{base}/hold")).streamed_body();
+        body.send("first").await.unwrap();
+        let response = timeout(Duration::from_secs(5), request.send_streaming())
+            .await
+            .expect("the response before the end of the request")
+            .unwrap();
+        assert_eq!(response.status(), 200);
+        assert!(
+            eventually(|| app.seen("hold got")).await,
+            "{:?}",
+            app.log.borrow()
+        );
+        // Given up (as a request timeout would), with the body still open.
+        drop(response);
+        // The server sees its request cut short, not ended...
+        assert!(
+            eventually(|| app.seen("hold cut")).await,
+            "{:?}",
+            app.log.borrow()
+        );
+        assert!(!app.seen("hold ended"), "{:?}", app.log.borrow());
+        // ...and the producer's next send fails: nothing more goes out.
+        let mut refused = false;
+        for _ in 0..200 {
+            if body.send("more").await.is_err() {
+                refused = true;
+                break;
+            }
+            sleep(Duration::from_millis(5)).await;
+        }
+        assert!(refused, "the producer was not told: {:?}", app.log.borrow());
+        // The connection carries the next request.
+        let again = client
+            .post(&format!("{base}/whole"))
+            .body("ab")
+            .send()
+            .await;
+        assert_eq!(again.unwrap().body(), b"whole 2");
     });
 }

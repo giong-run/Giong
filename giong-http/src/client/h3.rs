@@ -21,7 +21,7 @@ use std::future::{poll_fn, Future};
 use std::io;
 use std::pin::pin;
 use std::rc::Rc;
-use std::task::Poll;
+use std::task::{Poll, Waker};
 
 use giong_quic::{RecvStream, SendStream};
 
@@ -225,8 +225,30 @@ impl Connection {
             })
             .await?;
         }
-        if let Some(pump) = pump {
-            drop(giong::spawn(pump));
+        if let Some(mut pump) = pump {
+            // HTTP/3 halves are independent (unlike HTTP/2's RST_STREAM):
+            // a response given up must also end the upload, or the rest of
+            // the body would still go out.
+            let abandon = Rc::new(Abandon::default());
+            stream.abandon = Some(abandon.clone());
+            let body = body.clone();
+            drop(giong::spawn(async move {
+                poll_fn(|cx| {
+                    if abandon.set.get() {
+                        return Poll::Ready(());
+                    }
+                    abandon.waker.set(Some(cx.waker().clone()));
+                    pump.as_mut().poll(cx).map(drop)
+                })
+                .await;
+                if abandon.set.get() {
+                    // Dropping the pump resets the stream with
+                    // H3_REQUEST_CANCELLED (`Cancel`); without the source
+                    // the producer's next send fails.
+                    drop(pump);
+                    drop(body.source.borrow_mut().take());
+                }
+            }));
         }
         Ok(stream)
     }
@@ -287,6 +309,8 @@ impl Connection {
             done: false,
             early,
             qpack_waiting: false,
+            complete: false,
+            abandon: None,
         };
         let body = req.body.unwrap_or_default();
         let mut out = Vec::with_capacity(128 + req.path.len());
@@ -334,6 +358,24 @@ impl BodySource {
             return None;
         }
         self.source.borrow_mut().take()
+    }
+}
+
+/// Tells the task sending what is left of a streamed request body that
+/// the response was given up before it ended (dropped, or the request
+/// timed out), so that the body stops too.
+#[derive(Default)]
+struct Abandon {
+    set: Cell<bool>,
+    waker: Cell<Option<Waker>>,
+}
+
+impl Abandon {
+    fn now(&self) {
+        self.set.set(true);
+        if let Some(waker) = self.waker.take() {
+            waker.wake();
+        }
     }
 }
 
@@ -668,6 +710,12 @@ pub(crate) struct Stream {
     /// A field section waits for insertions on the server's encoder
     /// stream. Given up then, the decoder has told the encoder already.
     qpack_waiting: bool,
+    /// The whole response was read: a streamed request body still going
+    /// out may finish (RFC 9114, section 4.1.2).
+    complete: bool,
+    /// The task sending the rest of a streamed request body, told when the
+    /// stream goes before the response is complete.
+    abandon: Option<Rc<Abandon>>,
 }
 
 impl Stream {
@@ -915,6 +963,7 @@ impl Stream {
                         return Err(self.malformed("a body shorter than its content-length"));
                     }
                     self.done = true;
+                    self.complete = true;
                     return Ok(false);
                 }
                 Err(fail) => return Err(self.stop(fail)),
@@ -983,6 +1032,11 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
+        if !self.complete {
+            if let Some(abandon) = &self.abandon {
+                abandon.now();
+            }
+        }
         self.cancel();
     }
 }
