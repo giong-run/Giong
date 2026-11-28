@@ -323,10 +323,18 @@ def analyse(data_dir):
 
 def report(args):
     meta, rows, runs, jobs = analyse(args.dir)
+    total = len(rows)
+    if args.ready_after:
+        rows = [r for r in rows if r["ready"] >= args.ready_after]
+    if args.exclude_author:
+        rows = [r for r in rows if r["author"] not in args.exclude_author]
     out = []
     w = out.append
     w(f"# Workflow metrics: {meta['since']} to {meta['until']}\n")
-    w(f"{len(rows)} pull requests merged into main (fetched {meta['fetched']}).\n")
+    w(f"{len(rows)} pull requests merged into main (fetched {meta['fetched']})"
+      + (f", of {total} in the window: ready after {args.ready_after or '-'}, "
+         f"authors left out: {', '.join(args.exclude_author or []) or '-'}" if len(rows) != total else "")
+      + ".\n")
 
     def line(label, vals, f=fmt_min):
         vals = [v for v in vals if v is not None]
@@ -439,6 +447,10 @@ def main():
     r = sub.add_parser("report")
     r.add_argument("dir")
     r.add_argument("--csv")
+    r.add_argument("--ready-after", metavar="TIME",
+                   help="only pull requests ready for review at or after TIME (a new workflow's own)")
+    r.add_argument("--exclude-author", nargs="+", metavar="LOGIN",
+                   help="leave out these authors' pull requests (the release bot's, say)")
     args = ap.parse_args()
     {"fetch": fetch, "report": report}[args.cmd](args)
 
